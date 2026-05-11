@@ -25,11 +25,7 @@ No Chromium, no bundled agents, no telemetry. No company behind it, and there ne
 
 ## Screenshots
 
-<p align="center">
-    <img alt="Alacritree with project sidebar" src="alacritree/assets/screenshot1.png">
-    <img alt="Alacritree with git status sidebar" src="alacritree/assets/screenshot2.png">
-    <img alt="Alacritree with both sidebars" src="alacritree/assets/screenshot3.png">
-</p>
+https://github.com/user-attachments/assets/c0b0aa23-59f1-49d3-a3aa-dcdf1eff7363
 
 > **Status:** early, single-author project. Linux is the only platform
 > with a working build today — the GUI deps currently target Linux, so the
