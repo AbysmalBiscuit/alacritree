@@ -16,6 +16,8 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::command_ext::CommandExt;
+
 /// Re-query at most this often.  PR base branches rarely change, and a stale
 /// answer just falls back to the previous diff target — not worth hammering
 /// `gh` on every status refresh.
@@ -120,6 +122,7 @@ fn spawn_lookup(
 /// to be checked out in the worktree.
 fn query_gh(path: &Path, branch: &str) -> Option<PrInfo> {
     let output = Command::new("gh")
+        .hide_console()
         .current_dir(path)
         .args(["pr", "view", branch, "--json", "number,baseRefName,url"])
         .stdout(Stdio::piped())
@@ -147,7 +150,8 @@ mod tests {
 
     #[test]
     fn parses_gh_json() {
-        let stdout = br#"{"baseRefName":"main","number":42,"url":"https://github.com/o/r/pull/42"}"#;
+        let stdout =
+            br#"{"baseRefName":"main","number":42,"url":"https://github.com/o/r/pull/42"}"#;
         let info = parse_gh_output(stdout).unwrap();
         assert_eq!(info.number, 42);
         assert_eq!(info.base_branch, "main");

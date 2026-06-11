@@ -26,13 +26,26 @@ fn default_true() -> bool {
 }
 
 pub fn config_path() -> Option<PathBuf> {
-    let base = if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-        PathBuf::from(xdg)
-    } else {
-        let home = std::env::var_os("HOME")?;
-        PathBuf::from(home).join(".config")
-    };
-    Some(base.join("alacritree").join("state.toml"))
+    Some(config_dir()?.join("alacritree").join("state.toml"))
+}
+
+/// Per-user config base: XDG on Unix, the roaming app-data dir on Windows
+/// (which has neither `$XDG_CONFIG_HOME` nor `$HOME`).
+#[cfg(not(windows))]
+fn config_dir() -> Option<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        return Some(PathBuf::from(xdg));
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".config"))
+}
+
+#[cfg(windows)]
+fn config_dir() -> Option<PathBuf> {
+    std::env::var_os("APPDATA")
+        .or_else(|| std::env::var_os("LOCALAPPDATA"))
+        .map(PathBuf::from)
+        .or_else(home::home_dir)
 }
 
 pub fn load() -> PersistedState {

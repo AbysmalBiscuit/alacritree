@@ -1146,25 +1146,30 @@ impl AlacritreeApp {
     }
 }
 
-/// Pipe `git diff` for the clicked file through delta. Positional args via
-/// `sh -c '…' name "$1" "$2"` keep path/branch names out of the script body so
-/// no shell metacharacter in the file name can be interpreted.
+/// Show the clicked file's `git diff` in delta, wired in as git's pager so git
+/// drives the pipe itself.  This drops the POSIX-`sh` dependency the old
+/// `sh -c '… | delta'` had — which had no equivalent on Windows, so diffs never
+/// opened there.  Paths/branches stay in argv, so no file name is shell-parsed.
 fn build_diff_command(req: &DiffRequest) -> (String, Vec<String>) {
-    let script: &str = match &req.source {
-        DiffSource::Staged => r#"git diff --cached -- "$1" | delta --paging=always"#,
-        DiffSource::Worktree => r#"git diff -- "$1" | delta --paging=always"#,
-        // `--no-index` is git's "diff arbitrary files" mode; against /dev/null it
-        // shows the untracked file as a pure addition. Exits non-zero by design.
-        DiffSource::Untracked => r#"git diff --no-index -- /dev/null "$1" | delta --paging=always"#,
+    let mut args =
+        vec!["-c".to_string(), "core.pager=delta --paging=always".to_string(), "diff".to_string()];
+    match &req.source {
+        DiffSource::Staged => args.push("--cached".to_string()),
+        DiffSource::Worktree => {},
+        // `--no-index` against /dev/null shows the untracked file as a pure
+        // addition; git special-cases "/dev/null" on every platform. Exits
+        // non-zero by design.
+        DiffSource::Untracked => args.push("--no-index".to_string()),
         // Triple-dot diff = "from merge-base to HEAD" — matches the sidebar's
         // `Changes vs <branch>` stat semantics in git_status.rs.
-        DiffSource::Branch { .. } => r#"git diff "$2"... -- "$1" | delta --paging=always"#,
-    };
-    let mut args = vec!["-c".to_string(), script.to_string(), "sh".to_string(), req.file.clone()];
-    if let DiffSource::Branch { base } = &req.source {
-        args.push(base.clone());
+        DiffSource::Branch { base } => args.push(format!("{base}...")),
     }
-    ("sh".to_string(), args)
+    args.push("--".to_string());
+    if matches!(req.source, DiffSource::Untracked) {
+        args.push("/dev/null".to_string());
+    }
+    args.push(req.file.clone());
+    ("git".to_string(), args)
 }
 
 fn dirty_warning(counts: &DirtyCounts) -> Option<String> {

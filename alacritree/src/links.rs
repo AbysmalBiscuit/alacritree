@@ -12,6 +12,7 @@ use alacritty_terminal::index::{Direction, Point};
 use alacritty_terminal::term::Term;
 use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 
+use crate::command_ext::CommandExt;
 use crate::session::EventProxy;
 
 // Identical to alacritty's built-in URL hint regex so the set of recognised
@@ -161,6 +162,7 @@ pub fn open(uri: &str) {
 #[cfg(target_os = "macos")]
 fn spawn(uri: &str) -> std::io::Result<()> {
     Command::new("open")
+        .hide_console()
         .arg(uri)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -174,6 +176,7 @@ fn spawn(uri: &str) -> std::io::Result<()> {
     // `start` treats its first quoted argument as a window title, so pass an
     // empty title before the URL to keep `cmd` from eating it.
     Command::new("cmd")
+        .hide_console()
         .args(["/c", "start", ""])
         .arg(uri)
         .stdin(Stdio::null())
@@ -186,6 +189,7 @@ fn spawn(uri: &str) -> std::io::Result<()> {
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn spawn(uri: &str) -> std::io::Result<()> {
     Command::new("xdg-open")
+        .hide_console()
         .arg(uri)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

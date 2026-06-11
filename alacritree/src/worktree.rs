@@ -6,6 +6,8 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
+use crate::command_ext::CommandExt;
+
 #[derive(Debug, Clone)]
 pub enum Progress {
     Step(String),
@@ -141,6 +143,7 @@ fn enable_claude_terminal_bell(worktree_root: &Path) -> std::io::Result<()> {
 
 fn run_git(cwd: &Path, args: &[&str]) -> Result<(), String> {
     let output = Command::new("git")
+        .hide_console()
         .arg("-C")
         .arg(cwd)
         .args(args)
@@ -159,6 +162,7 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<(), String> {
 
 fn has_remote(cwd: &Path, name: &str) -> bool {
     Command::new("git")
+        .hide_console()
         .arg("-C")
         .arg(cwd)
         .args(["remote", "get-url", name])
@@ -219,6 +223,7 @@ fn resolve_base_branch(cwd: &Path, hint: Option<&str>) -> Result<(String, String
 
 fn rev_parse_verify(cwd: &Path, name: &str) -> bool {
     Command::new("git")
+        .hide_console()
         .arg("-C")
         .arg(cwd)
         .args(["rev-parse", "--verify", "--quiet", name])
@@ -235,6 +240,7 @@ fn rev_parse_verify(cwd: &Path, name: &str) -> bool {
 /// We pull the `refs/heads/<name>` from the symref line.
 fn query_origin_head(cwd: &Path) -> Option<String> {
     let output = Command::new("git")
+        .hide_console()
         .arg("-C")
         .arg(cwd)
         .args(["ls-remote", "--symref", "origin", "HEAD"])

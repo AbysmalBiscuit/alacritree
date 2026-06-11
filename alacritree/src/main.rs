@@ -5,6 +5,7 @@ mod bindings;
 mod builtin_font;
 mod clipboard;
 mod colors;
+mod command_ext;
 mod config;
 mod fonts;
 mod git_status;
