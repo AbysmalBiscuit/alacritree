@@ -66,6 +66,20 @@ const DEFAULT_FAMILY: &str = if cfg!(target_os = "macos") {
     "monospace"
 };
 
+/// Where `scanned_coverage` persists its results.  `Standard` resolves the
+/// per-user location lazily at scan time; `Fixed` pins the cache to a given
+/// file — or disables it with `None` — so tests never read or write the
+/// user's real cache.
+#[cfg(not(unix))]
+#[derive(Default)]
+enum CacheLocation {
+    #[default]
+    Standard,
+    // Only tests pin the location; production always resolves `Standard`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Fixed(Option<PathBuf>),
+}
+
 /// Lazily-loaded system font database shared by every resolution within one
 /// `install_terminal_fonts` call.  Loading is deferred so Unix systems where
 /// fontconfig answers everything never pay for a fontdb scan.
@@ -74,9 +88,25 @@ struct SystemFonts {
     db: OnceCell<fontdb::Database>,
     #[cfg(not(unix))]
     coverage: OnceCell<Vec<(coverage::Candidate, coverage::Coverage)>>,
+    #[cfg(not(unix))]
+    cache_location: CacheLocation,
 }
 
 impl SystemFonts {
+    /// Pin the coverage cache to `cache_path`, or disable it with `None`.
+    /// Compiled on Unix too (where there is no coverage cache and the
+    /// location is ignored) so platform-neutral tests can call it.
+    #[cfg(test)]
+    fn with_cache_dir(cache_path: Option<PathBuf>) -> Self {
+        #[cfg(unix)]
+        let _ = cache_path;
+        Self {
+            #[cfg(not(unix))]
+            cache_location: CacheLocation::Fixed(cache_path),
+            ..Self::default()
+        }
+    }
+
     fn db(&self) -> &fontdb::Database {
         self.db.get_or_init(|| {
             let mut db = fontdb::Database::new();
@@ -90,17 +120,56 @@ impl SystemFonts {
     #[cfg(not(unix))]
     fn scanned_coverage(&self) -> &[(coverage::Candidate, coverage::Coverage)] {
         self.coverage.get_or_init(|| {
-            let started = std::time::Instant::now();
-            let db = self.db();
-            let mut scanned = Vec::new();
-            for face in db.faces() {
-                let (path, face_index) = match &face.source {
-                    fontdb::Source::File(p) | fontdb::Source::SharedFile(p, _) => {
-                        (p.clone(), face.index)
-                    },
-                    // Embedded faces aren't path-addressable by our loader.
-                    fontdb::Source::Binary(_) => continue,
-                };
+            let cache_path = match &self.cache_location {
+                CacheLocation::Standard => disk_cache::default_cache_path(),
+                CacheLocation::Fixed(path) => path.clone(),
+            };
+            scan_coverage(self.db(), cache_path.as_deref())
+        })
+    }
+}
+
+/// Scan every system face's cmap, reusing ranges from `cache_path` for files
+/// whose size and mtime still match a prior scan.  `cache_path` is a
+/// parameter (rather than always `disk_cache::default_cache_path()`) so
+/// tests can point it at a scratch directory instead of the real
+/// `%LOCALAPPDATA%`.
+#[cfg(not(unix))]
+fn scan_coverage(
+    db: &fontdb::Database,
+    cache_path: Option<&Path>,
+) -> Vec<(coverage::Candidate, coverage::Coverage)> {
+    let started = std::time::Instant::now();
+    let cache = cache_path.and_then(disk_cache::load).unwrap_or_default();
+    let mut stat_memo: HashMap<PathBuf, Option<(u64, u64)>> = HashMap::new();
+    let mut fresh_files: HashMap<String, disk_cache::CachedFile> = HashMap::new();
+    let mut scanned = Vec::new();
+    let mut hits = 0usize;
+    let mut any_fresh = false;
+
+    for face in db.faces() {
+        let (path, face_index) = match &face.source {
+            fontdb::Source::File(p) | fontdb::Source::SharedFile(p, _) => (p.clone(), face.index),
+            // Embedded faces aren't path-addressable by our loader.
+            fontdb::Source::Binary(_) => continue,
+        };
+        let path_key = path.to_string_lossy().into_owned();
+        let stat = *stat_memo.entry(path.clone()).or_insert_with(|| disk_cache::stat_file(&path));
+
+        let cached_ranges = stat.and_then(|(size, mtime_millis)| {
+            let cached_file = cache.get(&path_key)?;
+            (cached_file.size == size && cached_file.mtime_millis == mtime_millis)
+                .then(|| cached_file.faces.get(&face_index).cloned())
+                .flatten()
+        });
+
+        let cov = match cached_ranges.and_then(coverage::Coverage::from_stored_ranges) {
+            Some(cov) => {
+                hits += 1;
+                cov
+            },
+            None => {
+                any_fresh = true;
                 let Some(cov) = db
                     .with_face_data(face.id, |data, index| {
                         let parsed = ttf_parser::Face::parse(data, index).ok()?;
@@ -111,27 +180,183 @@ impl SystemFonts {
                     log::debug!("skipping unparseable font {}", path.display());
                     continue;
                 };
-                let family =
-                    face.families.first().map(|(name, _)| name.clone()).unwrap_or_default();
-                scanned.push((
-                    coverage::Candidate {
-                        path,
-                        face_index,
-                        family,
-                        weight: face.weight.0,
-                        italic: face.style != fontdb::Style::Normal,
-                        monospaced: face.monospaced,
-                    },
-                    cov,
-                ));
+                cov
+            },
+        };
+
+        if let Some((size, mtime_millis)) = stat {
+            fresh_files
+                .entry(path_key)
+                .or_insert_with(|| disk_cache::CachedFile {
+                    size,
+                    mtime_millis,
+                    faces: HashMap::new(),
+                })
+                .faces
+                .insert(face_index, cov.ranges().to_vec());
+        }
+
+        let family = face.families.first().map(|(name, _)| name.clone()).unwrap_or_default();
+        scanned.push((
+            coverage::Candidate {
+                path,
+                face_index,
+                family,
+                weight: face.weight.0,
+                italic: face.style != fontdb::Style::Normal,
+                monospaced: face.monospaced,
+            },
+            cov,
+        ));
+    }
+
+    // A cache that was absent or invalid produced zero hits, so every face
+    // above went through the fresh-parse branch and `any_fresh` is already
+    // true; no separate "was the cache valid" bookkeeping is needed.
+    if any_fresh {
+        if let Some(cache_path) = cache_path {
+            disk_cache::write(cache_path, &fresh_files);
+        }
+    }
+
+    log::info!(
+        "scanned {} font faces for fallback coverage in {} ms ({} from cache)",
+        scanned.len(),
+        started.elapsed().as_millis(),
+        hits
+    );
+    scanned
+}
+
+/// Persists the coverage scan across launches, keyed by each font file's
+/// size and mtime.  A custom binary format (rather than a serde crate) keeps
+/// this cache std-only; corruption or a version mismatch just means the next
+/// launch rescans, so the format has no need to be self-describing beyond a
+/// magic/version check.
+#[cfg(not(unix))]
+mod disk_cache {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::time::UNIX_EPOCH;
+
+    const MAGIC: &[u8; 4] = b"ATCC";
+    const VERSION: u32 = 1;
+
+    pub struct CachedFile {
+        pub size: u64,
+        pub mtime_millis: u64,
+        pub faces: HashMap<u32, Vec<(u32, u32)>>,
+    }
+
+    pub fn default_cache_path() -> Option<PathBuf> {
+        let local_app_data = std::env::var_os("LOCALAPPDATA")?;
+        Some(PathBuf::from(local_app_data).join("alacritree").join("coverage-cache.v1.bin"))
+    }
+
+    /// A file's identity for cache purposes: byte size plus modification
+    /// time.  Either changing is treated as "this file might have new
+    /// glyphs" and forces a rescan of every face in it.
+    pub fn stat_file(path: &Path) -> Option<(u64, u64)> {
+        let meta = std::fs::metadata(path).ok()?;
+        let modified = meta.modified().ok()?;
+        let millis = modified.duration_since(UNIX_EPOCH).ok()?.as_millis() as u64;
+        Some((meta.len(), millis))
+    }
+
+    pub fn load(path: &Path) -> Option<HashMap<String, CachedFile>> {
+        let bytes = std::fs::read(path).ok()?;
+        parse(&bytes)
+    }
+
+    fn read_bytes<'a>(bytes: &'a [u8], cursor: &mut usize, len: usize) -> Option<&'a [u8]> {
+        let end = cursor.checked_add(len)?;
+        let slice = bytes.get(*cursor..end)?;
+        *cursor = end;
+        Some(slice)
+    }
+
+    fn read_u32(bytes: &[u8], cursor: &mut usize) -> Option<u32> {
+        Some(u32::from_le_bytes(read_bytes(bytes, cursor, 4)?.try_into().ok()?))
+    }
+
+    fn read_u64(bytes: &[u8], cursor: &mut usize) -> Option<u64> {
+        Some(u64::from_le_bytes(read_bytes(bytes, cursor, 8)?.try_into().ok()?))
+    }
+
+    fn parse(bytes: &[u8]) -> Option<HashMap<String, CachedFile>> {
+        let cursor = &mut 0usize;
+        if read_bytes(bytes, cursor, 4)? != MAGIC {
+            return None;
+        }
+        if read_u32(bytes, cursor)? != VERSION {
+            return None;
+        }
+        let file_count = read_u32(bytes, cursor)?;
+        // Counts are untrusted until the reads they promise succeed, so no
+        // pre-reservation: a corrupt count must fail at the bounds check, not
+        // as a giant allocation that aborts the process.
+        let mut files = HashMap::new();
+        for _ in 0..file_count {
+            let path_len = read_u32(bytes, cursor)? as usize;
+            let path = String::from_utf8(read_bytes(bytes, cursor, path_len)?.to_vec()).ok()?;
+            let size = read_u64(bytes, cursor)?;
+            let mtime_millis = read_u64(bytes, cursor)?;
+            let face_count = read_u32(bytes, cursor)?;
+            let mut faces = HashMap::new();
+            for _ in 0..face_count {
+                let face_index = read_u32(bytes, cursor)?;
+                let range_count = read_u32(bytes, cursor)?;
+                let mut ranges = Vec::new();
+                for _ in 0..range_count {
+                    let start = read_u32(bytes, cursor)?;
+                    let end = read_u32(bytes, cursor)?;
+                    ranges.push((start, end));
+                }
+                faces.insert(face_index, ranges);
             }
-            log::info!(
-                "scanned {} font faces for fallback coverage in {} ms",
-                scanned.len(),
-                started.elapsed().as_millis()
-            );
-            scanned
-        })
+            files.insert(path, CachedFile { size, mtime_millis, faces });
+        }
+        Some(files)
+    }
+
+    /// Font problems must never fail startup, so every I/O error here is
+    /// swallowed after a debug log; the next launch simply rescans.
+    pub fn write(path: &Path, files: &HashMap<String, CachedFile>) {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&VERSION.to_le_bytes());
+        buf.extend_from_slice(&(files.len() as u32).to_le_bytes());
+        for (file_path, cached) in files {
+            let path_bytes = file_path.as_bytes();
+            buf.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(path_bytes);
+            buf.extend_from_slice(&cached.size.to_le_bytes());
+            buf.extend_from_slice(&cached.mtime_millis.to_le_bytes());
+            buf.extend_from_slice(&(cached.faces.len() as u32).to_le_bytes());
+            for (face_index, ranges) in &cached.faces {
+                buf.extend_from_slice(&face_index.to_le_bytes());
+                buf.extend_from_slice(&(ranges.len() as u32).to_le_bytes());
+                for &(start, end) in ranges {
+                    buf.extend_from_slice(&start.to_le_bytes());
+                    buf.extend_from_slice(&end.to_le_bytes());
+                }
+            }
+        }
+
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                log::debug!("could not create font coverage cache dir {}: {e}", parent.display());
+                return;
+            }
+        }
+        let tmp_path = path.with_extension("tmp");
+        if let Err(e) = std::fs::write(&tmp_path, &buf) {
+            log::debug!("could not write font coverage cache {}: {e}", tmp_path.display());
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, path) {
+            log::debug!("could not install font coverage cache {}: {e}", path.display());
+        }
     }
 }
 
@@ -684,7 +909,7 @@ mod tests {
         std::fs::write(&path, b"egui parses this later; registration only reads bytes").unwrap();
 
         let mut defs = FontDefinitions::default();
-        let fonts = SystemFonts::default();
+        let fonts = SystemFonts::with_cache_dir(None);
         let mut book = FallbackBook::default();
         let entries = vec![path.to_string_lossy().into_owned()];
 
@@ -721,7 +946,7 @@ mod tests {
     #[test]
     fn unresolved_user_fallback_warns_once_and_adds_nothing() {
         let mut defs = FontDefinitions::default();
-        let fonts = SystemFonts::default();
+        let fonts = SystemFonts::with_cache_dir(None);
         let mut book = FallbackBook::default();
         let entries = vec![String::from("alacritree-no-such-family-6c1e")];
         let before = defs.families[&FontFamily::Monospace].len();
@@ -737,7 +962,7 @@ mod tests {
     #[cfg(not(unix))]
     #[test]
     fn windows_chain_respects_limit_skip_set_and_uniqueness() {
-        let fonts = SystemFonts::default();
+        let fonts = SystemFonts::with_cache_dir(None);
         let skip = HashSet::new();
         let faces = gather_fallback_faces("Consolas", None, Variant::Normal, &skip, 8, &fonts);
         assert!(faces.len() <= 8);
@@ -756,7 +981,7 @@ mod tests {
     #[cfg(not(unix))]
     #[test]
     fn later_variants_reuse_faces_loaded_by_an_earlier_chain() {
-        let fonts = SystemFonts::default();
+        let fonts = SystemFonts::with_cache_dir(None);
         let mut defs = FontDefinitions::default();
         let mut book = FallbackBook::default();
 
@@ -795,7 +1020,7 @@ mod tests {
     #[test]
     fn automatic_chain_records_every_loaded_path_in_ids_by_path() {
         let mut defs = FontDefinitions::default();
-        let fonts = SystemFonts::default();
+        let fonts = SystemFonts::with_cache_dir(None);
         let mut book = FallbackBook::default();
 
         let targets = [FontFamily::Monospace];
@@ -830,7 +1055,7 @@ mod tests {
         std::fs::write(&path, b"egui parses this later; registration only reads bytes").unwrap();
 
         let mut defs = FontDefinitions::default();
-        let fonts = SystemFonts::default();
+        let fonts = SystemFonts::with_cache_dir(None);
         let mut book = FallbackBook::default();
         let entries = vec![path.to_string_lossy().into_owned()];
         let targets = [FontFamily::Monospace];
@@ -888,6 +1113,82 @@ mod tests {
         assert!(fallback_tweak(Some(own * 1.5), &data, 0).scale > 1.0);
         assert!(fallback_tweak(Some(own * 0.5), &data, 0).scale < 1.0);
     }
+
+    #[cfg(not(unix))]
+    fn scratch_cache_path(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("alacritree_test_coverage_cache_{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("coverage-cache.v1.bin")
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn coverage_cache_round_trips_across_scans() {
+        let cache_path = scratch_cache_path("round_trip");
+        std::fs::remove_file(&cache_path).ok();
+
+        let cold_fonts = SystemFonts::with_cache_dir(None);
+        let cold = scan_coverage(cold_fonts.db(), Some(&cache_path));
+        assert!(cache_path.is_file());
+
+        let warm_fonts = SystemFonts::with_cache_dir(None);
+        let warm = scan_coverage(warm_fonts.db(), Some(&cache_path));
+
+        assert_eq!(cold, warm);
+
+        std::fs::remove_file(&cache_path).ok();
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn coverage_cache_corruption_falls_back_to_full_rescan() {
+        let cache_path = scratch_cache_path("corruption");
+        std::fs::remove_file(&cache_path).ok();
+
+        let cold_fonts = SystemFonts::with_cache_dir(None);
+        let cold = scan_coverage(cold_fonts.db(), Some(&cache_path));
+
+        std::fs::write(&cache_path, b"not a valid coverage cache").unwrap();
+
+        let rescanned_fonts = SystemFonts::with_cache_dir(None);
+        let rescanned = scan_coverage(rescanned_fonts.db(), Some(&cache_path));
+
+        assert_eq!(cold, rescanned);
+
+        std::fs::remove_file(&cache_path).ok();
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn coverage_cache_rejects_huge_declared_counts_without_allocating() {
+        // Counts come from an untrusted file; a corrupt buffer with intact
+        // magic and version but a bogus count must fail at the bounds check,
+        // not pre-allocate gigabytes and abort the process.
+        let cache_path = scratch_cache_path("huge_counts");
+
+        let mut huge_file_count = Vec::new();
+        huge_file_count.extend_from_slice(b"ATCC");
+        huge_file_count.extend_from_slice(&1u32.to_le_bytes()); // version
+        huge_file_count.extend_from_slice(&u32::MAX.to_le_bytes()); // file_count
+        std::fs::write(&cache_path, &huge_file_count).unwrap();
+        assert!(disk_cache::load(&cache_path).is_none());
+
+        let mut huge_range_count = Vec::new();
+        huge_range_count.extend_from_slice(b"ATCC");
+        huge_range_count.extend_from_slice(&1u32.to_le_bytes()); // version
+        huge_range_count.extend_from_slice(&1u32.to_le_bytes()); // file_count
+        huge_range_count.extend_from_slice(&1u32.to_le_bytes()); // path length
+        huge_range_count.push(b'a');
+        huge_range_count.extend_from_slice(&10u64.to_le_bytes()); // size
+        huge_range_count.extend_from_slice(&20u64.to_le_bytes()); // mtime_millis
+        huge_range_count.extend_from_slice(&1u32.to_le_bytes()); // face_count
+        huge_range_count.extend_from_slice(&0u32.to_le_bytes()); // face_index
+        huge_range_count.extend_from_slice(&u32::MAX.to_le_bytes()); // range_count
+        std::fs::write(&cache_path, &huge_range_count).unwrap();
+        assert!(disk_cache::load(&cache_path).is_none());
+
+        std::fs::remove_file(&cache_path).ok();
+    }
 }
 
 // Pure candidate-selection logic for the automatic fallback chain: Unicode
@@ -903,7 +1204,7 @@ mod coverage {
         ranges: Vec<(u32, u32)>,
     }
 
-    #[derive(Clone, Debug)]
+    #[derive(Clone, Debug, PartialEq)]
     pub struct Candidate {
         pub path: PathBuf,
         pub face_index: u32,
@@ -927,6 +1228,25 @@ mod coverage {
                 }
             }
             Self { ranges }
+        }
+
+        /// Rebuild from ranges that were produced by `from_codepoints` and stored;
+        /// validated so a corrupt cache cannot break the sortedness invariant.
+        /// The Unicode bound matters too: a well-formed but bogus range like
+        /// `(0, u32::MAX)` would mark everything as covered and silently empty
+        /// the automatic chain until the font file changes.
+        pub fn from_stored_ranges(ranges: Vec<(u32, u32)>) -> Option<Self> {
+            if ranges.iter().any(|&(start, end)| start > end || end > 0x10FFFF) {
+                return None;
+            }
+            if ranges.windows(2).any(|w| w[1].0 < w[0].1.saturating_add(2)) {
+                return None;
+            }
+            Some(Self { ranges })
+        }
+
+        pub fn ranges(&self) -> &[(u32, u32)] {
+            &self.ranges
         }
 
         pub fn merge(&mut self, other: &Coverage) {
@@ -1109,6 +1429,27 @@ mod coverage {
             let kept = trim_by_coverage(candidates, &seed, 2);
             let names: Vec<_> = kept.iter().map(|c| c.family.as_str()).collect();
             assert_eq!(names, ["nerd", "emoji"]);
+        }
+
+        #[test]
+        fn from_stored_ranges_accepts_disjoint_nonadjacent_ranges() {
+            let ranges = vec![(1, 3), (10, 20), (25, 25)];
+            assert_eq!(Coverage::from_stored_ranges(ranges.clone()), Some(Coverage { ranges }));
+        }
+
+        #[test]
+        fn from_stored_ranges_rejects_malformed_ranges() {
+            // start > end within a range.
+            assert!(Coverage::from_stored_ranges(vec![(5, 3)]).is_none());
+            // Overlapping ranges.
+            assert!(Coverage::from_stored_ranges(vec![(1, 5), (5, 10)]).is_none());
+            // Adjacent ranges that `from_codepoints` would have merged.
+            assert!(Coverage::from_stored_ranges(vec![(1, 5), (6, 10)]).is_none());
+            // Out of order.
+            assert!(Coverage::from_stored_ranges(vec![(10, 20), (1, 5)]).is_none());
+            // Beyond the last Unicode codepoint.
+            assert!(Coverage::from_stored_ranges(vec![(0, u32::MAX)]).is_none());
+            assert!(Coverage::from_stored_ranges(vec![(1, 3), (10, 0x110000)]).is_none());
         }
     }
 }
