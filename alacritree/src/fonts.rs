@@ -695,6 +695,32 @@ mod coverage {
         }
     }
 
+    /// Order candidates by fontconfig-like affinity to the seed face:
+    /// same-family siblings, then weight/slant matches, then monospace, then
+    /// everything else; ties break on family name, path, and face index so
+    /// the resulting chain is deterministic across runs.
+    pub fn order_candidates(
+        candidates: &mut [(Candidate, Coverage)],
+        family: &str,
+        weight: u16,
+        italic: bool,
+    ) {
+        candidates.sort_by(|(a, _), (b, _)| {
+            let affinity = |c: &Candidate| {
+                (
+                    !c.family.eq_ignore_ascii_case(family),
+                    !(c.weight == weight && c.italic == italic),
+                    !c.monospaced,
+                )
+            };
+            affinity(a)
+                .cmp(&affinity(b))
+                .then_with(|| a.family.cmp(&b.family))
+                .then_with(|| a.path.cmp(&b.path))
+                .then_with(|| a.face_index.cmp(&b.face_index))
+        });
+    }
+
     /// Greedy trim mirroring FcFontSort(trim=true): walk candidates in order,
     /// keeping only faces that cover at least one codepoint the seed face and
     /// the already-kept faces don't.
@@ -730,6 +756,34 @@ mod coverage {
                 italic: false,
                 monospaced: true,
             }
+        }
+
+        fn cand2(family: &str, weight: u16, italic: bool, monospaced: bool) -> Candidate {
+            Candidate { weight, italic, monospaced, ..cand(family) }
+        }
+
+        #[test]
+        fn orders_family_then_style_then_monospace_then_name() {
+            let mut candidates = vec![
+                (cand2("Zeta", 400, false, false), Coverage::default()),
+                (cand2("Beta", 400, false, true), Coverage::default()),
+                (cand2("Alpha", 700, true, false), Coverage::default()),
+                (cand2("Seed Family", 400, false, false), Coverage::default()),
+                (cand2("Beta", 700, false, true), Coverage::default()),
+            ];
+            order_candidates(&mut candidates, "seed family", 700, false);
+            let order: Vec<_> =
+                candidates.iter().map(|(c, _)| (c.family.as_str(), c.weight)).collect();
+            assert_eq!(
+                order,
+                [
+                    ("Seed Family", 400), // same family wins even without a style match
+                    ("Beta", 700),        // style match + monospace
+                    ("Beta", 400),        // monospace
+                    ("Alpha", 700),       // italic mismatches the variant; name order
+                    ("Zeta", 400),
+                ]
+            );
         }
 
         #[test]
