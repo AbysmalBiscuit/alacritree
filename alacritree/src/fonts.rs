@@ -72,6 +72,8 @@ const DEFAULT_FAMILY: &str = if cfg!(target_os = "macos") {
 #[derive(Default)]
 struct SystemFonts {
     db: OnceCell<fontdb::Database>,
+    #[cfg(not(unix))]
+    coverage: OnceCell<Vec<(coverage::Candidate, coverage::Coverage)>>,
 }
 
 impl SystemFonts {
@@ -80,6 +82,55 @@ impl SystemFonts {
             let mut db = fontdb::Database::new();
             db.load_system_fonts();
             db
+        })
+    }
+
+    /// Scan every system face's cmap once per install; all four variant
+    /// chains reorder and trim this shared list.
+    #[cfg(not(unix))]
+    fn scanned_coverage(&self) -> &[(coverage::Candidate, coverage::Coverage)] {
+        self.coverage.get_or_init(|| {
+            let started = std::time::Instant::now();
+            let db = self.db();
+            let mut scanned = Vec::new();
+            for face in db.faces() {
+                let (path, face_index) = match &face.source {
+                    fontdb::Source::File(p) | fontdb::Source::SharedFile(p, _) => {
+                        (p.clone(), face.index)
+                    },
+                    // Embedded faces aren't path-addressable by our loader.
+                    fontdb::Source::Binary(_) => continue,
+                };
+                let Some(cov) = db
+                    .with_face_data(face.id, |data, index| {
+                        let parsed = ttf_parser::Face::parse(data, index).ok()?;
+                        cmap_coverage(&parsed)
+                    })
+                    .flatten()
+                else {
+                    log::debug!("skipping unparseable font {}", path.display());
+                    continue;
+                };
+                let family =
+                    face.families.first().map(|(name, _)| name.clone()).unwrap_or_default();
+                scanned.push((
+                    coverage::Candidate {
+                        path,
+                        face_index,
+                        family,
+                        weight: face.weight.0,
+                        italic: face.style != fontdb::Style::Normal,
+                        monospaced: face.monospaced,
+                    },
+                    cov,
+                ));
+            }
+            log::info!(
+                "scanned {} font faces for fallback coverage in {} ms",
+                scanned.len(),
+                started.elapsed().as_millis()
+            );
+            scanned
         })
     }
 }
@@ -304,15 +355,61 @@ fn gather_fallback_faces(
 }
 
 #[cfg(not(unix))]
+fn cmap_coverage(face: &ttf_parser::Face) -> Option<coverage::Coverage> {
+    let cmap = face.tables().cmap?;
+    let mut codepoints = Vec::new();
+    for subtable in cmap.subtables {
+        if !subtable.is_unicode() {
+            continue;
+        }
+        subtable.codepoints(|cp| codepoints.push(cp));
+    }
+    Some(coverage::Coverage::from_codepoints(codepoints))
+}
+
+/// Coverage of an already-resolved primary face.  Reads index 0, matching
+/// how the primary bytes are handed to egui.
+#[cfg(not(unix))]
+fn face_coverage_from_path(path: &Path) -> Option<coverage::Coverage> {
+    let data = std::fs::read(path).ok()?;
+    let parsed = ttf_parser::Face::parse(&data, 0).ok()?;
+    cmap_coverage(&parsed)
+}
+
+/// The fontdb equivalent of fontconfig's coverage-trimmed FcFontSort: order
+/// every system face by affinity to the seed, then keep only faces that add
+/// codepoints the seed and earlier picks don't cover.
+#[cfg(not(unix))]
 fn gather_fallback_faces(
-    _family: &str,
-    _style: Option<&str>,
-    _variant: Variant,
-    _skip_paths: &HashSet<PathBuf>,
-    _limit: usize,
-    _fonts: &SystemFonts,
+    family: &str,
+    style: Option<&str>,
+    variant: Variant,
+    skip_paths: &HashSet<PathBuf>,
+    limit: usize,
+    fonts: &SystemFonts,
 ) -> Vec<FallbackFace> {
-    Vec::new()
+    let seed_coverage = resolve_face(family, style, variant, fonts)
+        .and_then(|face| face_coverage_from_path(&face.path))
+        .unwrap_or_default();
+
+    let mut candidates: Vec<_> = fonts
+        .scanned_coverage()
+        .iter()
+        .filter(|(candidate, _)| !skip_paths.contains(&candidate.path))
+        .cloned()
+        .collect();
+    let (weight, db_style) = variant_query(variant);
+    coverage::order_candidates(
+        &mut candidates,
+        family,
+        weight.0,
+        db_style != fontdb::Style::Normal,
+    );
+
+    coverage::trim_by_coverage(candidates, &seed_coverage, limit)
+        .into_iter()
+        .map(|candidate| FallbackFace { path: candidate.path, face_index: candidate.face_index })
+        .collect()
 }
 
 fn insert_face(defs: &mut FontDefinitions, id: &str, bytes: Vec<u8>) {
@@ -600,6 +697,49 @@ mod tests {
         assert_eq!(defs.families[&FontFamily::Monospace].len(), before);
         assert_eq!(book.warned_entries.len(), 1);
     }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn windows_chain_respects_limit_skip_set_and_uniqueness() {
+        let fonts = SystemFonts::default();
+        let skip = HashSet::new();
+        let faces = gather_fallback_faces("Consolas", None, Variant::Normal, &skip, 8, &fonts);
+        assert!(faces.len() <= 8);
+        let mut seen = HashSet::new();
+        for face in &faces {
+            assert!(!skip.contains(&face.path));
+            assert!(seen.insert((face.path.clone(), face.face_index)));
+        }
+        // On any machine with system fonts the chain must not be empty —
+        // that emptiness is the Windows-tofu bug this feature fixes.
+        if fonts.db().faces().next().is_some() {
+            assert!(!faces.is_empty());
+        }
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn automatic_chain_records_every_loaded_path_in_ids_by_path() {
+        let mut defs = FontDefinitions::default();
+        let fonts = SystemFonts::default();
+        let mut book = FallbackBook::default();
+
+        let targets = [FontFamily::Monospace];
+        register_fallback_faces(
+            &mut defs,
+            "Consolas",
+            None,
+            Variant::Normal,
+            &targets,
+            &fonts,
+            &mut book,
+        );
+
+        if fonts.db().faces().next().is_some() {
+            let ids_keys: HashSet<_> = book.ids_by_path.keys().cloned().collect();
+            assert_eq!(ids_keys, book.loaded_paths);
+        }
+    }
 }
 
 // Pure candidate-selection logic for the automatic fallback chain: Unicode
@@ -615,7 +755,6 @@ mod coverage {
         ranges: Vec<(u32, u32)>,
     }
 
-    #[allow(dead_code)]
     #[derive(Clone, Debug)]
     pub struct Candidate {
         pub path: PathBuf,

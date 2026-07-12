@@ -21,6 +21,9 @@ toml = { workspace = true }
 xdg = "3.0.0"
 home = "0.5.5"
 fontdb = { version = "0.23", default-features = false, features = ["fontconfig", "memmap"] }
+# Reads cmap tables to build coverage sets for the Windows fallback chain.
+# Same major as the ttf-parser fontdb already pulls in, so no duplicate build.
+ttf-parser = "0.25"
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 png = "0.17"
 # Desktop notifications when a background session rings the bell.
