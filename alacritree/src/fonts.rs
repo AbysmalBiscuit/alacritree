@@ -332,19 +332,27 @@ fn register_fallback_faces(
     fonts: &SystemFonts,
     book: &mut FallbackBook,
 ) {
-    let fallbacks = gather_fallback_faces(
-        family,
-        style,
-        variant,
-        &book.loaded_paths,
-        MAX_FALLBACK_FACES,
-        fonts,
-    );
+    // Only primaries lack an id to reuse; everything else the chain finds
+    // can join this variant's family list without reloading.
+    let primaries: HashSet<PathBuf> = book
+        .loaded_paths
+        .iter()
+        .filter(|path| !book.ids_by_path.contains_key(*path))
+        .cloned()
+        .collect();
+    let fallbacks =
+        gather_fallback_faces(family, style, variant, &primaries, MAX_FALLBACK_FACES, fonts);
     if fallbacks.is_empty() {
         return;
     }
 
     for face in fallbacks {
+        if let Some(id) = book.ids_by_path.get(&face.path) {
+            for family in target_families {
+                defs.families.entry(family.clone()).or_default().push(id.clone());
+            }
+            continue;
+        }
         let bytes = match std::fs::read(&face.path) {
             Ok(b) => b,
             Err(e) => {
@@ -742,6 +750,44 @@ mod tests {
         // that emptiness is the Windows-tofu bug this feature fixes.
         if fonts.db().faces().next().is_some() {
             assert!(!faces.is_empty());
+        }
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn later_variants_reuse_faces_loaded_by_an_earlier_chain() {
+        let fonts = SystemFonts::default();
+        let mut defs = FontDefinitions::default();
+        let mut book = FallbackBook::default();
+
+        let normal_targets = [FontFamily::Monospace];
+        register_fallback_faces(
+            &mut defs,
+            "Consolas",
+            None,
+            Variant::Normal,
+            &normal_targets,
+            &fonts,
+            &mut book,
+        );
+        let normal_ids: HashSet<String> = book.ids_by_path.values().cloned().collect();
+
+        let bold_family = FontFamily::Name(BOLD_FAMILY.into());
+        let bold_targets = [bold_family.clone()];
+        register_fallback_faces(
+            &mut defs,
+            "Consolas",
+            Some("Bold"),
+            Variant::Bold,
+            &bold_targets,
+            &fonts,
+            &mut book,
+        );
+
+        if fonts.db().faces().next().is_some() && !normal_ids.is_empty() {
+            // The bold chain must be able to reach faces the normal chain already
+            // loaded; on any real system at least one top coverage-adder overlaps.
+            assert!(defs.families[&bold_family].iter().any(|id| normal_ids.contains(id)));
         }
     }
 
