@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use egui::{Context, FontData, FontDefinitions, FontFamily};
+use egui::{Context, FontData, FontDefinitions, FontFamily, FontTweak};
 
 use crate::config::FontConfig;
 
@@ -144,6 +144,9 @@ struct FallbackBook {
     loaded_paths: HashSet<PathBuf>,
     ids_by_path: HashMap<PathBuf, String>,
     warned_entries: HashSet<String>,
+    /// Height ratio of the primary normal face, used to normalize fallback
+    /// faces to the same visual size at a given point size.
+    primary_height_ratio: Option<f32>,
 }
 
 /// Register the user-configured `[font] fallback` entries for one variant.
@@ -184,7 +187,9 @@ fn register_user_fallbacks(
             },
         };
         let id = format!("alacritree_fallback_{}", defs.font_data.len());
-        defs.font_data.insert(id.clone(), Arc::new(FontData::from_owned(bytes)));
+        let tweak = fallback_tweak(book.primary_height_ratio, &bytes, 0);
+        let data = FontData { tweak, ..FontData::from_owned(bytes) };
+        defs.font_data.insert(id.clone(), Arc::new(data));
         for family in targets {
             defs.families.entry(family.clone()).or_default().push(id.clone());
         }
@@ -200,6 +205,27 @@ fn variant_query(variant: Variant) -> (fontdb::Weight, fontdb::Style) {
         Variant::Italic => (fontdb::Weight::NORMAL, fontdb::Style::Italic),
         Variant::BoldItalic => (fontdb::Weight::BOLD, fontdb::Style::Italic),
     }
+}
+
+/// A font's visual height for a given point size is
+/// `(ascender - descender) / units_per_em`, which varies between fonts.
+fn face_height_ratio(data: &[u8], index: u32) -> Option<f32> {
+    let face = ttf_parser::Face::parse(data, index).ok()?;
+    let units = f32::from(face.units_per_em());
+    let height = f32::from(face.ascender()) - f32::from(face.descender());
+    (units > 0.0 && height > 0.0).then(|| height / units)
+}
+
+/// Scale a fallback face so one point of it is as tall as one point of the
+/// primary face; without this, powerline caps, emoji, and CJK glyphs from
+/// fallback fonts overshoot or undershoot the cell.  Clamped so a face with
+/// broken metrics cannot render unreadably small or huge.
+fn fallback_tweak(primary_ratio: Option<f32>, data: &[u8], index: u32) -> FontTweak {
+    let scale = match (primary_ratio, face_height_ratio(data, index)) {
+        (Some(primary), Some(own)) => (primary / own).clamp(0.5, 2.0),
+        _ => 1.0,
+    };
+    FontTweak { scale, ..FontTweak::default() }
 }
 
 pub fn install_terminal_fonts(ctx: &Context, font: &FontConfig) {
@@ -266,6 +292,7 @@ pub fn install_terminal_fonts(ctx: &Context, font: &FontConfig) {
 
     let mut book = FallbackBook::default();
     book.loaded_paths.insert(normal_match.path.clone());
+    book.primary_height_ratio = face_height_ratio(&normal_bytes, 0);
 
     // Each variant gets its own fallback chain seeded from that variant's
     // configured family — same as crossfont's per-FontDesc fallback search,
@@ -326,7 +353,8 @@ fn register_fallback_faces(
             },
         };
         let id = format!("alacritree_fallback_{}", defs.font_data.len());
-        let data = FontData { index: face.face_index, ..FontData::from_owned(bytes) };
+        let tweak = fallback_tweak(book.primary_height_ratio, &bytes, face.face_index);
+        let data = FontData { index: face.face_index, tweak, ..FontData::from_owned(bytes) };
         defs.font_data.insert(id.clone(), Arc::new(data));
 
         for family in target_families {
@@ -739,6 +767,25 @@ mod tests {
             let ids_keys: HashSet<_> = book.ids_by_path.keys().cloned().collect();
             assert_eq!(ids_keys, book.loaded_paths);
         }
+    }
+
+    #[test]
+    fn fallback_tweak_defaults_to_unscaled_for_unparseable_data() {
+        let tweak = fallback_tweak(Some(1.2), b"not a font", 0);
+        assert_eq!(tweak.scale, 1.0);
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn fallback_tweak_normalizes_height_to_the_primary_face() {
+        // Any real font gives a positive height ratio; scaling it against a
+        // primary of half / double its ratio must move scale in that direction.
+        let data = std::fs::read("C:/Windows/Fonts/arial.ttf").unwrap();
+        let own = face_height_ratio(&data, 0).unwrap();
+        assert!(own > 0.0);
+        assert_eq!(fallback_tweak(Some(own), &data, 0).scale, 1.0);
+        assert!(fallback_tweak(Some(own * 1.5), &data, 0).scale > 1.0);
+        assert!(fallback_tweak(Some(own * 0.5), &data, 0).scale < 1.0);
     }
 }
 
