@@ -1548,8 +1548,17 @@ impl AlacritreeApp {
                 PaneFocus::GitSidebar => self.focus_sidebar(),
             },
             BindingAction::Named(NamedAction::CloseSession) => {
-                if let Some(idx) = self.active_session_index() {
-                    let id = self.sessions[idx].id;
+                let cursored = if self.focus == PaneFocus::ProjectsSidebar {
+                    match &self.sidebar_cursor {
+                        Some(SidebarRow::Session(id)) => Some(*id),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let target = cursored
+                    .or_else(|| self.active_session_index().map(|idx| self.sessions[idx].id));
+                if let Some(id) = target {
                     self.request_close_session(ctx, id);
                 }
             },

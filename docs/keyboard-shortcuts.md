@@ -57,7 +57,7 @@ and your TOML entries are checked first — so your config overrides any default
 | `Shift+Tab`          | Send `CSI Z` (reverse tab — readline/vim)             |
 | `Alt+Shift+Tab`      | Send `ESC` + `CSI Z`                                  |
 | `Ctrl+Shift+B`       | Toggle keyboard focus between terminal and sidebar    |
-| `Ctrl+Shift+W`       | Close the active session in the current workspace     |
+| `Ctrl+Shift+W`       | Close the cursored session (sidebar) or the current shell |
 
 ### Additional defaults on macOS
 
@@ -120,12 +120,13 @@ entry. Names match alacritty's own action names, so existing configs port over.
 - `SelectTab1` … `SelectTab9` — select the Nth session in the current
   workspace. Out-of-range indices are ignored.
 - `SelectLastTab` — select the last session in the current workspace.
-- `CloseSession` — close the active session in the current workspace.
-  Honors the `confirm_session_close` policy (may open a confirmation
-  dialog; `"busy"` prompts only while a process is running). When the
-  workspace's last session closes, `ui.last_session_close` decides what
-  follows: `"respawn"` (default) recycles a shell in place, `"navigate"`
-  moves to the project's main checkout or home.
+- `CloseSession` — close the session under the sidebar cursor when the sidebar
+  is focused on one, otherwise the active session in the current workspace.
+  Honors the `confirm_session_close` policy (may open a confirmation dialog;
+  `"busy"` prompts only while a process is running). When the workspace's
+  last session closes, `ui.last_session_close` decides what follows:
+  `"respawn"` (default) recycles a shell in place, `"navigate"` moves to the
+  project's main checkout or home.
 - `SpawnProfile1` … `SpawnProfile9` — spawn the Nth `[[ui.profiles]]` entry
   in the current workspace. Out-of-range indices show an error toast.
   Example binding:
