@@ -48,6 +48,9 @@ pub struct FontConfig {
     /// Computing characters from the built-in renderer instead of the font.
     /// Default `true` matches alacritty.
     pub builtin_box_drawing: bool,
+    /// Ordered fallback families or font file paths, consulted after the four
+    /// primary faces and before the automatic system fallback chain.
+    pub fallback: Vec<String>,
 }
 
 /// Pixel delta with x/y, mirroring alacritty's `Delta<i8>` for `font.offset`
@@ -208,6 +211,7 @@ impl Default for FontConfig {
             offset: FontDelta::default(),
             glyph_offset: FontDelta::default(),
             builtin_box_drawing: true,
+            fallback: Vec::new(),
         }
     }
 }
@@ -452,6 +456,12 @@ struct RawFont {
     offset: RawFontDelta,
     glyph_offset: RawFontDelta,
     builtin_box_drawing: Option<bool>,
+    /// Ordered list of fallback font families or font file paths, tried in
+    /// order after the four primary faces and before the automatic system
+    /// chain.  Recommended home is `alacritree.toml`: upstream alacritty
+    /// warns about unknown keys, so putting it in the shared `alacritty.toml`
+    /// would make the real alacritty noisy.
+    fallback: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -709,6 +719,7 @@ impl RawConfig {
         if let Some(b) = self.font.builtin_box_drawing {
             font.builtin_box_drawing = b;
         }
+        font.fallback = self.font.fallback.clone().unwrap_or_default();
 
         // ---- Cursor ----
         let mut cursor = config.cursor;
@@ -809,4 +820,42 @@ fn apply_set(target: &mut [Rgb; 8], set: RawSet) {
 
 fn rgb_to_color32(r: Rgb) -> Color32 {
     Color32::from_rgb(r.r, r.g, r.b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(s: &str) -> Config {
+        let value: toml::Value = toml::from_str(s).unwrap();
+        let raw: RawConfig = value.try_into().unwrap();
+        raw.into_config()
+    }
+
+    #[test]
+    fn font_fallback_list_parses() {
+        let config = parse(
+            r#"
+            [font]
+            fallback = ["JetBrainsMono Nerd Font", "C:\\Fonts\\custom.ttf"]
+            "#,
+        );
+        assert_eq!(config.font.fallback, ["JetBrainsMono Nerd Font", "C:\\Fonts\\custom.ttf"]);
+    }
+
+    #[test]
+    fn font_fallback_defaults_empty() {
+        assert!(parse("").font.fallback.is_empty());
+    }
+
+    #[test]
+    fn font_fallback_arrays_concatenate_across_files() {
+        // alacritty merge semantics: an array in alacritree.toml appends to
+        // the same array from alacritty.toml rather than replacing it.
+        let base: toml::Value = toml::from_str("[font]\nfallback = [\"A\"]").unwrap();
+        let over: toml::Value = toml::from_str("[font]\nfallback = [\"B\"]").unwrap();
+        let merged = merge(base, over);
+        let raw: RawConfig = merged.try_into().unwrap();
+        assert_eq!(raw.into_config().font.fallback, ["A", "B"]);
+    }
 }
