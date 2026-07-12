@@ -601,3 +601,173 @@ mod tests {
         assert_eq!(book.warned_entries.len(), 1);
     }
 }
+
+// Pure candidate-selection logic for the automatic fallback chain: Unicode
+// coverage sets and FcFontSort-style greedy trimming.  Platform-neutral so
+// the unit tests run on every platform, even though only the Windows chain
+// consumes it at runtime.
+#[cfg_attr(unix, allow(dead_code))]
+mod coverage {
+    use std::path::PathBuf;
+
+    #[derive(Clone, Debug, Default, PartialEq)]
+    pub struct Coverage {
+        ranges: Vec<(u32, u32)>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Clone, Debug)]
+    pub struct Candidate {
+        pub path: PathBuf,
+        pub face_index: u32,
+        pub family: String,
+        pub weight: u16,
+        pub italic: bool,
+        pub monospaced: bool,
+    }
+
+    impl Coverage {
+        /// Build from an arbitrary codepoint list: sorted, deduped, and
+        /// collapsed into inclusive, disjoint ranges.
+        pub fn from_codepoints(mut codepoints: Vec<u32>) -> Self {
+            codepoints.sort_unstable();
+            codepoints.dedup();
+            let mut ranges: Vec<(u32, u32)> = Vec::new();
+            for cp in codepoints {
+                match ranges.last_mut() {
+                    Some((_, end)) if *end + 1 == cp => *end = cp,
+                    _ => ranges.push((cp, cp)),
+                }
+            }
+            Self { ranges }
+        }
+
+        pub fn merge(&mut self, other: &Coverage) {
+            let mut merged: Vec<(u32, u32)> =
+                Vec::with_capacity(self.ranges.len() + other.ranges.len());
+            let push = |merged: &mut Vec<(u32, u32)>, range: (u32, u32)| match merged.last_mut() {
+                Some((_, end)) if *end >= range.0.saturating_sub(1) => *end = (*end).max(range.1),
+                _ => merged.push(range),
+            };
+            let (mut a, mut b) =
+                (self.ranges.iter().copied().peekable(), other.ranges.iter().copied().peekable());
+            while let (Some(&ra), Some(&rb)) = (a.peek(), b.peek()) {
+                if ra.0 <= rb.0 {
+                    push(&mut merged, ra);
+                    a.next();
+                } else {
+                    push(&mut merged, rb);
+                    b.next();
+                }
+            }
+            for range in a {
+                push(&mut merged, range);
+            }
+            for range in b {
+                push(&mut merged, range);
+            }
+            self.ranges = merged;
+        }
+
+        /// True if `self` covers at least one codepoint that `other` doesn't —
+        /// the FcFontSort(trim) keep-test.
+        pub fn has_novel_codepoint(&self, other: &Coverage) -> bool {
+            let mut i = 0;
+            for &(start, end) in &self.ranges {
+                let mut cp = start;
+                loop {
+                    while i < other.ranges.len() && other.ranges[i].1 < cp {
+                        i += 1;
+                    }
+                    match other.ranges.get(i) {
+                        Some(&(other_start, other_end)) if other_start <= cp => {
+                            // Covered through other_end; resume past it.
+                            if other_end >= end {
+                                break;
+                            }
+                            cp = other_end + 1;
+                        },
+                        _ => return true,
+                    }
+                }
+            }
+            false
+        }
+    }
+
+    /// Greedy trim mirroring FcFontSort(trim=true): walk candidates in order,
+    /// keeping only faces that cover at least one codepoint the seed face and
+    /// the already-kept faces don't.
+    pub fn trim_by_coverage(
+        candidates: Vec<(Candidate, Coverage)>,
+        seed_coverage: &Coverage,
+        limit: usize,
+    ) -> Vec<Candidate> {
+        let mut covered = seed_coverage.clone();
+        let mut kept = Vec::new();
+        for (candidate, coverage) in candidates {
+            if kept.len() >= limit {
+                break;
+            }
+            if coverage.has_novel_codepoint(&covered) {
+                covered.merge(&coverage);
+                kept.push(candidate);
+            }
+        }
+        kept
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        pub(super) fn cand(family: &str) -> Candidate {
+            Candidate {
+                path: PathBuf::from(family),
+                face_index: 0,
+                family: family.into(),
+                weight: 400,
+                italic: false,
+                monospaced: true,
+            }
+        }
+
+        #[test]
+        fn from_codepoints_sorts_dedups_and_merges_adjacent() {
+            let c = Coverage::from_codepoints(vec![3, 1, 2, 2, 10]);
+            assert_eq!(c, Coverage { ranges: vec![(1, 3), (10, 10)] });
+        }
+
+        #[test]
+        fn merge_coalesces_overlapping_and_adjacent_ranges() {
+            let mut a = Coverage::from_codepoints(vec![1, 2, 10]);
+            a.merge(&Coverage::from_codepoints(vec![3, 4, 9]));
+            assert_eq!(a, Coverage { ranges: vec![(1, 4), (9, 10)] });
+        }
+
+        #[test]
+        fn novel_codepoint_detection() {
+            let seed = Coverage::from_codepoints(vec![1, 2, 3, 4, 5]);
+            assert!(!Coverage::from_codepoints(vec![2, 4]).has_novel_codepoint(&seed));
+            assert!(Coverage::from_codepoints(vec![5, 6]).has_novel_codepoint(&seed));
+            assert!(Coverage::from_codepoints(vec![100]).has_novel_codepoint(&seed));
+            assert!(!Coverage::default().has_novel_codepoint(&seed));
+            assert!(seed.has_novel_codepoint(&Coverage::default()));
+        }
+
+        #[test]
+        fn trim_drops_subsumed_keeps_novel_respects_limit_in_order() {
+            let seed = Coverage::from_codepoints((0x20u32..0x7f).collect());
+            let candidates = vec![
+                (cand("subsumed"), Coverage::from_codepoints(vec![0x41, 0x42])),
+                (cand("nerd"), Coverage::from_codepoints(vec![0xE0A0, 0xE0B0])),
+                (cand("nerd-dup"), Coverage::from_codepoints(vec![0xE0A0])),
+                (cand("emoji"), Coverage::from_codepoints(vec![0x1F600])),
+                (cand("cjk"), Coverage::from_codepoints(vec![0x4E00])),
+            ];
+            let kept = trim_by_coverage(candidates, &seed, 2);
+            let names: Vec<_> = kept.iter().map(|c| c.family.as_str()).collect();
+            assert_eq!(names, ["nerd", "emoji"]);
+        }
+    }
+}
