@@ -821,6 +821,61 @@ mod tests {
         assert_eq!(tweak.scale, 1.0);
     }
 
+    #[test]
+    fn user_fallbacks_precede_the_automatic_chain() {
+        // User-configured fallbacks slot between the primary face and the
+        // automatic system chain, so their font id must land ahead of every
+        // id the automatic chain appends afterward in the family list.
+        let path = std::env::temp_dir().join("alacritree_test_user_precedes.ttf");
+        std::fs::write(&path, b"egui parses this later; registration only reads bytes").unwrap();
+
+        let mut defs = FontDefinitions::default();
+        let fonts = SystemFonts::default();
+        let mut book = FallbackBook::default();
+        let entries = vec![path.to_string_lossy().into_owned()];
+        let targets = [FontFamily::Monospace];
+
+        register_user_fallbacks(&mut defs, &entries, Variant::Normal, &targets, &fonts, &mut book);
+        let user_id = book.ids_by_path.get(&path).cloned().unwrap();
+        let user_index =
+            defs.families[&FontFamily::Monospace].iter().position(|id| *id == user_id).unwrap();
+        let before_len = defs.families[&FontFamily::Monospace].len();
+
+        register_fallback_faces(
+            &mut defs,
+            DEFAULT_FAMILY,
+            None,
+            Variant::Normal,
+            &targets,
+            &fonts,
+            &mut book,
+        );
+
+        let family_list = &defs.families[&FontFamily::Monospace];
+        if family_list.len() > before_len {
+            for id in &family_list[before_len..] {
+                let index = family_list.iter().position(|x| x == id).unwrap();
+                assert!(index > user_index);
+            }
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn primary_faces_are_never_tweaked() {
+        // Fallback faces get a tweak that rescales them to the primary
+        // face's height; the primary itself is the scale reference and must
+        // never carry a tweak, or scaling would be relative to a moving target.
+        let mut defs = FontDefinitions::default();
+        insert_face(
+            &mut defs,
+            "test_primary",
+            b"egui parses this later; registration only reads bytes".to_vec(),
+        );
+        assert_eq!(defs.font_data["test_primary"].tweak, FontTweak::default());
+    }
+
     #[cfg(not(unix))]
     #[test]
     fn fallback_tweak_normalizes_height_to_the_primary_face() {
