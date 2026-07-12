@@ -11,6 +11,7 @@ mod fonts;
 mod git_status;
 mod input;
 mod links;
+mod mouse;
 mod paste;
 mod pr_status;
 mod projects;
