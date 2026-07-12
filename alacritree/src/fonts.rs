@@ -14,13 +14,13 @@
 //! symbols and box-drawing characters that aren't in the primary face.
 
 use std::cell::OnceCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use egui::{Context, FontData, FontDefinitions, FontFamily};
 
-use crate::config::FontFace;
+use crate::config::FontConfig;
 
 /// Hard cap on fallback faces.  fontconfig's trimmed sort tops out at a few
 /// dozen on a typical system; this just bounds startup memory and parse cost
@@ -84,6 +84,64 @@ impl SystemFonts {
     }
 }
 
+/// Bookkeeping shared by all fallback registration within one install: which
+/// files already back an egui font, which font id serves each file (so one
+/// file can join several variants' family lists without duplicate data), and
+/// which user entries have already produced a warning.
+#[derive(Default)]
+struct FallbackBook {
+    loaded_paths: HashSet<PathBuf>,
+    ids_by_path: HashMap<PathBuf, String>,
+    warned_entries: HashSet<String>,
+}
+
+/// Register the user-configured `[font] fallback` entries for one variant.
+/// They slot between the primary face and the automatic system chain, in
+/// list order.  Entries are family names or font file paths, resolved with
+/// the variant's weight/slant so bold cells cascade through bold fallbacks.
+fn register_user_fallbacks(
+    defs: &mut FontDefinitions,
+    entries: &[String],
+    variant: Variant,
+    targets: &[FontFamily],
+    fonts: &SystemFonts,
+    book: &mut FallbackBook,
+) {
+    for entry in entries {
+        let Some(resolved) = resolve_face(entry, None, variant, fonts) else {
+            if book.warned_entries.insert(entry.clone()) {
+                log::warn!("font.fallback entry '{entry}' did not resolve to any font");
+            }
+            continue;
+        };
+        if let Some(id) = book.ids_by_path.get(&resolved.path) {
+            for family in targets {
+                defs.families.entry(family.clone()).or_default().push(id.clone());
+            }
+            continue;
+        }
+        if book.loaded_paths.contains(&resolved.path) {
+            // Already registered as a primary face, which sits ahead of every
+            // fallback in the family lists; appending it again is pointless.
+            continue;
+        }
+        let bytes = match std::fs::read(&resolved.path) {
+            Ok(b) => b,
+            Err(e) => {
+                log::debug!("skipping fallback font {}: {e}", resolved.path.display());
+                continue;
+            },
+        };
+        let id = format!("alacritree_fallback_{}", defs.font_data.len());
+        defs.font_data.insert(id.clone(), Arc::new(FontData::from_owned(bytes)));
+        for family in targets {
+            defs.families.entry(family.clone()).or_default().push(id.clone());
+        }
+        book.loaded_paths.insert(resolved.path.clone());
+        book.ids_by_path.insert(resolved.path, id);
+    }
+}
+
 fn variant_query(variant: Variant) -> (fontdb::Weight, fontdb::Style) {
     match variant {
         Variant::Normal => (fontdb::Weight::NORMAL, fontdb::Style::Normal),
@@ -93,13 +151,9 @@ fn variant_query(variant: Variant) -> (fontdb::Weight, fontdb::Style) {
     }
 }
 
-pub fn install_terminal_fonts(
-    ctx: &Context,
-    normal: &FontFace,
-    bold: &FontFace,
-    italic: &FontFace,
-    bold_italic: &FontFace,
-) {
+pub fn install_terminal_fonts(ctx: &Context, font: &FontConfig) {
+    let (normal, bold, italic, bold_italic) =
+        (&font.normal, &font.bold, &font.italic, &font.bold_italic);
     let family = normal.family.as_deref().unwrap_or(DEFAULT_FAMILY);
     let fonts = SystemFonts::default();
 
@@ -159,8 +213,8 @@ pub fn install_terminal_fonts(
         &normal_bytes,
     );
 
-    let mut loaded_paths: HashSet<PathBuf> = HashSet::new();
-    loaded_paths.insert(normal_match.path.clone());
+    let mut book = FallbackBook::default();
+    book.loaded_paths.insert(normal_match.path.clone());
 
     // Each variant gets its own fallback chain seeded from that variant's
     // configured family — same as crossfont's per-FontDesc fallback search,
@@ -180,15 +234,8 @@ pub fn install_terminal_fonts(
         ),
     ];
     for (family, style, variant, targets) in seeds {
-        register_fallback_faces(
-            &mut defs,
-            family,
-            style,
-            variant,
-            targets,
-            &fonts,
-            &mut loaded_paths,
-        );
+        register_user_fallbacks(&mut defs, &font.fallback, variant, targets, &fonts, &mut book);
+        register_fallback_faces(&mut defs, family, style, variant, targets, &fonts, &mut book);
     }
 
     ctx.set_fonts(defs);
@@ -205,10 +252,16 @@ fn register_fallback_faces(
     variant: Variant,
     target_families: &[FontFamily],
     fonts: &SystemFonts,
-    loaded_paths: &mut HashSet<PathBuf>,
+    book: &mut FallbackBook,
 ) {
-    let fallbacks =
-        gather_fallback_faces(family, style, variant, loaded_paths, MAX_FALLBACK_FACES, fonts);
+    let fallbacks = gather_fallback_faces(
+        family,
+        style,
+        variant,
+        &book.loaded_paths,
+        MAX_FALLBACK_FACES,
+        fonts,
+    );
     if fallbacks.is_empty() {
         return;
     }
@@ -228,7 +281,8 @@ fn register_fallback_faces(
         for family in target_families {
             defs.families.entry(family.clone()).or_default().push(id.clone());
         }
-        loaded_paths.insert(face.path);
+        book.loaded_paths.insert(face.path.clone());
+        book.ids_by_path.insert(face.path, id);
     }
 }
 
@@ -480,5 +534,70 @@ mod fontconfig_resolve {
             out.push(FallbackFace { path, face_index });
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_fallback_path_registers_for_every_variant() {
+        // A file-path entry resolves to the same file for all four variants;
+        // the bytes must be loaded once and the same egui font id appended to
+        // each variant's family list (a plain HashSet dedup would starve
+        // every variant after the first).
+        let path = std::env::temp_dir().join("alacritree_test_user_fallback.ttf");
+        std::fs::write(&path, b"egui parses this later; registration only reads bytes").unwrap();
+
+        let mut defs = FontDefinitions::default();
+        let fonts = SystemFonts::default();
+        let mut book = FallbackBook::default();
+        let entries = vec![path.to_string_lossy().into_owned()];
+
+        let normal_targets = [FontFamily::Monospace];
+        register_user_fallbacks(
+            &mut defs,
+            &entries,
+            Variant::Normal,
+            &normal_targets,
+            &fonts,
+            &mut book,
+        );
+        let bold_targets = [FontFamily::Name(BOLD_FAMILY.into())];
+        register_user_fallbacks(
+            &mut defs,
+            &entries,
+            Variant::Bold,
+            &bold_targets,
+            &fonts,
+            &mut book,
+        );
+
+        assert_eq!(book.ids_by_path.len(), 1);
+        let id = book.ids_by_path.values().next().unwrap();
+        assert!(defs.families[&FontFamily::Monospace].contains(id));
+        assert!(defs.families[&FontFamily::Name(BOLD_FAMILY.into())].contains(id));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    // Unix-excluded: fontconfig substitutes *some* font for any family name,
+    // so an unresolvable entry only exists where fontdb answers the query.
+    #[cfg(not(unix))]
+    #[test]
+    fn unresolved_user_fallback_warns_once_and_adds_nothing() {
+        let mut defs = FontDefinitions::default();
+        let fonts = SystemFonts::default();
+        let mut book = FallbackBook::default();
+        let entries = vec![String::from("alacritree-no-such-family-6c1e")];
+        let before = defs.families[&FontFamily::Monospace].len();
+
+        let targets = [FontFamily::Monospace];
+        register_user_fallbacks(&mut defs, &entries, Variant::Normal, &targets, &fonts, &mut book);
+        register_user_fallbacks(&mut defs, &entries, Variant::Bold, &targets, &fonts, &mut book);
+
+        assert_eq!(defs.families[&FontFamily::Monospace].len(), before);
+        assert_eq!(book.warned_entries.len(), 1);
     }
 }
