@@ -13,6 +13,7 @@
 //! this is what mirrors alacritty/crossfont's per-glyph fallback for
 //! symbols and box-drawing characters that aren't in the primary face.
 
+use std::cell::OnceCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -65,6 +66,33 @@ const DEFAULT_FAMILY: &str = if cfg!(target_os = "macos") {
     "monospace"
 };
 
+/// Lazily-loaded system font database shared by every resolution within one
+/// `install_terminal_fonts` call.  Loading is deferred so Unix systems where
+/// fontconfig answers everything never pay for a fontdb scan.
+#[derive(Default)]
+struct SystemFonts {
+    db: OnceCell<fontdb::Database>,
+}
+
+impl SystemFonts {
+    fn db(&self) -> &fontdb::Database {
+        self.db.get_or_init(|| {
+            let mut db = fontdb::Database::new();
+            db.load_system_fonts();
+            db
+        })
+    }
+}
+
+fn variant_query(variant: Variant) -> (fontdb::Weight, fontdb::Style) {
+    match variant {
+        Variant::Normal => (fontdb::Weight::NORMAL, fontdb::Style::Normal),
+        Variant::Bold => (fontdb::Weight::BOLD, fontdb::Style::Normal),
+        Variant::Italic => (fontdb::Weight::NORMAL, fontdb::Style::Italic),
+        Variant::BoldItalic => (fontdb::Weight::BOLD, fontdb::Style::Italic),
+    }
+}
+
 pub fn install_terminal_fonts(
     ctx: &Context,
     normal: &FontFace,
@@ -73,10 +101,12 @@ pub fn install_terminal_fonts(
     bold_italic: &FontFace,
 ) {
     let family = normal.family.as_deref().unwrap_or(DEFAULT_FAMILY);
+    let fonts = SystemFonts::default();
 
     // The variant lookups compare their resolved path against this one to
     // detect when fontconfig substituted the regular face for a missing variant.
-    let normal_match = match resolve_face(family, normal.style.as_deref(), Variant::Normal) {
+    let normal_match = match resolve_face(family, normal.style.as_deref(), Variant::Normal, &fonts)
+    {
         Some(m) => m,
         None => {
             log::warn!("could not resolve font '{family}'; using bundled monospace");
@@ -97,14 +127,20 @@ pub fn install_terminal_fonts(
     let bold_italic_family = bold_italic.family.as_deref().unwrap_or(family);
 
     let bold_bytes =
-        load_variant(bold_family, bold.style.as_deref(), Variant::Bold, &normal_match.path);
-    let italic_bytes =
-        load_variant(italic_family, italic.style.as_deref(), Variant::Italic, &normal_match.path);
+        load_variant(bold_family, bold.style.as_deref(), Variant::Bold, &normal_match.path, &fonts);
+    let italic_bytes = load_variant(
+        italic_family,
+        italic.style.as_deref(),
+        Variant::Italic,
+        &normal_match.path,
+        &fonts,
+    );
     let bold_italic_bytes = load_variant(
         bold_italic_family,
         bold_italic.style.as_deref(),
         Variant::BoldItalic,
         &normal_match.path,
+        &fonts,
     );
 
     let mut defs = FontDefinitions::default();
@@ -144,7 +180,15 @@ pub fn install_terminal_fonts(
         ),
     ];
     for (family, style, variant, targets) in seeds {
-        register_fallback_faces(&mut defs, family, style, variant, targets, &mut loaded_paths);
+        register_fallback_faces(
+            &mut defs,
+            family,
+            style,
+            variant,
+            targets,
+            &fonts,
+            &mut loaded_paths,
+        );
     }
 
     ctx.set_fonts(defs);
@@ -160,9 +204,11 @@ fn register_fallback_faces(
     style: Option<&str>,
     variant: Variant,
     target_families: &[FontFamily],
+    fonts: &SystemFonts,
     loaded_paths: &mut HashSet<PathBuf>,
 ) {
-    let fallbacks = gather_fallback_faces(family, style, variant, loaded_paths, MAX_FALLBACK_FACES);
+    let fallbacks =
+        gather_fallback_faces(family, style, variant, loaded_paths, MAX_FALLBACK_FACES, fonts);
     if fallbacks.is_empty() {
         return;
     }
@@ -198,6 +244,7 @@ fn gather_fallback_faces(
     variant: Variant,
     skip_paths: &HashSet<PathBuf>,
     limit: usize,
+    _fonts: &SystemFonts,
 ) -> Vec<FallbackFace> {
     fontconfig_resolve::sorted_fallbacks(family, style, variant, skip_paths, limit)
 }
@@ -209,6 +256,7 @@ fn gather_fallback_faces(
     _variant: Variant,
     _skip_paths: &HashSet<PathBuf>,
     _limit: usize,
+    _fonts: &SystemFonts,
 ) -> Vec<FallbackFace> {
     Vec::new()
 }
@@ -241,8 +289,9 @@ fn load_variant(
     style: Option<&str>,
     variant: Variant,
     normal_path: &Path,
+    fonts: &SystemFonts,
 ) -> Option<Vec<u8>> {
-    let resolved = resolve_face(family, style, variant)?;
+    let resolved = resolve_face(family, style, variant, fonts)?;
     if resolved.path == normal_path {
         log::debug!(
             "no real {} face for '{family}'; cells with that style will use the regular face",
@@ -272,6 +321,7 @@ fn resolve_face(
     family_or_path: &str,
     style: Option<&str>,
     variant: Variant,
+    fonts: &SystemFonts,
 ) -> Option<ResolvedFace> {
     if let Some(face) = resolve_via_path(family_or_path) {
         return Some(face);
@@ -281,7 +331,7 @@ fn resolve_face(
     }
     // fontdb fallback for the case where libfontconfig isn't available; it
     // doesn't expand <alias> rules, so it's strictly second-best on Unix.
-    resolve_via_fontdb(family_or_path, variant)
+    resolve_via_fontdb(family_or_path, variant, fonts)
 }
 
 #[cfg(not(unix))]
@@ -289,11 +339,12 @@ fn resolve_face(
     family_or_path: &str,
     _style: Option<&str>,
     variant: Variant,
+    fonts: &SystemFonts,
 ) -> Option<ResolvedFace> {
     if let Some(face) = resolve_via_path(family_or_path) {
         return Some(face);
     }
-    resolve_via_fontdb(family_or_path, variant)
+    resolve_via_fontdb(family_or_path, variant, fonts)
 }
 
 fn resolve_via_path(family_or_path: &str) -> Option<ResolvedFace> {
@@ -304,28 +355,25 @@ fn resolve_via_path(family_or_path: &str) -> Option<ResolvedFace> {
     None
 }
 
-fn resolve_via_fontdb(family: &str, variant: Variant) -> Option<ResolvedFace> {
-    let (weight, style) = match variant {
-        Variant::Normal => (fontdb::Weight::NORMAL, fontdb::Style::Normal),
-        Variant::Bold => (fontdb::Weight::BOLD, fontdb::Style::Normal),
-        Variant::Italic => (fontdb::Weight::NORMAL, fontdb::Style::Italic),
-        Variant::BoldItalic => (fontdb::Weight::BOLD, fontdb::Style::Italic),
-    };
-    let mut db = fontdb::Database::new();
-    db.load_system_fonts();
+fn resolve_via_fontdb(family: &str, variant: Variant, fonts: &SystemFonts) -> Option<ResolvedFace> {
+    let (weight, style) = variant_query(variant);
     let query = fontdb::Query {
         families: &[fontdb::Family::Name(family)],
         weight,
         stretch: fontdb::Stretch::Normal,
         style,
     };
+    let db = fonts.db();
     let face_id = db.query(&query)?;
     let face_info = db.face(face_id)?;
     match &face_info.source {
-        fontdb::Source::File(path) => Some(ResolvedFace { path: path.clone() }),
+        // A memory-mapped `SharedFile` still names a real file on disk.
+        fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => {
+            Some(ResolvedFace { path: path.clone() })
+        },
         // Embedded faces aren't path-addressable; we'd have to re-architect
-        // the loader to support them and they're rare on Unix.
-        fontdb::Source::Binary(_) | fontdb::Source::SharedFile(_, _) => None,
+        // the loader to support them and they're rare.
+        fontdb::Source::Binary(_) => None,
     }
 }
 
