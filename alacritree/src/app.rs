@@ -129,6 +129,7 @@ pub struct AlacritreeApp {
     notify_rx: Receiver<WorkspaceKey>,
     /// Shared across sessions; auto-invalidated when cell size changes.
     builtin_glyphs: crate::builtin_font::BuiltinGlyphCache,
+    color_glyphs: crate::color_glyph::ColorGlyphCache,
 }
 
 struct DeleteRequest {
@@ -179,7 +180,8 @@ impl AlacritreeApp {
     pub fn new(cc: &CreationContext<'_>, config: Config) -> Self {
         let theme = Theme::from_config(&config);
 
-        crate::fonts::install_terminal_fonts(&cc.egui_ctx, &config.font);
+        let font_chain = crate::fonts::install_terminal_fonts(&cc.egui_ctx, &config.font);
+        let color_glyph_budget_mb = config.font.color_glyph_cache_mb;
 
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = theme.terminal_bg;
@@ -259,6 +261,10 @@ impl AlacritreeApp {
             pending_create: None,
             notify_rx,
             builtin_glyphs: crate::builtin_font::BuiltinGlyphCache::new(),
+            color_glyphs: crate::color_glyph::ColorGlyphCache::new(
+                font_chain,
+                color_glyph_budget_mb,
+            ),
         };
 
         if let Err(e) = app.spawn_session(&cc.egui_ctx, None) {
@@ -2170,6 +2176,7 @@ impl eframe::App for AlacritreeApp {
                     &self.config,
                     !modal_open,
                     &mut self.builtin_glyphs,
+                    &mut self.color_glyphs,
                 );
             });
 
