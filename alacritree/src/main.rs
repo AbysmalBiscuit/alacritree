@@ -13,7 +13,6 @@ mod git_status;
 mod input;
 mod ipc;
 mod links;
-#[cfg(unix)]
 mod mcp;
 mod paste;
 mod pr_status;
@@ -64,7 +63,6 @@ fn main() -> eframe::Result<()> {
 /// `alacritree mcp [--socket <path>]`: run as an MCP stdio server bridging to
 /// a running instance's IPC socket instead of opening a window.  Log output
 /// goes to stderr (env_logger's default), leaving stdout to the protocol.
-#[cfg(unix)]
 fn run_mcp_server(mut args: impl Iterator<Item = String>) -> ! {
     let mut socket = None;
     while let Some(arg) = args.next() {
@@ -78,13 +76,6 @@ fn run_mcp_server(mut args: impl Iterator<Item = String>) -> ! {
     }
     mcp::run(socket);
     std::process::exit(0);
-}
-
-#[cfg(not(unix))]
-fn run_mcp_server(_args: impl Iterator<Item = String>) -> ! {
-    // The IPC socket is unix-only, mirroring upstream alacritty.
-    eprintln!("`alacritree mcp` is not supported on this platform");
-    std::process::exit(1);
 }
 
 /// A bad icon is cosmetic — log and fall back to the OS default rather than
