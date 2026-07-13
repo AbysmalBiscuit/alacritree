@@ -579,4 +579,47 @@ mod tests {
 
         assert_eq!(outcome.clipboard, vec![(Target::Clipboard, "hello".to_owned())]);
     }
+
+    /// A pane must not wait on the console host's startup handshake.
+    ///
+    /// `harden_dll_search_path` keeps `LoadLibraryW("conpty.dll")` off PATH.  Without
+    /// it, any `conpty.dll` sitting in another terminal's install directory (WezTerm
+    /// ships one) hosts our pseudoconsoles, and WezTerm's blocks the child process
+    /// for three seconds waiting on a device-attributes reply that never satisfies
+    /// it.  The child here prints and exits immediately, so a runtime anywhere near
+    /// that timeout means a foreign console server is back in the loop.
+    #[cfg(windows)]
+    #[test]
+    fn a_pane_runs_its_child_without_a_console_host_handshake() {
+        crate::harden_dll_search_path();
+
+        let start = Instant::now();
+        let mut session = Session::spawn_command(
+            egui::Context::default(),
+            &Config::default(),
+            std::env::current_dir().ok(),
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            "cmd".to_string(),
+            vec!["/c".to_string(), "echo".to_string(), "ready".to_string()],
+            "probe".to_string(),
+            SessionKind::Shell,
+        )
+        .unwrap();
+
+        let exited = loop {
+            assert!(start.elapsed() < Duration::from_secs(10), "child never exited");
+            match session.events.try_recv() {
+                Ok(TermEvent::ChildExit(_)) => break start.elapsed(),
+                Ok(_) => {},
+                Err(_) => std::thread::sleep(Duration::from_millis(1)),
+            }
+        };
+
+        assert!(
+            exited < Duration::from_secs(2),
+            "`cmd /c echo ready` took {exited:?}; the console host is stalling on a \
+             handshake (the foreign conpty.dll stall is ~3s)"
+        );
+    }
 }
