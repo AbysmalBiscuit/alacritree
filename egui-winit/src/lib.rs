@@ -765,10 +765,13 @@ impl State {
             if pressed {
                 if is_cut_command(self.egui_input.modifiers, active_key) {
                     self.egui_input.events.push(egui::Event::Cut);
-                    return;
+                    // alacritree: fall through to the Key event as well.  These
+                    // commands ignore Shift, so Ctrl+Shift+C matches them just
+                    // like Ctrl+C; swallowing the keystroke would leave the
+                    // binding table unable to tell the copy shortcut apart from
+                    // the interrupt, and terminal apps would never see ETX/CAN.
                 } else if is_copy_command(self.egui_input.modifiers, active_key) {
                     self.egui_input.events.push(egui::Event::Copy);
-                    return;
                 } else if is_paste_command(self.egui_input.modifiers, active_key) {
                     // alacritree: fall through to Key event when the clipboard
                     // had no text, so terminal apps still see raw 0x16.
