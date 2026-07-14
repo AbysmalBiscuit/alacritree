@@ -16,7 +16,7 @@
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use egui::{Context, FontData, FontDefinitions, FontFamily, FontTweak};
 
@@ -404,7 +404,7 @@ fn register_user_fallbacks(
             // fallback in the family lists; appending it again is pointless.
             continue;
         }
-        let bytes = match std::fs::read(&resolved.path) {
+        let bytes = match map_font_file(&resolved.path) {
             Ok(b) => b,
             Err(e) => {
                 log::debug!("skipping fallback font {}: {e}", resolved.path.display());
@@ -412,8 +412,8 @@ fn register_user_fallbacks(
             },
         };
         let id = format!("alacritree_fallback_{}", defs.font_data.len());
-        let tweak = fallback_tweak(book.primary_height_ratio, &bytes, 0);
-        let data = FontData { tweak, ..FontData::from_owned(bytes) };
+        let tweak = fallback_tweak(book.primary_height_ratio, bytes, 0);
+        let data = FontData { tweak, ..FontData::from_static(bytes) };
         defs.font_data.insert(id.clone(), Arc::new(data));
         for family in targets {
             defs.families.entry(family.clone()).or_default().push(id.clone());
@@ -469,7 +469,7 @@ pub fn install_terminal_fonts(ctx: &Context, font: &FontConfig) {
             return;
         },
     };
-    let normal_bytes = match std::fs::read(&normal_match.path) {
+    let normal_bytes = match map_font_file(&normal_match.path) {
         Ok(b) => b,
         Err(e) => {
             log::warn!("could not read font file {}: {e}", normal_match.path.display());
@@ -501,23 +501,23 @@ pub fn install_terminal_fonts(ctx: &Context, font: &FontConfig) {
 
     let mut defs = FontDefinitions::default();
 
-    insert_face(&mut defs, NORMAL_FONT_ID, normal_bytes.clone());
+    insert_face(&mut defs, NORMAL_FONT_ID, normal_bytes);
     register_default_family(&mut defs, FontFamily::Monospace, NORMAL_FONT_ID);
     register_default_family(&mut defs, FontFamily::Proportional, NORMAL_FONT_ID);
 
-    register_variant(&mut defs, BOLD_FONT_ID, BOLD_FAMILY, bold_bytes, &normal_bytes);
-    register_variant(&mut defs, ITALIC_FONT_ID, ITALIC_FAMILY, italic_bytes, &normal_bytes);
+    register_variant(&mut defs, BOLD_FONT_ID, BOLD_FAMILY, bold_bytes, normal_bytes);
+    register_variant(&mut defs, ITALIC_FONT_ID, ITALIC_FAMILY, italic_bytes, normal_bytes);
     register_variant(
         &mut defs,
         BOLD_ITALIC_FONT_ID,
         BOLD_ITALIC_FAMILY,
         bold_italic_bytes,
-        &normal_bytes,
+        normal_bytes,
     );
 
     let mut book = FallbackBook::default();
     book.loaded_paths.insert(normal_match.path.clone());
-    book.primary_height_ratio = face_height_ratio(&normal_bytes, 0);
+    book.primary_height_ratio = face_height_ratio(normal_bytes, 0);
 
     // Each variant gets its own fallback chain seeded from that variant's
     // configured family — same as crossfont's per-FontDesc fallback search,
@@ -578,7 +578,7 @@ fn register_fallback_faces(
             }
             continue;
         }
-        let bytes = match std::fs::read(&face.path) {
+        let bytes = match map_font_file(&face.path) {
             Ok(b) => b,
             Err(e) => {
                 log::debug!("skipping fallback font {}: {e}", face.path.display());
@@ -586,8 +586,8 @@ fn register_fallback_faces(
             },
         };
         let id = format!("alacritree_fallback_{}", defs.font_data.len());
-        let tweak = fallback_tweak(book.primary_height_ratio, &bytes, face.face_index);
-        let data = FontData { index: face.face_index, tweak, ..FontData::from_owned(bytes) };
+        let tweak = fallback_tweak(book.primary_height_ratio, bytes, face.face_index);
+        let data = FontData { index: face.face_index, tweak, ..FontData::from_static(bytes) };
         defs.font_data.insert(id.clone(), Arc::new(data));
 
         for family in target_families {
@@ -673,8 +673,43 @@ fn gather_fallback_faces(
         .collect()
 }
 
-fn insert_face(defs: &mut FontDefinitions, id: &str, bytes: Vec<u8>) {
-    defs.font_data.insert(id.to_string(), Arc::new(FontData::from_owned(bytes)));
+/// Face bytes reach egui as a mapping rather than a buffer.  `FontData` holds
+/// a `Cow<'static, [u8]>` and epaint clones the whole buffer of every owned
+/// entry when it builds the `ab_glyph` face, so a face handed over as bytes
+/// costs its file size twice for the life of the process.  Handed over
+/// borrowed it costs nothing: the pages stay file-backed, and a fallback face
+/// no cell ever renders from resides as its table headers instead of its full
+/// size.  This is what FreeType does for alacritty and wezterm, which is why
+/// they carry a long fallback chain for a fraction of the memory.
+///
+/// A mapping outlives the egui context it is registered with, which lives as
+/// long as the process — so the mappings do too.  Keying them by path is what
+/// bounds that: a face maps once no matter how many variant chains list it,
+/// and a second `install_terminal_fonts` reuses the mappings of the first.
+static FONT_MAPS: OnceLock<Mutex<HashMap<PathBuf, &'static [u8]>>> = OnceLock::new();
+
+fn map_font_file(path: &Path) -> std::io::Result<&'static [u8]> {
+    let mut maps = FONT_MAPS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(bytes) = maps.get(path) {
+        return Ok(bytes);
+    }
+
+    let file = std::fs::File::open(path)?;
+    // SAFETY: the mapping is read-only and never written through.  Rewriting a
+    // font file in place while it is mapped would fault the process — the same
+    // bet FreeType makes when it maps a face, and fontdb already maps every
+    // system font to scan its cmap.
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    let bytes: &'static [u8] = Box::leak(Box::new(mmap));
+    maps.insert(path.to_path_buf(), bytes);
+    Ok(bytes)
+}
+
+fn insert_face(defs: &mut FontDefinitions, id: &str, bytes: &'static [u8]) {
+    defs.font_data.insert(id.to_string(), Arc::new(FontData::from_static(bytes)));
 }
 
 fn register_default_family(defs: &mut FontDefinitions, family: FontFamily, id: &str) {
@@ -685,10 +720,10 @@ fn register_variant(
     defs: &mut FontDefinitions,
     font_id: &str,
     family_name: &str,
-    bytes: Option<Vec<u8>>,
-    fallback: &[u8],
+    bytes: Option<&'static [u8]>,
+    fallback: &'static [u8],
 ) {
-    let bytes = bytes.unwrap_or_else(|| fallback.to_vec());
+    let bytes = bytes.unwrap_or(fallback);
     insert_face(defs, font_id, bytes);
     defs.families.insert(FontFamily::Name(family_name.into()), vec![font_id.to_string()]);
 }
@@ -702,7 +737,7 @@ fn load_variant(
     variant: Variant,
     normal_path: &Path,
     fonts: &SystemFonts,
-) -> Option<Vec<u8>> {
+) -> Option<&'static [u8]> {
     let resolved = resolve_face(family, style, variant, fonts)?;
     if resolved.path == normal_path {
         log::debug!(
@@ -711,7 +746,7 @@ fn load_variant(
         );
         return None;
     }
-    match std::fs::read(&resolved.path) {
+    match map_font_file(&resolved.path) {
         Ok(b) => Some(b),
         Err(e) => {
             log::warn!(
@@ -940,6 +975,31 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    // epaint clones the whole buffer of every `Cow::Owned` face it parses, so
+    // an owned face costs its file size twice for the life of the process.
+    #[test]
+    fn registered_faces_hand_epaint_borrowed_bytes() {
+        let path = std::env::temp_dir().join("alacritree_test_borrowed_bytes.ttf");
+        std::fs::write(&path, b"registration only maps and stats bytes").unwrap();
+
+        let mut defs = FontDefinitions::default();
+        let fonts = SystemFonts::with_cache_dir(None);
+        let mut book = FallbackBook::default();
+        let entries = vec![path.to_string_lossy().into_owned()];
+
+        let targets = [FontFamily::Monospace];
+        register_user_fallbacks(&mut defs, &entries, Variant::Normal, &targets, &fonts, &mut book);
+
+        let id = book.ids_by_path.get(&path).expect("fallback registered");
+        let data = &defs.font_data[id];
+        assert!(
+            matches!(data.font, std::borrow::Cow::Borrowed(_)),
+            "{id} owns its bytes; epaint will clone them"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
     // Unix-excluded: fontconfig substitutes *some* font for any family name,
     // so an unresolvable entry only exists where fontdb answers the query.
     #[cfg(not(unix))]
@@ -1093,11 +1153,7 @@ mod tests {
         // face's height; the primary itself is the scale reference and must
         // never carry a tweak, or scaling would be relative to a moving target.
         let mut defs = FontDefinitions::default();
-        insert_face(
-            &mut defs,
-            "test_primary",
-            b"egui parses this later; registration only reads bytes".to_vec(),
-        );
+        insert_face(&mut defs, "test_primary", b"egui parses this later; registration only maps");
         assert_eq!(defs.font_data["test_primary"].tweak, FontTweak::default());
     }
 

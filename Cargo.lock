@@ -61,6 +61,7 @@ dependencies = [
  "git2",
  "home",
  "log",
+ "memmap2",
  "notify-rust",
  "png 0.17.16",
  "rfd",
