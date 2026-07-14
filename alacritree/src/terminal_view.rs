@@ -13,6 +13,7 @@ use egui::{
 
 use crate::builtin_font::{BuiltinGlyphCache, Metrics, is_builtin_glyph};
 use crate::clipboard::{self, Target};
+use crate::color_glyph::{CachedColorGlyph, ColorGlyphCache};
 use crate::colors::{background, foreground, resolve, rgb_to_color32};
 use crate::config::Config;
 use crate::fonts::{BOLD_FAMILY, BOLD_ITALIC_FAMILY, ITALIC_FAMILY};
@@ -29,6 +30,7 @@ pub fn show(
     allow_focus: bool,
     builtin_glyphs: &mut BuiltinGlyphCache,
     ime: &mut crate::ime::Ime,
+    color_glyphs: &mut ColorGlyphCache,
 ) -> Response {
     let font_id = FontId::monospace(config.font.egui_size());
     let (cell_w_pt, cell_h_pt) = ui.ctx().fonts(|f| {
@@ -128,6 +130,7 @@ pub fn show(
         ppp,
         &metrics,
         builtin_glyphs,
+        color_glyphs,
         ui.ctx(),
         hovered_link.as_ref().map(|l| &l.bounds),
         // The preedit overlay replaces the cursor while composing
@@ -721,6 +724,7 @@ fn paint_grid(
     ppp: f32,
     metrics: &Metrics,
     builtin_glyphs: &mut BuiltinGlyphCache,
+    color_glyphs: &mut ColorGlyphCache,
     ctx: &egui::Context,
     link_bounds: Option<&Match>,
     cursor_hidden: bool,
@@ -787,6 +791,7 @@ fn paint_grid(
                 ppp,
                 metrics,
                 builtin_glyphs,
+                color_glyphs,
                 ctx,
             );
         }
@@ -857,6 +862,7 @@ fn paint_run(
     ppp: f32,
     metrics: &Metrics,
     builtin_glyphs: &mut BuiltinGlyphCache,
+    color_glyphs: &mut ColorGlyphCache,
     ctx: &egui::Context,
 ) {
     if run.is_empty() {
@@ -928,6 +934,15 @@ fn paint_run(
                 )
             {
                 paint_builtin_glyph(painter, cached, cell_x, y, cell_h, ppp, fg);
+                continue;
+            }
+            // Emoji are resolved against the normal chain whatever the cell's
+            // style: colour fonts ship one set of artwork, and a bold or italic
+            // variant of it would be synthesized rather than drawn.
+            if config.font.color_glyphs
+                && let Some(cached) = color_glyphs.get(ctx, ch, metrics, char_cells(ch))
+            {
+                paint_color_glyph(painter, cached, cell_x, y, ppp);
                 continue;
             }
             painter.text(
@@ -1081,6 +1096,32 @@ fn paint_preedit(
         fg,
     );
     Some(Rect::from_min_size(Pos2::new(caret_x, y), Vec2::new(cell_w, cell_h)))
+}
+
+/// How many cells a character occupies, so a double-width emoji is fitted to
+/// both of them rather than squeezed into the first.
+fn char_cells(c: char) -> u32 {
+    use unicode_width::UnicodeWidthChar;
+    c.width().unwrap_or(1).max(1) as u32
+}
+
+/// Blit a colour glyph into its cell.  Unlike the built-in glyphs, this carries
+/// its own colours, so it is tinted white (a no-op multiply) rather than with
+/// the cell's foreground.  Placement is already centred within the cell box by
+/// the cache, so the offsets only need converting from pixels to points.
+fn paint_color_glyph(
+    painter: &egui::Painter,
+    cached: &CachedColorGlyph,
+    cell_x: f32,
+    cell_y: f32,
+    ppp: f32,
+) {
+    let rect = Rect::from_min_size(
+        Pos2::new(cell_x + cached.left as f32 / ppp, cell_y + cached.top as f32 / ppp),
+        Vec2::new(cached.width as f32 / ppp, cached.height as f32 / ppp),
+    );
+    let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+    painter.image(cached.texture.id(), rect, uv, Color32::WHITE);
 }
 
 /// Place the cached pixel-space glyph into the cell.  alacritty positions

@@ -361,6 +361,19 @@ mod disk_cache {
     }
 }
 
+/// One face in the order egui consults it: the primary, then the user's
+/// `[font] fallback` entries, then the automatic system chain.  Colour-only
+/// faces appear here even though they are withheld from egui, because the
+/// colour glyph renderer resolves against this same order and must see the
+/// face the user asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChainFace {
+    pub path: PathBuf,
+    pub face_index: u32,
+    /// egui cannot rasterize this face; only the colour glyph renderer can.
+    pub color_only: bool,
+}
+
 /// Bookkeeping shared by all fallback registration within one install: which
 /// files already back an egui font, which font id serves each file (so one
 /// file can join several variants' family lists without duplicate data), and
@@ -370,9 +383,102 @@ struct FallbackBook {
     loaded_paths: HashSet<PathBuf>,
     ids_by_path: HashMap<PathBuf, String>,
     warned_entries: HashSet<String>,
+    /// Faces withheld from egui because they carry no outlines.  Kept so a
+    /// later variant's chain doesn't re-read and re-probe the same file.
+    color_only: HashSet<PathBuf>,
     /// Height ratio of the primary normal face, used to normalize fallback
     /// faces to the same visual size at a given point size.
     primary_height_ratio: Option<f32>,
+    /// The normal-variant chain, in resolution order, for the colour renderer.
+    chain: Vec<ChainFace>,
+}
+
+impl FallbackBook {
+    /// Record a face in the normal-variant chain.  Other variants re-walk the
+    /// same fallbacks and must not append to it a second time.
+    fn extend_chain(&mut self, variant: Variant, path: &Path, face_index: u32, color_only: bool) {
+        if !matches!(variant, Variant::Normal) {
+            return;
+        }
+        let face = ChainFace { path: path.to_path_buf(), face_index, color_only };
+        if !self.chain.contains(&face) {
+            self.chain.push(face);
+        }
+    }
+}
+
+/// Whether `face` can hand egui an outline for `c`.  A face may claim a
+/// character in its cmap and still have nothing to draw for it, which is what
+/// makes a cell go blank.
+#[cfg(test)]
+#[cfg(test)]
+pub fn face_outlines_char(face: &ChainFace, c: char) -> bool {
+    let Ok(data) = std::fs::read(&face.path) else {
+        return false;
+    };
+    let Ok(parsed) = ttf_parser::Face::parse(&data, face.face_index) else {
+        return false;
+    };
+    let Some(glyph) = parsed.glyph_index(c) else {
+        return false;
+    };
+    parsed.outline_glyph(glyph, &mut DiscardOutline).is_some()
+}
+
+struct DiscardOutline;
+impl ttf_parser::OutlineBuilder for DiscardOutline {
+    fn move_to(&mut self, _: f32, _: f32) {}
+    fn line_to(&mut self, _: f32, _: f32) {}
+    fn quad_to(&mut self, _: f32, _: f32, _: f32, _: f32) {}
+    fn curve_to(&mut self, _: f32, _: f32, _: f32, _: f32, _: f32, _: f32) {}
+    fn close(&mut self) {}
+}
+
+/// egui rasterizes `glyf`/`CFF` outlines and nothing else.  COLR and CBDT
+/// emoji fonts keep their artwork in colour tables and leave the base glyphs
+/// empty, so egui would claim every character such a face covers and then paint
+/// a blank cell.  Those faces are withheld from egui and drawn by `color_glyph`
+/// instead.
+///
+/// A table-level check is not enough — Twemoji has a `glyf` table full of empty
+/// shapes — so this samples covered codepoints and asks for a real outline.
+///
+/// A face that does not parse is *not* colour-only: it is a font we know
+/// nothing about, and withholding it here would quietly change which fonts
+/// reach egui at all.
+fn is_color_only(data: &[u8], index: u32) -> bool {
+    /// Enough to clear any run of empty glyphs at the head of a cmap without
+    /// walking a 20 000-glyph CJK face.
+    const PROBE_LIMIT: usize = 64;
+
+    let Ok(face) = ttf_parser::Face::parse(data, index) else {
+        return false;
+    };
+    let Some(cmap) = face.tables().cmap else {
+        return false;
+    };
+
+    let mut probed = 0usize;
+    let mut outlined = false;
+    for subtable in cmap.subtables {
+        if !subtable.is_unicode() {
+            continue;
+        }
+        subtable.codepoints(|cp| {
+            if outlined || probed >= PROBE_LIMIT {
+                return;
+            }
+            let Some(glyph) = char::from_u32(cp).and_then(|c| face.glyph_index(c)) else {
+                return;
+            };
+            probed += 1;
+            outlined |= face.outline_glyph(glyph, &mut DiscardOutline).is_some();
+        });
+        if outlined {
+            break;
+        }
+    }
+    probed > 0 && !outlined
 }
 
 /// Register the user-configured `[font] fallback` entries for one variant.
@@ -394,10 +500,15 @@ fn register_user_fallbacks(
             }
             continue;
         };
+        if book.color_only.contains(&resolved.path) {
+            book.extend_chain(variant, &resolved.path, resolved.face_index, true);
+            continue;
+        }
         if let Some(id) = book.ids_by_path.get(&resolved.path) {
             for family in targets {
                 defs.families.entry(family.clone()).or_default().push(id.clone());
             }
+            book.extend_chain(variant, &resolved.path, resolved.face_index, false);
             continue;
         }
         if book.loaded_paths.contains(&resolved.path) {
@@ -412,13 +523,22 @@ fn register_user_fallbacks(
                 continue;
             },
         };
+        if is_color_only(bytes, resolved.face_index) {
+            log::debug!(
+                "font.fallback entry '{entry}' has no outlines; drawing it as colour glyphs"
+            );
+            book.color_only.insert(resolved.path.clone());
+            book.extend_chain(variant, &resolved.path, resolved.face_index, true);
+            continue;
+        }
         let id = format!("alacritree_fallback_{}", defs.font_data.len());
-        let tweak = fallback_tweak(book.primary_height_ratio, bytes, 0);
-        let data = FontData { tweak, ..FontData::from_static(bytes) };
+        let tweak = fallback_tweak(book.primary_height_ratio, bytes, resolved.face_index);
+        let data = FontData { index: resolved.face_index, tweak, ..FontData::from_static(bytes) };
         defs.font_data.insert(id.clone(), Arc::new(data));
         for family in targets {
             defs.families.entry(family.clone()).or_default().push(id.clone());
         }
+        book.extend_chain(variant, &resolved.path, resolved.face_index, false);
         book.loaded_paths.insert(resolved.path.clone());
         book.ids_by_path.insert(resolved.path, id);
     }
@@ -454,7 +574,10 @@ fn fallback_tweak(primary_ratio: Option<f32>, data: &[u8], index: u32) -> FontTw
     FontTweak { scale, ..FontTweak::default() }
 }
 
-pub fn install_terminal_fonts(ctx: &Context, font: &FontConfig) {
+/// Register the terminal faces with egui and return the normal-variant
+/// fallback chain, in the order egui consults it, for the colour glyph
+/// renderer to resolve against.
+pub fn install_terminal_fonts(ctx: &Context, font: &FontConfig) -> Vec<ChainFace> {
     let (normal, bold, italic, bold_italic) =
         (&font.normal, &font.bold, &font.italic, &font.bold_italic);
     let family = normal.family.as_deref().unwrap_or(DEFAULT_FAMILY);
@@ -467,14 +590,14 @@ pub fn install_terminal_fonts(ctx: &Context, font: &FontConfig) {
         Some(m) => m,
         None => {
             log::warn!("could not resolve font '{family}'; using bundled monospace");
-            return;
+            return Vec::new();
         },
     };
     let normal_bytes = match map_font_file(&normal_match.path) {
         Ok(b) => b,
         Err(e) => {
             log::warn!("could not read font file {}: {e}", normal_match.path.display());
-            return;
+            return Vec::new();
         },
     };
 
@@ -518,7 +641,15 @@ pub fn install_terminal_fonts(ctx: &Context, font: &FontConfig) {
 
     let mut book = FallbackBook::default();
     book.loaded_paths.insert(normal_match.path.clone());
-    book.primary_height_ratio = face_height_ratio(normal_bytes, 0);
+    book.primary_height_ratio = face_height_ratio(normal_bytes, normal_match.face_index);
+    // The primary is registered unconditionally above, so it heads the chain
+    // as an egui-drawable face even in the pathological case of a colour-only
+    // font being configured as `[font.normal]`.
+    book.chain.push(ChainFace {
+        path: normal_match.path.clone(),
+        face_index: normal_match.face_index,
+        color_only: false,
+    });
 
     // Each variant gets its own fallback chain seeded from that variant's
     // configured family — same as crossfont's per-FontDesc fallback search,
@@ -543,6 +674,7 @@ pub fn install_terminal_fonts(ctx: &Context, font: &FontConfig) {
     }
 
     ctx.set_fonts(defs);
+    book.chain
 }
 
 /// Append every font from fontconfig's trimmed sort to `target_families` so
@@ -573,10 +705,15 @@ fn register_fallback_faces(
     }
 
     for face in fallbacks {
+        if book.color_only.contains(&face.path) {
+            book.extend_chain(variant, &face.path, face.face_index, true);
+            continue;
+        }
         if let Some(id) = book.ids_by_path.get(&face.path) {
             for family in target_families {
                 defs.families.entry(family.clone()).or_default().push(id.clone());
             }
+            book.extend_chain(variant, &face.path, face.face_index, false);
             continue;
         }
         let bytes = match map_font_file(&face.path) {
@@ -586,6 +723,11 @@ fn register_fallback_faces(
                 continue;
             },
         };
+        if is_color_only(bytes, face.face_index) {
+            book.color_only.insert(face.path.clone());
+            book.extend_chain(variant, &face.path, face.face_index, true);
+            continue;
+        }
         let id = format!("alacritree_fallback_{}", defs.font_data.len());
         let tweak = fallback_tweak(book.primary_height_ratio, bytes, face.face_index);
         let data = FontData { index: face.face_index, tweak, ..FontData::from_static(bytes) };
@@ -594,6 +736,7 @@ fn register_fallback_faces(
         for family in target_families {
             defs.families.entry(family.clone()).or_default().push(id.clone());
         }
+        book.extend_chain(variant, &face.path, face.face_index, false);
         book.loaded_paths.insert(face.path.clone());
         book.ids_by_path.insert(face.path, id);
     }
@@ -762,6 +905,10 @@ fn load_variant(
 
 struct ResolvedFace {
     path: PathBuf,
+    /// Which face inside the file.  A `.ttc` holds several — `Noto Sans Mono
+    /// CJK KR` and its `JP` sibling can share one file — so dropping this
+    /// would silently load the wrong language's face.
+    face_index: u32,
 }
 
 #[cfg(unix)]
@@ -798,7 +945,7 @@ fn resolve_face(
 fn resolve_via_path(family_or_path: &str) -> Option<ResolvedFace> {
     let path = Path::new(family_or_path);
     if path.is_file() {
-        return Some(ResolvedFace { path: path.to_path_buf() });
+        return Some(ResolvedFace { path: path.to_path_buf(), face_index: 0 });
     }
     None
 }
@@ -817,7 +964,7 @@ fn resolve_via_fontdb(family: &str, variant: Variant, fonts: &SystemFonts) -> Op
     match &face_info.source {
         // A memory-mapped `SharedFile` still names a real file on disk.
         fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => {
-            Some(ResolvedFace { path: path.clone() })
+            Some(ResolvedFace { path: path.clone(), face_index: face_info.index })
         },
         // Embedded faces aren't path-addressable; we'd have to re-architect
         // the loader to support them and they're rare.
@@ -867,7 +1014,8 @@ mod fontconfig_resolve {
 
         let matched = pattern.font_match();
         let path = matched.filename()?;
-        Some(ResolvedFace { path: PathBuf::from(path) })
+        let face_index = matched.face_index().unwrap_or(0).max(0) as u32;
+        Some(ResolvedFace { path: PathBuf::from(path), face_index })
     }
 
     /// `FcFontSort` with `trim=true` returns fonts in match order, dropping

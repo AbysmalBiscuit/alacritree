@@ -159,6 +159,7 @@ pub struct AlacritreeApp {
     /// Shared across sessions; auto-invalidated when cell size changes.
     builtin_glyphs: crate::builtin_font::BuiltinGlyphCache,
     ime: crate::ime::Ime,
+    color_glyphs: crate::color_glyph::ColorGlyphCache,
 }
 
 struct DeleteRequest {
@@ -214,7 +215,8 @@ impl AlacritreeApp {
     pub fn new(cc: &CreationContext<'_>, config: Config) -> Self {
         let theme = Theme::from_config(&config);
 
-        crate::fonts::install_terminal_fonts(&cc.egui_ctx, &config.font);
+        let font_chain = crate::fonts::install_terminal_fonts(&cc.egui_ctx, &config.font);
+        let color_glyph_budget_mb = config.font.color_glyph_cache_mb;
 
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = theme.terminal_bg;
@@ -324,6 +326,10 @@ impl AlacritreeApp {
             _ipc_socket: ipc_socket,
             builtin_glyphs: crate::builtin_font::BuiltinGlyphCache::new(),
             ime: crate::ime::Ime::default(),
+            color_glyphs: crate::color_glyph::ColorGlyphCache::new(
+                font_chain,
+                color_glyph_budget_mb,
+            ),
         };
 
         if let Err(e) = app.spawn_session(&cc.egui_ctx, None) {
@@ -3011,6 +3017,7 @@ impl eframe::App for AlacritreeApp {
                     !modal_open && self.focus == PaneFocus::Terminal,
                     &mut self.builtin_glyphs,
                     ime,
+                    &mut self.color_glyphs,
                 );
                 // egui fake-clicks the natively focused widget on Space/Enter,
                 // and the terminal keeps native focus while the sidebar owns

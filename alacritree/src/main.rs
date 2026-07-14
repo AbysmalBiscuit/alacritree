@@ -4,6 +4,7 @@ mod app;
 mod bindings;
 mod builtin_font;
 mod clipboard;
+mod color_glyph;
 mod colors;
 mod command_ext;
 mod config;

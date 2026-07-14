@@ -62,6 +62,15 @@ pub struct FontConfig {
     /// Ordered fallback families or font file paths, consulted after the four
     /// primary faces and before the automatic system fallback chain.
     pub fallback: Vec<String>,
+    /// Draw emoji from their font's colour tables.  Turning this off falls
+    /// through to the first fallback face that has ordinary outlines, so
+    /// emoji render monochrome rather than in colour.
+    pub color_glyphs: bool,
+    /// Ceiling on the rasterized colour glyph cache.  The cache is already
+    /// bounded by how many codepoints the colour fonts cover (a few thousand),
+    /// but that ceiling moves with cell size and with the fallback list, so it
+    /// is worth a budget rather than a promise.
+    pub color_glyph_cache_mb: usize,
 }
 
 /// Pixel delta with x/y, mirroring alacritty's `Delta<i8>` for `font.offset`
@@ -300,6 +309,8 @@ impl Default for FontConfig {
             glyph_offset: FontDelta::default(),
             builtin_box_drawing: true,
             fallback: Vec::new(),
+            color_glyphs: true,
+            color_glyph_cache_mb: 10,
         }
     }
 }
@@ -562,6 +573,10 @@ struct RawFont {
     /// warns about unknown keys, so putting it in the shared `alacritty.toml`
     /// would make the real alacritty noisy.
     fallback: Option<Vec<String>>,
+    /// Also alacritree-only, so it belongs in `alacritree.toml` alongside
+    /// `fallback`.
+    color_glyphs: Option<bool>,
+    color_glyph_cache_mb: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -860,6 +875,12 @@ impl RawConfig {
             font.builtin_box_drawing = b;
         }
         font.fallback = self.font.fallback.clone().unwrap_or_default();
+        if let Some(c) = self.font.color_glyphs {
+            font.color_glyphs = c;
+        }
+        if let Some(mb) = self.font.color_glyph_cache_mb {
+            font.color_glyph_cache_mb = mb;
+        }
 
         // ---- Cursor ----
         let mut cursor = config.cursor;
