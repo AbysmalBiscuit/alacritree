@@ -957,11 +957,13 @@ fn paint_run(
 
     if style.flags.intersects(Flags::ALL_UNDERLINES) {
         let uy = y + cell_h - 1.5;
-        painter.line_segment([Pos2::new(x, uy), Pos2::new(x + width, uy)], Stroke::new(1.0, fg));
+        painter
+            .line_segment([Pos2::new(x, uy), Pos2::new(x + width, uy)], Stroke::new(1.0_f32, fg));
     }
     if style.flags.contains(Flags::STRIKEOUT) {
         let sy = y + cell_h * 0.5;
-        painter.line_segment([Pos2::new(x, sy), Pos2::new(x + width, sy)], Stroke::new(1.0, fg));
+        painter
+            .line_segment([Pos2::new(x, sy), Pos2::new(x + width, sy)], Stroke::new(1.0_f32, fg));
     }
 }
 
@@ -1004,7 +1006,7 @@ fn paint_cursor(
             painter.rect_stroke(
                 cursor_rect,
                 0.0,
-                Stroke::new(1.0, cursor_color),
+                Stroke::new(1.0_f32, cursor_color),
                 egui::StrokeKind::Inside,
             );
         },
@@ -1085,7 +1087,7 @@ fn paint_preedit(
     }
 
     let uy = y + cell_h - 1.5;
-    painter.line_segment([Pos2::new(x, uy), Pos2::new(x + width_pt, uy)], Stroke::new(1.0, fg));
+    painter.line_segment([Pos2::new(x, uy), Pos2::new(x + width_pt, uy)], Stroke::new(1.0_f32, fg));
 
     // Beam caret on the cell the next char lands in, clamped to the grid.
     let caret_col = (layout.start_col + layout.width).min(cols.saturating_sub(1));
