@@ -27,6 +27,7 @@ mod terminal_view;
 #[cfg(test)]
 mod test_util;
 mod worktree;
+mod wsl;
 
 use app::AlacritreeApp;
 
@@ -75,6 +76,7 @@ fn main() -> eframe::Result<()> {
     }
 
     let config = config::load();
+    wsl::set_automount_root(config.wsl_automount_root.clone());
     let translucent = config.window.opacity < 1.0;
 
     let mut viewport = egui::ViewportBuilder::default()

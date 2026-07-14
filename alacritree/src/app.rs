@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 
+use alacritty_terminal::tty::Shell;
 use eframe::CreationContext;
 use egui::{Color32, Context, Frame, Margin, RichText, ScrollArea, SidePanel, Stroke};
 
@@ -23,6 +24,7 @@ use crate::sidebar_nav::{self, SidebarRow};
 use crate::state::{self, PersistedProject, PersistedState};
 use crate::terminal_view;
 use crate::worktree::{self as wt, CreateRequest, Progress};
+use crate::wsl::{self, ShellChoice};
 
 /// `None` is the home workspace (sessions inherit `$PWD`); `Some` is a worktree path.
 type WorkspaceKey = Option<PathBuf>;
@@ -160,6 +162,10 @@ pub struct AlacritreeApp {
     builtin_glyphs: crate::builtin_font::BuiltinGlyphCache,
     ime: crate::ime::Ime,
     color_glyphs: crate::color_glyph::ColorGlyphCache,
+    /// In-flight background re-discoveries, keyed by project root.  WSL
+    /// discovery shells out to wsl.exe and must never block paint; results
+    /// are adopted in `poll_project_refreshes`.
+    pending_project_refresh: HashMap<PathBuf, Receiver<Project>>,
 }
 
 struct DeleteRequest {
@@ -283,12 +289,22 @@ impl AlacritreeApp {
         };
 
         let persisted = state::load();
-        let projects = persisted
+        let projects: Vec<Project> = persisted
             .projects
             .iter()
             .map(|p| {
-                let mut project = Project::discover(p.root.clone());
+                // WSL roots discover in the background after construction —
+                // a cold distro takes seconds to boot and would block first
+                // paint. Normalize the root first so a persisted `\\wsl$\`
+                // spelling converges with the `\\wsl.localhost\` paths that
+                // background discovery later swaps in via `poll_project_refreshes`.
+                let root = wsl::normalize_root(p.root.clone());
+                let mut project = match wsl::classify(&root) {
+                    wsl::Location::Windows(_) => Project::discover(root),
+                    wsl::Location::Wsl { .. } => Project::placeholder(root),
+                };
                 project.expanded = p.expanded;
+                project.shell_override = p.shell.as_deref().and_then(wsl::ShellChoice::parse);
                 project
             })
             .collect();
@@ -330,7 +346,19 @@ impl AlacritreeApp {
                 font_chain,
                 color_glyph_budget_mb,
             ),
+            pending_project_refresh: HashMap::new(),
         };
+
+        let wsl_indices: Vec<usize> = app
+            .projects
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| matches!(wsl::classify(&p.root), wsl::Location::Wsl { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        for idx in wsl_indices {
+            app.refresh_project(&cc.egui_ctx, idx);
+        }
 
         if let Err(e) = app.spawn_session(&cc.egui_ctx, None) {
             app.last_error = Some(format!("failed to spawn shell: {e}"));
@@ -344,7 +372,11 @@ impl AlacritreeApp {
             projects: self
                 .projects
                 .iter()
-                .map(|p| PersistedProject { root: p.root.clone(), expanded: p.expanded })
+                .map(|p| PersistedProject {
+                    root: p.root.clone(),
+                    expanded: p.expanded,
+                    shell: p.shell_override.as_ref().map(|c| c.to_state_string()),
+                })
                 .collect(),
             // Don't persist a sidebar the user never opened — an auto-shown
             // sidebar (e.g. from Ctrl+Shift+B while it was hidden) should not
@@ -353,6 +385,46 @@ impl AlacritreeApp {
             show_right_sidebar: self.show_right_sidebar,
         };
         state::save(&state);
+    }
+
+    /// Windows projects re-discover synchronously (git2, fast).  WSL
+    /// projects re-discover on a worker thread: wsl.exe takes ~400 ms warm
+    /// and seconds while the distro VM boots.
+    fn refresh_project(&mut self, ctx: &Context, idx: usize) {
+        let root = self.projects[idx].root.clone();
+        if matches!(wsl::classify(&root), wsl::Location::Windows(_)) {
+            self.projects[idx].refresh();
+            return;
+        }
+        if self.pending_project_refresh.contains_key(&root) {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        let worker_root = root.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Project::discover(worker_root));
+            ctx.request_repaint();
+        });
+        self.pending_project_refresh.insert(root, rx);
+    }
+
+    /// Adopt completed background discoveries.  Only worktrees and the
+    /// default branch are copied — `expanded` and the shell override are
+    /// user state that survives refreshes (mirrors `Project::refresh`).
+    fn poll_project_refreshes(&mut self) {
+        let projects = &mut self.projects;
+        self.pending_project_refresh.retain(|root, rx| match rx.try_recv() {
+            Ok(fresh) => {
+                if let Some(project) = projects.iter_mut().find(|p| p.root == *root) {
+                    project.worktrees = fresh.worktrees;
+                    project.default_branch = fresh.default_branch;
+                }
+                false
+            },
+            Err(mpsc::TryRecvError::Empty) => true,
+            Err(mpsc::TryRecvError::Disconnected) => false,
+        });
     }
 
     fn spawn_session(
@@ -365,12 +437,14 @@ impl AlacritreeApp {
         if let Some(dir) = &working_directory {
             self.sync_doppler_scopes(dir.clone());
         }
+        let shell = self.resolve_shell(&working_directory);
         let session = Session::spawn(
             ctx.clone(),
             &self.config,
             working_directory.clone(),
             TermSize::new(80, 24),
             (8.0, 16.0),
+            shell,
         )?;
         let id = session.id;
         self.sessions.push(session);
@@ -399,6 +473,32 @@ impl AlacritreeApp {
         let linked = doppler::mirror_scopes(&main_checkout, &worktree);
         if linked > 0 {
             log::info!("linked {linked} doppler scope(s) into {}", worktree.display());
+        }
+    }
+
+    /// Shell for a workspace: the owning project's override wins, then a WSL
+    /// location auto-selects that distro's default shell, then the
+    /// configured shell.  The home tab (None) always uses the configured
+    /// shell.  `None` means "no override" — `Session::spawn` falls through
+    /// to alacritty's config-driven shell with its OS-guaranteed fallback.
+    fn resolve_shell(&self, workspace: &WorkspaceKey) -> Option<Shell> {
+        let path = workspace.as_ref()?;
+        let choice = self
+            .projects
+            .iter()
+            .find(|p| p.worktrees.iter().any(|wt| &wt.path == path))
+            .and_then(|p| p.shell_override.clone());
+        match choice {
+            Some(ShellChoice::Windows) => None,
+            Some(ShellChoice::Wsl(distro)) => {
+                if wsl::distros().iter().any(|d| d.name == distro) {
+                    Some(wsl_shell(&distro, path))
+                } else {
+                    log::warn!("shell override names unknown WSL distro `{distro}`; using auto");
+                    auto_wsl_shell(path)
+                }
+            },
+            None => auto_wsl_shell(path),
         }
     }
 
@@ -538,10 +638,18 @@ impl AlacritreeApp {
         order
     }
 
-    fn add_project_via_dialog(&mut self) {
+    fn add_project_via_dialog(&mut self, ctx: &Context) {
         if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            let path = wsl::normalize_root(path);
             if !self.projects.iter().any(|p| p.root == path) {
-                self.projects.push(Project::discover(path));
+                match wsl::classify(&path) {
+                    wsl::Location::Windows(_) => self.projects.push(Project::discover(path)),
+                    wsl::Location::Wsl { .. } => {
+                        self.projects.push(Project::placeholder(path));
+                        let idx = self.projects.len() - 1;
+                        self.refresh_project(ctx, idx);
+                    },
+                }
                 self.persist();
             }
         }
@@ -779,7 +887,7 @@ impl AlacritreeApp {
             BindingAction::Named(NamedAction::SelectPreviousWorkspace) => {
                 self.cycle_workspaces(ctx, -1);
             },
-            BindingAction::Named(NamedAction::AddProject) => self.add_project_via_dialog(),
+            BindingAction::Named(NamedAction::AddProject) => self.add_project_via_dialog(ctx),
             BindingAction::Named(NamedAction::ToggleSidebarFocus) => match self.focus {
                 PaneFocus::Terminal => self.focus_sidebar(),
                 PaneFocus::ProjectsSidebar => self.focus_terminal(),
@@ -991,6 +1099,8 @@ impl AlacritreeApp {
                     .collect()
             })
             .collect();
+        let distros = wsl::distros();
+        let mut shell_override_changed = false;
 
         let panel_resp = SidePanel::left("left_sidebar")
             .resizable(true)
@@ -1055,6 +1165,7 @@ impl AlacritreeApp {
                         // worktree rows already show the dot, and doubling it
                         // on the parent reads as noise.
                         let show_proj_dot = proj_attention && !project.expanded;
+                        let mut name_resp: Option<egui::Response> = None;
                         let row_rect = row_with_trailing(
                             ui,
                             |ui| {
@@ -1063,14 +1174,17 @@ impl AlacritreeApp {
                                     project.expanded = !project.expanded;
                                     expand_toggled = true;
                                 }
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&project.name)
-                                            .color(theme.text)
-                                            .strong()
-                                            .small(),
-                                    )
-                                    .truncate(),
+                                name_resp = Some(
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&project.name)
+                                                .color(theme.text)
+                                                .strong()
+                                                .small(),
+                                        )
+                                        .truncate()
+                                        .sense(egui::Sense::click()),
+                                    ),
                                 );
                             },
                             |ui| {
@@ -1107,6 +1221,58 @@ impl AlacritreeApp {
                             paint_cursor_outline(ui, rect, &theme);
                             if cursor_moved {
                                 ui.scroll_to_rect(rect, None);
+                            }
+                        }
+
+                        // Right-click: choose which shell this project's
+                        // sessions use. Hidden entirely when no distros are
+                        // registered so non-WSL setups see zero new UI.
+                        if !distros.is_empty() {
+                            if let Some(resp) = name_resp {
+                                resp.context_menu(|ui| {
+                                    ui.label(
+                                        RichText::new("Open in…").color(theme.text_muted).small(),
+                                    );
+                                    let mark =
+                                        |selected: bool| if selected { "• " } else { "   " };
+                                    let auto = project.shell_override.is_none();
+                                    if ui
+                                        .button(format!("{}Auto (by location)", mark(auto)))
+                                        .clicked()
+                                    {
+                                        project.shell_override = None;
+                                        shell_override_changed = true;
+                                        ui.close_menu();
+                                    }
+                                    let win = matches!(
+                                        project.shell_override,
+                                        Some(ShellChoice::Windows)
+                                    );
+                                    if ui.button(format!("{}Windows shell", mark(win))).clicked() {
+                                        project.shell_override = Some(ShellChoice::Windows);
+                                        shell_override_changed = true;
+                                        ui.close_menu();
+                                    }
+                                    for distro in &distros {
+                                        let selected = matches!(
+                                            &project.shell_override,
+                                            Some(ShellChoice::Wsl(name)) if name == &distro.name
+                                        );
+                                        if ui
+                                            .button(format!(
+                                                "{}WSL ({})",
+                                                mark(selected),
+                                                distro.name
+                                            ))
+                                            .clicked()
+                                        {
+                                            project.shell_override =
+                                                Some(ShellChoice::Wsl(distro.name.clone()));
+                                            shell_override_changed = true;
+                                            ui.close_menu();
+                                        }
+                                    }
+                                });
                             }
                         }
 
@@ -1188,16 +1354,19 @@ impl AlacritreeApp {
             });
 
         if add_project_clicked {
-            self.add_project_via_dialog();
+            self.add_project_via_dialog(ctx);
         }
         if let Some(idx) = refresh_idx {
-            self.projects[idx].refresh();
+            self.refresh_project(ctx, idx);
         }
         if let Some(idx) = remove_idx {
             self.projects.remove(idx);
             self.persist();
         }
         if expand_toggled {
+            self.persist();
+        }
+        if shell_override_changed {
             self.persist();
         }
         if home_clicked {
@@ -1313,9 +1482,7 @@ impl AlacritreeApp {
 
                     ui.add(
                         egui::Label::new(
-                            RichText::new(path.display().to_string())
-                                .color(theme.text_muted)
-                                .small(),
+                            RichText::new(wsl::display_path(&path)).color(theme.text_muted).small(),
                         )
                         .truncate(),
                     );
@@ -1452,7 +1619,10 @@ impl AlacritreeApp {
             return;
         }
 
-        let (program, args) = build_diff_command(&req);
+        let (program, args) = match wsl::classify(&workspace) {
+            wsl::Location::Wsl { distro, .. } => build_wsl_diff_command(&distro, &workspace, &req),
+            wsl::Location::Windows(_) => build_diff_command(&req),
+        };
         let title = format!("diff: {}", req.file);
         match Session::spawn_command(
             ctx.clone(),
@@ -1489,13 +1659,10 @@ impl AlacritreeApp {
     }
 }
 
-/// Show the clicked file's `git diff` in delta, wired in as git's pager so git
-/// drives the pipe itself.  This drops the POSIX-`sh` dependency the old
-/// `sh -c '… | delta'` had — which had no equivalent on Windows, so diffs never
-/// opened there.  Paths/branches stay in argv, so no file name is shell-parsed.
-fn build_diff_command(req: &DiffRequest) -> (String, Vec<String>) {
-    let mut args =
-        vec!["-c".to_string(), "core.pager=delta --paging=always".to_string(), "diff".to_string()];
+/// git arguments (everything after `git`) for the requested diff — shared
+/// by the Windows and WSL pane commands.
+fn diff_args(req: &DiffRequest) -> Vec<String> {
+    let mut args = vec!["diff".to_string()];
     match &req.source {
         DiffSource::Staged => args.push("--cached".to_string()),
         DiffSource::Worktree => {},
@@ -1512,7 +1679,56 @@ fn build_diff_command(req: &DiffRequest) -> (String, Vec<String>) {
         args.push("/dev/null".to_string());
     }
     args.push(req.file.clone());
+    args
+}
+
+/// Show the clicked file's `git diff` in delta, wired in as git's pager so git
+/// drives the pipe itself.  This drops the POSIX-`sh` dependency the old
+/// `sh -c '… | delta'` had — which had no equivalent on Windows, so diffs never
+/// opened there.  Paths/branches stay in argv, so no file name is shell-parsed.
+fn build_diff_command(req: &DiffRequest) -> (String, Vec<String>) {
+    let mut args = vec!["-c".to_string(), "core.pager=delta --paging=always".to_string()];
+    args.extend(diff_args(req));
     ("git".to_string(), args)
+}
+
+/// The same diff run inside the repo's distro.  `sh -l` sources the user's
+/// profile so `delta` resolves from their PATH (`--exec` alone only sees the
+/// default system PATH; a missing delta prints in the pane, same failure
+/// surface as Windows).  Diff arguments travel as positional parameters, so
+/// no file name is shell-parsed.
+fn build_wsl_diff_command(
+    distro: &str,
+    workspace: &Path,
+    req: &DiffRequest,
+) -> (String, Vec<String>) {
+    let mut args = vec![
+        "-d".to_string(),
+        distro.to_string(),
+        "--cd".to_string(),
+        workspace.to_string_lossy().into_owned(),
+        "--exec".to_string(),
+        "sh".to_string(),
+        "-lc".to_string(),
+        r#"exec git -c "core.pager=delta --paging=always" "$@""#.to_string(),
+        "sh".to_string(),
+    ];
+    args.extend(diff_args(req));
+    ("wsl.exe".to_string(), args)
+}
+
+/// WSL-resident paths get their distro's shell; everything else falls back
+/// to the configured shell.
+fn auto_wsl_shell(path: &Path) -> Option<Shell> {
+    match wsl::classify(path) {
+        wsl::Location::Wsl { distro, .. } => Some(wsl_shell(&distro, path)),
+        wsl::Location::Windows(_) => None,
+    }
+}
+
+fn wsl_shell(distro: &str, workdir: &Path) -> Shell {
+    let (program, args) = wsl::shell_invocation(distro, workdir);
+    Shell::new(program, args)
 }
 
 fn dirty_warning(counts: &DirtyCounts) -> Option<String> {
@@ -2374,7 +2590,7 @@ impl AlacritreeApp {
         );
 
         if confirm_via_key || confirmed {
-            self.run_pending_delete();
+            self.run_pending_delete(ctx);
             return;
         }
         if cancel_via_key || cancelled || modal.should_close() {
@@ -2449,7 +2665,7 @@ impl AlacritreeApp {
         }
     }
 
-    fn run_pending_delete(&mut self) {
+    fn run_pending_delete(&mut self, ctx: &Context) {
         let Some(req) = self.pending_delete.take() else {
             return;
         };
@@ -2478,7 +2694,7 @@ impl AlacritreeApp {
             let action = if req.prunable { "prune" } else { "delete" };
             self.last_error = Some(format!("{action} failed: {e}"));
         }
-        self.projects[req.project_idx].refresh();
+        self.refresh_project(ctx, req.project_idx);
     }
 
     fn show_create_dialog(&mut self, ctx: &Context) {
@@ -2506,7 +2722,7 @@ impl AlacritreeApp {
             CreateState::Done { project_idx, steps, result } => {
                 if self.show_create_done(ctx, project_idx, &steps, &result) {
                     if let Ok(path) = &result {
-                        self.projects[project_idx].refresh();
+                        self.refresh_project(ctx, project_idx);
                         let path = path.clone();
                         self.activate_worktree(ctx, &path);
                     }
@@ -2945,6 +3161,7 @@ impl eframe::App for AlacritreeApp {
     }
 
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        self.poll_project_refreshes();
         let modal_open = self.is_modal_open();
         // Keys pressed mid-composition drive the IME's candidate window,
         // not the app — alacritty's key_input returns early the same way,
@@ -3151,5 +3368,58 @@ mod tests {
 
         let two_match = vec![(ws("/a"), 1), (ws("/other"), 2), (ws("/a"), 3)];
         assert_eq!(sidebar_session_ids(&two_match, &ws("/a")), vec![1, 3]);
+    }
+
+    fn req(file: &str, source: DiffSource) -> DiffRequest {
+        DiffRequest { file: file.to_string(), source }
+    }
+
+    #[test]
+    fn diff_args_staged() {
+        let args = diff_args(&req("a.rs", DiffSource::Staged));
+        assert_eq!(args, vec!["diff", "--cached", "--", "a.rs"]);
+    }
+
+    #[test]
+    fn diff_args_worktree() {
+        let args = diff_args(&req("a.rs", DiffSource::Worktree));
+        assert_eq!(args, vec!["diff", "--", "a.rs"]);
+    }
+
+    #[test]
+    fn diff_args_untracked() {
+        let args = diff_args(&req("a.rs", DiffSource::Untracked));
+        assert_eq!(args, vec!["diff", "--no-index", "--", "/dev/null", "a.rs"]);
+    }
+
+    #[test]
+    fn diff_args_branch() {
+        let args = diff_args(&req("a.rs", DiffSource::Branch { base: "main".to_string() }));
+        assert_eq!(args, vec!["diff", "main...", "--", "a.rs"]);
+    }
+
+    #[test]
+    fn wsl_diff_command_wraps_diff_args_in_login_shell() {
+        let (program, args) = build_wsl_diff_command(
+            "arch",
+            Path::new(r"\\wsl.localhost\arch\home\user\proj"),
+            &req("a.rs", DiffSource::Staged),
+        );
+        assert_eq!(program, "wsl.exe");
+        assert_eq!(
+            args[..8],
+            [
+                "-d",
+                "arch",
+                "--cd",
+                r"\\wsl.localhost\arch\home\user\proj",
+                "--exec",
+                "sh",
+                "-lc",
+                r#"exec git -c "core.pager=delta --paging=always" "$@""#,
+            ]
+        );
+        assert_eq!(args[8], "sh");
+        assert_eq!(&args[9..], diff_args(&req("a.rs", DiffSource::Staged)).as_slice());
     }
 }

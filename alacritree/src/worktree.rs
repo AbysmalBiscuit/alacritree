@@ -7,6 +7,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use crate::command_ext::CommandExt;
+use crate::wsl;
 
 #[derive(Debug, Clone)]
 pub enum Progress {
@@ -95,17 +96,8 @@ fn run_create(
 
     send("Creating git worktree…");
     let target = pick_worktree_path(&req.project_root, &req.branch, req.base_dir.as_deref())?;
-    run_git(
-        &req.project_root,
-        &[
-            "worktree",
-            "add",
-            target.to_str().ok_or("invalid worktree path")?,
-            "-b",
-            &req.branch,
-            &base_ref,
-        ],
-    )?;
+    let target_arg = git_path_arg(&req.project_root, &target)?;
+    run_git(&req.project_root, &["worktree", "add", &target_arg, "-b", &req.branch, &base_ref])?;
 
     send("Copying LLM configurations…");
     let copied = copy_llm_configs(&req.project_root, &target);
@@ -149,11 +141,36 @@ fn enable_claude_terminal_bell(worktree_root: &Path) -> std::io::Result<()> {
     std::fs::write(path, pretty)
 }
 
+/// `git` primed to run against `cwd`'s repo: `git -C <cwd>` for Windows
+/// paths, the same command inside the owning distro for WSL paths.  Path
+/// *arguments* for WSL repos must already be Linux paths (`git_path_arg`).
+fn git_command(cwd: &Path) -> Command {
+    match wsl::classify(cwd) {
+        wsl::Location::Windows(path) => {
+            let mut cmd = Command::new("git");
+            cmd.hide_console().arg("-C").arg(path);
+            cmd
+        },
+        wsl::Location::Wsl { distro, linux_path } => {
+            let mut cmd = wsl::command(&distro, None);
+            cmd.arg("git").arg("-C").arg(linux_path);
+            cmd
+        },
+    }
+}
+
+/// The form of `path` git receives as an argument: Linux for WSL repos
+/// (in-distro git can't resolve UNC paths), the Windows string otherwise.
+fn git_path_arg(repo: &Path, path: &Path) -> Result<String, String> {
+    match wsl::classify(repo) {
+        wsl::Location::Windows(_) => Ok(path.to_str().ok_or("invalid worktree path")?.to_string()),
+        wsl::Location::Wsl { .. } => wsl::windows_to_linux(path)
+            .ok_or_else(|| "worktree path is outside the distro".to_string()),
+    }
+}
+
 fn run_git(cwd: &Path, args: &[&str]) -> Result<(), String> {
-    let output = Command::new("git")
-        .hide_console()
-        .arg("-C")
-        .arg(cwd)
+    let output = git_command(cwd)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -169,10 +186,7 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<(), String> {
 }
 
 fn has_remote(cwd: &Path, name: &str) -> bool {
-    Command::new("git")
-        .hide_console()
-        .arg("-C")
-        .arg(cwd)
+    git_command(cwd)
         .args(["remote", "get-url", name])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -230,10 +244,7 @@ fn resolve_base_branch(cwd: &Path, hint: Option<&str>) -> Result<(String, String
 }
 
 fn rev_parse_verify(cwd: &Path, name: &str) -> bool {
-    Command::new("git")
-        .hide_console()
-        .arg("-C")
-        .arg(cwd)
+    git_command(cwd)
         .args(["rev-parse", "--verify", "--quiet", name])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -247,10 +258,7 @@ fn rev_parse_verify(cwd: &Path, name: &str) -> bool {
 ///   <sha>\tHEAD
 /// We pull the `refs/heads/<name>` from the symref line.
 fn query_origin_head(cwd: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .hide_console()
-        .arg("-C")
-        .arg(cwd)
+    let output = git_command(cwd)
         .args(["ls-remote", "--symref", "origin", "HEAD"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -291,13 +299,31 @@ fn pick_worktree_path(repo: &Path, branch: &str, base: Option<&Path>) -> Result<
     Ok(candidate)
 }
 
+/// Worktrees live under `<base>/<project>-<hash>/`.  `base` is the configured
+/// `[workspace]` override when set; otherwise `<home>/.alacritree/worktrees`,
+/// using the *distro's* home for WSL repos so the worktree stays on the Linux
+/// filesystem next to its repo instead of crossing onto 9P-mounted NTFS.  The
+/// path hash disambiguates same-named repos in different locations.
 fn project_worktree_dir(repo: &Path, base: Option<&Path>) -> Result<PathBuf, String> {
     let base = match base {
         Some(dir) => dir.to_path_buf(),
-        None => home::home_dir()
-            .ok_or_else(|| "could not locate home directory".to_string())?
-            .join(".alacritree")
-            .join("worktrees"),
+        None => {
+            let home = match wsl::classify(repo) {
+                wsl::Location::Windows(_) => {
+                    home::home_dir().ok_or_else(|| "could not locate home directory".to_string())?
+                },
+                wsl::Location::Wsl { distro, .. } => {
+                    let stdout = wsl::run_batch(&distro, r#"printf '%s' "$HOME""#, &[])
+                        .map_err(|e| format!("could not query WSL home: {e}"))?;
+                    let linux_home = String::from_utf8_lossy(&stdout).trim().to_string();
+                    if linux_home.is_empty() {
+                        return Err("could not determine the distro home directory".into());
+                    }
+                    wsl::linux_to_windows(&linux_home, &distro)
+                },
+            };
+            home.join(".alacritree").join("worktrees")
+        },
     };
     let canonical = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
     let project_name = canonical
@@ -353,6 +379,33 @@ fn copy_llm_configs(src_root: &Path, dst_root: &Path) -> usize {
     copied
 }
 
+#[cfg(test)]
+#[cfg(windows)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_path_arg_windows_repo_passes_path_through() {
+        let repo = Path::new(r"C:\x");
+        let path = Path::new(r"C:\x\y");
+        assert_eq!(git_path_arg(repo, path).as_deref(), Ok(r"C:\x\y"));
+    }
+
+    #[test]
+    fn git_path_arg_wsl_repo_translates_worktree_path() {
+        let repo = Path::new(r"\\wsl.localhost\arch\home\user\proj");
+        let path = Path::new(r"\\wsl.localhost\arch\home\user\wt");
+        assert_eq!(git_path_arg(repo, path).as_deref(), Ok("/home/user/wt"));
+    }
+
+    #[test]
+    fn git_path_arg_wsl_repo_errors_outside_distro_mapping() {
+        let repo = Path::new(r"\\wsl.localhost\arch\home\user\proj");
+        let path = Path::new("wt");
+        assert!(git_path_arg(repo, path).is_err());
+    }
+}
+
 fn copy_path(src: &Path, dst: &Path) -> std::io::Result<()> {
     if src.is_dir() {
         std::fs::create_dir_all(dst)?;
@@ -378,7 +431,7 @@ pub fn delete_worktree(
     branch: Option<&str>,
     force: bool,
 ) -> Result<(), String> {
-    let path_str = worktree_path.to_str().ok_or_else(|| "invalid worktree path".to_string())?;
+    let path_arg = git_path_arg(project_root, worktree_path)?;
     // Resolve before removal: canonicalize needs the directory to still
     // exist, and the doppler cleanup below runs after git has deleted it.
     let scope_root =
@@ -387,7 +440,7 @@ pub fn delete_worktree(
     if force {
         args.push("--force");
     }
-    args.push(path_str);
+    args.push(&path_arg);
     run_git(project_root, &args)?;
     if let Some(branch) = branch {
         // Branch may already be gone (e.g. detached HEAD) — ignore errors here.

@@ -56,6 +56,9 @@ windows-sys = { version = "0.59", features = ["Win32_System_LibraryLoader"] }
 # Foreground-agent detection: walks the shell's descendant process tree.
 # Linux reads /proc directly, so the dependency is Windows-only.
 sysinfo = { version = "0.36", default-features = false, features = ["system"] }
+# Distro enumeration reads HKCU\...\Lxss directly (Windows Terminal's
+# approach) — no process spawn at startup, and it identifies the default.
+winreg = "0.55"
 
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3.0.2"

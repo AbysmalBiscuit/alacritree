@@ -38,6 +38,7 @@ pub struct Config {
     /// Offer the IPC socket that `alacritree mcp` connects to.  Mirrors
     /// alacritty's `[general] ipc_socket` (default on).
     pub ipc_socket: bool,
+    pub wsl_automount_root: String,
 }
 
 #[derive(Debug, Clone)]
@@ -291,6 +292,7 @@ impl Default for Config {
             selection: SelectionConfig::default(),
             bindings: Vec::new(),
             ipc_socket: true,
+            wsl_automount_root: "/mnt".to_string(),
         }
     }
 }
@@ -718,6 +720,16 @@ struct RawIndexed {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
+struct RawUiWsl {
+    /// Distro-side mount point for Windows drives, mirroring wsl.conf's
+    /// `[automount] root`.  Only used for paths *we* translate (git output
+    /// from inside a distro); `wsl.exe --cd` translates with the distro's
+    /// real mount table regardless of this value.
+    automount_root: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 struct RawUi {
     sidebar_background: Option<RgbStr>,
     sidebar_foreground: Option<RgbStr>,
@@ -727,6 +739,7 @@ struct RawUi {
     /// When the sidebar × on a session row asks before killing the PTY:
     /// "never" (default) | "busy" | "always".
     confirm_session_close: Option<String>,
+    wsl: RawUiWsl,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -951,6 +964,15 @@ impl RawConfig {
                 .collect(),
         };
 
+        // ---- WSL ----
+        let wsl_automount_root = self
+            .ui
+            .wsl
+            .automount_root
+            .map(|r| r.trim_end_matches('/').to_string())
+            .filter(|r| r.starts_with('/') && r.len() > 1)
+            .unwrap_or_else(|| "/mnt".to_string());
+
         Config {
             palette,
             ui,
@@ -964,6 +986,7 @@ impl RawConfig {
             selection,
             bindings,
             ipc_socket: self.general.ipc_socket.unwrap_or(true),
+            wsl_automount_root,
         }
     }
 }
@@ -1013,6 +1036,19 @@ mod tests {
         let value: toml::Value = toml::from_str(input).expect("valid toml");
         let raw: RawConfig = value.try_into().expect("valid config");
         raw.into_config().ui
+    }
+
+    #[test]
+    fn automount_root_defaults_and_normalizes() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        assert_eq!(raw.into_config().wsl_automount_root, "/mnt");
+
+        let raw: RawConfig = toml::from_str("[ui.wsl]\nautomount_root = \"/drives/\"").unwrap();
+        assert_eq!(raw.into_config().wsl_automount_root, "/drives");
+
+        // Nonsense values fall back rather than corrupting every translation.
+        let raw: RawConfig = toml::from_str("[ui.wsl]\nautomount_root = \"mnt\"").unwrap();
+        assert_eq!(raw.into_config().wsl_automount_root, "/mnt");
     }
 
     #[test]
