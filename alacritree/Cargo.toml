@@ -34,6 +34,10 @@ notify-rust = "4"
 # (alacritty's font backend, present in this workspace) pulls in.
 fontconfig = "0.8"
 
+[target.'cfg(windows)'.dependencies]
+# Restricts the DLL search path at startup; see `harden_dll_search_path`.
+windows-sys = { version = "0.59", features = ["Win32_System_LibraryLoader"] }
+
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3.0.2"
 
