@@ -140,6 +140,7 @@ pub struct AlacritreeApp {
     _ipc_socket: Option<ipc::SocketHandle>,
     /// Shared across sessions; auto-invalidated when cell size changes.
     builtin_glyphs: crate::builtin_font::BuiltinGlyphCache,
+    ime: crate::ime::Ime,
 }
 
 struct DeleteRequest {
@@ -239,6 +240,11 @@ impl AlacritreeApp {
         }
         cc.egui_ctx.set_style(style);
 
+        // Terminal IME hint — matches alacritty's set_ime_purpose.
+        cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::IMEPurpose(
+            egui::viewport::IMEPurpose::Terminal,
+        ));
+
         alacritty_terminal::tty::setup_env();
 
         // Before the first PTY spawn so children inherit ALACRITREE_SOCKET.
@@ -295,6 +301,7 @@ impl AlacritreeApp {
             ipc_rx,
             _ipc_socket: ipc_socket,
             builtin_glyphs: crate::builtin_font::BuiltinGlyphCache::new(),
+            ime: crate::ime::Ime::default(),
         };
 
         if let Err(e) = app.spawn_session(&cc.egui_ctx, None) {
@@ -2338,7 +2345,10 @@ impl eframe::App for AlacritreeApp {
 
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         let modal_open = self.is_modal_open();
-        if !modal_open {
+        // Keys pressed mid-composition drive the IME's candidate window,
+        // not the app — alacritty's key_input returns early the same way,
+        // above binding dispatch.
+        if !modal_open && self.ime.preedit().is_none() {
             self.handle_shortcuts(ctx);
         }
         self.process_notification_actions(ctx);
@@ -2369,6 +2379,10 @@ impl eframe::App for AlacritreeApp {
                 self.show_tab_strip(ui);
 
                 if let Some(err) = self.last_error.as_deref() {
+                    // A preedit can only be finalized or cancelled by the terminal
+                    // view's event drain, so without a session view to run it the
+                    // preedit would go stale and keep shortcuts suppressed forever.
+                    self.ime.clear();
                     ui.label(
                         RichText::new(err)
                             .color(rgb_to_color32(self.config.palette.normal[1]))
@@ -2382,18 +2396,23 @@ impl eframe::App for AlacritreeApp {
                 }
 
                 let Some(idx) = self.active_session_index() else {
+                    // Same rationale as the last_error branch above: without an
+                    // active session view, no code path can advance the preedit.
+                    self.ime.clear();
                     ui.label(
                         RichText::new("no session — Ctrl+T to open one").color(theme.text_dim),
                     );
                     return;
                 };
                 let session = &mut self.sessions[idx];
+                let ime = &mut self.ime;
                 let _ = terminal_view::show(
                     ui,
                     session,
                     &self.config,
                     !modal_open,
                     &mut self.builtin_glyphs,
+                    ime,
                 );
             });
 
