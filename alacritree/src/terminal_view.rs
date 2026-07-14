@@ -121,8 +121,11 @@ pub fn show(
     );
 
     if allow_focus && response.has_focus() {
+        // Kitty-protocol and mouse modes negotiated by the running app decide
+        // how events encode, so the encoder needs the live terminal mode.
+        let mode = *session.term.lock().mode();
         let consumed: Vec<ConsumedEvent> =
-            ui.input(|i| i.events.iter().filter_map(consumed_event).collect());
+            ui.input(|i| i.events.iter().filter_map(|e| consumed_event(e, mode)).collect());
         if !consumed.is_empty() {
             // Typing drops the selection and snaps back to the prompt so the
             // user sees their input — matches alacritty's on_terminal_input_start.
@@ -441,10 +444,10 @@ enum ConsumedEvent {
 /// rebind or unbind.  Keyboard paste runs through `NamedAction::Paste`, which
 /// reads the clipboard itself.  Text widgets outside the terminal still consume
 /// the event normally.
-fn consumed_event(event: &Event) -> Option<ConsumedEvent> {
+fn consumed_event(event: &Event, mode: TermMode) -> Option<ConsumedEvent> {
     match event {
         Event::Paste(_) => None,
-        _ => event_to_bytes(event).map(ConsumedEvent::Bytes),
+        _ => event_to_bytes(event, mode).map(ConsumedEvent::Bytes),
     }
 }
 
@@ -849,7 +852,7 @@ mod tests {
     /// binding table says — and leave the shortcut impossible to rebind.
     #[test]
     fn paste_event_does_not_reach_the_terminal() {
-        assert!(consumed_event(&Event::Paste("hi".into())).is_none());
+        assert!(consumed_event(&Event::Paste("hi".into()), TermMode::empty()).is_none());
     }
 
     /// Alacritty sends SYN on Ctrl+V; paste is a Ctrl+Shift+V binding.
@@ -863,7 +866,7 @@ mod tests {
             modifiers: Modifiers::CTRL,
         };
         assert!(
-            matches!(consumed_event(&press), Some(ConsumedEvent::Bytes(ref b)) if b == &vec![0x16]),
+            matches!(consumed_event(&press, TermMode::empty()), Some(ConsumedEvent::Bytes(ref b)) if b == &vec![0x16]),
             "Ctrl+V must reach the PTY as 0x16"
         );
     }
