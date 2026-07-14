@@ -82,7 +82,16 @@ pub fn parse_bindings(raw: Vec<RawBinding>) -> Vec<KeyBinding> {
             }
             continue;
         };
-        let mods = r.mods.as_deref().map_or(Modifiers::NONE, parse_mods);
+        let mods = match r.mods.as_deref() {
+            None => Modifiers::NONE,
+            Some(s) => match parse_mods(s) {
+                Some(m) => m,
+                None => {
+                    log::warn!("ignoring binding for '{}': mods '{s}' unavailable here", r.key);
+                    continue;
+                },
+            },
+        };
         let action = if let Some(chars) = r.chars {
             BindingAction::Chars(unescape(&chars).into_bytes())
         } else if let Some(action) = r.action {
@@ -369,7 +378,9 @@ fn f_key(n: u8) -> Option<Key> {
     })
 }
 
-fn parse_mods(s: &str) -> Modifiers {
+/// `None` when the chord can't be represented on this platform, so the caller
+/// drops the binding rather than letting it fire on the wrong keys.
+fn parse_mods(s: &str) -> Option<Modifiers> {
     let mut m = Modifiers::NONE;
     for token in s.split('|') {
         match token.trim() {
@@ -380,7 +391,17 @@ fn parse_mods(s: &str) -> Modifiers {
             other => log::warn!("unknown modifier '{other}'"),
         }
     }
-    m
+    // Off macOS there is no Super modifier to match on: egui carries no such
+    // field, and egui-winit raises `command` on every Ctrl press.  A Super
+    // chord could therefore only ever fire on the Ctrl chord instead — and for
+    // the clipboard bindings a shared alacritty.toml carries (`Super+C ->
+    // Copy`), that means eating Ctrl+C.  Drop it rather than steal the
+    // interrupt.
+    #[cfg(not(target_os = "macos"))]
+    if m.command {
+        return None;
+    }
+    Some(m)
 }
 
 fn parse_action(name: &str) -> BindingAction {
@@ -465,4 +486,46 @@ fn unescape(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw_action(key: &str, mods: Option<&str>, action: &str) -> RawBinding {
+        RawBinding {
+            key: key.into(),
+            mods: mods.map(Into::into),
+            mode: None,
+            chars: None,
+            action: Some(action.into()),
+            command: None,
+        }
+    }
+
+    /// A shared alacritty.toml commonly carries macOS clipboard bindings like
+    /// `Super+C -> Copy`.  egui has no Super modifier and egui-winit raises
+    /// `command` on every Ctrl press, so honoring that binding here would let
+    /// it fire on Ctrl+C and swallow the interrupt every terminal app needs.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn super_binding_does_not_swallow_the_interrupt() {
+        let bindings = parse_bindings(vec![raw_action("c", Some("Super"), "Copy")]);
+        let ctrl = Modifiers { ctrl: true, command: true, ..Modifiers::NONE };
+        let matched = all_matches(&bindings, Key::C, ctrl);
+        assert!(matched.is_empty(), "Super+C hijacked Ctrl+C: {matched:?}");
+    }
+
+    /// Ctrl+Shift+C stays the copy shortcut.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn ctrl_shift_c_still_copies() {
+        let bindings = parse_bindings(vec![]);
+        let ctrl_shift = Modifiers { ctrl: true, shift: true, command: true, ..Modifiers::NONE };
+        let matched = all_matches(&bindings, Key::C, ctrl_shift);
+        assert!(
+            matched.iter().any(|a| matches!(a, BindingAction::Named(NamedAction::Copy))),
+            "Ctrl+Shift+C no longer copies: {matched:?}"
+        );
+    }
 }
