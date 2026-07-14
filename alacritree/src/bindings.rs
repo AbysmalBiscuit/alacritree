@@ -53,6 +53,8 @@ pub enum NamedAction {
     ToggleSidebarFocus,
     FocusProjectsSidebar,
     FocusTerminal,
+    /// 1-indexed into the `[[ui.profiles]]` order.
+    SpawnProfile(u8),
     Quit,
     /// Used to unbind a key — consumes the press without acting on it.
     NoOp,
@@ -497,6 +499,16 @@ fn parse_action(name: &str) -> BindingAction {
         "ToggleSidebarFocus" => BindingAction::Named(ToggleSidebarFocus),
         "FocusProjectsSidebar" => BindingAction::Named(FocusProjectsSidebar),
         "FocusTerminal" => BindingAction::Named(FocusTerminal),
+        "SpawnProfile1" => BindingAction::Named(SpawnProfile(1)),
+        "SpawnProfile2" => BindingAction::Named(SpawnProfile(2)),
+        "SpawnProfile3" => BindingAction::Named(SpawnProfile(3)),
+        "SpawnProfile4" => BindingAction::Named(SpawnProfile(4)),
+        "SpawnProfile5" => BindingAction::Named(SpawnProfile(5)),
+        "SpawnProfile6" => BindingAction::Named(SpawnProfile(6)),
+        "SpawnProfile7" => BindingAction::Named(SpawnProfile(7)),
+        "SpawnProfile8" => BindingAction::Named(SpawnProfile(8)),
+        "SpawnProfile9" => BindingAction::Named(SpawnProfile(9)),
+
         "Quit" => BindingAction::Named(Quit),
         "None" => BindingAction::Named(NoOp),
         "ReceiveChar" => BindingAction::Named(ReceiveChar),
@@ -559,6 +571,42 @@ mod tests {
         }
     }
 
+    fn parse_one(action: &str) -> BindingAction {
+        let raw = RawBinding {
+            key: "F1".into(),
+            mods: None,
+            mode: None,
+            chars: None,
+            action: Some(action.into()),
+            command: None,
+        };
+        // User bindings are parsed before the appended defaults, so the
+        // first entry is ours.
+        parse_bindings(vec![raw]).remove(0).action
+    }
+
+    fn raw_chars(key: &str, mods: Option<&str>, chars: &str) -> RawBinding {
+        RawBinding {
+            key: key.into(),
+            mods: mods.map(Into::into),
+            mode: None,
+            chars: Some(chars.into()),
+            action: None,
+            command: None,
+        }
+    }
+
+    /// The `NamedAction`s that fire for a key press, ignoring other kinds.
+    fn named_matches(bindings: &[KeyBinding], key: Key, mods: Modifiers) -> Vec<NamedAction> {
+        all_matches(bindings, key, mods)
+            .into_iter()
+            .filter_map(|a| match a {
+                BindingAction::Named(n) => Some(*n),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// A shared alacritty.toml commonly carries macOS clipboard bindings like
     /// `Super+C -> Copy`.  egui has no Super modifier and egui-winit raises
     /// `command` on every Ctrl press, so honoring that binding here would let
@@ -599,25 +647,14 @@ mod tests {
         );
     }
 
-    /// The `NamedAction`s that fire for a key press, ignoring other kinds.
-    fn named_matches(bindings: &[KeyBinding], key: Key, mods: Modifiers) -> Vec<NamedAction> {
-        all_matches(bindings, key, mods)
-            .into_iter()
-            .filter_map(|a| match a {
-                BindingAction::Named(n) => Some(*n),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn raw_chars(key: &str, mods: Option<&str>, chars: &str) -> RawBinding {
-        RawBinding {
-            key: key.into(),
-            mods: mods.map(Into::into),
-            mode: None,
-            chars: Some(chars.into()),
-            action: None,
-            command: None,
+    #[test]
+    fn spawn_profile_actions_parse() {
+        for n in 1..=9u8 {
+            let action = parse_one(&format!("SpawnProfile{n}"));
+            assert!(
+                matches!(action, BindingAction::Named(NamedAction::SpawnProfile(m)) if m == n),
+                "SpawnProfile{n} parsed to {action:?}"
+            );
         }
     }
 
@@ -731,6 +768,17 @@ mod tests {
             (Key::B, ctrl_shift, ToggleSidebarFocus),
         ] {
             assert_eq!(named_matches(&b, key, mods), vec![expected], "{key:?}+{mods:?}");
+        }
+    }
+
+    #[test]
+    fn out_of_range_spawn_profile_is_unsupported() {
+        for name in ["SpawnProfile0", "SpawnProfile10", "SpawnProfile"] {
+            let action = parse_one(name);
+            assert!(
+                matches!(&action, BindingAction::Unsupported(s) if s == name),
+                "{name} parsed to {action:?}"
+            );
         }
     }
 }

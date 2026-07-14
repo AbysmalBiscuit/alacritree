@@ -19,8 +19,8 @@ pub struct PersistedProject {
     pub root: PathBuf,
     #[serde(default = "default_true")]
     pub expanded: bool,
-    /// Shell override: `"windows"` or `"wsl:<distro>"`.  Absent = auto by
-    /// project location.
+    /// Shell override: `"windows"`, `"wsl:<distro>"`, or `"profile:<name>"`.
+    /// Absent = auto by project location.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell: Option<String>,
 }
@@ -105,12 +105,12 @@ mod tests {
             projects: vec![PersistedProject {
                 root: PathBuf::from("C:/x"),
                 expanded: true,
-                shell: Some("wsl:arch".to_string()),
+                shell: Some("wsl:kali-linux".to_string()),
             }],
             ..Default::default()
         };
         let text = toml::to_string_pretty(&state).unwrap();
         let back: PersistedState = toml::from_str(&text).unwrap();
-        assert_eq!(back.projects[0].shell.as_deref(), Some("wsl:arch"));
+        assert_eq!(back.projects[0].shell.as_deref(), Some("wsl:kali-linux"));
     }
 }

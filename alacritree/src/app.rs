@@ -438,6 +438,15 @@ impl AlacritreeApp {
             self.sync_doppler_scopes(dir.clone());
         }
         let shell = self.resolve_shell(&working_directory);
+        self.spawn_session_with_shell(ctx, working_directory, shell)
+    }
+
+    fn spawn_session_with_shell(
+        &mut self,
+        ctx: &Context,
+        working_directory: WorkspaceKey,
+        shell: Option<Shell>,
+    ) -> std::io::Result<SessionId> {
         let session = Session::spawn(
             ctx.clone(),
             &self.config,
@@ -476,29 +485,51 @@ impl AlacritreeApp {
         }
     }
 
-    /// Shell for a workspace: the owning project's override wins, then a WSL
-    /// location auto-selects that distro's default shell, then the
-    /// configured shell.  The home tab (None) always uses the configured
-    /// shell.  `None` means "no override" — `Session::spawn` falls through
-    /// to alacritty's config-driven shell with its OS-guaranteed fallback.
+    /// Spawn a named profile into the current workspace, bypassing the
+    /// override/auto resolution chain — the user asked for this profile
+    /// explicitly.
+    fn spawn_profile_session(&mut self, ctx: &Context, name: &str) {
+        let Some(profile) = self.config.profile(name) else {
+            log::warn!("no shell profile named `{name}`");
+            self.last_error = Some(format!("no shell profile named `{name}`"));
+            return;
+        };
+        let shell = Some(profile_shell(profile));
+        let ws = self.current_workspace.clone();
+        if let Err(e) = self.spawn_session_with_shell(ctx, ws, shell) {
+            self.last_error = Some(format!("failed to spawn profile `{name}`: {e}"));
+        }
+    }
+
+    /// Shell for a workspace; `None` means "no override" — `Session::spawn`
+    /// falls through to alacritty's config-driven shell with its
+    /// OS-guaranteed fallback.  The home tab (`None` workspace) has no
+    /// project or location, so only the default profile can apply there.
     fn resolve_shell(&self, workspace: &WorkspaceKey) -> Option<Shell> {
-        let path = workspace.as_ref()?;
-        let choice = self
-            .projects
-            .iter()
-            .find(|p| p.worktrees.iter().any(|wt| &wt.path == path))
-            .and_then(|p| p.shell_override.clone());
-        match choice {
-            Some(ShellChoice::Windows) => None,
-            Some(ShellChoice::Wsl(distro)) => {
-                if wsl::distros().iter().any(|d| d.name == distro) {
-                    Some(wsl_shell(&distro, path))
-                } else {
-                    log::warn!("shell override names unknown WSL distro `{distro}`; using auto");
-                    auto_wsl_shell(path)
-                }
-            },
-            None => auto_wsl_shell(path),
+        let path = workspace.as_deref();
+        let choice = path.and_then(|p| {
+            self.projects
+                .iter()
+                .find(|proj| proj.worktrees.iter().any(|wt| wt.path.as_path() == p))
+                .and_then(|proj| proj.shell_override.clone())
+        });
+        let location_distro = path.and_then(|p| match wsl::classify(p) {
+            wsl::Location::Wsl { distro, .. } => Some(distro),
+            wsl::Location::Windows(_) => None,
+        });
+        let known: Vec<String> = wsl::distros().into_iter().map(|d| d.name).collect();
+        match shell_decision(
+            choice.as_ref(),
+            location_distro.as_deref(),
+            &known,
+            &self.config.profiles,
+            self.config.default_profile.as_deref(),
+        ) {
+            ShellDecision::ConfigShell => None,
+            // A WSL decision only arises from a workspace path (override or
+            // location), never from the home tab.
+            ShellDecision::WslDistro(distro) => path.map(|p| wsl_shell(&distro, p)),
+            ShellDecision::Profile(name) => self.config.profile(&name).map(profile_shell),
         }
     }
 
@@ -865,6 +896,18 @@ impl AlacritreeApp {
             BindingAction::Named(NamedAction::SelectPreviousTab) => self.cycle_tabs(-1),
             BindingAction::Named(NamedAction::SelectTab(n)) => self.select_tab(n),
             BindingAction::Named(NamedAction::SelectLastTab) => self.select_last_tab(),
+            BindingAction::Named(NamedAction::SpawnProfile(n)) => {
+                match self.config.profiles.get((n - 1) as usize).map(|p| p.name.clone()) {
+                    Some(name) => self.spawn_profile_session(ctx, &name),
+                    None => {
+                        log::warn!(
+                            "SpawnProfile{n}: only {} profiles configured",
+                            self.config.profiles.len()
+                        );
+                        self.last_error = Some(format!("SpawnProfile{n}: no such profile"));
+                    },
+                }
+            },
             BindingAction::Named(NamedAction::NoOp) => {},
             BindingAction::Named(NamedAction::ReceiveChar) => {},
             BindingAction::Named(NamedAction::ToggleLeftSidebar) => {
@@ -955,7 +998,7 @@ impl AlacritreeApp {
     fn show_tab_strip(&mut self, ui: &mut egui::Ui) {
         let theme = self.theme;
         let indices = self.current_session_indices();
-        if indices.len() < 2 {
+        if indices.is_empty() {
             ui.add_space(2.0);
             return;
         }
@@ -964,46 +1007,98 @@ impl AlacritreeApp {
         // Reserve a 2px-tall strip across the full width of the terminal pane.
         let strip_height = 2.0;
         let gap = 4.0;
+        let plus_width = 12.0;
         let avail = ui.available_width();
-        let segment_width =
-            ((avail - gap * (indices.len() as f32 - 1.0)) / indices.len() as f32).max(1.0);
         let (rect, _) =
             ui.allocate_exact_size(egui::vec2(avail, strip_height + 2.0), egui::Sense::hover());
 
         let mut activate: Option<SessionId> = None;
-        for (i, &session_idx) in indices.iter().enumerate() {
-            let x0 = rect.min.x + i as f32 * (segment_width + gap);
-            let seg_rect = egui::Rect::from_min_size(
-                egui::pos2(x0, rect.min.y + 1.0),
-                egui::vec2(segment_width, strip_height),
-            );
-            let is_active = active_idx == Some(session_idx);
-            // 2px is too small to reliably click — expand the hit zone vertically.
-            let click_rect = seg_rect.expand2(egui::vec2(0.0, 4.0));
-            let id = ui.id().with(("tab_strip", self.sessions[session_idx].id));
-            let resp = ui.interact(click_rect, id, egui::Sense::click());
-            // Attention wins over the active/inactive shading so a bell from a
-            // non-active tab pulls the eye even when another tab is selected.
-            let color = if self.sessions[session_idx].needs_attention {
-                theme.attention
-            } else if is_active {
-                theme.text
-            } else if resp.hovered() {
-                theme.text_dim
-            } else {
-                theme.text_muted
-            };
-            ui.painter().rect_filled(seg_rect, 0.0, color);
-            if resp.clicked() {
-                activate = Some(self.sessions[session_idx].id);
-            }
-            if resp.hovered() {
-                resp.on_hover_text(&self.sessions[session_idx].title);
+        // Session segments only when there is a choice to make, but the
+        // trailing + segment always renders alongside them once the strip
+        // itself renders (i.e. at least one session exists).
+        if indices.len() >= 2 {
+            let seg_avail = avail - plus_width - gap;
+            let segment_width =
+                ((seg_avail - gap * (indices.len() as f32 - 1.0)) / indices.len() as f32).max(1.0);
+            for (i, &session_idx) in indices.iter().enumerate() {
+                let x0 = rect.min.x + i as f32 * (segment_width + gap);
+                let seg_rect = egui::Rect::from_min_size(
+                    egui::pos2(x0, rect.min.y + 1.0),
+                    egui::vec2(segment_width, strip_height),
+                );
+                let is_active = active_idx == Some(session_idx);
+                // 2px is too small to reliably click — expand the hit zone vertically.
+                let click_rect = seg_rect.expand2(egui::vec2(0.0, 4.0));
+                let id = ui.id().with(("tab_strip", self.sessions[session_idx].id));
+                let resp = ui.interact(click_rect, id, egui::Sense::click());
+                // Attention wins over the active/inactive shading so a bell from a
+                // non-active tab pulls the eye even when another tab is selected.
+                let color = if self.sessions[session_idx].needs_attention {
+                    theme.attention
+                } else if is_active {
+                    theme.text
+                } else if resp.hovered() {
+                    theme.text_dim
+                } else {
+                    theme.text_muted
+                };
+                ui.painter().rect_filled(seg_rect, 0.0, color);
+                if resp.clicked() {
+                    activate = Some(self.sessions[session_idx].id);
+                }
+                if resp.hovered() {
+                    resp.on_hover_text(&self.sessions[session_idx].title);
+                }
             }
         }
 
+        let profile_names: Vec<String> =
+            self.config.profiles.iter().map(|p| p.name.clone()).collect();
+        let mut spawn_default = false;
+        let mut spawn_profile: Option<String> = None;
+
+        let plus_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.max.x - plus_width, rect.min.y + 1.0),
+            egui::vec2(plus_width, strip_height),
+        );
+        let click_rect = plus_rect.expand2(egui::vec2(0.0, 4.0));
+        let resp = ui.interact(click_rect, ui.id().with("tab_strip_plus"), egui::Sense::click());
+        let color = if resp.hovered() { theme.text_dim } else { theme.text_muted };
+        ui.painter().rect_filled(plus_rect, 0.0, color);
+        if resp.clicked() {
+            spawn_default = true;
+        }
+        if !profile_names.is_empty() {
+            resp.context_menu(|ui| {
+                ui.label(RichText::new("New session with…").color(theme.text_muted).small());
+                for name in &profile_names {
+                    if ui.button(name).clicked() {
+                        spawn_profile = Some(name.clone());
+                        ui.close_menu();
+                    }
+                }
+            });
+        }
+        let hover_text = if profile_names.is_empty() {
+            "New session"
+        } else {
+            "New session (right-click: profiles)"
+        };
+        resp.on_hover_text(hover_text);
+
         if let Some(id) = activate {
             self.set_active_in_current_workspace(id);
+        }
+        if spawn_default {
+            let ctx = ui.ctx().clone();
+            let ws = self.current_workspace.clone();
+            if let Err(e) = self.spawn_session(&ctx, ws) {
+                self.last_error = Some(format!("failed to spawn shell: {e}"));
+            }
+        }
+        if let Some(name) = spawn_profile {
+            let ctx = ui.ctx().clone();
+            self.spawn_profile_session(&ctx, &name);
         }
     }
 
@@ -1100,6 +1195,8 @@ impl AlacritreeApp {
             })
             .collect();
         let distros = wsl::distros();
+        let profile_names: Vec<String> =
+            self.config.profiles.iter().map(|p| p.name.clone()).collect();
         let mut shell_override_changed = false;
 
         let panel_resp = SidePanel::left("left_sidebar")
@@ -1225,9 +1322,10 @@ impl AlacritreeApp {
                         }
 
                         // Right-click: choose which shell this project's
-                        // sessions use. Hidden entirely when no distros are
-                        // registered so non-WSL setups see zero new UI.
-                        if !distros.is_empty() {
+                        // sessions use. Hidden entirely when there is nothing
+                        // to choose (no distros, no profiles) so minimal
+                        // setups see zero new UI.
+                        if !distros.is_empty() || !profile_names.is_empty() {
                             if let Some(resp) = name_resp {
                                 resp.context_menu(|ui| {
                                     ui.label(
@@ -1268,6 +1366,21 @@ impl AlacritreeApp {
                                         {
                                             project.shell_override =
                                                 Some(ShellChoice::Wsl(distro.name.clone()));
+                                            shell_override_changed = true;
+                                            ui.close_menu();
+                                        }
+                                    }
+                                    for name in &profile_names {
+                                        let selected = matches!(
+                                            &project.shell_override,
+                                            Some(ShellChoice::Profile(n)) if n == name
+                                        );
+                                        if ui
+                                            .button(format!("{}Profile: {}", mark(selected), name))
+                                            .clicked()
+                                        {
+                                            project.shell_override =
+                                                Some(ShellChoice::Profile(name.clone()));
                                             shell_override_changed = true;
                                             ui.close_menu();
                                         }
@@ -1482,7 +1595,9 @@ impl AlacritreeApp {
 
                     ui.add(
                         egui::Label::new(
-                            RichText::new(wsl::display_path(&path)).color(theme.text_muted).small(),
+                            RichText::new(path.display().to_string())
+                                .color(theme.text_muted)
+                                .small(),
                         )
                         .truncate(),
                     );
@@ -1717,18 +1832,61 @@ fn build_wsl_diff_command(
     ("wsl.exe".to_string(), args)
 }
 
-/// WSL-resident paths get their distro's shell; everything else falls back
-/// to the configured shell.
-fn auto_wsl_shell(path: &Path) -> Option<Shell> {
-    match wsl::classify(path) {
-        wsl::Location::Wsl { distro, .. } => Some(wsl_shell(&distro, path)),
-        wsl::Location::Windows(_) => None,
-    }
-}
-
 fn wsl_shell(distro: &str, workdir: &Path) -> Shell {
     let (program, args) = wsl::shell_invocation(distro, workdir);
     Shell::new(program, args)
+}
+
+/// What shell a new session should run, decided from plain data so the
+/// precedence chain stays testable off the GUI.
+#[derive(Debug, PartialEq, Eq)]
+enum ShellDecision {
+    /// Fall through to `[terminal.shell]` / the OS default.
+    ConfigShell,
+    /// A shell inside this WSL distro (`wsl_shell` builds the argv).
+    WslDistro(String),
+    /// A named `[[ui.profiles]]` entry, verified to exist.
+    Profile(String),
+}
+
+/// Precedence: project override, then WSL location, then the default
+/// profile, then the config shell.  A stale override (distro unregistered,
+/// profile removed from config) warns and continues down the chain rather
+/// than failing the spawn.
+fn shell_decision(
+    override_choice: Option<&ShellChoice>,
+    location_distro: Option<&str>,
+    known_distros: &[String],
+    profiles: &[crate::config::Profile],
+    default_profile: Option<&str>,
+) -> ShellDecision {
+    match override_choice {
+        Some(ShellChoice::Windows) => return ShellDecision::ConfigShell,
+        Some(ShellChoice::Wsl(d)) => {
+            if known_distros.iter().any(|k| k == d) {
+                return ShellDecision::WslDistro(d.clone());
+            }
+            log::warn!("shell override names unknown WSL distro `{d}`; using auto");
+        },
+        Some(ShellChoice::Profile(n)) => {
+            if profiles.iter().any(|p| &p.name == n) {
+                return ShellDecision::Profile(n.clone());
+            }
+            log::warn!("shell override names unknown profile `{n}`; using auto");
+        },
+        None => {},
+    }
+    if let Some(d) = location_distro {
+        return ShellDecision::WslDistro(d.to_string());
+    }
+    if let Some(n) = default_profile {
+        return ShellDecision::Profile(n.to_string());
+    }
+    ShellDecision::ConfigShell
+}
+
+fn profile_shell(profile: &crate::config::Profile) -> Shell {
+    Shell::new(profile.program.clone(), profile.args.clone())
 }
 
 fn dirty_warning(counts: &DirtyCounts) -> Option<String> {
@@ -3401,8 +3559,8 @@ mod tests {
     #[test]
     fn wsl_diff_command_wraps_diff_args_in_login_shell() {
         let (program, args) = build_wsl_diff_command(
-            "arch",
-            Path::new(r"\\wsl.localhost\arch\home\user\proj"),
+            "kali-linux",
+            Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj"),
             &req("a.rs", DiffSource::Staged),
         );
         assert_eq!(program, "wsl.exe");
@@ -3410,9 +3568,9 @@ mod tests {
             args[..8],
             [
                 "-d",
-                "arch",
+                "kali-linux",
                 "--cd",
-                r"\\wsl.localhost\arch\home\user\proj",
+                r"\\wsl.localhost\kali-linux\home\lev\proj",
                 "--exec",
                 "sh",
                 "-lc",
@@ -3421,5 +3579,104 @@ mod tests {
         );
         assert_eq!(args[8], "sh");
         assert_eq!(&args[9..], diff_args(&req("a.rs", DiffSource::Staged)).as_slice());
+    }
+
+    fn test_profiles() -> Vec<crate::config::Profile> {
+        vec![
+            crate::config::Profile {
+                name: "pwsh".into(),
+                program: "pwsh".into(),
+                args: vec!["-NoLogo".into()],
+            },
+            crate::config::Profile {
+                name: "ubuntu".into(),
+                program: "wsl.exe".into(),
+                args: vec!["-d".into(), "ubuntu".into()],
+            },
+        ]
+    }
+
+    #[test]
+    fn override_profile_wins_over_location_and_default() {
+        let d = shell_decision(
+            Some(&ShellChoice::Profile("pwsh".into())),
+            Some("ubuntu"),
+            &["ubuntu".into()],
+            &test_profiles(),
+            Some("ubuntu"),
+        );
+        assert_eq!(d, ShellDecision::Profile("pwsh".into()));
+    }
+
+    #[test]
+    fn override_windows_skips_default_profile() {
+        let d = shell_decision(
+            Some(&ShellChoice::Windows),
+            Some("ubuntu"),
+            &["ubuntu".into()],
+            &test_profiles(),
+            Some("pwsh"),
+        );
+        assert_eq!(d, ShellDecision::ConfigShell);
+    }
+
+    #[test]
+    fn stale_profile_override_falls_back_to_auto() {
+        // Unknown profile behaves like the unknown-distro case: warn, then
+        // continue down the auto chain (location, then default profile).
+        let d = shell_decision(
+            Some(&ShellChoice::Profile("gone".into())),
+            Some("ubuntu"),
+            &["ubuntu".into()],
+            &test_profiles(),
+            None,
+        );
+        assert_eq!(d, ShellDecision::WslDistro("ubuntu".into()));
+
+        let d = shell_decision(
+            Some(&ShellChoice::Profile("gone".into())),
+            None,
+            &[],
+            &test_profiles(),
+            Some("pwsh"),
+        );
+        assert_eq!(d, ShellDecision::Profile("pwsh".into()));
+    }
+
+    #[test]
+    fn wsl_location_beats_default_profile() {
+        let d = shell_decision(
+            None,
+            Some("ubuntu"),
+            &["ubuntu".into()],
+            &test_profiles(),
+            Some("pwsh"),
+        );
+        assert_eq!(d, ShellDecision::WslDistro("ubuntu".into()));
+    }
+
+    #[test]
+    fn default_profile_applies_without_override_or_location() {
+        // This is also the home-tab case: no project, no WSL location.
+        let d = shell_decision(None, None, &[], &test_profiles(), Some("pwsh"));
+        assert_eq!(d, ShellDecision::Profile("pwsh".into()));
+    }
+
+    #[test]
+    fn no_config_means_config_shell() {
+        let d = shell_decision(None, None, &[], &[], None);
+        assert_eq!(d, ShellDecision::ConfigShell);
+    }
+
+    #[test]
+    fn stale_wsl_override_falls_through_to_default_profile() {
+        let d = shell_decision(
+            Some(&ShellChoice::Wsl("gone".into())),
+            None,
+            &["ubuntu".into()],
+            &test_profiles(),
+            Some("pwsh"),
+        );
+        assert_eq!(d, ShellDecision::Profile("pwsh".into()));
     }
 }

@@ -10,12 +10,13 @@ use std::path::{Component, Path, PathBuf, Prefix};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
-/// Per-project shell override, persisted in state.toml as `"windows"` or
-/// `"wsl:<distro>"`.  Absent means auto-by-location.
+/// Per-project shell override, persisted in state.toml as `"windows"`,
+/// `"wsl:<distro>"`, or `"profile:<name>"`.  Absent means auto-by-location.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellChoice {
     Windows,
     Wsl(String),
+    Profile(String),
 }
 
 impl ShellChoice {
@@ -23,13 +24,17 @@ impl ShellChoice {
         if s == "windows" {
             return Some(Self::Windows);
         }
-        s.strip_prefix("wsl:").filter(|d| !d.is_empty()).map(|d| Self::Wsl(d.to_string()))
+        if let Some(d) = s.strip_prefix("wsl:").filter(|d| !d.is_empty()) {
+            return Some(Self::Wsl(d.to_string()));
+        }
+        s.strip_prefix("profile:").filter(|n| !n.is_empty()).map(|n| Self::Profile(n.to_string()))
     }
 
     pub fn to_state_string(&self) -> String {
         match self {
             Self::Windows => "windows".to_string(),
             Self::Wsl(distro) => format!("wsl:{distro}"),
+            Self::Profile(name) => format!("profile:{name}"),
         }
     }
 }
@@ -122,16 +127,6 @@ pub fn normalize_root(path: PathBuf) -> PathBuf {
     match classify(&path) {
         Location::Wsl { distro, linux_path } => linux_to_windows(&linux_path, &distro),
         Location::Windows(_) => path,
-    }
-}
-
-/// User-facing spelling of a path: WSL-resident paths render as their
-/// in-distro Linux form (`/home/…`) instead of the `\\wsl.localhost\` UNC
-/// form the app stores internally.
-pub fn display_path(path: &Path) -> String {
-    match classify(path) {
-        Location::Wsl { linux_path, .. } => linux_path,
-        Location::Windows(p) => p.display().to_string(),
     }
 }
 
@@ -348,10 +343,13 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn classifies_wsl_localhost_unc() {
-        let loc = classify(Path::new(r"\\wsl.localhost\arch\home\user\proj"));
+        let loc = classify(Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj"));
         assert_eq!(
             loc,
-            Location::Wsl { distro: "arch".to_string(), linux_path: "/home/user/proj".to_string() }
+            Location::Wsl {
+                distro: "kali-linux".to_string(),
+                linux_path: "/home/lev/proj".to_string(),
+            }
         );
     }
 
@@ -368,22 +366,25 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn classifies_distro_root() {
-        let loc = classify(Path::new(r"\\wsl.localhost\arch"));
-        assert_eq!(loc, Location::Wsl { distro: "arch".to_string(), linux_path: "/".to_string() });
+        let loc = classify(Path::new(r"\\wsl.localhost\kali-linux"));
+        assert_eq!(
+            loc,
+            Location::Wsl { distro: "kali-linux".to_string(), linux_path: "/".to_string() }
+        );
     }
 
     #[cfg(windows)]
     #[test]
     fn classifies_drive_and_non_wsl_unc_as_windows() {
-        assert!(matches!(classify(Path::new(r"C:\Users\user")), Location::Windows(_)));
+        assert!(matches!(classify(Path::new(r"C:\Users\Lev")), Location::Windows(_)));
         assert!(matches!(classify(Path::new(r"\\server\share\x")), Location::Windows(_)));
     }
 
     #[cfg(windows)]
     #[test]
     fn normalize_root_converges_wsl_dollar_and_localhost() {
-        let normalized = normalize_root(PathBuf::from(r"\\wsl$\arch\home\user"));
-        assert_eq!(normalized, PathBuf::from(r"\\wsl.localhost\arch\home\user"));
+        let normalized = normalize_root(PathBuf::from(r"\\wsl$\kali-linux\home\lev"));
+        assert_eq!(normalized, PathBuf::from(r"\\wsl.localhost\kali-linux\home\lev"));
     }
 
     #[cfg(windows)]
@@ -393,27 +394,17 @@ mod tests {
         assert_eq!(normalized, PathBuf::from(r"C:\x"));
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn display_path_renders_wsl_paths_as_linux() {
-        assert_eq!(
-            display_path(Path::new(r"\\wsl.localhost\arch\home\user\proj")),
-            "/home/user/proj"
-        );
-        assert_eq!(display_path(Path::new(r"C:\Users\user")), r"C:\Users\user");
-    }
-
     #[test]
     fn linux_home_path_maps_to_unc() {
-        let p = linux_to_windows_with("/home/user/proj", "arch", "/mnt");
-        assert_eq!(p, PathBuf::from(r"\\wsl.localhost\arch\home\user\proj"));
+        let p = linux_to_windows_with("/home/lev/proj", "kali-linux", "/mnt");
+        assert_eq!(p, PathBuf::from(r"\\wsl.localhost\kali-linux\home\lev\proj"));
     }
 
     #[test]
     fn linux_automount_path_maps_to_drive() {
-        let p = linux_to_windows_with("/mnt/c/Users/user", "arch", "/mnt");
-        assert_eq!(p, PathBuf::from(r"C:\Users\user"));
-        let p = linux_to_windows_with("/drives/d/x", "arch", "/drives");
+        let p = linux_to_windows_with("/mnt/c/Users/Lev", "kali-linux", "/mnt");
+        assert_eq!(p, PathBuf::from(r"C:\Users\Lev"));
+        let p = linux_to_windows_with("/drives/d/x", "kali-linux", "/drives");
         assert_eq!(p, PathBuf::from(r"D:\x"));
     }
 
@@ -421,18 +412,18 @@ mod tests {
     fn automount_prefix_must_be_a_whole_segment() {
         // "/mnta/…" must not match root "/mnt", and a multi-char segment
         // after the root is a directory, not a drive letter.
-        let p = linux_to_windows_with("/mnta/c/x", "arch", "/mnt");
-        assert_eq!(p, PathBuf::from(r"\\wsl.localhost\arch\mnta\c\x"));
-        let p = linux_to_windows_with("/mnt/cd/x", "arch", "/mnt");
-        assert_eq!(p, PathBuf::from(r"\\wsl.localhost\arch\mnt\cd\x"));
+        let p = linux_to_windows_with("/mnta/c/x", "kali", "/mnt");
+        assert_eq!(p, PathBuf::from(r"\\wsl.localhost\kali\mnta\c\x"));
+        let p = linux_to_windows_with("/mnt/cd/x", "kali", "/mnt");
+        assert_eq!(p, PathBuf::from(r"\\wsl.localhost\kali\mnt\cd\x"));
     }
 
     #[cfg(windows)]
     #[test]
     fn drive_path_maps_to_automount() {
         assert_eq!(
-            windows_to_linux_with(Path::new(r"C:\Users\user"), "/mnt").as_deref(),
-            Some("/mnt/c/Users/user")
+            windows_to_linux_with(Path::new(r"C:\Users\Lev"), "/mnt").as_deref(),
+            Some("/mnt/c/Users/Lev")
         );
         assert_eq!(
             windows_to_linux_with(Path::new(r"D:\x y\z"), "/drives").as_deref(),
@@ -444,42 +435,46 @@ mod tests {
     #[test]
     fn wsl_unc_maps_back_to_linux() {
         assert_eq!(
-            windows_to_linux_with(Path::new(r"\\wsl.localhost\arch\home\user"), "/mnt").as_deref(),
-            Some("/home/user")
+            windows_to_linux_with(Path::new(r"\\wsl.localhost\kali-linux\home\lev"), "/mnt")
+                .as_deref(),
+            Some("/home/lev")
         );
     }
 
     #[test]
     fn parses_utf8_distro_list() {
-        let out = b"arch\nUbuntu\ndocker-desktop\n";
+        let out = b"kali-linux\nUbuntu\ndocker-desktop\n";
         let distros = parse_distro_list(out);
         assert_eq!(distros.len(), 2);
-        assert_eq!(distros[0], WslDistro { name: "arch".to_string(), is_default: true });
+        assert_eq!(distros[0], WslDistro { name: "kali-linux".to_string(), is_default: true });
         assert_eq!(distros[1], WslDistro { name: "Ubuntu".to_string(), is_default: false });
     }
 
     #[test]
     fn parses_utf16_distro_list() {
         // wsl.exe older than 0.64.0 ignores WSL_UTF8 and emits UTF-16LE.
-        let text = "arch\r\n";
+        let text = "kali-linux\r\n";
         let bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
         let distros = parse_distro_list(&bytes);
-        assert_eq!(distros, vec![WslDistro { name: "arch".to_string(), is_default: true }]);
+        assert_eq!(distros, vec![WslDistro { name: "kali-linux".to_string(), is_default: true }]);
     }
 
     #[test]
     fn command_builds_expected_argv() {
-        let cmd = command("arch", Some(Path::new(r"\\wsl.localhost\arch\home")));
+        let cmd = command("kali-linux", Some(Path::new(r"\\wsl.localhost\kali-linux\home")));
         let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         assert_eq!(cmd.get_program().to_string_lossy(), "wsl.exe");
-        assert_eq!(args, vec!["-d", "arch", "--cd", r"\\wsl.localhost\arch\home", "--exec"]);
+        assert_eq!(
+            args,
+            vec!["-d", "kali-linux", "--cd", r"\\wsl.localhost\kali-linux\home", "--exec"]
+        );
     }
 
     #[test]
     fn shell_invocation_has_no_exec() {
-        let (program, args) = shell_invocation("arch", Path::new(r"C:\proj"));
+        let (program, args) = shell_invocation("kali-linux", Path::new(r"C:\proj"));
         assert_eq!(program, "wsl.exe");
-        assert_eq!(args, vec!["-d", "arch", "--cd", r"C:\proj"]);
+        assert_eq!(args, vec!["-d", "kali-linux", "--cd", r"C:\proj"]);
     }
 
     #[test]
@@ -506,11 +501,24 @@ mod tests {
     #[test]
     fn shell_choice_round_trips() {
         assert_eq!(ShellChoice::parse("windows"), Some(ShellChoice::Windows));
-        assert_eq!(ShellChoice::parse("wsl:arch"), Some(ShellChoice::Wsl("arch".to_string())));
+        assert_eq!(
+            ShellChoice::parse("wsl:kali-linux"),
+            Some(ShellChoice::Wsl("kali-linux".to_string()))
+        );
         assert_eq!(ShellChoice::parse("wsl:"), None);
         assert_eq!(ShellChoice::parse("plan9"), None);
         assert_eq!(ShellChoice::Wsl("u".to_string()).to_state_string(), "wsl:u");
         assert_eq!(ShellChoice::Windows.to_state_string(), "windows");
+    }
+
+    #[test]
+    fn profile_choice_round_trips() {
+        assert_eq!(
+            ShellChoice::parse("profile:pwsh"),
+            Some(ShellChoice::Profile("pwsh".to_string()))
+        );
+        assert_eq!(ShellChoice::parse("profile:"), None);
+        assert_eq!(ShellChoice::Profile("pwsh".to_string()).to_state_string(), "profile:pwsh");
     }
 
     /// Live round trip against the default distro.  Requires WSL; run
