@@ -190,6 +190,13 @@ fn is_spinner_title(title: &str) -> bool {
     })
 }
 
+/// A session "looks busy" when its foreground process is a recognized
+/// agent or its title is in a spinner state — the signal the sidebar's
+/// close-confirmation policy keys on.
+fn looks_busy(agent_glyph: Option<char>, title: &str) -> bool {
+    agent_glyph.is_some() || is_spinner_title(title)
+}
+
 /// `<glyph> <text>` titles are the universal agent-CLI shape: a non-ASCII
 /// leading glyph followed by whitespace.  Plain titles (`~/foo`, `bash`)
 /// fail both checks.
@@ -493,6 +500,13 @@ impl Session {
         title_glyph
     }
 
+    /// A session "looks busy" when its foreground process is a recognized
+    /// agent or its title is in a spinner state — the signal the sidebar's
+    /// close-confirmation policy keys on.
+    pub fn is_busy(&self) -> bool {
+        looks_busy(self.agent_glyph(), &self.title)
+    }
+
     fn process_agent_glyph(&self) -> Option<char> {
         let cached = self.agent_cache.get();
         let fresh = cached.polled_at.is_some_and(|t| t.elapsed() < AGENT_CACHE_TTL);
@@ -779,5 +793,21 @@ mod tests {
     #[test]
     fn an_unset_cursor_color_is_left_unanswered() {
         assert_eq!(reply_to(b"\x1b]12;?\x07", &Palette::default()), None);
+    }
+
+    #[test]
+    fn busy_when_agent_glyph_present() {
+        assert!(looks_busy(Some('✳'), "plain title"));
+    }
+
+    #[test]
+    fn busy_when_title_is_spinner() {
+        assert!(looks_busy(None, "⠋ Thinking…"));
+    }
+
+    #[test]
+    fn idle_when_no_glyph_and_plain_title() {
+        assert!(!looks_busy(None, "~/projects/alacritree"));
+        assert!(!looks_busy(None, ""));
     }
 }
