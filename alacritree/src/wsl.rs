@@ -167,6 +167,7 @@ pub struct WslDistro {
 }
 
 /// Docker/Rancher register utility distros the user never shells into.
+#[cfg(any(windows, test))]
 fn is_utility_distro(name: &str) -> bool {
     name.starts_with("docker-desktop") || name.starts_with("rancher-desktop")
 }
@@ -236,6 +237,7 @@ fn cli_distros() -> Vec<WslDistro> {
 /// `wsl -l -q` lists the default distro first.  Output is UTF-8 when
 /// WSL_UTF8=1 is honored (WSL 0.64.0+); older versions emit UTF-16LE,
 /// detected by the NUL bytes ASCII names acquire in that encoding.
+#[cfg(any(windows, test))]
 fn parse_distro_list(stdout: &[u8]) -> Vec<WslDistro> {
     let text = if stdout.contains(&0) {
         let units: Vec<u16> =
