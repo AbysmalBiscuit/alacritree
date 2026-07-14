@@ -18,7 +18,7 @@ use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, StatusCache};
 use crate::ipc;
 use crate::paste;
 use crate::pr_status::PrCache;
-use crate::projects::{Project, Worktree};
+use crate::projects::{Project, Worktree, project_json};
 use crate::session::{Session, SessionId, SessionKind, TermSize};
 use crate::sidebar_nav::{self, SidebarRow};
 use crate::state::{self, PersistedProject};
@@ -697,6 +697,30 @@ impl AlacritreeApp {
             },
         }
         self.persist_project(&path);
+    }
+
+    /// Put a project in the sidebar, discovering its worktrees.  A project that
+    /// is already there is left alone rather than duplicated, so callers that
+    /// cannot see the sidebar (IPC) need not check first.  WSL roots discover
+    /// synchronously here (no `ctx` for a worker); the folder picker uses the
+    /// async path in `add_project_via_dialog`.
+    fn add_project(&mut self, path: PathBuf) -> &Project {
+        if let Some(idx) = self.projects.iter().position(|p| p.root == path) {
+            return &self.projects[idx];
+        }
+        self.projects.push(Project::discover(path.clone()));
+        self.persist_project(&path);
+        self.projects.last().expect("just pushed")
+    }
+
+    /// Drop a project from the sidebar.  Nothing on disk is touched, and
+    /// sessions already open in its worktrees keep running — they outlive the
+    /// sidebar entry the same way they outlive a workspace switch.
+    fn remove_project(&mut self, idx: usize) -> PathBuf {
+        let root = self.projects.remove(idx).root;
+        let key = root.clone();
+        state::mutate(move |s| s.projects.retain(|p| p.root != key));
+        root
     }
 
     fn is_modal_open(&self) -> bool {
@@ -1486,8 +1510,7 @@ impl AlacritreeApp {
             self.refresh_project(ctx, idx);
         }
         if let Some(idx) = remove_idx {
-            let root = self.projects.remove(idx).root;
-            state::mutate(|s| s.projects.retain(|p| p.root != root));
+            self.remove_project(idx);
         }
         if let Some((root, expanded)) = expand_toggled {
             state::mutate(|s| {
@@ -3272,6 +3295,14 @@ impl AlacritreeApp {
                 project.refresh();
                 Ok(project_json(project))
             },
+            Req::AddProject { path } => Ok(project_json(self.add_project(path))),
+            Req::RemoveProject { root } => {
+                let idx =
+                    self.projects.iter().position(|p| p.root == root).ok_or_else(|| {
+                        format!("{} is not a project in the sidebar", root.display())
+                    })?;
+                Ok(json!({ "removed": self.remove_project(idx) }))
+            },
             // Dispatched on the IPC connection thread; never forwarded here.
             Req::GitStatus { .. } | Req::CreateWorktree { .. } => {
                 Err("request is handled off the UI thread".to_string())
@@ -3292,24 +3323,6 @@ impl AlacritreeApp {
 
 fn unknown_worktree(path: &Path) -> String {
     format!("{} is not a worktree in the sidebar — see list_projects", path.display())
-}
-
-fn project_json(project: &Project) -> Value {
-    json!({
-        "name": project.name,
-        "root": project.root,
-        "default_branch": project.default_branch,
-        "worktrees": project
-            .worktrees
-            .iter()
-            .map(|wt| json!({
-                "name": wt.name,
-                "path": wt.path,
-                "branch": wt.branch,
-                "is_main": wt.is_main,
-            }))
-            .collect::<Vec<_>>(),
-    })
 }
 
 fn session_json(session: &Session, is_active_tab: bool) -> Value {
