@@ -830,7 +830,7 @@ mod tests {
         crate::harden_dll_search_path();
 
         let start = Instant::now();
-        let mut session = Session::spawn_command(
+        let session = Session::spawn_command(
             egui::Context::default(),
             &Config::default(),
             std::env::current_dir().ok(),
