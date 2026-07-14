@@ -167,6 +167,11 @@ struct DeleteRequest {
     worktree_name: String,
     branch: Option<String>,
     dirty: DirtyCounts,
+    /// The checkout dir is already gone; confirm prunes metadata instead of
+    /// removing a directory.
+    prunable: bool,
+    /// Checkbox state for the prune dialog's "also delete branch".
+    delete_branch: bool,
 }
 
 enum CreateState {
@@ -398,6 +403,19 @@ impl AlacritreeApp {
     }
 
     fn activate_worktree(&mut self, ctx: &Context, path: &Path) {
+        // The dir can vanish between discovery marking the row live and the
+        // click. Switching first would strand the user on a dead workspace
+        // with a failed spawn — stay put and let the sidebar re-mark the row.
+        if !path.is_dir() {
+            self.last_error =
+                Some("worktree directory is missing — prune it from the sidebar".to_string());
+            if let Some(idx) =
+                self.projects.iter().position(|p| p.worktrees.iter().any(|w| w.path == path))
+            {
+                self.projects[idx].refresh();
+            }
+            return;
+        }
         self.current_workspace = Some(path.to_path_buf());
         self.ensure_active_session(ctx);
     }
@@ -510,7 +528,11 @@ impl AlacritreeApp {
         let mut order: Vec<WorkspaceKey> = vec![None];
         for project in &self.projects {
             for wt in &project.worktrees {
-                order.push(Some(wt.path.clone()));
+                // Prunable rows can't host a shell; cycling into one would
+                // just bounce off the activate guard on every keypress.
+                if !wt.prunable {
+                    order.push(Some(wt.path.clone()));
+                }
             }
         }
         order
@@ -1119,12 +1141,25 @@ impl AlacritreeApp {
                                     activate_request.set(Some(wt.path.clone()));
                                 }
                                 if action.delete {
+                                    // Discovery marking can be stale; a dir
+                                    // deleted since the last refresh should
+                                    // still get the prune flow, not a doomed
+                                    // `git worktree remove`.
+                                    let prunable = wt.prunable || !wt.path.is_dir();
                                     delete_request.set(Some(DeleteRequest {
                                         project_idx: idx,
                                         worktree_path: wt.path.clone(),
                                         worktree_name: wt.name.clone(),
                                         branch: wt.branch.clone(),
-                                        dirty: git_status::dirty_counts(&wt.path),
+                                        // A missing dir has nothing to be dirty;
+                                        // skip the status probe.
+                                        dirty: if prunable {
+                                            DirtyCounts::default()
+                                        } else {
+                                            git_status::dirty_counts(&wt.path)
+                                        },
+                                        prunable,
+                                        delete_branch: true,
                                     }));
                                 }
                                 if action.spawn {
@@ -1977,7 +2012,13 @@ fn worktree_row(
     let resp = frame
         .show(ui, |ui| {
             let default_icon = if wt.is_main { "●" } else { "○" };
-            let name_color = if is_active { theme.text } else { theme.text_dim };
+            let name_color = if wt.prunable {
+                theme.text_muted
+            } else if is_active {
+                theme.text
+            } else {
+                theme.text_dim
+            };
             row_with_trailing(
                 ui,
                 |ui| {
@@ -1996,8 +2037,13 @@ fn worktree_row(
                 },
                 |ui| {
                     if !wt.is_main {
-                        let btn = icon_button(ui, "×", theme.text_muted, theme)
-                            .on_hover_text("delete worktree and branch");
+                        let hover = if wt.prunable {
+                            "prune worktree"
+                        } else {
+                            "delete worktree and branch"
+                        };
+                        let btn =
+                            icon_button(ui, "×", theme.text_muted, theme).on_hover_text(hover);
                         delete_rect = Some(btn.rect);
                         if btn.clicked() {
                             delete_clicked = true;
@@ -2014,6 +2060,11 @@ fn worktree_row(
         })
         .response
         .interact(egui::Sense::click());
+    let resp = if wt.prunable {
+        resp.on_hover_text("worktree directory is missing — × prunes it")
+    } else {
+        resp
+    };
 
     // Frame allocates its space at end-of-show, so its retroactive `interact`
     // registers *after* the inner button in egui's z-order — meaning clicks on
@@ -2047,7 +2098,7 @@ fn worktree_row(
         }
     }
     WorktreeAction {
-        activate: resp.clicked() && !delete_clicked && !spawn_clicked,
+        activate: resp.clicked() && !delete_clicked && !spawn_clicked && !wt.prunable,
         delete: delete_clicked,
         spawn: spawn_clicked,
     }
@@ -2247,13 +2298,25 @@ impl AlacritreeApp {
     fn show_delete_dialog(&mut self, ctx: &Context) {
         let theme = self.theme;
         let danger = rgb_to_color32(self.config.palette.normal[1]);
-        let Some(req) = self.pending_delete.as_ref() else {
+        let Some(req) = self.pending_delete.as_mut() else {
             return;
         };
-        let title = format!("Delete worktree `{}`?", req.worktree_name);
-        let detail = match &req.branch {
-            Some(b) => format!("Removes the worktree directory and deletes branch `{b}`."),
-            None => "Removes the worktree directory.".to_string(),
+        let (title, detail, verb) = if req.prunable {
+            (
+                format!("Prune worktree `{}`?", req.worktree_name),
+                "The worktree directory is already gone; this removes git's leftover metadata."
+                    .to_string(),
+                "Prune",
+            )
+        } else {
+            (
+                format!("Delete worktree `{}`?", req.worktree_name),
+                match &req.branch {
+                    Some(b) => format!("Removes the worktree directory and deletes branch `{b}`."),
+                    None => "Removes the worktree directory.".to_string(),
+                },
+                "Delete",
+            )
         };
         let warning = dirty_warning(&req.dirty);
 
@@ -2274,17 +2337,26 @@ impl AlacritreeApp {
                 if let Some(w) = &warning {
                     ui.label(RichText::new(w).color(danger).small());
                 }
+                if req.prunable {
+                    if let Some(b) = req.branch.clone() {
+                        ui.checkbox(
+                            &mut req.delete_branch,
+                            RichText::new(format!("Also delete branch `{b}`"))
+                                .color(theme.text_muted)
+                                .small(),
+                        );
+                    }
+                }
                 ui.add_space(4.0 * s);
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new("Enter to delete · Esc to cancel")
+                        RichText::new(format!("Enter to {} · Esc to cancel", verb.to_lowercase()))
                             .color(theme.text_muted)
                             .small(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let delete = ui.add(
-                            egui::Button::new(RichText::new("Delete").color(danger)).frame(false),
-                        );
+                        let delete = ui
+                            .add(egui::Button::new(RichText::new(verb).color(danger)).frame(false));
                         if delete.clicked() {
                             confirmed = true;
                         }
@@ -2392,10 +2464,19 @@ impl AlacritreeApp {
         self.active_session.remove(&Some(req.worktree_path.clone()));
 
         let force = req.dirty.is_dirty();
-        if let Err(e) =
+        let result = if req.prunable {
+            wt::prune_worktree(
+                &project_root,
+                &req.worktree_name,
+                req.branch.as_deref(),
+                req.delete_branch,
+            )
+        } else {
             wt::delete_worktree(&project_root, &req.worktree_path, req.branch.as_deref(), force)
-        {
-            self.last_error = Some(format!("delete failed: {e}"));
+        };
+        if let Err(e) = result {
+            let action = if req.prunable { "prune" } else { "delete" };
+            self.last_error = Some(format!("{action} failed: {e}"));
         }
         self.projects[req.project_idx].refresh();
     }

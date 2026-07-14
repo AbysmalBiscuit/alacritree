@@ -89,6 +89,7 @@ mod tests {
                     path: PathBuf::from(p),
                     branch: None,
                     is_main: false,
+                    prunable: false,
                 })
                 .collect(),
             expanded,

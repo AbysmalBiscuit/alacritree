@@ -23,6 +23,8 @@ mod session;
 mod sidebar_nav;
 mod state;
 mod terminal_view;
+#[cfg(test)]
+mod test_util;
 mod worktree;
 
 use app::AlacritreeApp;
