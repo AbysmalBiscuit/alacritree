@@ -383,7 +383,7 @@ fn copy_llm_configs(src_root: &Path, dst_root: &Path) -> usize {
 
 #[cfg(test)]
 #[cfg(windows)]
-mod tests {
+mod windows_tests {
     use super::*;
 
     #[test]
