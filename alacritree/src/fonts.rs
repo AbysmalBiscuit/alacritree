@@ -205,6 +205,7 @@ fn scan_coverage(
                 weight: face.weight.0,
                 italic: face.style != fontdb::Style::Normal,
                 monospaced: face.monospaced,
+                bytes: stat.map_or(0, |(size, _)| size),
             },
             cov,
         ));
@@ -1268,6 +1269,9 @@ mod coverage {
         pub weight: u16,
         pub italic: bool,
         pub monospaced: bool,
+        /// Size of the file backing this face; 0 when it could not be stat'd.
+        /// `trim_by_coverage` weighs the coverage a face adds against it.
+        pub bytes: u64,
     }
 
     impl Coverage {
@@ -1332,9 +1336,11 @@ mod coverage {
             self.ranges = merged;
         }
 
-        /// True if `self` covers at least one codepoint that `other` doesn't —
-        /// the FcFontSort(trim) keep-test.
-        pub fn has_novel_codepoint(&self, other: &Coverage) -> bool {
+        /// How many codepoints `self` covers that `other` doesn't — the
+        /// FcFontSort(trim) keep-test, counted rather than merely detected so
+        /// the trim can weigh what a face adds against what it costs.
+        pub fn novel_codepoints(&self, other: &Coverage) -> u64 {
+            let mut novel = 0;
             let mut i = 0;
             for &(start, end) in &self.ranges {
                 let mut cp = start;
@@ -1350,12 +1356,39 @@ mod coverage {
                             }
                             cp = other_end + 1;
                         },
-                        _ => return true,
+                        // Novel up to the next covered range, or to the end.
+                        Some(&(other_start, _)) if other_start <= end => {
+                            novel += u64::from(other_start - cp);
+                            cp = other_start;
+                        },
+                        _ => {
+                            novel += u64::from(end - cp) + 1;
+                            break;
+                        },
                     }
                 }
             }
-            false
+            novel
         }
+    }
+
+    /// A fallback face is mapped and parsed at startup and stays registered
+    /// with egui for the life of the process, so one that covers a handful of
+    /// codepoints nothing will render is pure cost.  Weighing coverage against
+    /// file size is what separates a 21 MiB CJK face carrying 58k codepoints
+    /// from a 35 MiB one carrying three.  Faces below `CHEAP_FACE_BYTES` skip
+    /// the test — at that size coverage alone is reason enough to keep them,
+    /// and a small face with a few rare glyphs (powerline caps, a script's
+    /// combining marks) is exactly what the chain exists to find.
+    const CHEAP_FACE_BYTES: u64 = 4 * 1024 * 1024;
+    const MIN_NOVEL_CODEPOINTS_PER_MIB: u64 = 64;
+
+    fn earns_its_size(bytes: u64, novel: u64) -> bool {
+        if bytes <= CHEAP_FACE_BYTES {
+            return true;
+        }
+        let mib = bytes.div_ceil(1024 * 1024);
+        novel / mib >= MIN_NOVEL_CODEPOINTS_PER_MIB
     }
 
     /// Order candidates by fontconfig-like affinity to the seed face:
@@ -1385,8 +1418,9 @@ mod coverage {
     }
 
     /// Greedy trim mirroring FcFontSort(trim=true): walk candidates in order,
-    /// keeping only faces that cover at least one codepoint the seed face and
-    /// the already-kept faces don't.
+    /// keeping only faces that cover codepoints the seed face and the
+    /// already-kept faces don't — and, for the large ones, enough of them to
+    /// justify carrying the face at all.
     pub fn trim_by_coverage(
         candidates: Vec<(Candidate, Coverage)>,
         seed_coverage: &Coverage,
@@ -1398,10 +1432,12 @@ mod coverage {
             if kept.len() >= limit {
                 break;
             }
-            if coverage.has_novel_codepoint(&covered) {
-                covered.merge(&coverage);
-                kept.push(candidate);
+            let novel = coverage.novel_codepoints(&covered);
+            if novel == 0 || !earns_its_size(candidate.bytes, novel) {
+                continue;
             }
+            covered.merge(&coverage);
+            kept.push(candidate);
         }
         kept
     }
@@ -1418,7 +1454,52 @@ mod coverage {
                 weight: 400,
                 italic: false,
                 monospaced: true,
+                bytes: 0,
             }
+        }
+
+        fn sized_cand(family: &str, bytes: u64) -> Candidate {
+            Candidate { bytes, ..cand(family) }
+        }
+
+        const MIB: u64 = 1024 * 1024;
+
+        #[test]
+        fn trim_drops_faces_that_do_not_earn_their_size() {
+            // A 35 MiB CJK face that contributes three codepoints the chain
+            // lacks is not worth mapping and parsing; a face of the same size
+            // carrying tens of thousands of them is.  Small faces are cheap
+            // enough that coverage alone decides.
+            let seed = Coverage::from_codepoints((0..128).collect());
+            let candidates = vec![
+                (
+                    sized_cand("HugeAndUseless", 35 * MIB),
+                    Coverage::from_codepoints(vec![0x4E00, 0x4E01, 0x4E02]),
+                ),
+                (
+                    sized_cand("HugeAndUseful", 21 * MIB),
+                    Coverage::from_codepoints((0x20000..0x2A000).collect()),
+                ),
+                (sized_cand("SmallAndSparse", 64 * 1024), Coverage::from_codepoints(vec![0xE0B0])),
+            ];
+
+            let kept: Vec<String> =
+                trim_by_coverage(candidates, &seed, 32).into_iter().map(|c| c.family).collect();
+
+            assert_eq!(kept, ["HugeAndUseful", "SmallAndSparse"]);
+        }
+
+        #[test]
+        fn trim_keeps_a_face_of_unknown_size() {
+            // A face that could not be stat'd has no size to weigh coverage
+            // against; dropping it would silently starve the chain.
+            let seed = Coverage::from_codepoints((0..128).collect());
+            let candidates =
+                vec![(sized_cand("Unstatable", 0), Coverage::from_codepoints(vec![0xE0B0]))];
+
+            let kept = trim_by_coverage(candidates, &seed, 32);
+
+            assert_eq!(kept.len(), 1);
         }
 
         fn cand2(family: &str, weight: u16, italic: bool, monospaced: bool) -> Candidate {
@@ -1463,13 +1544,15 @@ mod coverage {
         }
 
         #[test]
-        fn novel_codepoint_detection() {
+        fn novel_codepoint_counting() {
             let seed = Coverage::from_codepoints(vec![1, 2, 3, 4, 5]);
-            assert!(!Coverage::from_codepoints(vec![2, 4]).has_novel_codepoint(&seed));
-            assert!(Coverage::from_codepoints(vec![5, 6]).has_novel_codepoint(&seed));
-            assert!(Coverage::from_codepoints(vec![100]).has_novel_codepoint(&seed));
-            assert!(!Coverage::default().has_novel_codepoint(&seed));
-            assert!(seed.has_novel_codepoint(&Coverage::default()));
+            assert_eq!(Coverage::from_codepoints(vec![2, 4]).novel_codepoints(&seed), 0);
+            assert_eq!(Coverage::from_codepoints(vec![5, 6]).novel_codepoints(&seed), 1);
+            assert_eq!(Coverage::from_codepoints(vec![100]).novel_codepoints(&seed), 1);
+            assert_eq!(Coverage::default().novel_codepoints(&seed), 0);
+            assert_eq!(seed.novel_codepoints(&Coverage::default()), 5);
+            // A range straddling the seed on both sides counts only the gaps.
+            assert_eq!(Coverage::from_codepoints((0..=9).collect()).novel_codepoints(&seed), 5);
         }
 
         #[test]
