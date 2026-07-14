@@ -19,6 +19,7 @@ use crate::paste;
 use crate::pr_status::PrCache;
 use crate::projects::{Project, Worktree};
 use crate::session::{Session, SessionId, SessionKind, TermSize};
+use crate::sidebar_nav::{self, SidebarRow};
 use crate::state::{self, PersistedProject, PersistedState};
 use crate::terminal_view;
 use crate::worktree::{self as wt, CreateRequest, Progress};
@@ -115,9 +116,25 @@ fn blend_toward(c: Color32, target: Color32, amount: f32) -> Color32 {
     Color32::from_rgb(mix(c.r(), target.r()), mix(c.g(), target.g()), mix(c.b(), target.b()))
 }
 
+/// Which pane owns keyboard input.  The terminal re-requests egui focus
+/// every frame while it owns this; anything else holding focus (modals
+/// aside) must win here first.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaneFocus {
+    Terminal,
+    ProjectsSidebar,
+}
+
 pub struct AlacritreeApp {
     show_left_sidebar: bool,
     show_right_sidebar: bool,
+    focus: PaneFocus,
+    sidebar_cursor: Option<SidebarRow>,
+    /// The focus toggle opened a hidden sidebar; returning focus closes it
+    /// again so a keyboard round trip leaves the layout untouched.
+    sidebar_auto_shown: bool,
+    /// One-shot: scroll the cursor row into view on the next sidebar paint.
+    sidebar_cursor_moved: bool,
     sessions: Vec<Session>,
     current_workspace: WorkspaceKey,
     active_session: HashMap<WorkspaceKey, SessionId>,
@@ -284,6 +301,10 @@ impl AlacritreeApp {
         let mut app = Self {
             show_left_sidebar: persisted.show_left_sidebar,
             show_right_sidebar: persisted.show_right_sidebar,
+            focus: PaneFocus::Terminal,
+            sidebar_cursor: None,
+            sidebar_auto_shown: false,
+            sidebar_cursor_moved: false,
             sessions: Vec::new(),
             current_workspace: None,
             active_session: HashMap::new(),
@@ -318,7 +339,10 @@ impl AlacritreeApp {
                 .iter()
                 .map(|p| PersistedProject { root: p.root.clone(), expanded: p.expanded })
                 .collect(),
-            show_left_sidebar: self.show_left_sidebar,
+            // Don't persist a sidebar the user never opened — an auto-shown
+            // sidebar (e.g. from Ctrl+Shift+B while it was hidden) should not
+            // reappear on next launch.
+            show_left_sidebar: self.show_left_sidebar && !self.sidebar_auto_shown,
             show_right_sidebar: self.show_right_sidebar,
         };
         state::save(&state);
@@ -492,6 +516,27 @@ impl AlacritreeApp {
         self.quit_dialog_open || self.pending_delete.is_some() || self.pending_create.is_some()
     }
 
+    fn focus_sidebar(&mut self) {
+        if !self.show_left_sidebar {
+            self.show_left_sidebar = true;
+            self.sidebar_auto_shown = true;
+            self.persist();
+        }
+        self.focus = PaneFocus::ProjectsSidebar;
+        self.sidebar_cursor =
+            Some(sidebar_nav::seed(&self.projects, self.current_workspace.as_deref()));
+        self.sidebar_cursor_moved = true;
+    }
+
+    fn focus_terminal(&mut self) {
+        self.focus = PaneFocus::Terminal;
+        if self.sidebar_auto_shown {
+            self.show_left_sidebar = false;
+            self.sidebar_auto_shown = false;
+            self.persist();
+        }
+    }
+
     /// Match key events against the binding table (user bindings + defaults)
     /// before the terminal sees raw events, so a binding wins over plain
     /// text input.  Matched events are consumed unless every matched action
@@ -519,6 +564,96 @@ impl AlacritreeApp {
         });
         for action in actions {
             self.dispatch_action(ctx, action);
+        }
+    }
+
+    /// Arrow/Enter/Escape navigation while the projects sidebar owns
+    /// keyboard focus.  Consumes only unmodified keys, so modifier-bound
+    /// app shortcuts still match in `handle_shortcuts` afterwards.
+    fn handle_sidebar_nav(&mut self, ctx: &Context) {
+        use egui::Key;
+        let keys: Vec<Key> = ctx.input_mut(|i| {
+            let mut pressed = Vec::new();
+            i.events.retain(|ev| {
+                if let egui::Event::Key { key, pressed: true, modifiers, .. } = ev {
+                    if modifiers.is_none() && is_sidebar_nav_key(*key) {
+                        pressed.push(*key);
+                        return false;
+                    }
+                }
+                true
+            });
+            pressed
+        });
+        for key in keys {
+            self.apply_sidebar_nav(ctx, key);
+        }
+    }
+
+    fn apply_sidebar_nav(&mut self, ctx: &Context, key: egui::Key) {
+        use egui::Key;
+        let rows = sidebar_nav::visible_rows(&self.projects);
+        let cursor = match self.sidebar_cursor.clone() {
+            Some(c) if rows.contains(&c) => c,
+            // Stale or unseeded cursor (worktree removed, project collapsed
+            // by mouse): land on Home and let the next press act from there.
+            _ => {
+                self.set_sidebar_cursor(SidebarRow::Home);
+                return;
+            },
+        };
+        match key {
+            Key::ArrowUp => self.set_sidebar_cursor(sidebar_nav::step(&rows, &cursor, -1)),
+            Key::ArrowDown => self.set_sidebar_cursor(sidebar_nav::step(&rows, &cursor, 1)),
+            Key::ArrowRight => {
+                if let SidebarRow::Project(root) = &cursor {
+                    self.set_project_expanded(root, true);
+                }
+            },
+            Key::ArrowLeft => match &cursor {
+                SidebarRow::Project(root) => self.set_project_expanded(root, false),
+                SidebarRow::Worktree(_) => {
+                    if let Some(target) = sidebar_nav::left_target(&rows, &cursor) {
+                        self.set_sidebar_cursor(target);
+                    }
+                },
+                SidebarRow::Home => {},
+            },
+            Key::Enter => match &cursor {
+                SidebarRow::Home => {
+                    self.activate_home(ctx);
+                    self.focus_terminal();
+                },
+                SidebarRow::Worktree(path) => {
+                    let path = path.clone();
+                    self.activate_worktree(ctx, &path);
+                    self.focus_terminal();
+                },
+                SidebarRow::Project(root) => {
+                    let root = root.clone();
+                    let expanded =
+                        self.projects.iter().find(|p| p.root == root).is_some_and(|p| p.expanded);
+                    self.set_project_expanded(&root, !expanded);
+                },
+            },
+            Key::Escape => self.focus_terminal(),
+            _ => {},
+        }
+    }
+
+    fn set_sidebar_cursor(&mut self, row: SidebarRow) {
+        if self.sidebar_cursor.as_ref() != Some(&row) {
+            self.sidebar_cursor = Some(row);
+            self.sidebar_cursor_moved = true;
+        }
+    }
+
+    fn set_project_expanded(&mut self, root: &Path, expanded: bool) {
+        if let Some(p) = self.projects.iter_mut().find(|p| p.root == *root) {
+            if p.expanded != expanded {
+                p.expanded = expanded;
+                self.persist();
+            }
         }
     }
 
@@ -588,6 +723,12 @@ impl AlacritreeApp {
             BindingAction::Named(NamedAction::ReceiveChar) => {},
             BindingAction::Named(NamedAction::ToggleLeftSidebar) => {
                 self.show_left_sidebar = !self.show_left_sidebar;
+                // A deliberate visibility change opts out of the auto-shown
+                // round trip, and a hidden sidebar cannot keep keyboard focus.
+                self.sidebar_auto_shown = false;
+                if !self.show_left_sidebar && self.focus == PaneFocus::ProjectsSidebar {
+                    self.focus = PaneFocus::Terminal;
+                }
                 self.persist();
             },
             BindingAction::Named(NamedAction::ToggleRightSidebar) => {
@@ -601,6 +742,16 @@ impl AlacritreeApp {
                 self.cycle_workspaces(ctx, -1);
             },
             BindingAction::Named(NamedAction::AddProject) => self.add_project_via_dialog(),
+            BindingAction::Named(NamedAction::ToggleSidebarFocus) => match self.focus {
+                PaneFocus::Terminal => self.focus_sidebar(),
+                PaneFocus::ProjectsSidebar => self.focus_terminal(),
+            },
+            BindingAction::Named(NamedAction::FocusProjectsSidebar) => {
+                if self.focus != PaneFocus::ProjectsSidebar {
+                    self.focus_sidebar();
+                }
+            },
+            BindingAction::Named(NamedAction::FocusTerminal) => self.focus_terminal(),
             BindingAction::Named(other) => {
                 self.dispatch_scroll_or_other(other);
             },
@@ -720,6 +871,12 @@ impl AlacritreeApp {
         let mut expand_toggled = false;
         let mut home_clicked = false;
         let theme = self.theme;
+        let cursor_row = if self.focus == PaneFocus::ProjectsSidebar {
+            self.sidebar_cursor.clone()
+        } else {
+            None
+        };
+        let cursor_moved = std::mem::take(&mut self.sidebar_cursor_moved);
 
         // Snapshot attention + agent-glyph state up-front so the `iter_mut`
         // over projects below isn't blocked from calling back into `&self`
@@ -772,6 +929,8 @@ impl AlacritreeApp {
                     if home_row(
                         ui,
                         self.current_workspace.is_none(),
+                        matches!(&cursor_row, Some(SidebarRow::Home)),
+                        cursor_moved,
                         home_attention,
                         home_agent_glyph,
                         &theme,
@@ -799,7 +958,7 @@ impl AlacritreeApp {
                         // worktree rows already show the dot, and doubling it
                         // on the parent reads as noise.
                         let show_proj_dot = proj_attention && !project.expanded;
-                        row_with_trailing(
+                        let row_rect = row_with_trailing(
                             ui,
                             |ui| {
                                 let arrow = if project.expanded { "▾" } else { "▸" };
@@ -842,6 +1001,17 @@ impl AlacritreeApp {
                                 }
                             },
                         );
+                        if matches!(&cursor_row, Some(SidebarRow::Project(r)) if *r == project.root)
+                        {
+                            let rect = egui::Rect::from_x_y_ranges(
+                                ui.max_rect().x_range(),
+                                row_rect.y_range(),
+                            );
+                            paint_cursor_outline(ui, rect, &theme);
+                            if cursor_moved {
+                                ui.scroll_to_rect(rect, None);
+                            }
+                        }
 
                         if project.expanded {
                             for (wt_idx, wt) in project.worktrees.iter().enumerate() {
@@ -856,8 +1026,20 @@ impl AlacritreeApp {
                                     .and_then(|v| v.get(wt_idx))
                                     .copied()
                                     .unwrap_or(None);
-                                let action =
-                                    worktree_row(ui, wt, is_active, wt_attention, wt_glyph, &theme);
+                                let is_cursor = matches!(
+                                    &cursor_row,
+                                    Some(SidebarRow::Worktree(p)) if *p == wt.path
+                                );
+                                let action = worktree_row(
+                                    ui,
+                                    wt,
+                                    is_active,
+                                    is_cursor,
+                                    cursor_moved,
+                                    wt_attention,
+                                    wt_glyph,
+                                    &theme,
+                                );
                                 if action.activate {
                                     activate_request.set(Some(wt.path.clone()));
                                 }
@@ -1484,7 +1666,7 @@ fn icon_button(ui: &mut egui::Ui, glyph: &str, color: Color32, theme: &Theme) ->
     resp
 }
 
-fn row_with_trailing<L, T>(ui: &mut egui::Ui, leading: L, trailing: T)
+fn row_with_trailing<L, T>(ui: &mut egui::Ui, leading: L, trailing: T) -> egui::Rect
 where
     L: FnOnce(&mut egui::Ui),
     T: FnOnce(&mut egui::Ui),
@@ -1502,12 +1684,45 @@ where
             egui::Layout::left_to_right(egui::Align::Center),
             leading,
         );
-    });
+    })
+    .response
+    .rect
+}
+
+/// Keyboard-cursor indicator: an outline rather than a fill so it stays
+/// legible on top of the active row's lightened background.
+fn paint_cursor_outline(ui: &egui::Ui, rect: egui::Rect, theme: &Theme) {
+    ui.painter().rect_stroke(
+        rect,
+        0.0,
+        egui::Stroke::new(1.0, theme.accent),
+        egui::StrokeKind::Inside,
+    );
+}
+
+fn is_sidebar_nav_key(key: egui::Key) -> bool {
+    use egui::Key;
+    matches!(
+        key,
+        Key::ArrowUp
+            | Key::ArrowDown
+            | Key::ArrowLeft
+            | Key::ArrowRight
+            | Key::Enter
+            // egui synthesizes a click on the natively focused widget from
+            // Space (like Enter); consuming it here stops keyboard clicks on
+            // widgets the cursor model doesn't govern while the sidebar owns
+            // focus.
+            | Key::Space
+            | Key::Escape
+    )
 }
 
 fn home_row(
     ui: &mut egui::Ui,
     is_active: bool,
+    is_cursor: bool,
+    scroll_into_view: bool,
     attention: bool,
     agent_glyph: Option<char>,
     theme: &Theme,
@@ -1541,6 +1756,12 @@ fn home_row(
     if bg != Color32::TRANSPARENT {
         ui.painter().set(bg_idx, egui::Shape::rect_filled(hit_rect, 0.0, bg));
     }
+    if is_cursor {
+        paint_cursor_outline(ui, hit_rect, theme);
+        if scroll_into_view {
+            ui.scroll_to_rect(hit_rect, None);
+        }
+    }
     resp
 }
 
@@ -1553,6 +1774,8 @@ fn worktree_row(
     ui: &mut egui::Ui,
     wt: &Worktree,
     is_active: bool,
+    is_cursor: bool,
+    scroll_into_view: bool,
     attention: bool,
     agent_glyph: Option<char>,
     theme: &Theme,
@@ -1620,9 +1843,15 @@ fn worktree_row(
     } else {
         Color32::TRANSPARENT
     };
+    let full_rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
     if bg != Color32::TRANSPARENT {
-        let rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
-        ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 0.0, bg));
+        ui.painter().set(bg_idx, egui::Shape::rect_filled(full_rect, 0.0, bg));
+    }
+    if is_cursor {
+        paint_cursor_outline(ui, full_rect, theme);
+        if scroll_into_view {
+            ui.scroll_to_rect(full_rect, None);
+        }
     }
     WorktreeAction { activate: resp.clicked() && !delete_clicked, delete: delete_clicked }
 }
@@ -2280,6 +2509,9 @@ impl eframe::App for AlacritreeApp {
         // not the app — alacritty's key_input returns early the same way,
         // above binding dispatch.
         if !modal_open && self.ime.preedit().is_none() {
+            if self.focus == PaneFocus::ProjectsSidebar {
+                self.handle_sidebar_nav(ctx);
+            }
             self.handle_shortcuts(ctx);
         }
         self.process_notification_actions(ctx);
@@ -2337,14 +2569,22 @@ impl eframe::App for AlacritreeApp {
                 };
                 let session = &mut self.sessions[idx];
                 let ime = &mut self.ime;
-                let _ = terminal_view::show(
+                let response = terminal_view::show(
                     ui,
                     session,
                     &self.config,
-                    !modal_open,
+                    !modal_open && self.focus == PaneFocus::Terminal,
                     &mut self.builtin_glyphs,
                     ime,
                 );
+                // egui fake-clicks the natively focused widget on Space/Enter,
+                // and the terminal keeps native focus while the sidebar owns
+                // app focus — so keyboard "clicks" must not steal it back.
+                if response.clicked_by(egui::PointerButton::Primary)
+                    && self.focus != PaneFocus::Terminal
+                {
+                    self.focus_terminal();
+                }
             });
 
         if self.pending_create.is_some() {
