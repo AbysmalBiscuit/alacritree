@@ -39,7 +39,7 @@ notify-rust = "4"
 interprocess = { version = "2.4.2", default-features = false }
 
 [dev-dependencies]
-# Throwaway repos for worktree discovery/prune tests.
+# Throwaway repos and state files for worktree, prune, and persistence tests.
 tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]

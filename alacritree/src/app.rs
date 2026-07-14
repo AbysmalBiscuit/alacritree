@@ -21,7 +21,7 @@ use crate::pr_status::PrCache;
 use crate::projects::{Project, Worktree};
 use crate::session::{Session, SessionId, SessionKind, TermSize};
 use crate::sidebar_nav::{self, SidebarRow};
-use crate::state::{self, PersistedProject, PersistedState};
+use crate::state::{self, PersistedProject};
 use crate::terminal_view;
 use crate::worktree::{self as wt, CreateRequest, Progress};
 use crate::wsl::{self, ShellChoice};
@@ -367,24 +367,35 @@ impl AlacritreeApp {
         app
     }
 
-    fn persist(&self) {
-        let state = PersistedState {
-            projects: self
-                .projects
-                .iter()
-                .map(|p| PersistedProject {
-                    root: p.root.clone(),
-                    expanded: p.expanded,
-                    shell: p.shell_override.as_ref().map(|c| c.to_state_string()),
-                })
-                .collect(),
-            // Don't persist a sidebar the user never opened — an auto-shown
-            // sidebar (e.g. from Ctrl+Shift+B while it was hidden) should not
-            // reappear on next launch.
-            show_left_sidebar: self.show_left_sidebar && !self.sidebar_auto_shown,
-            show_right_sidebar: self.show_right_sidebar,
+    fn persist_sidebars(&self) {
+        // Don't persist a sidebar the user never opened — an auto-shown
+        // sidebar (e.g. from Ctrl+Shift+B while it was hidden) should not
+        // reappear on next launch.
+        let left = self.show_left_sidebar && !self.sidebar_auto_shown;
+        let right = self.show_right_sidebar;
+        state::mutate(|s| {
+            s.show_left_sidebar = left;
+            s.show_right_sidebar = right;
+        });
+    }
+
+    /// Persist one project's `expanded` / `shell` fields without touching the
+    /// rest of the file, so a second window's project list survives.
+    fn persist_project(&self, root: &Path) {
+        let Some(p) = self.projects.iter().find(|p| &p.root == root) else {
+            return;
         };
-        state::save(&state);
+        let (expanded, shell) =
+            (p.expanded, p.shell_override.as_ref().map(|c| c.to_state_string()));
+        let root = root.to_path_buf();
+        state::mutate(move |s| {
+            if let Some(ps) = s.projects.iter_mut().find(|ps| ps.root == root) {
+                ps.expanded = expanded;
+                ps.shell = shell;
+            } else {
+                s.projects.push(PersistedProject { root, expanded, shell });
+            }
+        });
     }
 
     /// Windows projects re-discover synchronously (git2, fast).  WSL
@@ -670,20 +681,22 @@ impl AlacritreeApp {
     }
 
     fn add_project_via_dialog(&mut self, ctx: &Context) {
-        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-            let path = wsl::normalize_root(path);
-            if !self.projects.iter().any(|p| p.root == path) {
-                match wsl::classify(&path) {
-                    wsl::Location::Windows(_) => self.projects.push(Project::discover(path)),
-                    wsl::Location::Wsl { .. } => {
-                        self.projects.push(Project::placeholder(path));
-                        let idx = self.projects.len() - 1;
-                        self.refresh_project(ctx, idx);
-                    },
-                }
-                self.persist();
-            }
+        let Some(path) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        let path = wsl::normalize_root(path);
+        if self.projects.iter().any(|p| p.root == path) {
+            return;
         }
+        match wsl::classify(&path) {
+            wsl::Location::Windows(_) => self.projects.push(Project::discover(path.clone())),
+            wsl::Location::Wsl { .. } => {
+                self.projects.push(Project::placeholder(path.clone()));
+                let idx = self.projects.len() - 1;
+                self.refresh_project(ctx, idx);
+            },
+        }
+        self.persist_project(&path);
     }
 
     fn is_modal_open(&self) -> bool {
@@ -697,7 +710,7 @@ impl AlacritreeApp {
         if !self.show_left_sidebar {
             self.show_left_sidebar = true;
             self.sidebar_auto_shown = true;
-            self.persist();
+            self.persist_sidebars();
         }
         self.focus = PaneFocus::ProjectsSidebar;
         self.sidebar_cursor =
@@ -710,7 +723,7 @@ impl AlacritreeApp {
         if self.sidebar_auto_shown {
             self.show_left_sidebar = false;
             self.sidebar_auto_shown = false;
-            self.persist();
+            self.persist_sidebars();
         }
     }
 
@@ -829,7 +842,7 @@ impl AlacritreeApp {
         if let Some(p) = self.projects.iter_mut().find(|p| p.root == *root) {
             if p.expanded != expanded {
                 p.expanded = expanded;
-                self.persist();
+                self.persist_project(root);
             }
         }
     }
@@ -918,11 +931,11 @@ impl AlacritreeApp {
                 if !self.show_left_sidebar && self.focus == PaneFocus::ProjectsSidebar {
                     self.focus = PaneFocus::Terminal;
                 }
-                self.persist();
+                self.persist_sidebars();
             },
             BindingAction::Named(NamedAction::ToggleRightSidebar) => {
                 self.show_right_sidebar = !self.show_right_sidebar;
-                self.persist();
+                self.persist_sidebars();
             },
             BindingAction::Named(NamedAction::SelectNextWorkspace) => {
                 self.cycle_workspaces(ctx, 1);
@@ -1113,7 +1126,7 @@ impl AlacritreeApp {
         let mut add_project_clicked = false;
         let mut refresh_idx: Option<usize> = None;
         let mut remove_idx: Option<usize> = None;
-        let mut expand_toggled = false;
+        let mut expand_toggled: Option<(PathBuf, bool)> = None;
         let mut home_clicked = false;
         let theme = self.theme;
         let cursor_row = if self.focus == PaneFocus::ProjectsSidebar {
@@ -1197,7 +1210,7 @@ impl AlacritreeApp {
         let distros = wsl::distros();
         let profile_names: Vec<String> =
             self.config.profiles.iter().map(|p| p.name.clone()).collect();
-        let mut shell_override_changed = false;
+        let mut shell_override_changed: Option<PathBuf> = None;
 
         let panel_resp = SidePanel::left("left_sidebar")
             .resizable(true)
@@ -1269,7 +1282,7 @@ impl AlacritreeApp {
                                 let arrow = if project.expanded { "▾" } else { "▸" };
                                 if icon_button(ui, arrow, theme.text_dim, &theme).clicked() {
                                     project.expanded = !project.expanded;
-                                    expand_toggled = true;
+                                    expand_toggled = Some((project.root.clone(), project.expanded));
                                 }
                                 name_resp = Some(
                                     ui.add(
@@ -1339,7 +1352,7 @@ impl AlacritreeApp {
                                         .clicked()
                                     {
                                         project.shell_override = None;
-                                        shell_override_changed = true;
+                                        shell_override_changed = Some(project.root.clone());
                                         ui.close_menu();
                                     }
                                     let win = matches!(
@@ -1348,7 +1361,7 @@ impl AlacritreeApp {
                                     );
                                     if ui.button(format!("{}Windows shell", mark(win))).clicked() {
                                         project.shell_override = Some(ShellChoice::Windows);
-                                        shell_override_changed = true;
+                                        shell_override_changed = Some(project.root.clone());
                                         ui.close_menu();
                                     }
                                     for distro in &distros {
@@ -1366,7 +1379,7 @@ impl AlacritreeApp {
                                         {
                                             project.shell_override =
                                                 Some(ShellChoice::Wsl(distro.name.clone()));
-                                            shell_override_changed = true;
+                                            shell_override_changed = Some(project.root.clone());
                                             ui.close_menu();
                                         }
                                     }
@@ -1381,7 +1394,7 @@ impl AlacritreeApp {
                                         {
                                             project.shell_override =
                                                 Some(ShellChoice::Profile(name.clone()));
-                                            shell_override_changed = true;
+                                            shell_override_changed = Some(project.root.clone());
                                             ui.close_menu();
                                         }
                                     }
@@ -1473,14 +1486,18 @@ impl AlacritreeApp {
             self.refresh_project(ctx, idx);
         }
         if let Some(idx) = remove_idx {
-            self.projects.remove(idx);
-            self.persist();
+            let root = self.projects.remove(idx).root;
+            state::mutate(|s| s.projects.retain(|p| p.root != root));
         }
-        if expand_toggled {
-            self.persist();
+        if let Some((root, expanded)) = expand_toggled {
+            state::mutate(|s| {
+                if let Some(p) = s.projects.iter_mut().find(|p| p.root == root) {
+                    p.expanded = expanded;
+                }
+            });
         }
-        if shell_override_changed {
-            self.persist();
+        if let Some(root) = shell_override_changed {
+            self.persist_project(&root);
         }
         if home_clicked {
             self.activate_home(ctx);
