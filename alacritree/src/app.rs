@@ -214,13 +214,7 @@ impl AlacritreeApp {
     pub fn new(cc: &CreationContext<'_>, config: Config) -> Self {
         let theme = Theme::from_config(&config);
 
-        crate::fonts::install_terminal_fonts(
-            &cc.egui_ctx,
-            &config.font.normal,
-            &config.font.bold,
-            &config.font.italic,
-            &config.font.bold_italic,
-        );
+        crate::fonts::install_terminal_fonts(&cc.egui_ctx, &config.font);
 
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = theme.terminal_bg;

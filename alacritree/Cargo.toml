@@ -22,6 +22,12 @@ xdg = "3.0.0"
 home = "0.5.5"
 unicode-width = "0.2.0"
 fontdb = { version = "0.23", default-features = false, features = ["fontconfig", "memmap"] }
+# Reads cmap tables to build coverage sets for the Windows fallback chain.
+# Same major as the ttf-parser fontdb already pulls in, so no duplicate build.
+ttf-parser = "0.25"
+# Font faces reach egui as mappings, not buffers.  Same version fontdb already
+# links, so no duplicate build.
+memmap2 = "0.9"
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 png = "0.17"
 # Desktop notifications when a background session rings the bell.
