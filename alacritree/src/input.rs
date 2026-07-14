@@ -8,15 +8,9 @@ pub fn event_to_bytes(event: &Event) -> Option<Vec<u8>> {
             key_to_bytes(*key, *modifiers)
         },
         // `Event::Paste` is handled by the caller via `paste::paste` so it
-        // gets bracketed-paste wrapping and newline normalization.
-        // egui_winit eats Ctrl+C / Ctrl+X and re-emits them as Copy/Cut without a
-        // matching Key event, so the PTY would otherwise never see ETX/CAN.
-        // Skip on macOS where the gesture is Cmd+C (Ctrl+C still flows as a Key
-        // event there, so we don't want Cmd+C hijacked into SIGINT).
-        #[cfg(not(target_os = "macos"))]
-        Event::Copy => Some(vec![0x03]),
-        #[cfg(not(target_os = "macos"))]
-        Event::Cut => Some(vec![0x18]),
+        // gets bracketed-paste wrapping and newline normalization.  `Copy` and
+        // `Cut` carry no modifiers, so they can't tell Ctrl+C from Ctrl+Shift+C
+        // and must not be encoded here; the Key event alongside them does it.
         _ => None,
     }
 }
@@ -104,4 +98,33 @@ fn ctrl_byte(key: Key) -> Option<u8> {
         _ => return None,
     };
     Some(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// egui's clipboard commands ignore Shift, so Ctrl+Shift+C raises the same
+    /// synthetic `Copy` as Ctrl+C.  Encoding it would send the interrupt on the
+    /// copy shortcut; the Key event emitted alongside it carries the modifiers
+    /// and is what the binding table and the encoder act on.
+    #[test]
+    fn synthetic_clipboard_events_send_nothing() {
+        assert_eq!(event_to_bytes(&Event::Copy), None);
+        assert_eq!(event_to_bytes(&Event::Cut), None);
+    }
+
+    /// The interrupt still has to reach the PTY off the Key event.
+    #[test]
+    fn ctrl_c_still_sends_sigint() {
+        let ctrl = Modifiers { ctrl: true, ..Modifiers::NONE };
+        let event = Event::Key {
+            key: Key::C,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: ctrl,
+        };
+        assert_eq!(event_to_bytes(&event), Some(vec![0x03]));
+    }
 }
