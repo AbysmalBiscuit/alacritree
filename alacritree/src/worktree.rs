@@ -71,6 +71,42 @@ pub fn spawn_create(req: CreateRequest, ctx: egui::Context) -> Receiver<Progress
     rx
 }
 
+pub struct RemoveRequest {
+    pub project_root: PathBuf,
+    pub worktree_path: PathBuf,
+    pub worktree_name: String,
+    pub branch: Option<String>,
+    /// The checkout dir is already gone; prune metadata instead of removing
+    /// a directory.
+    pub prunable: bool,
+    /// Prune path only: also delete the branch. The removal path always
+    /// deletes the branch when one is known.
+    pub delete_branch: bool,
+    /// Pass `--force` to `git worktree remove` (dirty checkout).
+    pub force: bool,
+}
+
+/// Run the removal on a background thread, waking the UI when it finishes.
+/// The heavy `rm -rf` of the checkout must never run on the paint thread.
+pub fn spawn_remove(req: RemoveRequest, ctx: egui::Context) -> Receiver<Result<(), String>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result = if req.prunable {
+            prune_worktree(
+                &req.project_root,
+                &req.worktree_name,
+                req.branch.as_deref(),
+                req.delete_branch,
+            )
+        } else {
+            delete_worktree(&req.project_root, &req.worktree_path, req.branch.as_deref(), req.force)
+        };
+        let _ = tx.send(result);
+        ctx.request_repaint();
+    });
+    rx
+}
+
 /// Create the worktree on the calling thread, reporting each step as it starts.
 ///
 /// Nothing here needs a window, so callers without one (the CLI, with no
@@ -550,5 +586,58 @@ mod tests {
         assert!(prune_worktree(&repo_dir, "live", Some("live"), false).is_err());
         assert!(repo.find_worktree("live").is_ok());
         assert!(repo.find_branch("live", git2::BranchType::Local).is_ok());
+    }
+
+    #[test]
+    fn spawn_remove_deletes_worktree_in_background() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        let repo = init_repo(&repo_dir);
+        let wt_path = add_worktree(&repo, "doomed");
+
+        let rx = spawn_remove(
+            RemoveRequest {
+                project_root: repo_dir.clone(),
+                worktree_path: wt_path.clone(),
+                worktree_name: "doomed".into(),
+                branch: Some("doomed".into()),
+                prunable: false,
+                delete_branch: true,
+                force: false,
+            },
+            egui::Context::default(),
+        );
+
+        let result = rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
+        assert_eq!(result, Ok(()));
+        assert!(!wt_path.exists());
+        assert!(repo.find_worktree("doomed").is_err());
+    }
+
+    #[test]
+    fn spawn_remove_routes_prunable_to_prune() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        let repo = init_repo(&repo_dir);
+        let wt_path = add_worktree(&repo, "stale");
+        std::fs::remove_dir_all(&wt_path).unwrap();
+
+        let rx = spawn_remove(
+            RemoveRequest {
+                project_root: repo_dir.clone(),
+                worktree_path: wt_path,
+                worktree_name: "stale".into(),
+                branch: Some("stale".into()),
+                prunable: true,
+                delete_branch: true,
+                force: false,
+            },
+            egui::Context::default(),
+        );
+
+        let result = rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
+        assert_eq!(result, Ok(()));
+        assert!(repo.find_worktree("stale").is_err());
+        assert!(repo.find_branch("stale", git2::BranchType::Local).is_err());
     }
 }
