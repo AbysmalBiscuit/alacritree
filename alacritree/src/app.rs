@@ -1215,6 +1215,10 @@ impl AlacritreeApp {
     fn show_project_sidebar(&mut self, ctx: &Context, panel_frame: Frame) -> egui::Rect {
         let activate_request: std::cell::Cell<Option<PathBuf>> = std::cell::Cell::new(None);
         let delete_request: std::cell::Cell<Option<DeleteRequest>> = std::cell::Cell::new(None);
+        // Snapshot: the projects loop below borrows `self.projects` mutably,
+        // so the in-flight set can't be read from `self` inside it.
+        let deleting_paths: HashSet<PathBuf> =
+            self.pending_worktree_deletes.keys().cloned().collect();
         let create_request: std::cell::Cell<Option<usize>> = std::cell::Cell::new(None);
         let spawn_shell_request: std::cell::Cell<Option<WorkspaceKey>> = std::cell::Cell::new(None);
         let activate_session_request: std::cell::Cell<Option<(WorkspaceKey, SessionId)>> =
@@ -1535,6 +1539,7 @@ impl AlacritreeApp {
                                 let action = worktree_row(
                                     ui,
                                     wt,
+                                    deleting_paths.contains(&wt.path),
                                     is_active,
                                     is_cursor,
                                     cursor_moved,
@@ -2502,6 +2507,7 @@ fn session_row_title(title: &str, agent_glyph: Option<char>) -> String {
 fn worktree_row(
     ui: &mut egui::Ui,
     wt: &Worktree,
+    deleting: bool,
     is_active: bool,
     is_cursor: bool,
     scroll_into_view: bool,
@@ -2523,7 +2529,7 @@ fn worktree_row(
     let resp = frame
         .show(ui, |ui| {
             let default_icon = if wt.is_main { "●" } else { "○" };
-            let name_color = if wt.prunable {
+            let name_color = if deleting || wt.prunable {
                 theme.text_muted
             } else if is_active {
                 theme.text
@@ -2533,20 +2539,33 @@ fn worktree_row(
             row_with_trailing(
                 ui,
                 |ui| {
-                    paint_row_status_icon(
-                        ui,
-                        theme,
-                        attention,
-                        agent_glyph,
-                        default_icon,
-                        is_active,
-                    );
+                    if deleting {
+                        // Spinner repaints itself every frame, keeping the
+                        // animation alive without PTY or input events.
+                        ui.add(
+                            egui::Spinner::new()
+                                .size(10.0 * theme.ui_scale)
+                                .color(theme.text_muted),
+                        );
+                    } else {
+                        paint_row_status_icon(
+                            ui,
+                            theme,
+                            attention,
+                            agent_glyph,
+                            default_icon,
+                            is_active,
+                        );
+                    }
                     ui.add(
                         egui::Label::new(RichText::new(&wt.name).color(name_color).small())
                             .truncate(),
                     );
                 },
                 |ui| {
+                    if deleting {
+                        return;
+                    }
                     if !wt.is_main {
                         let hover = if wt.prunable {
                             "prune worktree"
@@ -2571,7 +2590,7 @@ fn worktree_row(
         })
         .response
         .interact(egui::Sense::click());
-    let resp = if wt.prunable {
+    let resp = if wt.prunable && !deleting {
         resp.on_hover_text("worktree directory is missing — × prunes it")
     } else {
         resp
@@ -2593,7 +2612,7 @@ fn worktree_row(
 
     let bg = if is_active {
         theme.row_active_bg
-    } else if resp.hovered() {
+    } else if resp.hovered() && !deleting {
         theme.row_hover_bg
     } else {
         Color32::TRANSPARENT
@@ -2607,6 +2626,9 @@ fn worktree_row(
         if scroll_into_view {
             ui.scroll_to_rect(full_rect, None);
         }
+    }
+    if deleting {
+        return WorktreeAction { activate: false, delete: false, spawn: false };
     }
     WorktreeAction {
         activate: resp.clicked() && !delete_clicked && !spawn_clicked && !wt.prunable,
