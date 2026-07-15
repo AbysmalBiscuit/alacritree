@@ -491,7 +491,10 @@ impl AlacritreeApp {
                 false
             },
             Err(mpsc::TryRecvError::Empty) => true,
-            Err(mpsc::TryRecvError::Disconnected) => false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                finished.push((path.clone(), Err("removal worker crashed".to_string())));
+                false
+            },
         });
         for (path, result) in finished {
             if let Err(e) = result {
@@ -742,9 +745,10 @@ impl AlacritreeApp {
         let mut order: Vec<WorkspaceKey> = vec![None];
         for project in &self.projects {
             for wt in &project.worktrees {
-                // Prunable rows can't host a shell; cycling into one would
-                // just bounce off the activate guard on every keypress.
-                if !wt.prunable {
+                // Prunable and deleting rows can't host a shell; cycling into
+                // one would just bounce off the activate guard on every
+                // keypress.
+                if !wt.prunable && !self.pending_worktree_deletes.contains_key(&wt.path) {
                     order.push(Some(wt.path.clone()));
                 }
             }
@@ -3433,6 +3437,9 @@ impl AlacritreeApp {
                 },
                 Some(p) => {
                     let known = self.known_worktree_path(&p).ok_or_else(|| unknown_worktree(&p))?;
+                    if self.pending_worktree_deletes.contains_key(&known) {
+                        return Err(worktree_removal_in_progress(&known));
+                    }
                     self.activate_worktree(ctx, &known);
                     Ok(json!({ "workspace": known }))
                 },
@@ -3441,7 +3448,12 @@ impl AlacritreeApp {
                 let workspace = match workspace {
                     None => None,
                     Some(p) => {
-                        Some(self.known_worktree_path(&p).ok_or_else(|| unknown_worktree(&p))?)
+                        let known =
+                            self.known_worktree_path(&p).ok_or_else(|| unknown_worktree(&p))?;
+                        if self.pending_worktree_deletes.contains_key(&known) {
+                            return Err(worktree_removal_in_progress(&known));
+                        }
+                        Some(known)
                     },
                 };
                 let id = self
@@ -3522,6 +3534,10 @@ impl AlacritreeApp {
 
 fn unknown_worktree(path: &Path) -> String {
     format!("{} is not a worktree in the sidebar — see list_projects", path.display())
+}
+
+fn worktree_removal_in_progress(path: &Path) -> String {
+    format!("{}: worktree removal in progress", path.display())
 }
 
 fn session_json(session: &Session, is_active_tab: bool) -> Value {
