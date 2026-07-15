@@ -167,6 +167,10 @@ pub struct AlacritreeApp {
     /// discovery shells out to wsl.exe and must never block paint; results
     /// are adopted in `poll_project_refreshes`.
     pending_project_refresh: HashMap<PathBuf, Receiver<Project>>,
+    /// In-flight background worktree removals, keyed by worktree path. A
+    /// worktree in this map renders faded/non-interactive; results are
+    /// adopted in `poll_worktree_deletes`.
+    pending_worktree_deletes: HashMap<PathBuf, Receiver<Result<(), String>>>,
 }
 
 struct DeleteRequest {
@@ -358,6 +362,7 @@ impl AlacritreeApp {
                 color_glyph_budget_mb,
             ),
             pending_project_refresh: HashMap::new(),
+            pending_worktree_deletes: HashMap::new(),
         };
 
         let wsl_indices: Vec<usize> = app
@@ -473,6 +478,33 @@ impl AlacritreeApp {
         });
     }
 
+    /// Adopt finished background removals: clear the in-flight marker,
+    /// surface failures, and re-discover the owning project so the row
+    /// disappears (or un-fades after a failure). The project is found by
+    /// worktree path, not a stored index — `projects` can reorder while a
+    /// removal runs.
+    fn poll_worktree_deletes(&mut self, ctx: &Context) {
+        let mut finished: Vec<(PathBuf, Result<(), String>)> = Vec::new();
+        self.pending_worktree_deletes.retain(|path, rx| match rx.try_recv() {
+            Ok(result) => {
+                finished.push((path.clone(), result));
+                false
+            },
+            Err(mpsc::TryRecvError::Empty) => true,
+            Err(mpsc::TryRecvError::Disconnected) => false,
+        });
+        for (path, result) in finished {
+            if let Err(e) = result {
+                self.last_error = Some(format!("worktree removal failed: {e}"));
+            }
+            if let Some(idx) =
+                self.projects.iter().position(|p| p.worktrees.iter().any(|w| w.path == path))
+            {
+                self.refresh_project(ctx, idx);
+            }
+        }
+    }
+
     fn spawn_session(
         &mut self,
         ctx: &Context,
@@ -580,6 +612,11 @@ impl AlacritreeApp {
     }
 
     fn activate_worktree(&mut self, ctx: &Context, path: &Path) {
+        // A removal in flight owns the row; activating would spawn a shell
+        // in a directory that is being deleted underneath it.
+        if self.pending_worktree_deletes.contains_key(path) {
+            return;
+        }
         // The dir can vanish between discovery marking the row live and the
         // click. Switching first would strand the user on a dead workspace
         // with a failed spawn — stay put and let the sidebar re-mark the row.
@@ -1587,7 +1624,9 @@ impl AlacritreeApp {
             self.activate_worktree(ctx, &path);
         }
         if let Some(req) = delete_request.take() {
-            self.pending_delete = Some(req);
+            if !self.pending_worktree_deletes.contains_key(&req.worktree_path) {
+                self.pending_delete = Some(req);
+            }
         }
         if let Some(idx) = create_request.take() {
             self.pending_create =
@@ -2935,22 +2974,19 @@ impl AlacritreeApp {
         }
         self.active_session.remove(&Some(req.worktree_path.clone()));
 
-        let force = req.dirty.is_dirty();
-        let result = if req.prunable {
-            wt::prune_worktree(
-                &project_root,
-                &req.worktree_name,
-                req.branch.as_deref(),
-                req.delete_branch,
-            )
-        } else {
-            wt::delete_worktree(&project_root, &req.worktree_path, req.branch.as_deref(), force)
-        };
-        if let Err(e) = result {
-            let action = if req.prunable { "prune" } else { "delete" };
-            self.last_error = Some(format!("{action} failed: {e}"));
-        }
-        self.refresh_project(ctx, req.project_idx);
+        let rx = wt::spawn_remove(
+            wt::RemoveRequest {
+                project_root,
+                worktree_path: req.worktree_path.clone(),
+                worktree_name: req.worktree_name,
+                branch: req.branch,
+                prunable: req.prunable,
+                delete_branch: req.delete_branch,
+                force: req.dirty.is_dirty(),
+            },
+            ctx.clone(),
+        );
+        self.pending_worktree_deletes.insert(req.worktree_path, rx);
     }
 
     fn show_rename_dialog(&mut self, ctx: &Context) {
@@ -3491,6 +3527,7 @@ impl eframe::App for AlacritreeApp {
 
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.poll_project_refreshes();
+        self.poll_worktree_deletes(ctx);
         let modal_open = self.is_modal_open();
         // Keys pressed mid-composition drive the IME's candidate window,
         // not the app — alacritty's key_input returns early the same way,
