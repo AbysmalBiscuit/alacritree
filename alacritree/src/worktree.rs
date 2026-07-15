@@ -612,6 +612,7 @@ mod tests {
         assert_eq!(result, Ok(()));
         assert!(!wt_path.exists());
         assert!(repo.find_worktree("doomed").is_err());
+        assert!(repo.find_branch("doomed", git2::BranchType::Local).is_err());
     }
 
     #[test]
