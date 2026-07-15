@@ -2201,6 +2201,30 @@ fn focus_default(ctx: &Context, id: egui::Id) {
     }
 }
 
+/// A modal action button.  Framed and filled so it reads as clickable —
+/// frameless text buttons looked like captions and users reached for the
+/// keyboard hint instead of the mouse.
+fn modal_button(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    label: &str,
+    text_color: Color32,
+) -> egui::Response {
+    let s = theme.ui_scale;
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = egui::vec2(10.0 * s, 3.0 * s);
+        let widgets = &mut ui.visuals_mut().widgets;
+        widgets.inactive.weak_bg_fill = theme.row_hover_bg;
+        widgets.inactive.bg_stroke = Stroke::new(1.0_f32, theme.sidebar_border);
+        widgets.hovered.weak_bg_fill = theme.row_active_bg;
+        widgets.hovered.bg_stroke = Stroke::new(1.0_f32, theme.sidebar_border);
+        widgets.active.weak_bg_fill = theme.row_active_bg;
+        ui.add(egui::Button::new(RichText::new(label).color(text_color)))
+    })
+    .inner
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 /// Render a collapsed-when-empty git section.
 ///
 /// Empty sections are skipped entirely — a placeholder glyph for "no files
@@ -3084,16 +3108,11 @@ impl AlacritreeApp {
                             .small(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let delete = ui
-                            .add(egui::Button::new(RichText::new(verb).color(danger)).frame(false));
+                        let delete = modal_button(ui, &theme, verb, danger);
                         if delete.clicked() {
                             confirmed = true;
                         }
-                        let cancel = ui.add(
-                            egui::Button::new(RichText::new("Cancel").color(theme.text_dim))
-                                .frame(false),
-                        );
-                        if cancel.clicked() {
+                        if modal_button(ui, &theme, "Cancel", theme.text_dim).clicked() {
                             cancelled = true;
                         }
                         focus_default(ui.ctx(), delete.id);
@@ -3150,17 +3169,11 @@ impl AlacritreeApp {
                             .small(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let close_btn = ui.add(
-                            egui::Button::new(RichText::new("Close").color(danger)).frame(false),
-                        );
+                        let close_btn = modal_button(ui, &theme, "Close", danger);
                         if close_btn.clicked() {
                             confirmed = true;
                         }
-                        let cancel = ui.add(
-                            egui::Button::new(RichText::new("Cancel").color(theme.text_dim))
-                                .frame(false),
-                        );
-                        if cancel.clicked() {
+                        if modal_button(ui, &theme, "Cancel", theme.text_dim).clicked() {
                             cancelled = true;
                         }
                         focus_default(ui.ctx(), close_btn.id);
@@ -3424,22 +3437,10 @@ impl AlacritreeApp {
                             .small(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new("Rename").color(theme.accent))
-                                    .frame(false),
-                            )
-                            .clicked()
-                        {
+                        if modal_button(ui, &theme, "Rename", theme.accent).clicked() {
                             rename_clicked = true;
                         }
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new("Cancel").color(theme.text_dim))
-                                    .frame(false),
-                            )
-                            .clicked()
-                        {
+                        if modal_button(ui, &theme, "Cancel", theme.text_dim).clicked() {
                             cancelled = true;
                         }
                     });
@@ -3561,22 +3562,10 @@ impl AlacritreeApp {
                             .small(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new("Create").color(theme.accent))
-                                    .frame(false),
-                            )
-                            .clicked()
-                        {
+                        if modal_button(ui, &theme, "Create", theme.accent).clicked() {
                             create_clicked = true;
                         }
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new("Cancel").color(theme.text_dim))
-                                    .frame(false),
-                            )
-                            .clicked()
-                        {
+                        if modal_button(ui, &theme, "Cancel", theme.text_dim).clicked() {
                             cancelled = true;
                         }
                     });
@@ -3701,9 +3690,7 @@ impl AlacritreeApp {
                 ui.add_space(4.0 * s);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let label = if result.is_ok() { "Open" } else { "Close" };
-                    let btn = ui.add(
-                        egui::Button::new(RichText::new(label).color(theme.accent)).frame(false),
-                    );
+                    let btn = modal_button(ui, &theme, label, theme.accent);
                     if btn.clicked() {
                         close = true;
                     }
@@ -3749,23 +3736,14 @@ impl AlacritreeApp {
                             .small(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let quit_id = egui::Id::new("alacritree_quit_btn");
-                        let quit = ui.add(
-                            egui::Button::new(RichText::new("Quit").color(danger)).frame(false),
-                        );
+                        let quit = modal_button(ui, &theme, "Quit", danger);
                         if quit.clicked() {
                             quit_clicked = true;
                         }
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new("Cancel").color(theme.text_dim))
-                                    .frame(false),
-                            )
-                            .clicked()
-                        {
+                        if modal_button(ui, &theme, "Cancel", theme.text_dim).clicked() {
                             cancel_clicked = true;
                         }
-                        focus_default(ui.ctx(), quit_id);
+                        focus_default(ui.ctx(), quit.id);
                     });
                 });
             },
