@@ -84,6 +84,65 @@ impl NamedAction {
                 | Self::SidebarPreviousProject
         )
     }
+
+    /// The name `parse_action` accepts for this action — what a user writes
+    /// in `[[keyboard.bindings]]`, and the label the shortcuts window shows.
+    pub fn config_name(&self) -> String {
+        match self {
+            Self::SelectTab(n) => format!("SelectTab{n}"),
+            Self::SpawnProfile(n) => format!("SpawnProfile{n}"),
+            other => format!("{other:?}"),
+        }
+    }
+
+    /// One-line human description for the shortcuts window.
+    pub fn description(&self) -> String {
+        match self {
+            Self::Paste => "Paste from the clipboard".into(),
+            Self::PasteSelection => "Paste from the primary (X11) selection".into(),
+            Self::Copy => "Copy the selection to the clipboard".into(),
+            Self::CopySelection => "Copy the selection to the primary selection".into(),
+            Self::ScrollPageUp => "Scroll the scrollback one page up".into(),
+            Self::ScrollPageDown => "Scroll the scrollback one page down".into(),
+            Self::ScrollHalfPageUp => "Scroll the scrollback half a page up".into(),
+            Self::ScrollHalfPageDown => "Scroll the scrollback half a page down".into(),
+            Self::ScrollLineUp => "Scroll the scrollback one line up".into(),
+            Self::ScrollLineDown => "Scroll the scrollback one line down".into(),
+            Self::ScrollToTop => "Scroll to the top of the scrollback".into(),
+            Self::ScrollToBottom => "Scroll to the bottom of the scrollback".into(),
+            Self::ClearHistory => "Clear the scrollback buffer".into(),
+            Self::SpawnNewInstance => "Open a new shell session in the current workspace".into(),
+            Self::IncreaseFontSize => "Increase the font size".into(),
+            Self::DecreaseFontSize => "Decrease the font size".into(),
+            Self::ResetFontSize => "Reset the font size".into(),
+            Self::ToggleFullscreen => "Toggle fullscreen".into(),
+            Self::ToggleMaximized => "Toggle the maximized window state".into(),
+            Self::Minimize => "Minimize the window".into(),
+            Self::SelectNextTab => "Cycle to the next session in the workspace".into(),
+            Self::SelectPreviousTab => "Cycle to the previous session in the workspace".into(),
+            Self::SelectTab(n) => format!("Select session {n} in the current workspace"),
+            Self::SelectLastTab => "Select the last session in the current workspace".into(),
+            Self::ToggleLeftSidebar => "Toggle the projects sidebar".into(),
+            Self::ToggleRightSidebar => "Toggle the git sidebar".into(),
+            Self::SelectNextWorkspace => "Switch to the next workspace".into(),
+            Self::SelectPreviousWorkspace => "Switch to the previous workspace".into(),
+            Self::AddProject => "Add a project to the sidebar".into(),
+            Self::ToggleSidebarFocus => "Toggle keyboard focus between terminal and sidebar".into(),
+            Self::CloseSession => "Close the cursored or active session".into(),
+            Self::SidebarTop => "Move the sidebar cursor to the first row".into(),
+            Self::SidebarBottom => "Move the sidebar cursor to the last row".into(),
+            Self::SidebarNextProject => "Jump the sidebar cursor to the next project".into(),
+            Self::SidebarPreviousProject => {
+                "Jump the sidebar cursor to the previous project".into()
+            },
+            Self::FocusProjectsSidebar => "Focus the projects sidebar".into(),
+            Self::FocusGitSidebar => "Focus the git sidebar".into(),
+            Self::FocusTerminal => "Focus the terminal".into(),
+            Self::SpawnProfile(n) => format!("Open a session with shell profile {n}"),
+            Self::Quit => "Open the quit confirmation dialog".into(),
+            Self::NoOp | Self::ReceiveChar => String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

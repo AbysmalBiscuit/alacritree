@@ -24,6 +24,7 @@ mod paste;
 mod pr_status;
 mod projects;
 mod session;
+mod shortcuts_window;
 mod sidebar_nav;
 mod stale_exe;
 mod state;
