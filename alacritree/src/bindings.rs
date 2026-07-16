@@ -56,6 +56,7 @@ pub enum NamedAction {
     SidebarBottom,
     SidebarNextProject,
     SidebarPreviousProject,
+    ShowShortcuts,
     FocusProjectsSidebar,
     FocusGitSidebar,
     FocusTerminal,
@@ -140,6 +141,7 @@ impl NamedAction {
             Self::FocusTerminal => "Focus the terminal".into(),
             Self::SpawnProfile(n) => format!("Open a session with shell profile {n}"),
             Self::Quit => "Open the quit confirmation dialog".into(),
+            Self::ShowShortcuts => "Show this shortcuts window".into(),
             Self::NoOp | Self::ReceiveChar => String::new(),
         }
     }
@@ -293,6 +295,11 @@ fn default_bindings() -> Vec<KeyBinding> {
             key: Key::PageUp,
             mods: Modifiers::NONE,
             action: BindingAction::Named(SidebarPreviousProject),
+        },
+        KeyBinding {
+            key: Key::F1,
+            mods: Modifiers::NONE,
+            action: BindingAction::Named(ShowShortcuts),
         },
         KeyBinding { key: Key::G, mods: ctrl_shift, action: BindingAction::Named(FocusGitSidebar) },
         KeyBinding { key: Key::W, mods: ctrl_shift, action: BindingAction::Named(CloseSession) },
@@ -605,6 +612,7 @@ fn parse_action(name: &str) -> BindingAction {
         "SidebarBottom" => BindingAction::Named(SidebarBottom),
         "SidebarNextProject" => BindingAction::Named(SidebarNextProject),
         "SidebarPreviousProject" => BindingAction::Named(SidebarPreviousProject),
+        "ShowShortcuts" => BindingAction::Named(ShowShortcuts),
         "FocusProjectsSidebar" => BindingAction::Named(FocusProjectsSidebar),
         "FocusGitSidebar" => BindingAction::Named(FocusGitSidebar),
         "FocusTerminal" => BindingAction::Named(FocusTerminal),
@@ -938,5 +946,15 @@ mod tests {
         for a in [CloseSession, ScrollToTop, ScrollPageUp, ToggleSidebarFocus, Quit] {
             assert!(!a.is_sidebar_scoped(), "{a:?}");
         }
+    }
+
+    #[test]
+    fn show_shortcuts_is_a_default_f1_binding_and_parses() {
+        let b = parse_bindings(vec![]);
+        assert_eq!(named_matches(&b, Key::F1, Modifiers::NONE), vec![NamedAction::ShowShortcuts]);
+        assert!(matches!(
+            parse_action("ShowShortcuts"),
+            BindingAction::Named(NamedAction::ShowShortcuts)
+        ));
     }
 }

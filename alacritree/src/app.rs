@@ -22,6 +22,7 @@ use crate::paste;
 use crate::pr_status::PrCache;
 use crate::projects::{Project, Worktree, project_json};
 use crate::session::{Session, SessionId, SessionKind, TermSize};
+use crate::shortcuts_window;
 use crate::sidebar_nav::{self, SidebarRow};
 use crate::state::{self, PersistedProject};
 use crate::terminal_view;
@@ -163,6 +164,12 @@ pub struct AlacritreeApp {
     /// The focus toggle opened a hidden git sidebar; returning focus closes it
     /// again so a keyboard round trip leaves the layout untouched.
     git_sidebar_auto_shown: bool,
+    /// The F1 shortcuts overlay.  Transient: never persisted.
+    shortcuts_window_open: bool,
+    shortcuts_query: String,
+    /// One-shot: give the search box focus on the next window paint (set on
+    /// open and by `/`), mirroring the `*_cursor_moved` one-shots.
+    shortcuts_focus_search: bool,
     sessions: Vec<Session>,
     current_workspace: WorkspaceKey,
     active_session: HashMap<WorkspaceKey, SessionId>,
@@ -439,6 +446,9 @@ impl AlacritreeApp {
             git_rows: Vec::new(),
             git_branch_base: None,
             git_sidebar_auto_shown: false,
+            shortcuts_window_open: false,
+            shortcuts_query: String::new(),
+            shortcuts_focus_search: false,
             sessions: Vec::new(),
             current_workspace: None,
             active_session: HashMap::new(),
@@ -998,7 +1008,8 @@ impl AlacritreeApp {
     /// text input.  Matched events are consumed unless every matched action
     /// is `ReceiveChar` (alacritty's pass-through marker).
     fn handle_shortcuts(&mut self, ctx: &Context) {
-        let sidebar_focused = self.focus == PaneFocus::ProjectsSidebar;
+        let sidebar_focused =
+            self.focus == PaneFocus::ProjectsSidebar && !self.shortcuts_window_open;
         let actions: Vec<BindingAction> = ctx.input_mut(|i| {
             let mut actions = Vec::new();
             i.events.retain(|ev| {
@@ -1613,6 +1624,13 @@ impl AlacritreeApp {
             },
             BindingAction::Named(NamedAction::SidebarPreviousProject) => {
                 self.sidebar_cursor_project_jump(-1)
+            },
+            BindingAction::Named(NamedAction::ShowShortcuts) => {
+                self.shortcuts_window_open = !self.shortcuts_window_open;
+                if self.shortcuts_window_open {
+                    self.shortcuts_query.clear();
+                    self.shortcuts_focus_search = true;
+                }
             },
             BindingAction::Named(NamedAction::FocusProjectsSidebar) => {
                 if self.focus != PaneFocus::ProjectsSidebar {
@@ -4227,6 +4245,119 @@ impl AlacritreeApp {
         }
     }
 
+    /// The F1 shortcuts overlay: every effective app binding plus the
+    /// hardcoded sidebar keys, filtered live by the search box.  An
+    /// informational overlay, not a modal — bindings keep dispatching, which
+    /// is also how the ShowShortcuts key toggles it closed.
+    fn show_shortcuts_window(&mut self, ctx: &Context) {
+        let theme = self.theme;
+        let s = theme.ui_scale;
+
+        // Keys pressed mid-composition drive the IME's candidate window, not this
+        // window, so leave Esc and `/` in the event queue for it to see.
+        if self.ime.preedit().is_none() {
+            // Esc narrows before it closes: drain it ahead of the TextEdit,
+            // which would otherwise only drop focus.
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                if self.shortcuts_query.is_empty() {
+                    self.shortcuts_window_open = false;
+                    return;
+                }
+                self.shortcuts_query.clear();
+            }
+            // `/` re-focuses the search box instead of typing into it.
+            let slash = ctx.input_mut(|i| {
+                let mut hit = false;
+                i.events.retain(|ev| {
+                    let is_slash = matches!(ev, egui::Event::Text(t) if t == "/");
+                    hit |= is_slash;
+                    !is_slash
+                });
+                hit
+            });
+            if slash {
+                self.shortcuts_focus_search = true;
+            }
+        }
+
+        egui::Window::new(RichText::new("Keyboard shortcuts").color(theme.text).strong())
+            .id(egui::Id::new("alacritree_shortcuts_window"))
+            .frame(modal_frame(&theme))
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.set_width(480.0 * s);
+                ui.spacing_mut().item_spacing.y = 4.0 * s;
+
+                let search = ui.add(
+                    egui::TextEdit::singleline(&mut self.shortcuts_query)
+                        .hint_text("type to search — / refocuses, Esc clears")
+                        .desired_width(f32::INFINITY),
+                );
+                if std::mem::take(&mut self.shortcuts_focus_search) {
+                    search.request_focus();
+                }
+
+                let query = self.shortcuts_query.clone();
+                let app_rows: Vec<_> = shortcuts_window::named_rows(&self.config.bindings)
+                    .into_iter()
+                    .filter(|r| shortcuts_window::row_matches(&query, r))
+                    .collect();
+                let nav_rows: Vec<_> = shortcuts_window::sidebar_nav_rows()
+                    .into_iter()
+                    .filter(|r| shortcuts_window::row_matches(&query, r))
+                    .collect();
+
+                egui::ScrollArea::vertical().max_height(420.0 * s).show(ui, |ui| {
+                    if app_rows.is_empty() && nav_rows.is_empty() {
+                        ui.label(RichText::new("no matches").color(theme.text_dim));
+                        return;
+                    }
+                    if !app_rows.is_empty() {
+                        ui.label(RichText::new("App shortcuts").color(theme.text_muted).small());
+                        egui::Grid::new("shortcuts_app_grid").num_columns(2).striped(true).show(
+                            ui,
+                            |ui| {
+                                for row in &app_rows {
+                                    ui.label(
+                                        RichText::new(&row.keys).color(theme.accent).monospace(),
+                                    );
+                                    ui.vertical(|ui| {
+                                        ui.label(RichText::new(&row.description).color(theme.text));
+                                        ui.label(
+                                            RichText::new(&row.name).color(theme.text_dim).small(),
+                                        );
+                                    });
+                                    ui.end_row();
+                                }
+                            },
+                        );
+                    }
+                    if !nav_rows.is_empty() {
+                        ui.add_space(6.0 * s);
+                        ui.label(
+                            RichText::new("Sidebar navigation (while a panel has focus)")
+                                .color(theme.text_muted)
+                                .small(),
+                        );
+                        egui::Grid::new("shortcuts_nav_grid").num_columns(2).striped(true).show(
+                            ui,
+                            |ui| {
+                                for row in &nav_rows {
+                                    ui.label(
+                                        RichText::new(&row.keys).color(theme.accent).monospace(),
+                                    );
+                                    ui.label(RichText::new(&row.description).color(theme.text));
+                                    ui.end_row();
+                                }
+                            },
+                        );
+                    }
+                });
+            });
+    }
+
     fn run_pending_delete(&mut self, ctx: &Context) {
         let Some(req) = self.pending_delete.take() else {
             return;
@@ -4851,10 +4982,14 @@ impl eframe::App for AlacritreeApp {
         // not the app — alacritty's key_input returns early the same way,
         // above binding dispatch.
         if !modal_open && self.ime.preedit().is_none() {
-            match self.focus {
-                PaneFocus::ProjectsSidebar => self.handle_sidebar_nav(ctx),
-                PaneFocus::GitSidebar => self.handle_git_sidebar_nav(ctx),
-                PaneFocus::Terminal => {},
+            // While the shortcuts overlay is open, typed text belongs to its
+            // search box — the panel filters must not intercept it.
+            if !self.shortcuts_window_open {
+                match self.focus {
+                    PaneFocus::ProjectsSidebar => self.handle_sidebar_nav(ctx),
+                    PaneFocus::GitSidebar => self.handle_git_sidebar_nav(ctx),
+                    PaneFocus::Terminal => {},
+                }
             }
             self.handle_shortcuts(ctx);
         }
@@ -4917,7 +5052,7 @@ impl eframe::App for AlacritreeApp {
                     ui,
                     session,
                     &self.config,
-                    !modal_open && self.focus == PaneFocus::Terminal,
+                    !modal_open && !self.shortcuts_window_open && self.focus == PaneFocus::Terminal,
                     &mut self.builtin_glyphs,
                     ime,
                     &mut self.color_glyphs,
@@ -4952,6 +5087,9 @@ impl eframe::App for AlacritreeApp {
         }
         if self.quit_dialog_open {
             self.show_quit_dialog(ctx);
+        }
+        if self.shortcuts_window_open && !modal_open {
+            self.show_shortcuts_window(ctx);
         }
 
         self.reap_exited_sessions(ctx);
