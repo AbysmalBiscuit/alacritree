@@ -58,6 +58,8 @@ and your TOML entries are checked first — so your config overrides any default
 | `Alt+Shift+Tab`      | Send `ESC` + `CSI Z`                                  |
 | `Ctrl+Shift+B`       | Toggle keyboard focus between terminal and sidebar    |
 | `Ctrl+Shift+W`       | Close the cursored session (sidebar) or the current shell |
+| `Home` / `End`       | Sidebar focused: cursor to the first / last row       |
+| `PageUp` / `PageDown`| Sidebar focused: jump to the previous / next project  |
 
 ### Additional defaults on macOS
 
@@ -127,6 +129,14 @@ entry. Names match alacritty's own action names, so existing configs port over.
   last session closes, `ui.last_session_close` decides what follows:
   `"respawn"` (default) recycles a shell in place, `"navigate"` moves to the
   project's main checkout or home.
+- `SidebarTop` / `SidebarBottom` — move the sidebar cursor to the first / last
+  visible row.
+- `SidebarPreviousProject` / `SidebarNextProject` — jump the sidebar cursor to
+  the nearest project header above / below.
+
+All four sidebar actions act only while the projects sidebar has keyboard
+focus; anywhere else their keys pass through to the terminal untouched, so
+the unmodified defaults don't shadow Home/End/PageUp/PageDown in TUIs.
 - `SpawnProfile1` … `SpawnProfile9` — spawn the Nth `[[ui.profiles]]` entry
   in the current workspace. Out-of-range indices show an error toast.
   Example binding:

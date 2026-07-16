@@ -998,12 +998,25 @@ impl AlacritreeApp {
     /// text input.  Matched events are consumed unless every matched action
     /// is `ReceiveChar` (alacritty's pass-through marker).
     fn handle_shortcuts(&mut self, ctx: &Context) {
+        let sidebar_focused = self.focus == PaneFocus::ProjectsSidebar;
         let actions: Vec<BindingAction> = ctx.input_mut(|i| {
             let mut actions = Vec::new();
             i.events.retain(|ev| {
                 if let egui::Event::Key { key, pressed: true, modifiers, .. } = ev {
                     let matched =
                         crate::bindings::all_matches(&self.config.bindings, *key, *modifiers);
+                    // Sidebar-cursor actions only exist while the sidebar owns focus;
+                    // anywhere else their keys (unmodified Home/End/PageUp/PageDown) are
+                    // terminal input.  Stacked user bindings can mix a sidebar action with
+                    // a global one on a single trigger, so filter per action — and if
+                    // nothing else matched, let the event through untouched.
+                    let matched: Vec<_> = matched
+                        .into_iter()
+                        .filter(|a| {
+                            sidebar_focused
+                                || !matches!(a, BindingAction::Named(n) if n.is_sidebar_scoped())
+                        })
+                        .collect();
                     if !matched.is_empty() {
                         let suppress_chars = matched
                             .iter()
@@ -1103,6 +1116,37 @@ impl AlacritreeApp {
             },
         };
         self.set_sidebar_cursor(sidebar_nav::step(&rows, &cursor, delta));
+    }
+
+    /// Home/End for the sidebar cursor: first or last of the rows the arrow
+    /// keys step over (the filtered set while a filter is active).
+    fn sidebar_cursor_to_edge(&mut self, top: bool) {
+        let rows = self.current_project_rows();
+        let target = if top { rows.first() } else { rows.last() };
+        if let Some(row) = target.cloned() {
+            self.set_sidebar_cursor(row);
+        }
+    }
+
+    /// PageUp/PageDown for the sidebar cursor: the nearest project header
+    /// above/below, clamped at the extremes.  A stale cursor reseats on the
+    /// first row, same as `apply_sidebar_nav`.
+    fn sidebar_cursor_project_jump(&mut self, delta: i32) {
+        let rows = self.current_project_rows();
+        let Some(cursor) = self.sidebar_cursor.clone().filter(|c| rows.contains(c)) else {
+            if let Some(first) = rows.first() {
+                self.set_sidebar_cursor(first.clone());
+            }
+            return;
+        };
+        let target = if delta > 0 {
+            sidebar_nav::next_project(&rows, &cursor)
+        } else {
+            sidebar_nav::previous_project(&rows, &cursor)
+        };
+        if let Some(row) = target {
+            self.set_sidebar_cursor(row);
+        }
     }
 
     /// Rows the sidebar cursor steps over this frame: the fuzzy/toggle-filtered
@@ -1561,6 +1605,14 @@ impl AlacritreeApp {
                 if let Some(id) = target {
                     self.request_close_session(ctx, id);
                 }
+            },
+            BindingAction::Named(NamedAction::SidebarTop) => self.sidebar_cursor_to_edge(true),
+            BindingAction::Named(NamedAction::SidebarBottom) => self.sidebar_cursor_to_edge(false),
+            BindingAction::Named(NamedAction::SidebarNextProject) => {
+                self.sidebar_cursor_project_jump(1)
+            },
+            BindingAction::Named(NamedAction::SidebarPreviousProject) => {
+                self.sidebar_cursor_project_jump(-1)
             },
             BindingAction::Named(NamedAction::FocusProjectsSidebar) => {
                 if self.focus != PaneFocus::ProjectsSidebar {
