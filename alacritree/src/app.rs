@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use crate::bindings::{BindingAction, NamedAction};
 use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
-use crate::config::Config;
+use crate::config::{Config, LastSessionClose};
 use crate::doppler;
 use crate::git_nav::{self, GitSection, SectionCount};
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, GitStatus, StatusCache};
@@ -718,10 +718,8 @@ impl AlacritreeApp {
         if self.active_session_index().is_some() {
             return;
         }
-        let ws_idx = self.workspace_session_indices(&self.current_workspace);
-        if let Some(&idx) = ws_idx.first() {
-            let id = self.sessions[idx].id;
-            self.active_session.insert(self.current_workspace.clone(), id);
+        self.adopt_active_session();
+        if self.active_session_index().is_some() {
             return;
         }
         if let Err(e) = self.spawn_session(ctx, self.current_workspace.clone()) {
@@ -729,7 +727,19 @@ impl AlacritreeApp {
         }
     }
 
-    fn close_session(&mut self, id: SessionId) {
+    /// Re-attach to an existing session when the active id went stale
+    /// (closed or reaped this frame). Never spawns: an emptied on-screen
+    /// workspace either navigated away in `close_session` or shows the
+    /// "no session" placeholder.
+    fn adopt_active_session(&mut self) {
+        let ws_idx = self.workspace_session_indices(&self.current_workspace);
+        if let Some(&idx) = ws_idx.first() {
+            let id = self.sessions[idx].id;
+            self.active_session.insert(self.current_workspace.clone(), id);
+        }
+    }
+
+    fn close_session(&mut self, ctx: &Context, id: SessionId) {
         let Some(idx) = self.sessions.iter().position(|s| s.id == id) else {
             return;
         };
@@ -741,23 +751,56 @@ impl AlacritreeApp {
                 self.sessions.iter().find(|s| s.working_directory == workspace).map(|s| s.id);
             match fallback {
                 Some(new_id) => {
-                    self.active_session.insert(workspace, new_id);
+                    self.active_session.insert(workspace.clone(), new_id);
                 },
                 None => {
                     self.active_session.remove(&workspace);
                 },
             }
         }
+
+        // Closing the on-screen workspace's last session must not strand the
+        // view on an empty pane. What happens instead is policy: `respawn`
+        // recycles a shell in place (the last session is by design
+        // unclosable), `navigate` falls back to the project main, then home.
+        let remaining: Vec<(WorkspaceKey, SessionId)> =
+            self.sessions.iter().map(|s| (s.working_directory.clone(), s.id)).collect();
+        let main = workspace.as_deref().and_then(|p| project_main_for(&self.projects, p));
+        let verdict = close_fallback(&workspace, &self.current_workspace, &remaining, main);
+        if verdict != CloseFallback::Stay
+            && self.config.ui.last_session_close == LastSessionClose::Respawn
+        {
+            if let Err(e) = self.spawn_session(ctx, workspace) {
+                self.last_error = Some(format!("failed to spawn shell: {e}"));
+            }
+            return;
+        }
+        match verdict {
+            CloseFallback::Stay => {},
+            CloseFallback::Activate(main) => {
+                // The fallback verified a session exists there, so this
+                // adopts rather than spawns.
+                self.current_workspace = Some(main);
+                self.ensure_active_session(ctx);
+                // Adopting an existing session produces no PTY events, so
+                // nothing else would wake the next paint.
+                ctx.request_repaint();
+            },
+            CloseFallback::Home => {
+                self.activate_home(ctx);
+                ctx.request_repaint();
+            },
+        }
     }
 
-    fn request_close_session(&mut self, id: SessionId) {
+    fn request_close_session(&mut self, ctx: &Context, id: SessionId) {
         let Some(session) = self.sessions.iter().find(|s| s.id == id) else {
             return;
         };
         if self.config.ui.confirm_session_close.requires_prompt(session.is_busy()) {
             self.pending_session_close = Some(id);
         } else {
-            self.close_session(id);
+            self.close_session(ctx, id);
         }
     }
 
@@ -1504,6 +1547,12 @@ impl AlacritreeApp {
                 // to the left one rather than doing nothing.
                 PaneFocus::GitSidebar => self.focus_sidebar(),
             },
+            BindingAction::Named(NamedAction::CloseSession) => {
+                if let Some(idx) = self.active_session_index() {
+                    let id = self.sessions[idx].id;
+                    self.request_close_session(ctx, id);
+                }
+            },
             BindingAction::Named(NamedAction::FocusProjectsSidebar) => {
                 if self.focus != PaneFocus::ProjectsSidebar {
                     self.focus_sidebar();
@@ -2225,13 +2274,13 @@ impl AlacritreeApp {
         }
         if let Some((ws, id)) = activate_session_request.take() {
             // A stale id (session reaped this frame) self-heals next frame:
-            // active_session_index() misses and ensure_active_session picks
-            // an existing shell or spawns one.
+            // active_session_index() misses and adopt_active_session picks
+            // an existing shell, or the empty-workspace placeholder shows.
             self.current_workspace = ws.clone();
             self.active_session.insert(ws, id);
         }
         if let Some(id) = close_session_request.take() {
-            self.request_close_session(id);
+            self.request_close_session(ctx, id);
         }
         if let Some(ws) = spawn_shell_request.take() {
             // Spawning activates the workspace and the new session, matching
@@ -2567,19 +2616,21 @@ impl AlacritreeApp {
             return;
         };
         let new_key = diff_key(&req);
-        let already_showing = self.sessions.iter().any(|s| {
+        let existing = self.sessions.iter().find(|s| {
             s.working_directory.as_deref() == Some(&workspace)
-                && matches!(&s.kind, SessionKind::Diff { key } if key == &new_key)
+                && matches!(&s.kind, SessionKind::Diff { .. })
         });
-        self.sessions.retain(|s| {
-            !(matches!(s.kind, SessionKind::Diff { .. })
-                && s.working_directory.as_deref() == Some(&workspace))
-        });
-        if already_showing {
-            // Active-session fallback to the workspace's shell happens next
-            // frame: `active_session_index()` returns None for the stale id, and
-            // `ensure_active_session` picks up an existing shell or spawns one.
-            return;
+        if let Some(session) = existing {
+            let id = session.id;
+            if matches!(&session.kind, SessionKind::Diff { key } if key == &new_key) {
+                // Routing through close_session applies the same
+                // sibling-promotion and fallback navigation as any other
+                // close, so toggling off the diff pane never strands the
+                // workspace on an empty view.
+                self.close_session(ctx, id);
+                return;
+            }
+            self.sessions.retain(|s| s.id != id);
         }
 
         let delta_override = self.config.delta_path.clone();
@@ -2891,6 +2942,7 @@ fn modal_button(
     })
     .inner
     .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
 
 /// Section header count: `visible of total` while a filter narrows the panel,
 /// the plain total otherwise.
@@ -3431,6 +3483,48 @@ fn sidebar_session_ids(pairs: &[(WorkspaceKey, SessionId)], ws: &WorkspaceKey) -
     if ids.len() < 2 { Vec::new() } else { ids }
 }
 
+/// Where the view goes after a session's removal.
+#[derive(Debug, PartialEq)]
+enum CloseFallback {
+    /// Removal didn't empty the on-screen workspace — no navigation.
+    Stay,
+    /// Switch to the project's main checkout, which still has a session.
+    Activate(PathBuf),
+    /// Switch to home; `activate_home` spawns a shell there if none exists.
+    Home,
+}
+
+/// Post-close navigation for the workspace that just lost a session.
+/// `remaining` is the session list after removal; `main_checkout` is the
+/// removed workspace's project main (None when the workspace *is* the main,
+/// is home, or belongs to no known project). Pure over (workspace, id)
+/// pairs for the same reason as `sidebar_session_ids`.
+fn close_fallback(
+    removed_ws: &WorkspaceKey,
+    current_ws: &WorkspaceKey,
+    remaining: &[(WorkspaceKey, SessionId)],
+    main_checkout: Option<PathBuf>,
+) -> CloseFallback {
+    if removed_ws != current_ws || remaining.iter().any(|(w, _)| w == removed_ws) {
+        return CloseFallback::Stay;
+    }
+    match main_checkout {
+        Some(main) if remaining.iter().any(|(w, _)| w.as_deref() == Some(main.as_path())) => {
+            CloseFallback::Activate(main)
+        },
+        _ => CloseFallback::Home,
+    }
+}
+
+/// The owning project's main checkout for `ws`, or None when `ws` already
+/// is the main (including non-git roots, whose single pseudo-worktree is
+/// its own main) or belongs to no known project.
+fn project_main_for(projects: &[Project], ws: &Path) -> Option<PathBuf> {
+    let project = projects.iter().find(|p| p.worktrees.iter().any(|w| w.path == ws))?;
+    let main = project.worktrees.iter().find(|w| w.is_main)?;
+    if main.path == ws { None } else { Some(main.path.clone()) }
+}
+
 /// Agent glyphs usually come from the title's own leading char
 /// (`Session::agent_glyph`), and the session row paints that glyph as its
 /// status icon right next to the title — showing it in both places doubles
@@ -3685,11 +3779,11 @@ fn session_row(
 }
 
 impl AlacritreeApp {
-    fn reap_exited_sessions(&mut self) {
+    fn reap_exited_sessions(&mut self, ctx: &Context) {
         let exited_ids: Vec<SessionId> =
             self.sessions.iter().filter(|s| s.is_exited()).map(|s| s.id).collect();
         for id in exited_ids {
-            self.close_session(id);
+            self.close_session(ctx, id);
         }
     }
 
@@ -3955,7 +4049,7 @@ impl AlacritreeApp {
 
         if confirm_via_key || confirmed {
             self.pending_session_close = None;
-            self.close_session(id);
+            self.close_session(ctx, id);
             return;
         }
         if cancel_via_key || cancelled || modal.should_close() {
@@ -4081,10 +4175,13 @@ impl AlacritreeApp {
         // Drop sessions whose cwd is the worktree before deleting it; the PTY
         // would otherwise block the directory removal on some filesystems.
         self.sessions.retain(|s| s.working_directory.as_deref() != Some(&req.worktree_path));
-        if self.current_workspace.as_deref() == Some(&req.worktree_path) {
-            self.current_workspace = None;
-        }
         self.active_session.remove(&Some(req.worktree_path.clone()));
+        if self.current_workspace.as_deref() == Some(&req.worktree_path) {
+            // Deleting the on-screen worktree is an explicit user action, so
+            // home should greet with a live shell rather than the "no
+            // session" placeholder.
+            self.activate_home(ctx);
+        }
 
         // The git removal (shellouts, branch delete, doppler cleanup) is slow
         // enough to stutter paint, so run it off-thread and adopt the result in
@@ -4590,7 +4687,7 @@ impl AlacritreeApp {
                 if !self.sessions.iter().any(|s| s.id == session_id) {
                     return Err(format!("no session with id {session_id}"));
                 }
-                self.close_session(session_id);
+                self.close_session(ctx, session_id);
                 Ok(json!({ "closed": session_id }))
             },
             Req::SendText { session_id, text } => {
@@ -4741,7 +4838,7 @@ impl eframe::App for AlacritreeApp {
                 }
 
                 if self.active_session_index().is_none() {
-                    self.ensure_active_session(ctx);
+                    self.adopt_active_session();
                 }
 
                 let Some(idx) = self.active_session_index() else {
@@ -4796,7 +4893,7 @@ impl eframe::App for AlacritreeApp {
             self.show_quit_dialog(ctx);
         }
 
-        self.reap_exited_sessions();
+        self.reap_exited_sessions(ctx);
     }
 }
 
@@ -4937,6 +5034,104 @@ mod tests {
 
         let two_match = vec![(ws("/a"), 1), (ws("/other"), 2), (ws("/a"), 3)];
         assert_eq!(sidebar_session_ids(&two_match, &ws("/a")), vec![1, 3]);
+    }
+
+    use crate::projects::{Project, Worktree};
+
+    /// A project whose main checkout is `root`, plus secondary worktrees.
+    fn project_with(root: &str, extra: &[&str]) -> Project {
+        let wt = |path: &str, is_main: bool| Worktree {
+            name: path.to_string(),
+            path: PathBuf::from(path),
+            branch: None,
+            is_main,
+            prunable: false,
+        };
+        Project {
+            root: PathBuf::from(root),
+            name: "p".to_string(),
+            label: None,
+            default_branch: None,
+            worktrees: std::iter::once(wt(root, true))
+                .chain(extra.iter().map(|p| wt(p, false)))
+                .collect(),
+            expanded: true,
+            shell_override: None,
+        }
+    }
+
+    #[test]
+    fn fallback_prefers_project_main_with_live_session() {
+        let remaining = vec![(ws("/repo"), 1)];
+        assert_eq!(
+            close_fallback(
+                &ws("/repo/wt"),
+                &ws("/repo/wt"),
+                &remaining,
+                Some(PathBuf::from("/repo"))
+            ),
+            CloseFallback::Activate(PathBuf::from("/repo"))
+        );
+    }
+
+    #[test]
+    fn fallback_goes_home_when_project_main_has_no_session() {
+        let remaining = vec![(ws("/other"), 1)];
+        assert_eq!(
+            close_fallback(
+                &ws("/repo/wt"),
+                &ws("/repo/wt"),
+                &remaining,
+                Some(PathBuf::from("/repo"))
+            ),
+            CloseFallback::Home
+        );
+    }
+
+    #[test]
+    fn fallback_goes_home_from_the_project_main_itself() {
+        // project_main_for returns None when ws is the main checkout, so the
+        // decision sees no main to activate.
+        assert_eq!(close_fallback(&ws("/repo"), &ws("/repo"), &[], None), CloseFallback::Home);
+    }
+
+    #[test]
+    fn fallback_goes_home_from_home() {
+        assert_eq!(close_fallback(&None, &None, &[], None), CloseFallback::Home);
+    }
+
+    #[test]
+    fn fallback_stays_on_background_workspace_close() {
+        assert_eq!(
+            close_fallback(&ws("/repo/wt"), &None, &[], Some(PathBuf::from("/repo"))),
+            CloseFallback::Stay
+        );
+    }
+
+    #[test]
+    fn fallback_stays_when_siblings_survive() {
+        let remaining = vec![(ws("/repo/wt"), 2)];
+        assert_eq!(
+            close_fallback(
+                &ws("/repo/wt"),
+                &ws("/repo/wt"),
+                &remaining,
+                Some(PathBuf::from("/repo"))
+            ),
+            CloseFallback::Stay
+        );
+    }
+
+    #[test]
+    fn project_main_resolves_for_secondary_worktrees_only() {
+        let projects = vec![project_with("/repo", &["/repo-wt/feat"])];
+        assert_eq!(
+            project_main_for(&projects, Path::new("/repo-wt/feat")),
+            Some(PathBuf::from("/repo"))
+        );
+        // The main itself and unknown paths have no fallback target.
+        assert_eq!(project_main_for(&projects, Path::new("/repo")), None);
+        assert_eq!(project_main_for(&projects, Path::new("/elsewhere")), None);
     }
 
     fn req(file: &str, source: DiffSource) -> DiffRequest {
