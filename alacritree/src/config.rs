@@ -39,6 +39,11 @@ pub struct Config {
     /// alacritty's `[general] ipc_socket` (default on).
     pub ipc_socket: bool,
     pub wsl_automount_root: String,
+    /// Explicit `delta` program for the diff pane, from `[ui] delta_path`.
+    /// When set it is used verbatim in git's `core.pager` on every platform
+    /// and skips WSL delta autodiscovery; when unset, native diffs run bare
+    /// `delta` (from PATH) and WSL diffs discover it inside the distro.
+    pub delta_path: Option<String>,
     pub profiles: Vec<Profile>,
     /// Validated at load: always names an entry in `profiles` when `Some`.
     pub default_profile: Option<String>,
@@ -329,6 +334,7 @@ impl Default for Config {
             bindings: Vec::new(),
             ipc_socket: true,
             wsl_automount_root: "/mnt".to_string(),
+            delta_path: None,
             profiles: Vec::new(),
             default_profile: None,
         }
@@ -822,6 +828,7 @@ struct RawUi {
     /// When the sidebar × on a session row asks before killing the PTY:
     /// "never" (default) | "busy" | "always".
     confirm_session_close: Option<String>,
+    delta_path: Option<String>,
     icons: RawUiIcons,
     wsl: RawUiWsl,
     profiles: Vec<RawProfile>,
@@ -1096,6 +1103,7 @@ impl RawConfig {
             bindings,
             ipc_socket: self.general.ipc_socket.unwrap_or(true),
             wsl_automount_root,
+            delta_path: self.ui.delta_path.filter(|s| !s.trim().is_empty()),
             profiles,
             default_profile,
         }
@@ -1187,6 +1195,19 @@ mod tests {
         // Nonsense values fall back rather than corrupting every translation.
         let raw: RawConfig = toml::from_str("[ui.wsl]\nautomount_root = \"mnt\"").unwrap();
         assert_eq!(raw.into_config().wsl_automount_root, "/mnt");
+    }
+
+    #[test]
+    fn delta_path_parses_and_blank_is_none() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        assert_eq!(raw.into_config().delta_path, None);
+
+        let raw: RawConfig = toml::from_str("[ui]\ndelta_path = \"/opt/delta\"").unwrap();
+        assert_eq!(raw.into_config().delta_path.as_deref(), Some("/opt/delta"));
+
+        // A blank override is treated as unset so discovery still runs.
+        let raw: RawConfig = toml::from_str("[ui]\ndelta_path = \"  \"").unwrap();
+        assert_eq!(raw.into_config().delta_path, None);
     }
 
     #[test]
