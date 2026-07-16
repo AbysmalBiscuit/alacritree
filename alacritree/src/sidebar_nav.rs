@@ -85,6 +85,20 @@ pub fn left_target(rows: &[SidebarRow], cursor: &SidebarRow) -> Option<SidebarRo
     }
 }
 
+/// The nearest project header strictly after `cursor` — the PageDown-style
+/// project jump.  `None` when no header follows or the cursor has vanished
+/// from `rows` (the caller reseats it, as `step` callers do).
+pub fn next_project(rows: &[SidebarRow], cursor: &SidebarRow) -> Option<SidebarRow> {
+    let pos = rows.iter().position(|r| r == cursor)?;
+    rows[pos + 1..].iter().find(|r| matches!(r, SidebarRow::Project(_))).cloned()
+}
+
+/// The nearest project header strictly before `cursor`.
+pub fn previous_project(rows: &[SidebarRow], cursor: &SidebarRow) -> Option<SidebarRow> {
+    let pos = rows.iter().position(|r| r == cursor)?;
+    rows[..pos].iter().rev().find(|r| matches!(r, SidebarRow::Project(_))).cloned()
+}
+
 /// Where the cursor lands when the sidebar gains focus: the active session's
 /// row when it's currently listed in the sidebar, otherwise the current
 /// workspace's row, its project header when that project is collapsed, or
@@ -481,5 +495,57 @@ mod tests {
         // Empty rows always fall back to None.
         assert_eq!(ensure_cursor(&[], Some(&SidebarRow::Home)), None);
         assert_eq!(ensure_cursor(&[], None), None);
+    }
+
+    #[test]
+    fn next_project_jumps_to_the_nearest_header_below() {
+        let projects = vec![project("/a", true, &["/a/wt1"]), project("/b", true, &["/b/wt1"])];
+        let rows = visible_rows(&projects, &no_sessions());
+        assert_eq!(
+            next_project(&rows, &SidebarRow::Home),
+            Some(SidebarRow::Project(PathBuf::from("/a")))
+        );
+        assert_eq!(
+            next_project(&rows, &SidebarRow::Worktree(PathBuf::from("/a/wt1"))),
+            Some(SidebarRow::Project(PathBuf::from("/b")))
+        );
+        // No header below the last project's subtree: stay put (None).
+        assert_eq!(next_project(&rows, &SidebarRow::Worktree(PathBuf::from("/b/wt1"))), None);
+    }
+
+    #[test]
+    fn previous_project_jumps_to_the_nearest_header_above() {
+        let projects = vec![project("/a", true, &["/a/wt1"]), project("/b", true, &["/b/wt1"])];
+        let rows = visible_rows(&projects, &no_sessions());
+        assert_eq!(
+            previous_project(&rows, &SidebarRow::Worktree(PathBuf::from("/b/wt1"))),
+            Some(SidebarRow::Project(PathBuf::from("/b")))
+        );
+        assert_eq!(
+            previous_project(&rows, &SidebarRow::Project(PathBuf::from("/b"))),
+            Some(SidebarRow::Project(PathBuf::from("/a")))
+        );
+        // Nothing above the first header or on Home: None.
+        assert_eq!(previous_project(&rows, &SidebarRow::Project(PathBuf::from("/a"))), None);
+        assert_eq!(previous_project(&rows, &SidebarRow::Home), None);
+    }
+
+    #[test]
+    fn project_jumps_from_session_rows_and_vanished_cursors() {
+        let projects = vec![project("/a", true, &["/a/wt1"]), project("/b", true, &["/b/wt1"])];
+        let sessions = HashMap::from([(Some(PathBuf::from("/a/wt1")), vec![7])]);
+        let rows = visible_rows(&projects, &sessions);
+        assert_eq!(
+            next_project(&rows, &SidebarRow::Session(7)),
+            Some(SidebarRow::Project(PathBuf::from("/b")))
+        );
+        assert_eq!(
+            previous_project(&rows, &SidebarRow::Session(7)),
+            Some(SidebarRow::Project(PathBuf::from("/a")))
+        );
+        // A cursor no longer in the rows has no anchor: None, caller reseats.
+        let gone = SidebarRow::Worktree(PathBuf::from("/gone"));
+        assert_eq!(next_project(&rows, &gone), None);
+        assert_eq!(previous_project(&rows, &gone), None);
     }
 }
