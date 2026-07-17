@@ -4330,7 +4330,12 @@ impl AlacritreeApp {
                     .filter(|r| shortcuts_window::row_matches(&query, r))
                     .collect();
 
-                egui::ScrollArea::vertical().max_height(list_height).show(ui, |ui| {
+                // auto_shrink would size the scroll area to the grids'
+                // content, leaving a dead margin between the rows and the
+                // window edge; fill the window's width instead.
+                let scroll =
+                    egui::ScrollArea::vertical().max_height(list_height).auto_shrink([false, true]);
+                scroll.show(ui, |ui| {
                     if scroll_delta != 0.0 {
                         ui.scroll_with_delta(egui::vec2(0.0, scroll_delta));
                     }
@@ -4348,6 +4353,10 @@ impl AlacritreeApp {
                                         RichText::new(&row.keys).color(theme.accent).monospace(),
                                     );
                                     ui.vertical(|ui| {
+                                        // Stretch the last column to the
+                                        // window edge so the stripes span the
+                                        // whole row, not just the text.
+                                        ui.set_min_width(ui.available_width());
                                         ui.label(RichText::new(&row.description).color(theme.text));
                                         ui.label(
                                             RichText::new(&row.name).color(theme.text_dim).small(),
@@ -4372,7 +4381,10 @@ impl AlacritreeApp {
                                     ui.label(
                                         RichText::new(&row.keys).color(theme.accent).monospace(),
                                     );
-                                    ui.label(RichText::new(&row.description).color(theme.text));
+                                    ui.vertical(|ui| {
+                                        ui.set_min_width(ui.available_width());
+                                        ui.label(RichText::new(&row.description).color(theme.text));
+                                    });
                                     ui.end_row();
                                 }
                             },
