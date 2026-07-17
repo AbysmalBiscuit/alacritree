@@ -4252,10 +4252,31 @@ impl AlacritreeApp {
     fn show_shortcuts_window(&mut self, ctx: &Context) {
         let theme = self.theme;
         let s = theme.ui_scale;
+        let list_height = 420.0 * s;
+        let mut scroll_delta = 0.0;
 
         // Keys pressed mid-composition drive the IME's candidate window, not this
         // window, so leave Esc and `/` in the event queue for it to see.
         if self.ime.preedit().is_none() {
+            // The search box keeps keyboard focus, so scrolling keys are
+            // consumed here before the TextEdit swallows them; the wheel
+            // shouldn't be the only way to reach rows below the fold.
+            scroll_delta = ctx.input_mut(|i| {
+                let mut delta = 0.0;
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                    delta += 40.0 * s;
+                }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                    delta -= 40.0 * s;
+                }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::PageUp) {
+                    delta += list_height;
+                }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::PageDown) {
+                    delta -= list_height;
+                }
+                delta
+            });
             // Esc narrows before it closes: drain it ahead of the TextEdit,
             // which would otherwise only drop focus.
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
@@ -4309,7 +4330,10 @@ impl AlacritreeApp {
                     .filter(|r| shortcuts_window::row_matches(&query, r))
                     .collect();
 
-                egui::ScrollArea::vertical().max_height(420.0 * s).show(ui, |ui| {
+                egui::ScrollArea::vertical().max_height(list_height).show(ui, |ui| {
+                    if scroll_delta != 0.0 {
+                        ui.scroll_with_delta(egui::vec2(0.0, scroll_delta));
+                    }
                     if app_rows.is_empty() && nav_rows.is_empty() {
                         ui.label(RichText::new("no matches").color(theme.text_dim));
                         return;
