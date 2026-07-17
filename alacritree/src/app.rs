@@ -124,17 +124,81 @@ fn blend_toward(c: Color32, target: Color32, amount: f32) -> Color32 {
 /// Which pane owns keyboard input.  The terminal re-requests egui focus
 /// every frame while it owns this; anything else holding focus (modals
 /// aside) must win here first.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaneFocus {
     Terminal,
     ProjectsSidebar,
     GitSidebar,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusDir {
+    Left,
+    Right,
+}
+
+/// Where a dispatched binding action came from.  A keyboard action consumed
+/// a real key press, so FocusLeft/FocusRight may re-synthesize it into the
+/// PTY when the inner TUI should handle it.  An IPC action has no key press
+/// to forward — the caller is typically that inner program declaring it has
+/// no window in the requested direction, and passthrough would bounce the
+/// key straight back to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionOrigin {
+    Keyboard,
+    Ipc,
+}
+
+/// What a FocusLeft/FocusRight press does, decided by [`focus_move`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusMove {
+    /// The TUI inside the terminal can still move that way — forward the
+    /// Ctrl+Arrow to the PTY instead of switching panels.
+    Passthrough,
+    Focus(PaneFocus),
+    Nothing,
+}
+
+/// Panel-focus decision for FocusLeft/FocusRight.  Panels sit in a fixed
+/// `ProjectsSidebar ↔ Terminal ↔ GitSidebar` row; movement toward a hidden
+/// panel is dropped (focus never opens a panel).  From the terminal, a
+/// keyboard-originated move is forwarded to a running split-managing TUI
+/// (`tui_running`, see [`Session::nav_tui_running`]): the TUI walks its own
+/// splits and hands focus back with `alacritree action Focus…` once it has
+/// no window left in that direction — which is why IPC moves never pass
+/// through (see [`ActionOrigin`]).
+fn focus_move(
+    focus: PaneFocus,
+    dir: FocusDir,
+    left_open: bool,
+    right_open: bool,
+    origin: ActionOrigin,
+    tui_running: bool,
+) -> FocusMove {
+    if origin == ActionOrigin::Keyboard && focus == PaneFocus::Terminal && tui_running {
+        return FocusMove::Passthrough;
+    }
+    let target = match (focus, dir) {
+        (PaneFocus::Terminal, FocusDir::Left) => left_open.then_some(PaneFocus::ProjectsSidebar),
+        (PaneFocus::Terminal, FocusDir::Right) => right_open.then_some(PaneFocus::GitSidebar),
+        (PaneFocus::ProjectsSidebar, FocusDir::Right) => Some(PaneFocus::Terminal),
+        (PaneFocus::GitSidebar, FocusDir::Left) => Some(PaneFocus::Terminal),
+        _ => None,
+    };
+    match target {
+        Some(t) => FocusMove::Focus(t),
+        None => FocusMove::Nothing,
+    }
+}
+
 pub struct AlacritreeApp {
     show_left_sidebar: bool,
     show_right_sidebar: bool,
     focus: PaneFocus,
+    /// Runtime copies of `[ui.session_display]`.  The config is only the
+    /// startup default; toggles flip these and are never persisted.
+    session_rows_always: bool,
+    session_tabs_always: bool,
     sidebar_cursor: Option<SidebarRow>,
     /// Reveals the project rows' drag grips.  A transient mode, not persisted:
     /// reordering is a rare, deliberate act, and a grip on every row the rest
@@ -435,6 +499,8 @@ impl AlacritreeApp {
             show_left_sidebar: persisted.show_left_sidebar,
             show_right_sidebar: persisted.show_right_sidebar,
             focus: PaneFocus::Terminal,
+            session_rows_always: config.ui.session_display.sidebar_always,
+            session_tabs_always: config.ui.session_display.tabs_always,
             sidebar_cursor: None,
             reorder_mode: false,
             sidebar_auto_shown: false,
@@ -1003,6 +1069,39 @@ impl AlacritreeApp {
         }
     }
 
+    fn move_focus(&mut self, dir: FocusDir, origin: ActionOrigin) {
+        let idx = self.active_session_index();
+        let tui_running = idx.is_some_and(|i| self.sessions[i].nav_tui_running());
+        let decision = focus_move(
+            self.focus,
+            dir,
+            self.show_left_sidebar,
+            self.show_right_sidebar,
+            origin,
+            tui_running,
+        );
+        match decision {
+            FocusMove::Passthrough => {
+                let Some(i) = idx else { return };
+                let key = match dir {
+                    FocusDir::Left => egui::Key::ArrowLeft,
+                    FocusDir::Right => egui::Key::ArrowRight,
+                };
+                let mode = *self.sessions[i].term.lock().mode();
+                // The binding consumed the key press before the terminal view
+                // saw it, so the Ctrl+Arrow the inner TUI listens for is
+                // re-synthesized with the terminal's own encoding.
+                if let Some(bytes) = crate::input::key_to_bytes(key, egui::Modifiers::CTRL, mode) {
+                    self.sessions[i].write(bytes);
+                }
+            },
+            FocusMove::Focus(PaneFocus::ProjectsSidebar) => self.focus_sidebar(),
+            FocusMove::Focus(PaneFocus::Terminal) => self.focus_terminal(),
+            FocusMove::Focus(PaneFocus::GitSidebar) => self.focus = PaneFocus::GitSidebar,
+            FocusMove::Nothing => {},
+        }
+    }
+
     /// Match key events against the binding table (user bindings + defaults)
     /// before the terminal sees raw events, so a binding wins over plain
     /// text input.  Matched events are consumed unless every matched action
@@ -1043,7 +1142,7 @@ impl AlacritreeApp {
             actions
         });
         for action in actions {
-            self.dispatch_action(ctx, action);
+            self.dispatch_action(ctx, action, ActionOrigin::Keyboard);
         }
     }
 
@@ -1492,7 +1591,7 @@ impl AlacritreeApp {
         }
     }
 
-    fn dispatch_action(&mut self, ctx: &Context, action: BindingAction) {
+    fn dispatch_action(&mut self, ctx: &Context, action: BindingAction, origin: ActionOrigin) {
         match action {
             BindingAction::Chars(bytes) => {
                 if let Some(idx) = self.active_session_index() {
@@ -1588,6 +1687,12 @@ impl AlacritreeApp {
                 }
                 self.persist_sidebars();
             },
+            BindingAction::Named(NamedAction::ToggleSessionRows) => {
+                self.session_rows_always = !self.session_rows_always;
+            },
+            BindingAction::Named(NamedAction::ToggleSessionTabs) => {
+                self.session_tabs_always = !self.session_tabs_always;
+            },
             BindingAction::Named(NamedAction::SelectNextWorkspace) => {
                 self.cycle_workspaces(ctx, 1);
             },
@@ -1645,6 +1750,12 @@ impl AlacritreeApp {
                 }
             },
             BindingAction::Named(NamedAction::FocusTerminal) => self.focus_terminal(),
+            BindingAction::Named(NamedAction::FocusLeft) => {
+                self.move_focus(FocusDir::Left, origin);
+            },
+            BindingAction::Named(NamedAction::FocusRight) => {
+                self.move_focus(FocusDir::Right, origin);
+            },
             BindingAction::Named(other) => {
                 self.dispatch_scroll_or_other(other);
             },
@@ -1717,10 +1828,11 @@ impl AlacritreeApp {
             ui.allocate_exact_size(egui::vec2(avail, strip_height + 2.0), egui::Sense::hover());
 
         let mut activate: Option<SessionId> = None;
-        // Session segments only when there is a choice to make, but the
-        // trailing + segment always renders alongside them once the strip
-        // itself renders (i.e. at least one session exists).
-        if indices.len() >= 2 {
+        // Session segments only when there is a choice to make (or the user
+        // forces them via session_display), but the trailing + segment always
+        // renders alongside them once the strip itself renders (i.e. at least
+        // one session exists).
+        if indices.len() >= 2 || self.session_tabs_always {
             let seg_avail = avail - plus_width - gap;
             let segment_width =
                 ((seg_avail - gap * (indices.len() as f32 - 1.0)) / indices.len() as f32).max(1.0);
@@ -3553,13 +3665,19 @@ struct SessionRowData {
     is_displayed: bool,
 }
 
-/// Spawn-ordered ids of the sessions in `ws`, or empty below the two-session
-/// list threshold — a single-session workspace row keeps its compact form,
-/// mirroring the tab strip. Pure over (workspace, id) pairs so the grouping
-/// rule is testable without spawning PTYs.
-fn sidebar_session_ids(pairs: &[(WorkspaceKey, SessionId)], ws: &WorkspaceKey) -> Vec<SessionId> {
+/// Spawn-ordered ids of the sessions in `ws`, or empty below the list
+/// threshold.  The threshold is normally two — a single-session workspace row
+/// keeps its compact form, mirroring the tab strip — and `always` lowers it
+/// to one.  Pure over (workspace, id) pairs so the grouping rule is testable
+/// without spawning PTYs.
+fn sidebar_session_ids(
+    pairs: &[(WorkspaceKey, SessionId)],
+    ws: &WorkspaceKey,
+    always: bool,
+) -> Vec<SessionId> {
     let ids: Vec<SessionId> = pairs.iter().filter(|(w, _)| w == ws).map(|(_, id)| *id).collect();
-    if ids.len() < 2 { Vec::new() } else { ids }
+    let threshold = if always { 1 } else { 2 };
+    if ids.len() < threshold { Vec::new() } else { ids }
 }
 
 /// Where the view goes after a session's removal.
@@ -3963,7 +4081,7 @@ impl AlacritreeApp {
         let mut listed = sidebar_nav::ListedSessions::new();
         for (ws, _) in &pairs {
             if !listed.contains_key(ws) {
-                let ids = sidebar_session_ids(&pairs, ws);
+                let ids = sidebar_session_ids(&pairs, ws, self.session_rows_always);
                 if !ids.is_empty() {
                     listed.insert(ws.clone(), ids);
                 }
@@ -3973,11 +4091,11 @@ impl AlacritreeApp {
     }
 
     /// Session rows for `ws`'s sidebar list, per `sidebar_session_ids`'s
-    /// two-session threshold.
+    /// list threshold.
     fn workspace_session_rows(&self, ws: &WorkspaceKey) -> Vec<SessionRowData> {
         let pairs: Vec<(WorkspaceKey, SessionId)> =
             self.sessions.iter().map(|s| (s.working_directory.clone(), s.id)).collect();
-        let ids = sidebar_session_ids(&pairs, ws);
+        let ids = sidebar_session_ids(&pairs, ws, self.session_rows_always);
         let active = self.active_session.get(ws).copied();
         let is_current = self.current_workspace == *ws;
         ids.iter()
@@ -4970,6 +5088,13 @@ impl AlacritreeApp {
                 let idx = self.rename_project(&root, label)?;
                 Ok(project_json(&self.projects[idx]))
             },
+            Req::RunAction { action } => match crate::bindings::parse_action(&action) {
+                BindingAction::Unsupported(name) => Err(format!("unknown action `{name}`")),
+                parsed => {
+                    self.dispatch_action(ctx, parsed, ActionOrigin::Ipc);
+                    Ok(json!({ "action": action }))
+                },
+            },
             // Dispatched on the IPC connection thread; never forwarded here.
             Req::GitStatus { .. } | Req::CreateWorktree { .. } => {
                 Err("request is handled off the UI thread".to_string())
@@ -5242,16 +5367,16 @@ mod tests {
     #[test]
     fn session_ids_filter_by_workspace_and_keep_spawn_order() {
         let pairs = vec![(None, 1), (ws("/a"), 2), (None, 3), (ws("/b"), 4), (ws("/a"), 5)];
-        assert_eq!(sidebar_session_ids(&pairs, &None), vec![1, 3]);
-        assert_eq!(sidebar_session_ids(&pairs, &ws("/a")), vec![2, 5]);
+        assert_eq!(sidebar_session_ids(&pairs, &None, false), vec![1, 3]);
+        assert_eq!(sidebar_session_ids(&pairs, &ws("/a"), false), vec![2, 5]);
         // /b has a single session, below the two-session list threshold.
-        assert!(sidebar_session_ids(&pairs, &ws("/b")).is_empty());
+        assert!(sidebar_session_ids(&pairs, &ws("/b"), false).is_empty());
     }
 
     #[test]
     fn session_ids_empty_for_unknown_workspace() {
         let pairs = vec![(None, 1)];
-        assert!(sidebar_session_ids(&pairs, &ws("/missing")).is_empty());
+        assert!(sidebar_session_ids(&pairs, &ws("/missing"), false).is_empty());
     }
 
     #[test]
@@ -5268,13 +5393,23 @@ mod tests {
     #[test]
     fn session_ids_apply_two_session_threshold() {
         let no_match: Vec<(WorkspaceKey, SessionId)> = vec![(ws("/other"), 1)];
-        assert!(sidebar_session_ids(&no_match, &ws("/a")).is_empty());
+        assert!(sidebar_session_ids(&no_match, &ws("/a"), false).is_empty());
 
         let one_match = vec![(ws("/a"), 1), (ws("/other"), 2)];
-        assert!(sidebar_session_ids(&one_match, &ws("/a")).is_empty());
+        assert!(sidebar_session_ids(&one_match, &ws("/a"), false).is_empty());
 
         let two_match = vec![(ws("/a"), 1), (ws("/other"), 2), (ws("/a"), 3)];
-        assert_eq!(sidebar_session_ids(&two_match, &ws("/a")), vec![1, 3]);
+        assert_eq!(sidebar_session_ids(&two_match, &ws("/a"), false), vec![1, 3]);
+    }
+
+    #[test]
+    fn session_ids_always_flag_lists_single_sessions() {
+        let one_match = vec![(ws("/a"), 1), (ws("/other"), 2)];
+        assert_eq!(sidebar_session_ids(&one_match, &ws("/a"), true), vec![1]);
+
+        // Zero sessions stays empty even with the flag on.
+        let no_match: Vec<(WorkspaceKey, SessionId)> = vec![(ws("/other"), 2)];
+        assert!(sidebar_session_ids(&no_match, &ws("/a"), true).is_empty());
     }
 
     use crate::projects::{Project, Worktree};
@@ -5373,6 +5508,91 @@ mod tests {
         // The main itself and unknown paths have no fallback target.
         assert_eq!(project_main_for(&projects, Path::new("/repo")), None);
         assert_eq!(project_main_for(&projects, Path::new("/elsewhere")), None);
+    }
+
+    /// Keyboard-originated `focus_move` with both panels open.
+    fn mv(focus: PaneFocus, dir: FocusDir, tui_running: bool) -> FocusMove {
+        focus_move(focus, dir, true, true, ActionOrigin::Keyboard, tui_running)
+    }
+
+    #[test]
+    fn focus_moves_between_open_panels() {
+        assert_eq!(
+            mv(PaneFocus::Terminal, FocusDir::Left, false),
+            FocusMove::Focus(PaneFocus::ProjectsSidebar)
+        );
+        assert_eq!(
+            mv(PaneFocus::Terminal, FocusDir::Right, false),
+            FocusMove::Focus(PaneFocus::GitSidebar)
+        );
+        assert_eq!(
+            mv(PaneFocus::ProjectsSidebar, FocusDir::Right, false),
+            FocusMove::Focus(PaneFocus::Terminal)
+        );
+        assert_eq!(
+            mv(PaneFocus::GitSidebar, FocusDir::Left, false),
+            FocusMove::Focus(PaneFocus::Terminal)
+        );
+    }
+
+    #[test]
+    fn focus_stops_at_the_outer_edges() {
+        assert_eq!(mv(PaneFocus::ProjectsSidebar, FocusDir::Left, false), FocusMove::Nothing);
+        assert_eq!(mv(PaneFocus::GitSidebar, FocusDir::Right, false), FocusMove::Nothing);
+    }
+
+    #[test]
+    fn focus_never_moves_toward_a_closed_panel() {
+        assert_eq!(
+            focus_move(
+                PaneFocus::Terminal,
+                FocusDir::Left,
+                false,
+                true,
+                ActionOrigin::Keyboard,
+                false
+            ),
+            FocusMove::Nothing
+        );
+        assert_eq!(
+            focus_move(
+                PaneFocus::Terminal,
+                FocusDir::Right,
+                true,
+                false,
+                ActionOrigin::Keyboard,
+                false
+            ),
+            FocusMove::Nothing
+        );
+    }
+
+    #[test]
+    fn running_tui_keeps_the_key() {
+        assert_eq!(mv(PaneFocus::Terminal, FocusDir::Left, true), FocusMove::Passthrough);
+        assert_eq!(mv(PaneFocus::Terminal, FocusDir::Right, true), FocusMove::Passthrough);
+    }
+
+    #[test]
+    fn sidebars_never_pass_through() {
+        assert_eq!(
+            mv(PaneFocus::ProjectsSidebar, FocusDir::Right, true),
+            FocusMove::Focus(PaneFocus::Terminal)
+        );
+    }
+
+    /// An IPC move is the inner program saying it is out of windows —
+    /// passthrough would bounce the key straight back to it.
+    #[test]
+    fn ipc_moves_never_pass_through() {
+        assert_eq!(
+            focus_move(PaneFocus::Terminal, FocusDir::Left, true, true, ActionOrigin::Ipc, true),
+            FocusMove::Focus(PaneFocus::ProjectsSidebar)
+        );
+        assert_eq!(
+            focus_move(PaneFocus::Terminal, FocusDir::Left, false, true, ActionOrigin::Ipc, true),
+            FocusMove::Nothing
+        );
     }
 
     fn req(file: &str, source: DiffSource) -> DiffRequest {
