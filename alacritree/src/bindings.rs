@@ -52,6 +52,10 @@ pub enum NamedAction {
     AddProject,
     ToggleSidebarFocus,
     CloseSession,
+    SidebarTop,
+    SidebarBottom,
+    SidebarNextProject,
+    SidebarPreviousProject,
     FocusProjectsSidebar,
     FocusGitSidebar,
     FocusTerminal,
@@ -64,6 +68,22 @@ pub enum NamedAction {
     /// us) but suppress_chars stays off so the key still reaches the PTY.
     /// Mirrors `Action::ReceiveChar` in `alacritty/src/input/keyboard.rs`.
     ReceiveChar,
+}
+
+impl NamedAction {
+    /// Actions that drive the projects-sidebar cursor.  Their default keys
+    /// (unmodified Home/End/PageUp/PageDown) are terminal input the rest of
+    /// the time, so dispatch must not consume them unless the sidebar owns
+    /// focus.
+    pub fn is_sidebar_scoped(&self) -> bool {
+        matches!(
+            self,
+            Self::SidebarTop
+                | Self::SidebarBottom
+                | Self::SidebarNextProject
+                | Self::SidebarPreviousProject
+        )
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -194,6 +214,26 @@ fn default_bindings() -> Vec<KeyBinding> {
             key: Key::B,
             mods: ctrl_shift,
             action: BindingAction::Named(ToggleSidebarFocus),
+        },
+        KeyBinding {
+            key: Key::Home,
+            mods: Modifiers::NONE,
+            action: BindingAction::Named(SidebarTop),
+        },
+        KeyBinding {
+            key: Key::End,
+            mods: Modifiers::NONE,
+            action: BindingAction::Named(SidebarBottom),
+        },
+        KeyBinding {
+            key: Key::PageDown,
+            mods: Modifiers::NONE,
+            action: BindingAction::Named(SidebarNextProject),
+        },
+        KeyBinding {
+            key: Key::PageUp,
+            mods: Modifiers::NONE,
+            action: BindingAction::Named(SidebarPreviousProject),
         },
         KeyBinding { key: Key::G, mods: ctrl_shift, action: BindingAction::Named(FocusGitSidebar) },
         KeyBinding { key: Key::W, mods: ctrl_shift, action: BindingAction::Named(CloseSession) },
@@ -502,6 +542,10 @@ fn parse_action(name: &str) -> BindingAction {
         "AddProject" => BindingAction::Named(AddProject),
         "ToggleSidebarFocus" => BindingAction::Named(ToggleSidebarFocus),
         "CloseSession" => BindingAction::Named(CloseSession),
+        "SidebarTop" => BindingAction::Named(SidebarTop),
+        "SidebarBottom" => BindingAction::Named(SidebarBottom),
+        "SidebarNextProject" => BindingAction::Named(SidebarNextProject),
+        "SidebarPreviousProject" => BindingAction::Named(SidebarPreviousProject),
         "FocusProjectsSidebar" => BindingAction::Named(FocusProjectsSidebar),
         "FocusGitSidebar" => BindingAction::Named(FocusGitSidebar),
         "FocusTerminal" => BindingAction::Named(FocusTerminal),
@@ -805,5 +849,35 @@ mod tests {
             parse_action("CloseSession"),
             BindingAction::Named(NamedAction::CloseSession)
         ));
+    }
+
+    #[test]
+    fn sidebar_nav_actions_have_unmodified_defaults_and_parse() {
+        let b = parse_bindings(vec![]);
+        for (key, expected, name) in [
+            (Key::Home, NamedAction::SidebarTop, "SidebarTop"),
+            (Key::End, NamedAction::SidebarBottom, "SidebarBottom"),
+            (Key::PageDown, NamedAction::SidebarNextProject, "SidebarNextProject"),
+            (Key::PageUp, NamedAction::SidebarPreviousProject, "SidebarPreviousProject"),
+        ] {
+            assert_eq!(named_matches(&b, key, Modifiers::NONE), vec![expected], "{name}");
+            assert!(
+                matches!(parse_action(name), BindingAction::Named(a) if a == expected),
+                "{name} does not parse"
+            );
+        }
+    }
+
+    /// Only the four sidebar cursor actions are focus-scoped: everything
+    /// else (CloseSession included) must keep firing from the terminal.
+    #[test]
+    fn only_sidebar_cursor_actions_are_sidebar_scoped() {
+        use NamedAction::*;
+        for a in [SidebarTop, SidebarBottom, SidebarNextProject, SidebarPreviousProject] {
+            assert!(a.is_sidebar_scoped(), "{a:?}");
+        }
+        for a in [CloseSession, ScrollToTop, ScrollPageUp, ToggleSidebarFocus, Quit] {
+            assert!(!a.is_sidebar_scoped(), "{a:?}");
+        }
     }
 }
