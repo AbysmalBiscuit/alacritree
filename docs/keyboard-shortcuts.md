@@ -141,9 +141,9 @@ the unmodified defaults don't shadow Home/End/PageUp/PageDown in TUIs.
 - `ShowShortcuts` — toggle a searchable window listing every effective
   binding. Type to fuzzy-filter, `/` refocuses the search box, `Escape`
   clears the query and then closes, and `Up`/`Down`/`PageUp`/`PageDown`
-  scroll the list without leaving the search box. The default `F1` shadows
-  `F1` for terminal apps; rebind or free it with `ReceiveChar` if you need
-  it there.
+  scroll the list without leaving the search box. Clicking outside the
+  window closes it. The default `F1` shadows `F1` for terminal apps;
+  rebind or free it with `ReceiveChar` if you need it there.
 - `SpawnProfile1` … `SpawnProfile9` — spawn the Nth `[[ui.profiles]]` entry
   in the current workspace. Out-of-range indices show an error toast.
   Example binding:

@@ -4301,7 +4301,7 @@ impl AlacritreeApp {
             }
         }
 
-        egui::Window::new(RichText::new("Keyboard shortcuts").color(theme.text).strong())
+        let win = egui::Window::new(RichText::new("Keyboard shortcuts").color(theme.text).strong())
             .id(egui::Id::new("alacritree_shortcuts_window"))
             .frame(modal_frame(&theme))
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -4392,6 +4392,12 @@ impl AlacritreeApp {
                     }
                 });
             });
+        // An informational overlay dismisses like a context menu: a click
+        // that lands outside it closes it (the click still reaches whatever
+        // it landed on, since the overlay is not modal).
+        if win.is_some_and(|w| w.response.clicked_elsewhere()) {
+            self.shortcuts_window_open = false;
+        }
     }
 
     fn run_pending_delete(&mut self, ctx: &Context) {
