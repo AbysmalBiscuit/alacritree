@@ -26,6 +26,7 @@ use crate::bindings::{self, KeyBinding};
 pub struct Config {
     pub palette: Palette,
     pub ui: UiTheme,
+    pub ui_font: UiFont,
     pub workspace: WorkspaceConfig,
     pub font: FontConfig,
     pub cursor: CursorConfig,
@@ -241,20 +242,6 @@ fn parse_confirm_session_close(raw: Option<&str>) -> ConfirmSessionClose {
 /// resolves through the system fallback chain `fonts.rs` registers.
 const DEFAULT_SEARCH_ICON: &str = "⌕";
 
-/// Sidebar glyphs overridable via `[ui.icons]`, for users whose fonts carry
-/// nicer symbols (Nerd Fonts etc.).
-#[derive(Debug, Clone)]
-pub struct UiIcons {
-    /// Glyph prefixing the sidebar search prompt.
-    pub search: String,
-}
-
-impl Default for UiIcons {
-    fn default() -> Self {
-        Self { search: DEFAULT_SEARCH_ICON.into() }
-    }
-}
-
 /// What happens when the on-screen workspace's last session closes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LastSessionClose {
@@ -289,6 +276,75 @@ pub struct SessionDisplay {
     pub tabs_always: bool,
 }
 
+/// alacritree-only `[ui.font]`: font family/size for the chrome (sidebars,
+/// modals — everything that isn't the terminal grid).  Both fields default
+/// to deriving from `[font]`, so an absent table changes nothing.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UiFont {
+    pub family: Option<String>,
+    /// Typographic points, same unit as `[font] size`; clamped to ≥ 1.0.
+    pub size: Option<f32>,
+}
+
+/// Sidebar status glyphs, each independently overridable from `[ui.icons]`.
+/// Overrides are trimmed and a blank value falls back to the default, so a
+/// row marker can never be rendered empty.  Action buttons (×, +, ↻, ⇅) are
+/// controls, not status, and stay fixed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Icons {
+    /// Glyph prefixing the sidebar search prompt.
+    pub search: String,
+    pub worktree_main: String,
+    pub worktree: String,
+    pub session: String,
+    pub home: String,
+    pub project_expanded: String,
+    pub project_collapsed: String,
+    pub pr_open: String,
+    pub pr_draft: String,
+    pub pr_merged: String,
+    pub pr_closed: String,
+}
+
+/// `[ui.focus_outline]`: stroke a border around a panel while it owns
+/// keyboard focus.  Per-panel toggles (`sidebar` covers both side panels),
+/// shared color/thickness; both toggles default off so unmodified config
+/// keeps today's look.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FocusOutline {
+    pub sidebar: bool,
+    pub terminal: bool,
+    /// `None` falls back to the theme accent at resolution time.
+    pub color: Option<Color32>,
+    /// Absolute logical pixels (deliberately not ui_scale-multiplied);
+    /// clamped to ≥ 0.5.
+    pub thickness: f32,
+}
+
+impl Default for FocusOutline {
+    fn default() -> Self {
+        Self { sidebar: false, terminal: false, color: None, thickness: 1.0 }
+    }
+}
+
+impl Default for Icons {
+    fn default() -> Self {
+        Self {
+            search: DEFAULT_SEARCH_ICON.into(),
+            worktree_main: "●".into(),
+            worktree: "○".into(),
+            session: "▪".into(),
+            home: "⌂".into(),
+            project_expanded: "▾".into(),
+            project_collapsed: "▸".into(),
+            pr_open: "⬤".into(),
+            pr_draft: "◯".into(),
+            pr_merged: "⬤".into(),
+            pr_closed: "⬤".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UiTheme {
     pub sidebar_background: Option<Color32>,
@@ -303,7 +359,13 @@ pub struct UiTheme {
     pub last_session_close: LastSessionClose,
     /// Show single-session sidebar rows / tab segments ([`SessionDisplay`]).
     pub session_display: SessionDisplay,
-    pub icons: UiIcons,
+    /// Paint PR-status badges on worktree rows (and poll `gh` for expanded
+    /// projects' worktrees).  Off by default so an unmodified config spawns
+    /// no `gh` processes; when enabled it is best-effort like the diff-base
+    /// lookup: no `gh`, no auth, or no PR silently paints nothing.
+    pub pr_status: bool,
+    pub icons: Icons,
+    pub focus_outline: FocusOutline,
 }
 
 impl Default for UiTheme {
@@ -317,7 +379,9 @@ impl Default for UiTheme {
             confirm_session_close: ConfirmSessionClose::Never,
             last_session_close: LastSessionClose::Respawn,
             session_display: SessionDisplay::default(),
-            icons: UiIcons::default(),
+            pr_status: false,
+            icons: Icons::default(),
+            focus_outline: FocusOutline::default(),
         }
     }
 }
@@ -364,6 +428,7 @@ impl Default for Config {
         Self {
             palette: Palette::default(),
             ui: UiTheme::default(),
+            ui_font: UiFont::default(),
             workspace: WorkspaceConfig::default(),
             font: FontConfig::default(),
             cursor: CursorConfig::default(),
@@ -839,15 +904,6 @@ struct RawIndexed {
     color: RgbStr,
 }
 
-/// `[ui.icons]`: sidebar glyph overrides.  Any string works, so Nerd Font
-/// users can substitute their own icons.
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct RawUiIcons {
-    /// Glyph prefixing the sidebar search prompt.
-    search: Option<String>,
-}
-
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RawUiWsl {
@@ -858,6 +914,48 @@ struct RawUiWsl {
     automount_root: Option<String>,
 }
 
+/// `[ui.icons]`: sidebar glyph overrides.  Any string works, so Nerd Font
+/// users can substitute their own icons.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawIcons {
+    search: Option<String>,
+    worktree_main: Option<String>,
+    worktree: Option<String>,
+    session: Option<String>,
+    home: Option<String>,
+    project_expanded: Option<String>,
+    project_collapsed: Option<String>,
+    pr_open: Option<String>,
+    pr_draft: Option<String>,
+    pr_merged: Option<String>,
+    pr_closed: Option<String>,
+}
+
+/// A trimmed, non-blank override — or the default.
+fn icon_or(raw: Option<String>, default: &str) -> String {
+    raw.map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
+fn build_icons(raw: RawIcons) -> Icons {
+    let d = Icons::default();
+    Icons {
+        search: icon_or(raw.search, &d.search),
+        worktree_main: icon_or(raw.worktree_main, &d.worktree_main),
+        worktree: icon_or(raw.worktree, &d.worktree),
+        session: icon_or(raw.session, &d.session),
+        home: icon_or(raw.home, &d.home),
+        project_expanded: icon_or(raw.project_expanded, &d.project_expanded),
+        project_collapsed: icon_or(raw.project_collapsed, &d.project_collapsed),
+        pr_open: icon_or(raw.pr_open, &d.pr_open),
+        pr_draft: icon_or(raw.pr_draft, &d.pr_draft),
+        pr_merged: icon_or(raw.pr_merged, &d.pr_merged),
+        pr_closed: icon_or(raw.pr_closed, &d.pr_closed),
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RawSessionDisplay {
@@ -865,6 +963,22 @@ struct RawSessionDisplay {
     sidebar_always: Option<bool>,
     /// Draw a tab-strip segment even with a single session.
     tabs_always: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawUiFont {
+    family: Option<String>,
+    size: Option<f32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawFocusOutline {
+    sidebar: Option<bool>,
+    terminal: Option<bool>,
+    color: Option<RgbStr>,
+    thickness: Option<f32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -883,10 +997,13 @@ struct RawUi {
     last_session_close: Option<String>,
     session_display: RawSessionDisplay,
     delta_path: Option<String>,
-    icons: RawUiIcons,
+    icons: RawIcons,
+    pr_status: Option<bool>,
+    font: RawUiFont,
     wsl: RawUiWsl,
     profiles: Vec<RawProfile>,
     default_profile: Option<String>,
+    focus_outline: RawFocusOutline,
 }
 
 /// One `[[ui.profiles]]` entry.  Fields are optional so a malformed entry
@@ -1017,8 +1134,13 @@ impl RawConfig {
                 sidebar_always: self.ui.session_display.sidebar_always.unwrap_or(false),
                 tabs_always: self.ui.session_display.tabs_always.unwrap_or(false),
             },
-            icons: UiIcons {
-                search: self.ui.icons.search.unwrap_or_else(|| DEFAULT_SEARCH_ICON.into()),
+            pr_status: self.ui.pr_status.unwrap_or(false),
+            icons: build_icons(self.ui.icons),
+            focus_outline: FocusOutline {
+                sidebar: self.ui.focus_outline.sidebar.unwrap_or(false),
+                terminal: self.ui.focus_outline.terminal.unwrap_or(false),
+                color: self.ui.focus_outline.color.map(|v| rgb_to_color32(v.0)),
+                thickness: self.ui.focus_outline.thickness.map_or(1.0, |t| t.max(0.5)),
             },
         };
 
@@ -1138,6 +1260,12 @@ impl RawConfig {
             .filter(|r| r.starts_with('/') && r.len() > 1)
             .unwrap_or_else(|| "/mnt".to_string());
 
+        // ---- UI Font ----
+        let ui_font = UiFont {
+            family: self.ui.font.family.clone().filter(|f| !f.trim().is_empty()),
+            size: self.ui.font.size.map(|s| s.max(1.0)),
+        };
+
         // ---- Profiles ----
         let profiles = build_profiles(self.ui.profiles);
         let default_profile = self.ui.default_profile.filter(|n| {
@@ -1151,6 +1279,7 @@ impl RawConfig {
         Config {
             palette,
             ui,
+            ui_font,
             workspace,
             font,
             cursor,
@@ -1530,5 +1659,94 @@ program = "second"
         let sd = raw.into_config().ui.session_display;
         assert!(sd.sidebar_always);
         assert!(sd.tabs_always);
+    }
+
+    #[test]
+    fn ui_font_defaults_to_none() {
+        let config = parse("");
+        assert_eq!(config.ui_font, UiFont::default());
+    }
+
+    #[test]
+    fn ui_font_parses_family_and_size() {
+        let config = parse("[ui.font]\nfamily = \"Inter\"\nsize = 12.5");
+        assert_eq!(config.ui_font.family.as_deref(), Some("Inter"));
+        assert_eq!(config.ui_font.size, Some(12.5));
+    }
+
+    #[test]
+    fn ui_font_size_clamps_to_one() {
+        let config = parse("[ui.font]\nsize = 0.1");
+        assert_eq!(config.ui_font.size, Some(1.0));
+    }
+
+    #[test]
+    fn blank_ui_font_family_is_ignored() {
+        let config = parse("[ui.font]\nfamily = \"  \"");
+        assert_eq!(config.ui_font.family, None);
+    }
+
+    #[test]
+    fn icons_default_to_todays_glyphs() {
+        let ui = ui_from_toml("");
+        assert_eq!(ui.icons, Icons::default());
+        assert_eq!(ui.icons.worktree_main, "●");
+        assert_eq!(ui.icons.worktree, "○");
+        assert_eq!(ui.icons.session, "▪");
+        assert_eq!(ui.icons.home, "⌂");
+        assert_eq!(ui.icons.project_expanded, "▾");
+        assert_eq!(ui.icons.project_collapsed, "▸");
+        assert_eq!(ui.icons.pr_open, "⬤");
+        assert_eq!(ui.icons.pr_draft, "◯");
+        assert_eq!(ui.icons.pr_merged, "⬤");
+        assert_eq!(ui.icons.pr_closed, "⬤");
+    }
+
+    #[test]
+    fn icon_overrides_apply_and_trim() {
+        let ui = ui_from_toml("[ui.icons]\nworktree = \" W \"\nhome = \"H\"");
+        assert_eq!(ui.icons.worktree, "W");
+        assert_eq!(ui.icons.home, "H");
+        assert_eq!(ui.icons.worktree_main, "●", "untouched fields keep defaults");
+    }
+
+    #[test]
+    fn blank_icon_override_falls_back() {
+        let ui = ui_from_toml("[ui.icons]\nworktree_main = \"   \"\nsession = \"\"");
+        assert_eq!(ui.icons.worktree_main, "●");
+        assert_eq!(ui.icons.session, "▪");
+    }
+
+    #[test]
+    fn pr_status_defaults_off_and_parses_on() {
+        assert!(!ui_from_toml("").pr_status);
+        assert!(ui_from_toml("[ui]\npr_status = true").pr_status);
+    }
+
+    #[test]
+    fn focus_outline_defaults_off() {
+        let fo = ui_from_toml("").focus_outline;
+        assert!(!fo.sidebar);
+        assert!(!fo.terminal);
+        assert_eq!(fo.color, None);
+        assert_eq!(fo.thickness, 1.0);
+    }
+
+    #[test]
+    fn focus_outline_parses_all_fields() {
+        let fo = ui_from_toml(
+            "[ui.focus_outline]\nsidebar = true\nterminal = true\ncolor = \"#89b4fa\"\nthickness = 2.5",
+        )
+        .focus_outline;
+        assert!(fo.sidebar);
+        assert!(fo.terminal);
+        assert_eq!(fo.color, Some(Color32::from_rgb(0x89, 0xb4, 0xfa)));
+        assert_eq!(fo.thickness, 2.5);
+    }
+
+    #[test]
+    fn focus_outline_thickness_clamps() {
+        let fo = ui_from_toml("[ui.focus_outline]\nthickness = 0.1").focus_outline;
+        assert_eq!(fo.thickness, 0.5);
     }
 }

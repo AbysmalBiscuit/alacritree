@@ -24,11 +24,22 @@ use crate::wsl;
 /// `gh` on every status refresh.
 const TTL: Duration = Duration::from_secs(300);
 
+/// GitHub's PR lifecycle, folded to what the sidebar paints.  `gh` reports
+/// draftness as a separate boolean, so OPEN splits into Open/Draft here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrState {
+    Open,
+    Draft,
+    Merged,
+    Closed,
+}
+
 #[derive(Debug, Clone)]
 pub struct PrInfo {
     pub number: u64,
     pub base_branch: String,
     pub url: String,
+    pub state: PrState,
 }
 
 #[derive(Default)]
@@ -47,7 +58,7 @@ struct Entry {
 }
 
 struct LookupResult {
-    branch: Option<String>,
+    branch: String,
     info: Option<PrInfo>,
 }
 
@@ -77,43 +88,66 @@ impl PrCache {
         // refresh — a result that just arrived shouldn't be ignored.
         if let Some(rx) = entry.pending.as_ref() {
             if let Ok(result) = rx.try_recv() {
-                entry.branch = result.branch;
+                entry.branch = Some(result.branch);
                 entry.info = result.info;
                 entry.queried_at = Some(Instant::now());
                 entry.pending = None;
             }
         }
 
-        let branch_matches = entry.branch.as_deref() == branch;
-        let fresh = entry.queried_at.map_or(false, |when| when.elapsed() < TTL);
-        let needs_refresh = !branch_matches || !fresh;
+        // A `None` poll (the git-status compute hasn't produced a branch
+        // yet, or never will) carries no information about the current
+        // branch, so it must not evict or refresh a lookup keyed to a real
+        // one from another caller — just read whatever is cached.
+        let Some(branch) = branch else {
+            return entry.info.clone();
+        };
 
-        if needs_refresh && entry.pending.is_none() {
+        let invalidate = should_invalidate(entry.branch.as_deref(), Some(branch));
+        let fresh = entry.queried_at.map_or(false, |when| when.elapsed() < TTL);
+
+        if (invalidate || !fresh) && entry.pending.is_none() {
             // Clear stale data immediately on branch switch so we don't show
             // a PR base that belongs to a different branch.
-            if !branch_matches {
+            if invalidate {
                 entry.info = None;
             }
-            entry.pending =
-                Some(spawn_lookup(path.to_path_buf(), branch.map(str::to_string), ctx.clone()));
+            entry.pending = Some(spawn_lookup(path.to_path_buf(), branch.to_string(), ctx.clone()));
         }
 
         entry.info.clone()
     }
 }
 
-fn spawn_lookup(
-    path: PathBuf,
-    branch: Option<String>,
-    ctx: egui::Context,
-) -> Receiver<LookupResult> {
+/// A `None` incoming branch never invalidates — the caller has nothing to
+/// compare against. A `Some` branch that disagrees with the cached one means
+/// a real branch switch and must invalidate.
+fn should_invalidate(cached_branch: Option<&str>, incoming_branch: Option<&str>) -> bool {
+    match incoming_branch {
+        None => false,
+        Some(_) => cached_branch != incoming_branch,
+    }
+}
+
+fn spawn_lookup(path: PathBuf, branch: String, ctx: egui::Context) -> Receiver<LookupResult> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let info = branch.as_deref().and_then(|b| query_gh(&path, b));
+        let info = query_gh(&path, &branch);
         let _ = tx.send(LookupResult { branch, info });
         ctx.request_repaint();
     });
     rx
+}
+
+fn pr_state(state: &str, is_draft: bool) -> PrState {
+    match state {
+        "MERGED" => PrState::Merged,
+        "CLOSED" => PrState::Closed,
+        "OPEN" if is_draft => PrState::Draft,
+        // Unknown states paint as open rather than vanishing; gh's enum is
+        // stable, so this is a forward-compatibility hedge, not a real case.
+        _ => PrState::Open,
+    }
 }
 
 /// Ask `gh` for the PR associated with `branch` in `path`.  Returns `None`
@@ -138,7 +172,7 @@ fn query_gh(path: &Path, branch: &str) -> Option<PrInfo> {
         },
     };
     let output = cmd
-        .args(["pr", "view", branch, "--json", "number,baseRefName,url"])
+        .args(["pr", "view", branch, "--json", "number,baseRefName,url,state,isDraft"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .stdin(Stdio::null())
@@ -155,7 +189,9 @@ fn parse_gh_output(stdout: &[u8]) -> Option<PrInfo> {
     let number = value.get("number")?.as_u64()?;
     let base = value.get("baseRefName")?.as_str()?.to_string();
     let url = value.get("url")?.as_str()?.to_string();
-    Some(PrInfo { number, base_branch: base, url })
+    let state = value.get("state").and_then(|v| v.as_str()).unwrap_or("OPEN");
+    let is_draft = value.get("isDraft").and_then(|v| v.as_bool()).unwrap_or(false);
+    Some(PrInfo { number, base_branch: base, url, state: pr_state(state, is_draft) })
 }
 
 #[cfg(test)]
@@ -175,5 +211,78 @@ mod tests {
     #[test]
     fn rejects_empty_output() {
         assert!(parse_gh_output(b"").is_none());
+    }
+
+    #[test]
+    fn parses_pr_states() {
+        for (json_state, is_draft, expected) in [
+            ("OPEN", false, PrState::Open),
+            ("OPEN", true, PrState::Draft),
+            ("MERGED", false, PrState::Merged),
+            ("CLOSED", false, PrState::Closed),
+            ("SOMETHING_NEW", false, PrState::Open),
+        ] {
+            let stdout = format!(
+                r#"{{"baseRefName":"main","number":1,"url":"https://github.com/o/r/pull/1","state":"{json_state}","isDraft":{is_draft}}}"#
+            );
+            let info = parse_gh_output(stdout.as_bytes()).unwrap();
+            assert_eq!(info.state, expected, "state={json_state} draft={is_draft}");
+        }
+    }
+
+    #[test]
+    fn missing_state_fields_default_to_open() {
+        // Old gh versions may omit fields we didn't ask for; degrade, don't drop.
+        let stdout =
+            br#"{"baseRefName":"main","number":42,"url":"https://github.com/o/r/pull/42"}"#;
+        assert_eq!(parse_gh_output(stdout).unwrap().state, PrState::Open);
+    }
+
+    fn sample_info() -> PrInfo {
+        PrInfo {
+            number: 7,
+            base_branch: "main".to_string(),
+            url: "https://github.com/o/r/pull/7".to_string(),
+            state: PrState::Open,
+        }
+    }
+
+    #[test]
+    fn none_branch_does_not_invalidate_a_cached_branch() {
+        assert!(!should_invalidate(Some("b"), None));
+    }
+
+    #[test]
+    fn mismatched_branch_invalidates() {
+        assert!(should_invalidate(Some("b"), Some("a")));
+    }
+
+    #[test]
+    fn matching_branch_does_not_invalidate() {
+        assert!(!should_invalidate(Some("b"), Some("b")));
+    }
+
+    #[test]
+    fn polling_with_none_retains_info_from_a_completed_some_branch_lookup() {
+        let mut cache = PrCache::new();
+        let path = PathBuf::from("/repo");
+        cache.entries.insert(
+            path.clone(),
+            Entry {
+                branch: Some("b".to_string()),
+                info: Some(sample_info()),
+                queried_at: Some(Instant::now()),
+                pending: None,
+            },
+        );
+
+        let ctx = egui::Context::default();
+        let result = cache.poll(&path, None, &ctx);
+
+        assert_eq!(result.map(|info| info.number), Some(7));
+        let entry = cache.entries.get(&path).unwrap();
+        assert_eq!(entry.branch.as_deref(), Some("b"));
+        assert!(entry.info.is_some(), "None poll must not clear the cached info");
+        assert!(entry.pending.is_none(), "None poll must not spawn a competing lookup");
     }
 }

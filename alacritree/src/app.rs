@@ -12,14 +12,14 @@ use serde_json::{Value, json};
 use crate::bindings::{BindingAction, NamedAction};
 use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
-use crate::config::{Config, LastSessionClose};
+use crate::config::{Config, FontConfig, Icons, LastSessionClose, UiFont};
 use crate::doppler;
 use crate::git_nav::{self, GitSection, SectionCount};
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, GitStatus, StatusCache};
 use crate::ipc;
 use crate::panel_filter::{self, PanelFilter};
 use crate::paste;
-use crate::pr_status::PrCache;
+use crate::pr_status::{PrCache, PrInfo, PrState};
 use crate::projects::{Project, Worktree, project_json};
 use crate::session::{Session, SessionId, SessionKind, TermSize};
 use crate::shortcuts_window;
@@ -39,6 +39,14 @@ pub type WorkspaceKey = Option<PathBuf>;
 static NOTIFY_TX: OnceLock<Mutex<Sender<WorkspaceKey>>> = OnceLock::new();
 
 #[derive(Clone, Copy)]
+struct FocusOutlineTheme {
+    sidebar: bool,
+    terminal: bool,
+    color: Color32,
+    thickness: f32,
+}
+
+#[derive(Clone, Copy)]
 struct Theme {
     terminal_bg: Color32,
     sidebar_bg: Color32,
@@ -52,6 +60,11 @@ struct Theme {
     /// "Needs attention" highlight.  Distinct from `accent` ("active
     /// workspace") so the two signals don't read as the same thing.
     attention: Color32,
+    /// PR badge colors, mapped to GitHub's conventions from the ANSI palette.
+    pr_open: Color32,
+    pr_draft: Color32,
+    pr_merged: Color32,
+    pr_closed: Color32,
     /// Logical-pixel size for headings (titles like "Projects", "Git").
     /// `FontConfig::UI_HEADING_RATIO` of the terminal font size.
     font_heading: f32,
@@ -64,6 +77,22 @@ struct Theme {
     /// historical 11.25-logical-pixel baseline so unmodified config keeps the
     /// existing layout proportions.
     ui_scale: f32,
+    focus_outline: FocusOutlineTheme,
+}
+
+/// Logical-pixel (normal, heading) sizes for UI text.  `[ui.font] size`
+/// overrides the normal size directly (same pt→px conversion as
+/// `FontConfig::egui_size`); the heading keeps its existing ratio to normal
+/// text.  Unset, both fall back to the `[font]`-derived values unchanged.
+fn ui_text_px(font: &FontConfig, ui_font: &UiFont) -> (f32, f32) {
+    match ui_font.size {
+        Some(pt) => {
+            let normal = pt * 96.0 / 72.0;
+            let heading = normal * (FontConfig::UI_HEADING_RATIO / FontConfig::UI_NORMAL_RATIO);
+            (normal, heading)
+        },
+        None => (font.ui_normal_px(), font.ui_heading_px()),
+    }
 }
 
 impl Theme {
@@ -75,6 +104,8 @@ impl Theme {
         let accent =
             config.ui.sidebar_accent.unwrap_or_else(|| rgb_to_color32(config.palette.normal[4])); // ANSI blue
         let border = config.ui.sidebar_border.unwrap_or_else(|| lighten(sidebar_bg, 0.10));
+        let text_muted = blend_toward(text, sidebar_bg, 0.55);
+        let (font_normal, font_heading) = ui_text_px(&config.font, &config.ui_font);
         Self {
             terminal_bg,
             sidebar_bg,
@@ -83,12 +114,22 @@ impl Theme {
             row_active_bg: lighten(sidebar_bg, 0.10),
             text,
             text_dim: blend_toward(text, sidebar_bg, 0.35),
-            text_muted: blend_toward(text, sidebar_bg, 0.55),
+            text_muted,
             accent,
             attention: rgb_to_color32(config.palette.normal[3]), // ANSI yellow
-            font_heading: config.font.ui_heading_px(),
-            font_normal: config.font.ui_normal_px(),
-            ui_scale: config.font.ui_normal_px() / 11.25,
+            pr_open: rgb_to_color32(config.palette.normal[2]),   // green
+            pr_draft: text_muted,
+            pr_merged: rgb_to_color32(config.palette.normal[5]), // magenta
+            pr_closed: rgb_to_color32(config.palette.normal[1]), // red
+            font_heading,
+            font_normal,
+            ui_scale: font_normal / 11.25,
+            focus_outline: FocusOutlineTheme {
+                sidebar: config.ui.focus_outline.sidebar,
+                terminal: config.ui.focus_outline.terminal,
+                color: config.ui.focus_outline.color.unwrap_or(accent),
+                thickness: config.ui.focus_outline.thickness,
+            },
         }
     }
 }
@@ -109,6 +150,20 @@ fn paint_panel_border(ctx: &Context, x: f32, y_range: egui::Rangef, color: Color
     let layer =
         egui::LayerId::new(egui::Order::Middle, egui::Id::new(("sidebar_border", x.to_bits())));
     ctx.layer_painter(layer).vline(x, y_range, Stroke::new(1.0_f32, color));
+}
+
+fn paint_focus_outline(ctx: &Context, rect: egui::Rect, theme: &Theme) {
+    let fo = theme.focus_outline;
+    let layer = egui::LayerId::new(
+        egui::Order::Middle,
+        egui::Id::new(("focus_outline", rect.min.x.to_bits())),
+    );
+    ctx.layer_painter(layer).rect_stroke(
+        rect,
+        0.0,
+        Stroke::new(fo.thickness, fo.color),
+        egui::StrokeKind::Inside,
+    );
 }
 
 fn blend_toward(c: Color32, target: Color32, amount: f32) -> Color32 {
@@ -399,7 +454,11 @@ impl AlacritreeApp {
     pub fn new(cc: &CreationContext<'_>, config: Config) -> Self {
         let theme = Theme::from_config(&config);
 
-        let font_chain = crate::fonts::install_terminal_fonts(&cc.egui_ctx, &config.font);
+        let font_chain = crate::fonts::install_terminal_fonts(
+            &cc.egui_ctx,
+            &config.font,
+            config.ui_font.family.as_deref(),
+        );
         let color_glyph_budget_mb = config.font.color_glyph_cache_mb;
 
         let mut visuals = egui::Visuals::dark();
@@ -2052,11 +2111,51 @@ impl AlacritreeApp {
         let creating: Vec<(usize, String)> =
             self.pending_creates.iter().map(|c| (c.project_idx, c.branch.clone())).collect();
         let distros = wsl::distros();
+        let icons = self.config.ui.icons.clone();
         let profile_names: Vec<String> =
             self.config.profiles.iter().map(|p| p.name.clone()).collect();
         let mut shell_override_changed: Option<PathBuf> = None;
         let mut label_cleared: Option<PathBuf> = None;
         let mut rename_request: Option<RenameState> = None;
+        // Polled up front, expanded projects only: collapsed projects cost no gh
+        // processes, and the panel closure borrows `projects` mutably so the cache
+        // cannot be polled from inside it.
+        let pr_enabled = self.config.ui.pr_status;
+        let mut pr_infos: Vec<Vec<Option<PrInfo>>> = Vec::with_capacity(self.projects.len());
+        for project in &self.projects {
+            let mut rows = Vec::with_capacity(project.worktrees.len());
+            for wt in &project.worktrees {
+                let info = if pr_enabled && project.expanded {
+                    // The right sidebar polls only the active workspace's PR
+                    // cache, using the live `StatusCache` branch (recomputed
+                    // every ~1.5s). Two pollers of the same path must agree on
+                    // a branch or each drain flips `entry.branch` and they
+                    // invalidate each other's lookups forever after an
+                    // in-terminal checkout — so share the live cache there.
+                    // For every other worktree there is only one poller (this
+                    // one), and its cache is created once a workspace goes
+                    // active but never re-polled or pruned after it goes
+                    // inactive again: reading it here would freeze the branch
+                    // at whatever it was on last visit and shadow later
+                    // `refresh_project` updates to `wt.branch`. Use the
+                    // refresh-responsive snapshot instead.
+                    let is_active = self.current_workspace.as_deref() == Some(&wt.path);
+                    let branch = if is_active {
+                        self.git_status
+                            .get(&wt.path)
+                            .and_then(|cache| cache.current_branch())
+                            .or(wt.branch.as_deref())
+                    } else {
+                        wt.branch.as_deref()
+                    };
+                    self.pr_cache.poll(&wt.path, branch, ctx)
+                } else {
+                    None
+                };
+                rows.push(info);
+            }
+            pr_infos.push(rows);
+        }
 
         let panel_resp = SidePanel::left("left_sidebar")
             .resizable(true)
@@ -2105,6 +2204,7 @@ impl AlacritreeApp {
                             cursor_moved,
                             home_attention,
                             home_agent_glyph,
+                            &icons,
                             &theme,
                         );
                         if home_action.activate {
@@ -2118,7 +2218,7 @@ impl AlacritreeApp {
                                 &cursor_row,
                                 Some(SidebarRow::Session(id)) if *id == row.id
                             );
-                            let act = session_row(ui, row, is_cursor, cursor_moved, &theme);
+                            let act = session_row(ui, row, is_cursor, cursor_moved, &icons, &theme);
                             if act.activate {
                                 activate_session_request.set(Some((None, row.id)));
                             }
@@ -2165,7 +2265,11 @@ impl AlacritreeApp {
                                     drag_handle(ui, &theme)
                                         .dnd_set_drag_payload(DraggedProject(project.root.clone()));
                                 }
-                                let arrow = if project.expanded { "▾" } else { "▸" };
+                                let arrow = if project.expanded {
+                                    icons.project_expanded.as_str()
+                                } else {
+                                    icons.project_collapsed.as_str()
+                                };
                                 if icon_button(ui, arrow, theme.text_dim, &theme).clicked() {
                                     project.expanded = !project.expanded;
                                     expand_toggled = Some((project.root.clone(), project.expanded));
@@ -2354,12 +2458,17 @@ impl AlacritreeApp {
                                 let action = worktree_row(
                                     ui,
                                     wt,
+                                    pr_infos
+                                        .get(idx)
+                                        .and_then(|v| v.get(wt_idx))
+                                        .and_then(Option::as_ref),
                                     is_active,
                                     is_cursor,
                                     cursor_moved,
                                     wt_attention,
                                     wt_glyph,
                                     is_deleting,
+                                    &icons,
                                     &theme,
                                 );
                                 if action.activate {
@@ -2400,7 +2509,14 @@ impl AlacritreeApp {
                                         &cursor_row,
                                         Some(SidebarRow::Session(id)) if *id == row.id
                                     );
-                                    let act = session_row(ui, row, is_cursor, cursor_moved, &theme);
+                                    let act = session_row(
+                                        ui,
+                                        row,
+                                        is_cursor,
+                                        cursor_moved,
+                                        &icons,
+                                        &theme,
+                                    );
                                     if act.activate {
                                         activate_session_request
                                             .set(Some((Some(wt.path.clone()), row.id)));
@@ -2411,7 +2527,7 @@ impl AlacritreeApp {
                                 }
                             }
                             for (_, branch) in creating.iter().filter(|(pi, _)| *pi == idx) {
-                                creating_row(ui, branch, &theme);
+                                creating_row(ui, branch, &icons, &theme);
                             }
                             ui.add_space(4.0);
                         }
@@ -3579,6 +3695,7 @@ fn home_row(
     scroll_into_view: bool,
     attention: bool,
     agent_glyph: Option<char>,
+    icons: &Icons,
     theme: &Theme,
 ) -> HomeAction {
     // Reserve a slot *before* the labels so the hover bg paints beneath them.
@@ -3593,7 +3710,14 @@ fn home_row(
             row_with_trailing(
                 ui,
                 |ui| {
-                    paint_row_status_icon(ui, theme, attention, agent_glyph, "⌂", is_active);
+                    paint_row_status_icon(
+                        ui,
+                        theme,
+                        attention,
+                        agent_glyph,
+                        &icons.home,
+                        is_active,
+                    );
                     ui.label(
                         RichText::new("Home")
                             .color(if is_active { theme.text } else { theme.text_dim })
@@ -3743,14 +3867,14 @@ fn session_row_title(title: &str, agent_glyph: Option<char>) -> String {
 /// spinner stands in until `poll_pending_creates` refreshes the project and the
 /// real worktree row takes its place.  Indentation and the leading glyph match
 /// `worktree_row` so it lines up with its future sibling.
-fn creating_row(ui: &mut egui::Ui, branch: &str, theme: &Theme) {
+fn creating_row(ui: &mut egui::Ui, branch: &str, icons: &Icons, theme: &Theme) {
     let s = theme.ui_scale;
     let frame = Frame::default().inner_margin(Margin { left: 16, right: 0, top: 3, bottom: 3 });
     frame.show(ui, |ui| {
         row_with_trailing(
             ui,
             |ui| {
-                ui.label(RichText::new("○").color(theme.text_muted).size(10.0 * s));
+                ui.label(RichText::new(&icons.worktree).color(theme.text_muted).size(10.0 * s));
                 ui.add(
                     egui::Label::new(RichText::new(branch).color(theme.text_muted).small())
                         .truncate(),
@@ -3763,15 +3887,31 @@ fn creating_row(ui: &mut egui::Ui, branch: &str, theme: &Theme) {
     });
 }
 
+/// Badge glyph, color, and tooltip word for a PR state.
+fn pr_badge<'a>(
+    icons: &'a Icons,
+    theme: &Theme,
+    state: PrState,
+) -> (&'a str, Color32, &'static str) {
+    match state {
+        PrState::Open => (&icons.pr_open, theme.pr_open, "open"),
+        PrState::Draft => (&icons.pr_draft, theme.pr_draft, "draft"),
+        PrState::Merged => (&icons.pr_merged, theme.pr_merged, "merged"),
+        PrState::Closed => (&icons.pr_closed, theme.pr_closed, "closed"),
+    }
+}
+
 fn worktree_row(
     ui: &mut egui::Ui,
     wt: &Worktree,
+    pr: Option<&PrInfo>,
     is_active: bool,
     is_cursor: bool,
     scroll_into_view: bool,
     attention: bool,
     agent_glyph: Option<char>,
     deleting: bool,
+    icons: &Icons,
     theme: &Theme,
 ) -> WorktreeAction {
     // Reserve a slot *before* the labels so the hover bg paints beneath them.
@@ -3787,7 +3927,7 @@ fn worktree_row(
     let frame = Frame::default().inner_margin(Margin { left: 16, right: 0, top: 3, bottom: 3 });
     let resp = frame
         .show(ui, |ui| {
-            let default_icon = if wt.is_main { "●" } else { "○" };
+            let default_icon = if wt.is_main { &icons.worktree_main } else { &icons.worktree };
             let name_color = if wt.prunable || deleting {
                 theme.text_muted
             } else if is_active {
@@ -3840,6 +3980,19 @@ fn worktree_row(
                     spawn_rect = Some(btn.rect);
                     if btn.clicked() {
                         spawn_clicked = true;
+                    }
+                    if let Some(info) = pr {
+                        let (glyph, color, word) = pr_badge(icons, theme, info.state);
+                        let (rect, resp) = ui
+                            .allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            glyph,
+                            egui::FontId::proportional(10.0 * theme.ui_scale),
+                            color,
+                        );
+                        resp.on_hover_text(format!("PR #{} — {word}", info.number));
                     }
                 },
             );
@@ -3900,6 +4053,7 @@ fn session_row(
     row: &SessionRowData,
     is_cursor: bool,
     scroll_into_view: bool,
+    icons: &Icons,
     theme: &Theme,
 ) -> SessionRowAction {
     // Reserve a slot *before* the labels so the hover bg paints beneath them.
@@ -3922,7 +4076,7 @@ fn session_row(
                         theme,
                         row.needs_attention,
                         row.agent_glyph,
-                        "▪",
+                        &icons.session,
                         row.is_active,
                     );
                     ui.add(
@@ -5175,14 +5329,23 @@ impl eframe::App for AlacritreeApp {
         if self.show_left_sidebar {
             let r = self.show_project_sidebar(ctx, panel_frame.clone());
             paint_panel_border(ctx, r.right(), r.y_range(), theme.sidebar_border);
+            if theme.focus_outline.sidebar
+                && !modal_open
+                && self.focus == PaneFocus::ProjectsSidebar
+            {
+                paint_focus_outline(ctx, r, &theme);
+            }
         }
 
         if self.show_right_sidebar {
             let r = self.show_git_sidebar(ctx, panel_frame);
             paint_panel_border(ctx, r.left(), r.y_range(), theme.sidebar_border);
+            if theme.focus_outline.sidebar && !modal_open && self.focus == PaneFocus::GitSidebar {
+                paint_focus_outline(ctx, r, &theme);
+            }
         }
 
-        egui::CentralPanel::default()
+        let central = egui::CentralPanel::default()
             .frame(Frame::default().fill(central_fill).inner_margin(Margin::same(0)))
             .show(ctx, |ui| {
                 self.show_tab_strip(ui);
@@ -5233,6 +5396,9 @@ impl eframe::App for AlacritreeApp {
                     self.focus_terminal();
                 }
             });
+        if theme.focus_outline.terminal && !modal_open && self.focus == PaneFocus::Terminal {
+            paint_focus_outline(ctx, central.response.rect, &theme);
+        }
 
         if self.pending_create.is_some() {
             self.show_create_dialog(ctx);
@@ -5796,5 +5962,26 @@ mod tests {
             Some("pwsh"),
         );
         assert_eq!(d, ShellDecision::Profile("pwsh".into()));
+    }
+
+    #[test]
+    fn ui_text_px_defaults_to_terminal_derivation() {
+        let font = crate::config::FontConfig::default();
+        let (normal, heading) = ui_text_px(&font, &crate::config::UiFont::default());
+        assert_eq!(normal, font.ui_normal_px());
+        assert_eq!(heading, font.ui_heading_px());
+    }
+
+    #[test]
+    fn ui_text_px_overrides_from_ui_font_size() {
+        let font = crate::config::FontConfig::default();
+        let ui = crate::config::UiFont { family: None, size: Some(12.0) };
+        let (normal, heading) = ui_text_px(&font, &ui);
+        assert_eq!(normal, 16.0); // 12 pt × 96/72
+        assert_eq!(
+            heading,
+            16.0 * (crate::config::FontConfig::UI_HEADING_RATIO
+                / crate::config::FontConfig::UI_NORMAL_RATIO)
+        );
     }
 }
