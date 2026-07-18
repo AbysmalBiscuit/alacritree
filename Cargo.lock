@@ -64,6 +64,7 @@ dependencies = [
  "git2",
  "home",
  "interprocess",
+ "libc",
  "log",
  "memmap2",
  "notify-rust",
