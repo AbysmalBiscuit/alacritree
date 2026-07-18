@@ -163,6 +163,13 @@ jobs:
           fi
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+            # A pre-existing release means release-please published it at
+            # PR-merge time, before any assets existed — so the downstream
+            # publishers already saw an assetless `release: published` event
+            # and skipped. Re-run them now that the assets are attached.
+            for workflow in aur-bin-publish.yml homebrew-update.yml scoop-update.yml; do
+              gh workflow run "$workflow" --repo "$GITHUB_REPOSITORY" -f tag="$TAG"
+            done
           else
             gh release create "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
