@@ -29,6 +29,10 @@ fontdb = { version = "0.23", default-features = false, features = ["fontconfig",
 # Reads cmap tables to build coverage sets for the Windows fallback chain.
 # Same major as the ttf-parser fontdb already pulls in, so no duplicate build.
 ttf-parser = "0.25"
+# The exact parse epaint applies to every registered face.  epaint aborts the
+# process on a face ab_glyph rejects, so registration must prove each face
+# parses first.  Same version epaint already links, so no duplicate build.
+ab_glyph = "0.2"
 # Font faces reach egui as mappings, not buffers.  Same version fontdb already
 # links, so no duplicate build.
 memmap2 = "0.9"

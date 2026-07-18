@@ -50,6 +50,7 @@ dependencies = [
 name = "alacritree"
 version = "0.1.2"
 dependencies = [
+ "ab_glyph",
  "alacritty_terminal",
  "arboard",
  "clap",

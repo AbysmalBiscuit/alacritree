@@ -486,6 +486,15 @@ fn is_color_only(data: &[u8], index: u32) -> bool {
     probed > 0 && !outlined
 }
 
+/// Whether epaint will accept this face.  epaint re-parses every registered
+/// face with ab_glyph and aborts the process on failure, so a face must pass
+/// this exact parse before it may reach the definitions.  System font indexes
+/// commonly list faces ab_glyph rejects — macOS `.dfont` suitcases and
+/// bitmap-only families — which the ttf_parser-based probes here don't catch.
+fn epaint_can_parse(bytes: &[u8], face_index: u32) -> bool {
+    ab_glyph::FontRef::try_from_slice_and_index(bytes, face_index).is_ok()
+}
+
 /// Register the user-configured `[font] fallback` entries for one variant.
 /// They slot between the primary face and the automatic system chain, in
 /// list order.  Entries are family names or font file paths, resolved with
@@ -534,6 +543,12 @@ fn register_user_fallbacks(
             );
             book.color_only.insert(resolved.path.clone());
             book.extend_chain(variant, &resolved.path, resolved.face_index, true);
+            continue;
+        }
+        if !epaint_can_parse(bytes, resolved.face_index) {
+            if book.warned_entries.insert(entry.clone()) {
+                log::warn!("font.fallback entry '{entry}' is not a parseable TTF/OTF; skipping");
+            }
             continue;
         }
         let id = format!("alacritree_fallback_{}", defs.font_data.len());
@@ -596,6 +611,13 @@ fn install_ui_font(defs: &mut FontDefinitions, family_or_path: &str, fonts: &Sys
             return false;
         },
     };
+    if !epaint_can_parse(bytes, resolved.face_index) {
+        log::warn!(
+            "ui font file {} is not a parseable TTF/OTF; keeping the terminal font",
+            resolved.path.display()
+        );
+        return false;
+    }
     insert_face(defs, UI_FONT_ID, bytes);
     let ui_family = FontFamily::Name(UI_FAMILY.into());
     defs.families.insert(ui_family.clone(), vec![UI_FONT_ID.to_string()]);
@@ -657,6 +679,14 @@ pub fn install_terminal_fonts(
             return Vec::new();
         },
     };
+    if !epaint_can_parse(normal_bytes, normal_match.face_index) {
+        log::warn!(
+            "font '{family}' resolved to {} which is not a parseable TTF/OTF; using bundled \
+             monospace",
+            normal_match.path.display()
+        );
+        return Vec::new();
+    }
 
     // Bold/italic/bold-italic inherit the normal family unless overridden.
     let bold_family = bold.family.as_deref().unwrap_or(family);
@@ -787,6 +817,14 @@ fn register_fallback_faces(
         if is_color_only(bytes, face.face_index) {
             book.color_only.insert(face.path.clone());
             book.extend_chain(variant, &face.path, face.face_index, true);
+            continue;
+        }
+        if !epaint_can_parse(bytes, face.face_index) {
+            log::debug!(
+                "skipping fallback font {} (face {}): not a parseable TTF/OTF",
+                face.path.display(),
+                face.face_index
+            );
             continue;
         }
         let id = format!("alacritree_fallback_{}", defs.font_data.len());
@@ -952,7 +990,16 @@ fn load_variant(
         return None;
     }
     match map_font_file(&resolved.path) {
-        Ok(b) => Some(b),
+        Ok(b) if epaint_can_parse(b, resolved.face_index) => Some(b),
+        Ok(_) => {
+            log::warn!(
+                "{} font file {} is not a parseable TTF/OTF; cells with that style will use the \
+                 regular face",
+                variant.label(),
+                resolved.path.display()
+            );
+            None
+        },
         Err(e) => {
             log::warn!(
                 "could not read {} font file {}: {e}",
@@ -1106,8 +1153,16 @@ mod fontconfig_resolve {
 
         let matched = pattern.font_match();
         let path = matched.filename()?;
-        let face_index = matched.face_index().unwrap_or(0).max(0) as u32;
+        let face_index = plain_face_index(matched.face_index().unwrap_or(0));
         Some(ResolvedFace { path: PathBuf::from(path), face_index })
+    }
+
+    /// fontconfig hands back `(named_instance << 16) | face` for a variable
+    /// font's named instances (FreeType's encoding).  ttf_parser and epaint
+    /// take a plain collection index and cannot apply a named instance
+    /// anyway, so the default instance stands in for the named one.
+    pub fn plain_face_index(index: i32) -> u32 {
+        (index.max(0) as u32) & 0xFFFF
     }
 
     /// `FcFontSort` with `trim=true` returns fonts in match order, dropping
@@ -1164,7 +1219,7 @@ mod fontconfig_resolve {
             if skip_paths.contains(&path) {
                 continue;
             }
-            let face_index = matched.face_index().unwrap_or(0).max(0) as u32;
+            let face_index = plain_face_index(matched.face_index().unwrap_or(0));
             out.push(FallbackFace { path, face_index });
         }
         out
@@ -1175,14 +1230,28 @@ mod fontconfig_resolve {
 mod tests {
     use super::*;
 
+    /// A real font on disk for tests that drive registration: faces failing
+    /// epaint's parse are rejected, so junk bytes would never register.
+    fn write_parseable_font(name: &str) -> PathBuf {
+        let bytes = FontDefinitions::default()
+            .font_data
+            .values()
+            .next()
+            .expect("egui bundles default fonts")
+            .font
+            .to_vec();
+        let path = std::env::temp_dir().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
     #[test]
     fn user_fallback_path_registers_for_every_variant() {
         // A file-path entry resolves to the same file for all four variants;
         // the bytes must be loaded once and the same egui font id appended to
         // each variant's family list (a plain HashSet dedup would starve
         // every variant after the first).
-        let path = std::env::temp_dir().join("alacritree_test_user_fallback.ttf");
-        std::fs::write(&path, b"egui parses this later; registration only reads bytes").unwrap();
+        let path = write_parseable_font("alacritree_test_user_fallback.ttf");
 
         let mut defs = FontDefinitions::default();
         let fonts = SystemFonts::with_cache_dir(None);
@@ -1218,8 +1287,7 @@ mod tests {
 
     #[test]
     fn ui_font_heads_the_proportional_family() {
-        let path = std::env::temp_dir().join("alacritree_test_ui_font.ttf");
-        std::fs::write(&path, b"registration only maps bytes").unwrap();
+        let path = write_parseable_font("alacritree_test_ui_font.ttf");
 
         let mut defs = FontDefinitions::default();
         let fonts = SystemFonts::with_cache_dir(None);
@@ -1252,8 +1320,7 @@ mod tests {
     // an owned face costs its file size twice for the life of the process.
     #[test]
     fn registered_faces_hand_epaint_borrowed_bytes() {
-        let path = std::env::temp_dir().join("alacritree_test_borrowed_bytes.ttf");
-        std::fs::write(&path, b"registration only maps and stats bytes").unwrap();
+        let path = write_parseable_font("alacritree_test_borrowed_bytes.ttf");
 
         let mut defs = FontDefinitions::default();
         let fonts = SystemFonts::with_cache_dir(None);
@@ -1271,6 +1338,53 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn named_instance_bits_are_stripped_from_fontconfig_indices() {
+        // Instance 7 of face 2 in a collection; the face index survives, the
+        // instance selection does not.
+        assert_eq!(fontconfig_resolve::plain_face_index((7 << 16) | 2), 2);
+        assert_eq!(fontconfig_resolve::plain_face_index(3), 3);
+        assert_eq!(fontconfig_resolve::plain_face_index(-1), 0);
+    }
+
+    // fontconfig returns `(named_instance << 16) | face` for variable fonts;
+    // handing that through unmasked makes ttf_parser and epaint reject the
+    // face outright, silently dropping every variable font from the chain.
+    #[cfg(unix)]
+    #[test]
+    fn fontconfig_face_indices_never_carry_instance_bits() {
+        let skip = HashSet::new();
+        let faces = fontconfig_resolve::sorted_fallbacks(
+            DEFAULT_FAMILY,
+            None,
+            Variant::Normal,
+            &skip,
+            MAX_FALLBACK_FACES,
+        );
+        for face in &faces {
+            assert!(
+                face.face_index < 0x1_0000,
+                "{} face {} carries named-instance bits",
+                face.path.display(),
+                face.face_index
+            );
+        }
+    }
+
+    // epaint re-parses every registered face with ab_glyph at first layout
+    // and panics on any it cannot parse, so the installed definitions must
+    // never contain one.  macOS font indexes commonly carry such faces
+    // (.dfont suitcases, bitmap-only families).
+    #[test]
+    fn every_registered_face_parses_like_epaint() {
+        let ctx = Context::default();
+        install_terminal_fonts(&ctx, &FontConfig::default(), None);
+        // The first pass is what forces epaint to parse every face.
+        ctx.begin_pass(Default::default());
+        let _ = ctx.end_pass();
     }
 
     // Unix-excluded: fontconfig substitutes *some* font for any family name,
@@ -1384,8 +1498,7 @@ mod tests {
         // User-configured fallbacks slot between the primary face and the
         // automatic system chain, so their font id must land ahead of every
         // id the automatic chain appends afterward in the family list.
-        let path = std::env::temp_dir().join("alacritree_test_user_precedes.ttf");
-        std::fs::write(&path, b"egui parses this later; registration only reads bytes").unwrap();
+        let path = write_parseable_font("alacritree_test_user_precedes.ttf");
 
         let mut defs = FontDefinitions::default();
         let fonts = SystemFonts::with_cache_dir(None);
