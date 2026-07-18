@@ -426,10 +426,12 @@ fn parse_key(name: &str) -> Option<Key> {
         "End" => Key::End,
         "PageUp" => Key::PageUp,
         "PageDown" => Key::PageDown,
-        "Up" => Key::ArrowUp,
-        "Down" => Key::ArrowDown,
-        "Left" => Key::ArrowLeft,
-        "Right" => Key::ArrowRight,
+        // Alacritty names keys after winit's `NamedKey` ("ArrowUp") and keeps
+        // the pre-0.13 names ("Up") as legacy aliases — accept both.
+        "ArrowUp" | "Up" => Key::ArrowUp,
+        "ArrowDown" | "Down" => Key::ArrowDown,
+        "ArrowLeft" | "Left" => Key::ArrowLeft,
+        "ArrowRight" | "Right" => Key::ArrowRight,
         "Minus" => Key::Minus,
         "Equals" | "Equal" => Key::Equals,
         "Plus" => Key::Plus,
@@ -778,6 +780,27 @@ mod tests {
             matched.iter().any(|a| matches!(a, BindingAction::Named(NamedAction::Paste))),
             "Ctrl+Shift+V no longer pastes: {matched:?}"
         );
+    }
+
+    /// Modern alacritty configs name keys after winit's `NamedKey`
+    /// ("ArrowUp"); the legacy alacritty names ("Up") are aliases.  Both
+    /// spellings must keep their bindings.
+    #[test]
+    fn winit_named_arrow_keys_parse() {
+        for (name, key) in [
+            ("ArrowUp", Key::ArrowUp),
+            ("ArrowDown", Key::ArrowDown),
+            ("ArrowLeft", Key::ArrowLeft),
+            ("ArrowRight", Key::ArrowRight),
+            ("Up", Key::ArrowUp),
+        ] {
+            let bindings = parse_bindings(vec![raw_chars(name, None, "x")]);
+            let matched = all_matches(&bindings, key, Modifiers::NONE);
+            assert!(
+                matched.iter().any(|a| matches!(a, BindingAction::Chars(c) if c == b"x")),
+                "{name} binding was dropped: {matched:?}"
+            );
+        }
     }
 
     #[test]
