@@ -461,6 +461,27 @@ fn ensure_working_directory(dir: Option<&Path>) -> std::io::Result<()> {
     }
 }
 
+/// The directory the PTY starts in: an explicit workspace dir always wins,
+/// then `[general] working_directory` fills in for sessions without one (the
+/// home tab).  A configured dir that does not exist is dropped with a warning
+/// rather than failing the spawn — a stale config value must not stop the
+/// home tab from opening (alacritty ignores an invalid `--working-directory`
+/// the same way).
+fn pty_working_directory(explicit: Option<PathBuf>, config: &Config) -> Option<PathBuf> {
+    explicit.or_else(|| {
+        config.working_directory.clone().filter(|dir| {
+            let ok = dir.is_dir();
+            if !ok {
+                log::warn!(
+                    "general.working_directory {} is not a directory; ignoring",
+                    dir.display()
+                );
+            }
+            ok
+        })
+    })
+}
+
 #[cfg(windows)]
 mod windows_process_probe {
     //! Shared, throttled process-table snapshot.  Every session probes at
@@ -605,7 +626,8 @@ impl Session {
         kind: SessionKind,
         escape_args: bool,
     ) -> std::io::Result<Self> {
-        ensure_working_directory(working_directory.as_deref())?;
+        let pty_cwd = pty_working_directory(working_directory.clone(), config);
+        ensure_working_directory(pty_cwd.as_deref())?;
         let window_size = window_size(size, cell_size);
 
         let (proxy, events) = EventProxy::new(ctx);
@@ -630,7 +652,7 @@ impl Session {
         let _ = escape_args;
         let pty_options = PtyOptions {
             shell,
-            working_directory: working_directory.clone(),
+            working_directory: pty_cwd,
             drain_on_exit: false,
             env,
             // Windows has no argv: alacritty_terminal joins these args into a
@@ -1034,6 +1056,77 @@ mod tests {
             "`cmd /c echo ready` took {exited:?}; the console host is stalling on a \
              handshake (the foreign conpty.dll stall is ~3s)"
         );
+    }
+
+    /// `[general] working_directory` supplies the PTY start dir when a session
+    /// has no explicit one (the home tab), without becoming the session's
+    /// workspace identity — a home-tab session must keep `working_directory:
+    /// None` or it would be filtered into a worktree workspace.
+    #[test]
+    fn a_home_session_starts_in_the_configured_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut config = Config::default();
+        config.working_directory = Some(dir.path().to_path_buf());
+
+        // The child writes its cwd into a relative path; the file landing in
+        // `dir` is itself proof the PTY honored the configured directory.
+        #[cfg(windows)]
+        let (program, args) = ("cmd", vec!["/c", "cd", ">", "cwd-probe.txt"]);
+        #[cfg(not(windows))]
+        let (program, args) = ("sh", vec!["-c", "pwd > cwd-probe.txt"]);
+
+        let session = Session::spawn_command(
+            egui::Context::default(),
+            &config,
+            None,
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            program.to_string(),
+            args.into_iter().map(str::to_string).collect(),
+            "probe".to_string(),
+            SessionKind::Shell,
+        )
+        .unwrap();
+
+        assert!(
+            session.working_directory.is_none(),
+            "the configured cwd must not turn the home tab into a worktree workspace"
+        );
+
+        let start = Instant::now();
+        loop {
+            assert!(start.elapsed() < Duration::from_secs(10), "child never exited");
+            match session.events.try_recv() {
+                Ok(TermEvent::ChildExit(_)) => break,
+                Ok(_) => {},
+                Err(_) => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+
+        let content = std::fs::read_to_string(dir.path().join("cwd-probe.txt"))
+            .expect("no probe file: the child did not start in general.working_directory");
+        let reported = PathBuf::from(content.trim()).canonicalize().unwrap();
+        assert_eq!(reported, dir.path().canonicalize().unwrap());
+    }
+
+    /// An explicit workspace dir (worktree/project tab) always wins over the
+    /// configured default, and a configured dir that no longer exists is
+    /// dropped rather than failing the spawn.
+    #[test]
+    fn explicit_dirs_win_and_missing_configured_dirs_are_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.working_directory = Some(tmp.path().join("gone"));
+
+        assert_eq!(
+            pty_working_directory(Some(tmp.path().to_path_buf()), &config),
+            Some(tmp.path().to_path_buf())
+        );
+        assert_eq!(pty_working_directory(None, &config), None);
+
+        config.working_directory = Some(tmp.path().to_path_buf());
+        assert_eq!(pty_working_directory(None, &config), Some(tmp.path().to_path_buf()));
     }
 
     #[derive(Default)]
