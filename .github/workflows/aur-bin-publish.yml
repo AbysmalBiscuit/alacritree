@@ -34,8 +34,8 @@ jobs:
                 --json assets --jq '.assets[].name')
 
           # A release published by release-please fires `release: published`
-          # before the build has uploaded anything; the fan-out at the end of
-          # release.yml re-dispatches this workflow once the assets exist. A
+          # before the build has uploaded anything; publish-downstream.yml
+          # re-dispatches this workflow once dist has attached the assets. A
           # release with *some* assets but not ours is genuinely broken and
           # still fails below.
           if [[ -z "$asset_names" ]]; then
@@ -45,7 +45,7 @@ jobs:
           fi
 
           for arch in x86_64 aarch64; do
-            asset="alacritree-${TAG}-${arch}-linux.tar.gz"
+            asset="alacritree-${arch}-unknown-linux-gnu.tar.gz"
             if ! grep -qx "$asset" <<< "$asset_names"; then
               echo "Release $TAG is missing $asset; refusing to publish a broken alacritree-bin." >&2
               exit 1
