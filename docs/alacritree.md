@@ -353,17 +353,25 @@ shell can change its own cwd, which is why this is a hook and not an app
 feature (requires `jq`):
 
 ```sh
+# bash (~/.bashrc)
 _alacritree_follow() {
   [ -n "$ALACRITREE_SESSION_ID" ] || return 0
   local ws
   ws=$(alacritree session list --json 2>/dev/null | jq -r --arg id "$ALACRITREE_SESSION_ID" \
     '.sessions[] | select((.id | tostring) == $id) | .workspace // empty')
-  [ -n "$ws" ] && [ "$ws" != "$PWD" ] && cd "$ws"
+  [ -n "$ws" ] || return 0
+  case "$PWD" in "$ws"|"$ws"/*) ;; *) cd "$ws" ;; esac
 }
+PROMPT_COMMAND="_alacritree_follow${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+
+# zsh (~/.zshrc)
+precmd_functions+=(_alacritree_follow)
 ```
 
 Both hooks cost one local-socket round trip per prompt; running both at once
-is fine (last writer wins).
+is fine — `_alacritree_follow` only `cd`s when the session's workspace points
+outside the current worktree, so it doesn't fight `_alacritree_report_cwd`
+over ordinary subdirectory moves within the same worktree.
 
 ---
 

@@ -183,9 +183,9 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "integer", "description": "Session to move (from list_sessions or ALACRITREE_SESSION_ID)." },
-                    "path": { "type": "string", "description": "A path inside the target worktree." }
+                    "path": { "type": "string", "description": "A path inside the target worktree." },
                 },
-                "required": ["session_id", "path"]
+                "required": ["session_id", "path"],
             }
         },
         {
