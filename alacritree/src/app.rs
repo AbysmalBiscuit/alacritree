@@ -947,6 +947,51 @@ impl AlacritreeApp {
         }
     }
 
+    /// Re-home `id` to `target`'s workspace.  A re-keying only: the PTY, its
+    /// threads, and the scrollback are untouched — the session must survive
+    /// a move the same way it survives a workspace switch.
+    fn move_session_to(&mut self, id: SessionId, target: PathBuf) -> Result<WorkspaceKey, String> {
+        let idx = self
+            .sessions
+            .iter()
+            .position(|s| s.id == id)
+            .ok_or_else(|| format!("no session with id {id} — see list_sessions"))?;
+        let source = self.sessions[idx].working_directory.clone();
+        let target: WorkspaceKey = Some(target);
+        if source == target {
+            return Ok(target);
+        }
+
+        let was_source_active = self.active_session.get(&source).copied() == Some(id);
+        let on_screen = was_source_active && self.current_workspace == source;
+        self.sessions[idx].working_directory = target.clone();
+        let next_in_source =
+            self.sessions.iter().find(|s| s.working_directory == source).map(|s| s.id);
+
+        let outcome = plan_move(
+            was_source_active,
+            on_screen,
+            next_in_source,
+            self.active_session.contains_key(&target),
+        );
+        match outcome.source {
+            SourceRepair::Keep => {},
+            SourceRepair::Set(next) => {
+                self.active_session.insert(source, next);
+            },
+            SourceRepair::Remove => {
+                self.active_session.remove(&source);
+            },
+        }
+        if outcome.claim_target {
+            self.active_session.insert(target.clone(), id);
+        }
+        if outcome.follow {
+            self.current_workspace = target.clone();
+        }
+        Ok(target)
+    }
+
     fn workspace_session_indices(&self, ws: &WorkspaceKey) -> Vec<usize> {
         self.sessions
             .iter()
@@ -3868,6 +3913,39 @@ fn close_fallback(
     }
 }
 
+/// What re-homing a session does to the active-session maps and the view.
+/// Pure over the same kind of snapshot `close_fallback` takes, so the policy
+/// is testable without spawning PTYs.
+#[derive(Debug, PartialEq, Eq)]
+enum SourceRepair {
+    Keep,
+    Set(SessionId),
+    Remove,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct MoveOutcome {
+    source: SourceRepair,
+    /// The moved session becomes the target workspace's active session.
+    claim_target: bool,
+    /// Switch the view to the target — the user was watching this session.
+    follow: bool,
+}
+
+fn plan_move(
+    was_source_active: bool,
+    on_screen: bool,
+    next_in_source: Option<SessionId>,
+    target_has_active: bool,
+) -> MoveOutcome {
+    let source = match (was_source_active, next_in_source) {
+        (false, _) => SourceRepair::Keep,
+        (true, Some(id)) => SourceRepair::Set(id),
+        (true, None) => SourceRepair::Remove,
+    };
+    MoveOutcome { source, claim_target: on_screen || !target_has_active, follow: on_screen }
+}
+
 /// The owning project's main checkout for `ws`, or None when `ws` already
 /// is the main (including non-git roots, whose single pseudo-worktree is
 /// its own main) or belongs to no known project.
@@ -6061,5 +6139,41 @@ mod tests {
             owning_worktree(&wts, Path::new("C:/repo/wt/inner/src")),
             Some(PathBuf::from("C:/repo/wt/inner"))
         );
+    }
+
+    /// The on-screen session keeps being watched: the view follows it to the
+    /// target workspace.
+    #[test]
+    fn moving_the_on_screen_session_follows_it() {
+        let out = plan_move(true, true, None, false);
+        assert!(out.follow);
+        assert!(out.claim_target);
+        assert!(matches!(out.source, SourceRepair::Remove));
+    }
+
+    /// A background move is silent — no focus stealing — and only claims the
+    /// target's active slot when the target had none.
+    #[test]
+    fn a_background_move_never_steals_focus() {
+        let out = plan_move(false, false, None, true);
+        assert!(!out.follow);
+        assert!(!out.claim_target, "the target's own active session stays");
+        assert!(matches!(out.source, SourceRepair::Keep));
+
+        let out = plan_move(false, false, None, false);
+        assert!(!out.follow);
+        assert!(out.claim_target, "an empty target adopts the arrival");
+    }
+
+    /// Moving the source workspace's active-but-not-on-screen session promotes
+    /// the next remaining session there, the way closing it would.
+    #[test]
+    fn the_source_workspace_repairs_its_active_session() {
+        let out = plan_move(true, false, Some(9), false);
+        assert!(matches!(out.source, SourceRepair::Set(9)));
+        assert!(!out.follow);
+
+        let out = plan_move(true, false, None, false);
+        assert!(matches!(out.source, SourceRepair::Remove), "no session left to promote");
     }
 }
