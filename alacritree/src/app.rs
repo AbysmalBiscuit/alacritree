@@ -33,10 +33,10 @@ use crate::wsl::{self, ShellChoice};
 pub type WorkspaceKey = Option<PathBuf>;
 
 /// Channel from notification-worker threads back to the app.  Set once by
-/// `AlacritreeApp::new`; each worker reads it to deliver the workspace the
+/// `AlacritreeApp::new`; each worker reads it to deliver the session the
 /// user clicked on.  Static because the worker has no other handle to the
 /// app and there's only ever one app instance per process.
-static NOTIFY_TX: OnceLock<Mutex<Sender<WorkspaceKey>>> = OnceLock::new();
+static NOTIFY_TX: OnceLock<Mutex<Sender<SessionId>>> = OnceLock::new();
 
 #[derive(Clone, Copy)]
 struct FocusOutlineTheme {
@@ -319,7 +319,7 @@ pub struct AlacritreeApp {
     /// more shells there doesn't re-invoke the doppler CLI.
     doppler_synced: HashSet<PathBuf>,
     pending_session_close: Option<SessionId>,
-    notify_rx: Receiver<WorkspaceKey>,
+    notify_rx: Receiver<SessionId>,
     /// Requests from IPC connection threads, drained once per frame.
     ipc_rx: Option<Receiver<ipc::AppCall>>,
     /// Held for its Drop: unlinks the socket file on shutdown.
@@ -4170,19 +4170,12 @@ impl AlacritreeApp {
         }
     }
 
-    /// Handle workspace-switch requests from clicked notifications.  Only
-    /// the most recent click is honored — if multiple toasts piled up, the
-    /// user most likely meant the latest one.
+    /// Handle session-switch requests from clicked notifications.  A stale
+    /// id (session closed before the click) makes the activate a no-op, but
+    /// the window still comes forward — the user asked for the app.
     fn process_notification_actions(&mut self, ctx: &Context) {
-        let mut latest: Option<WorkspaceKey> = None;
-        while let Ok(ws) = self.notify_rx.try_recv() {
-            latest = Some(ws);
-        }
-        let Some(ws) = latest else { return };
-        match ws {
-            None => self.activate_home(ctx),
-            Some(p) => self.activate_worktree(ctx, &p),
-        }
+        let Some(id) = latest_notification_click(&self.notify_rx) else { return };
+        self.activate_session_by_id(id);
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
@@ -5461,10 +5454,20 @@ impl eframe::App for AlacritreeApp {
     }
 }
 
-/// Spawn a throwaway thread so `notify-rust`'s synchronous D-Bus / WinRT
-/// calls don't stall the egui paint loop.  On Linux the thread sticks around
-/// for `wait_for_action` and posts the session's workspace back through
-/// `NOTIFY_TX` when the user clicks the notification.
+/// Drain every queued notification click, keeping only the newest.  Clicks
+/// can pile up while the window is unfocused; the user most likely meant
+/// the latest one.
+fn latest_notification_click(rx: &Receiver<SessionId>) -> Option<SessionId> {
+    let mut latest = None;
+    while let Ok(id) = rx.try_recv() {
+        latest = Some(id);
+    }
+    latest
+}
+
+/// Spawn a throwaway thread so the platform notifier's synchronous calls
+/// don't stall the egui paint loop.  The thread posts the session's id back
+/// through `NOTIFY_TX` when the user clicks the notification.
 fn notify_attention(session: &Session, ctx: &egui::Context) {
     let where_label = session
         .working_directory
@@ -5477,16 +5480,26 @@ fn notify_attention(session: &Session, ctx: &egui::Context) {
     } else {
         format!("{where_label} is waiting for input")
     };
-    let key = session.working_directory.clone();
+    let id = session.id;
     let ctx = ctx.clone();
     std::thread::Builder::new()
         .name("alacritree-notify".into())
-        .spawn(move || notify_worker(body, key, ctx))
+        .spawn(move || notify_worker(body, id, ctx))
         .ok();
 }
 
+/// Deliver a clicked notification's session id to the UI thread.
+fn notify_click(id: SessionId, ctx: &egui::Context) {
+    if let Some(lock) = NOTIFY_TX.get() {
+        if let Ok(tx) = lock.lock() {
+            let _ = tx.send(id);
+            ctx.request_repaint();
+        }
+    }
+}
+
 #[cfg(all(unix, not(target_os = "macos")))]
-fn notify_worker(body: String, key: WorkspaceKey, ctx: egui::Context) {
+fn notify_worker(body: String, id: SessionId, ctx: egui::Context) {
     // `default` is the action id freedesktop notifiers fire on body-click.
     let result = notify_rust::Notification::new()
         .summary("alacritree")
@@ -5504,21 +5517,41 @@ fn notify_worker(body: String, key: WorkspaceKey, ctx: egui::Context) {
         if action == "__closed" {
             return;
         }
-        if let Some(lock) = NOTIFY_TX.get() {
-            if let Ok(tx) = lock.lock() {
-                let _ = tx.send(key.clone());
-                ctx.request_repaint();
-            }
-        }
+        notify_click(id, &ctx);
     });
 }
 
-#[cfg(not(all(unix, not(target_os = "macos"))))]
-fn notify_worker(body: String, _key: WorkspaceKey, _ctx: egui::Context) {
-    // mac-notification-sys / WinRT don't expose blocking action waits via
-    // notify-rust today — fall back to a fire-and-forget toast.
-    if let Err(e) = notify_rust::Notification::new().summary("alacritree").body(&body).show() {
+#[cfg(windows)]
+fn notify_worker(body: String, id: SessionId, ctx: egui::Context) {
+    use tauri_winrt_notification::Toast;
+    // notify-rust doesn't surface WinRT activation, so drive its own backend
+    // crate directly.  `show` returns immediately; the WinRT runtime holds
+    // the activation handler, so this worker thread can exit right away.
+    let result = Toast::new(Toast::POWERSHELL_APP_ID)
+        .title("alacritree")
+        .text1(&body)
+        .on_activated(move |_action| {
+            notify_click(id, &ctx);
+            Ok(())
+        })
+        .show();
+    if let Err(e) = result {
         log::debug!("desktop notification failed: {e}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn notify_worker(body: String, id: SessionId, ctx: egui::Context) {
+    use mac_notification_sys::{Notification, NotificationResponse};
+    // notify-rust doesn't surface click responses on macOS, so call its own
+    // backend crate directly; `wait_for_click` blocks this thread until the
+    // user reacts or the notification is dismissed.
+    let mut options = Notification::new();
+    options.wait_for_click(true);
+    match mac_notification_sys::send_notification("alacritree", None, &body, Some(&options)) {
+        Ok(NotificationResponse::Click) => notify_click(id, &ctx),
+        Ok(_) => {},
+        Err(e) => log::debug!("desktop notification failed: {e}"),
     }
 }
 
@@ -5539,6 +5572,18 @@ mod tests {
             v.insert(to, it);
         }
         v
+    }
+
+    #[test]
+    fn a_pile_of_notification_clicks_resolves_to_the_newest() {
+        let (tx, rx) = mpsc::channel();
+        assert_eq!(latest_notification_click(&rx), None);
+        tx.send(3).unwrap();
+        tx.send(7).unwrap();
+        tx.send(5).unwrap();
+        assert_eq!(latest_notification_click(&rx), Some(5));
+        // The drain consumed everything, not just the returned click.
+        assert_eq!(latest_notification_click(&rx), None);
     }
 
     #[test]

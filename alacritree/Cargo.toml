@@ -71,6 +71,14 @@ sysinfo = { version = "0.36", default-features = false, features = ["system"] }
 # Distro enumeration reads HKCU\...\Lxss directly (Windows Terminal's
 # approach) — no process spawn at startup, and it identifies the default.
 winreg = "0.55"
+# notify-rust's own WinRT backend, used directly because notify-rust doesn't
+# expose toast activation — needed to focus the pinging session on click.
+tauri-winrt-notification = "0.7"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# notify-rust's own macOS backend, used directly because notify-rust doesn't
+# expose click responses — needed to focus the pinging session on click.
+mac-notification-sys = "0.6"
 
 [target.'cfg(windows)'.dev-dependencies]
 # Share-mode constants for tests that hold a file the way the loader holds a
