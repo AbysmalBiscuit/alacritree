@@ -5306,6 +5306,15 @@ impl AlacritreeApp {
                 self.close_session(ctx, session_id);
                 Ok(json!({ "closed": session_id }))
             },
+            Req::MoveSession { session_id, path } => {
+                let target =
+                    self.workspace_for_path(&path).ok_or_else(|| unknown_worktree(&path))?;
+                let workspace = self.move_session_to(session_id, target)?;
+                // A silent re-grouping produces no PTY events, so nothing
+                // else would wake the next paint.
+                ctx.request_repaint();
+                Ok(json!({ "session_id": session_id, "workspace": workspace }))
+            },
             Req::SendText { session_id, text } => {
                 let session = self
                     .sessions
