@@ -5297,6 +5297,27 @@ impl AlacritreeApp {
                 .then(|| wt.path.clone())
         })
     }
+
+    /// Like [`Self::known_worktree_path`], but a path anywhere *inside* a
+    /// worktree's subtree counts — a mover reports its cwd, which is usually
+    /// a subdirectory, not the worktree root itself.
+    fn workspace_for_path(&self, path: &Path) -> Option<PathBuf> {
+        let worktrees: Vec<PathBuf> =
+            self.projects.iter().flat_map(|p| &p.worktrees).map(|wt| wt.path.clone()).collect();
+        owning_worktree(&worktrees, path)
+            .or_else(|| path.canonicalize().ok().and_then(|c| owning_worktree(&worktrees, &c)))
+    }
+}
+
+/// The known worktree that owns `path`: the longest worktree path that
+/// `path` equals or descends from.  Longest wins so a worktree nested under
+/// another checkout resolves to the inner one.
+fn owning_worktree(worktrees: &[PathBuf], path: &Path) -> Option<PathBuf> {
+    worktrees
+        .iter()
+        .filter(|wt| path.starts_with(wt))
+        .max_by_key(|wt| wt.components().count())
+        .cloned()
 }
 
 fn unknown_worktree(path: &Path) -> String {
@@ -6014,6 +6035,31 @@ mod tests {
             heading,
             16.0 * (crate::config::FontConfig::UI_HEADING_RATIO
                 / crate::config::FontConfig::UI_NORMAL_RATIO)
+        );
+    }
+
+    #[test]
+    fn owning_worktree_matches_exact_and_descendant_paths() {
+        let wts = vec![PathBuf::from("C:/w/feat-a"), PathBuf::from("C:/w/feat-b")];
+        assert_eq!(
+            owning_worktree(&wts, Path::new("C:/w/feat-a")),
+            Some(PathBuf::from("C:/w/feat-a"))
+        );
+        assert_eq!(
+            owning_worktree(&wts, Path::new("C:/w/feat-b/src/deep")),
+            Some(PathBuf::from("C:/w/feat-b"))
+        );
+        assert_eq!(owning_worktree(&wts, Path::new("C:/elsewhere")), None);
+    }
+
+    /// A worktree checked out inside another checkout's subtree (e.g. under the
+    /// main repo) must resolve to the inner worktree, not the enclosing one.
+    #[test]
+    fn owning_worktree_prefers_the_longest_prefix() {
+        let wts = vec![PathBuf::from("C:/repo"), PathBuf::from("C:/repo/wt/inner")];
+        assert_eq!(
+            owning_worktree(&wts, Path::new("C:/repo/wt/inner/src")),
+            Some(PathBuf::from("C:/repo/wt/inner"))
         );
     }
 }
