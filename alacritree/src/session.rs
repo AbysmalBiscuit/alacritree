@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -534,6 +535,31 @@ mod windows_process_probe {
     }
 }
 
+/// The environment a session's PTY starts with: the user's `[env]` table,
+/// the diff-pane `LESS` default, and the session's own id — how a process
+/// inside the terminal names itself to `alacritree session move` / the MCP
+/// tools.
+fn session_env(
+    config_env: &HashMap<String, String>,
+    kind: &SessionKind,
+    id: SessionId,
+) -> HashMap<String, String> {
+    let mut env = config_env.clone();
+    if matches!(kind, SessionKind::Diff { .. }) {
+        // git hands its pager `LESS=FRX`; both of those defaults hurt a diff
+        // tab. `F` (quit-if-one-screen) makes delta's `less` exit the instant
+        // a diff fits the pane, so the tab is reaped before it can be read.
+        // `X` (no-init) keeps `less` off the alternate screen, and without
+        // `ALT_SCREEN` the wheel loses its alternate-scroll arrow keys
+        // (`terminal_view::apply_scroll`) and falls back to a scrollback that
+        // `-X` repaints over instead of filling, leaving the pane unscrollable.
+        // A `LESS` set by the user (via `[env]`) wins.
+        env.entry("LESS".to_string()).or_insert_with(|| "R".to_string());
+    }
+    env.insert("ALACRITREE_SESSION_ID".to_string(), id.to_string());
+    env
+}
+
 impl Session {
     pub fn spawn(
         ctx: egui::Context,
@@ -613,18 +639,8 @@ impl Session {
         let term = Term::new(term_config(config), &size, proxy.clone());
         let term = Arc::new(FairMutex::new(term));
 
-        let mut env = config.env.clone();
-        if matches!(kind, SessionKind::Diff { .. }) {
-            // git hands its pager `LESS=FRX`; both of those defaults hurt a diff
-            // tab. `F` (quit-if-one-screen) makes delta's `less` exit the instant
-            // a diff fits the pane, so the tab is reaped before it can be read.
-            // `X` (no-init) keeps `less` off the alternate screen, and without
-            // `ALT_SCREEN` the wheel loses its alternate-scroll arrow keys
-            // (`terminal_view::apply_scroll`) and falls back to a scrollback that
-            // `-X` repaints over instead of filling, leaving the pane unscrollable.
-            // A `LESS` set by the user (via `[env]`) wins.
-            env.entry("LESS".to_string()).or_insert_with(|| "R".to_string());
-        }
+        let id = next_session_id();
+        let env = session_env(&config.env, &kind, id);
 
         #[cfg(not(windows))]
         let _ = escape_args;
@@ -653,7 +669,7 @@ impl Session {
         event_loop.spawn();
 
         Ok(Self {
-            id: next_session_id(),
+            id,
             title,
             working_directory,
             kind,
@@ -1236,5 +1252,21 @@ mod tests {
             r"node C:\Users\lev\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\cli.js";
         assert_eq!(agent_glyph_by_cmdline([cmd]), Some('✳'));
         assert_eq!(agent_glyph_by_cmdline([r"pwsh.exe -NoLogo"]), None);
+    }
+
+    #[test]
+    fn every_session_exports_its_id_into_the_environment() {
+        let env = session_env(&Default::default(), &SessionKind::Shell, 42);
+        assert_eq!(env.get("ALACRITREE_SESSION_ID").map(String::as_str), Some("42"));
+    }
+
+    /// The `[env]` table is the user's; the id key is ours.  A user-set
+    /// `ALACRITREE_SESSION_ID` would misroute every shell hook, so ours wins.
+    #[test]
+    fn the_session_id_overrides_a_user_env_entry() {
+        let mut user = std::collections::HashMap::new();
+        user.insert("ALACRITREE_SESSION_ID".to_string(), "999".to_string());
+        let env = session_env(&user, &SessionKind::Shell, 7);
+        assert_eq!(env.get("ALACRITREE_SESSION_ID").map(String::as_str), Some("7"));
     }
 }
