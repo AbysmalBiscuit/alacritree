@@ -14,7 +14,15 @@ on:
 
 jobs:
   app:
-    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            triple: aarch64-apple-darwin
+          - runner: macos-15-intel
+            triple: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
 
@@ -33,7 +41,9 @@ jobs:
             exit 0
           fi
           tag=$(jq -r '.announcement_tag' <<< "$PLAN")
+          # make-app.sh builds for the runner's native arch, so each matrix
+          # leg produces its own .app.
           ./alacritree/extra/osx/make-app.sh
-          asset="alacritree-${tag}-Alacritree.app.tar.gz"
+          asset="Alacritree-${{ matrix.triple }}.app.tar.gz"
           tar -C target/release/osx -czf "$asset" Alacritree.app
           gh release upload "$tag" "$asset" --repo "$GITHUB_REPOSITORY" --clobber
