@@ -299,6 +299,7 @@ Tools:
 | `close_session` | Close a session |
 | `send_text` | Type into a session's terminal (control chars pass through; `\r` submits) |
 | `read_screen` | Read a session's screen text, cursor position, and optional scrollback |
+| `move_session` | Re-home a session under another worktree (`alacritree session move <session_id> <path>`); path may be anywhere inside it |
 | `git_status` | Staged/unstaged files and per-file +/- vs the default branch |
 | `create_worktree` | Create a worktree + branch, same flow as the sidebar's `+` button |
 | `refresh_project` | Re-scan a project's worktrees |
@@ -311,6 +312,58 @@ clients fall back to scanning the socket directory, or can pass
 `alacritree mcp --socket <path>` explicitly. Set `ipc_socket = false` under
 `[general]` (shared with Alacritty's option of the same name) to disable the
 socket entirely.
+
+### Shell integration: following the cwd
+
+alacritree never guesses a session's directory — a session tells it, via
+`ALACRITREE_SESSION_ID` (exported into every session) and
+`alacritree session move`. Two opt-in hooks cover the common flows; add the
+one(s) you want to your shell config.
+
+**Sidebar follows the shell** — report the cwd at every prompt:
+
+```sh
+# bash (~/.bashrc)
+_alacritree_report_cwd() {
+  [ -n "$ALACRITREE_SESSION_ID" ] || return 0
+  alacritree session move "$ALACRITREE_SESSION_ID" "$PWD" >/dev/null 2>&1 || true
+}
+PROMPT_COMMAND="_alacritree_report_cwd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+
+# zsh (~/.zshrc)
+precmd_functions+=(_alacritree_report_cwd)
+```
+
+```powershell
+# PowerShell ($PROFILE) — wrap your existing prompt function
+function prompt {
+  if ($env:ALACRITREE_SESSION_ID) {
+    alacritree session move $env:ALACRITREE_SESSION_ID "$PWD" *> $null
+  }
+  "PS $PWD> "
+}
+```
+
+Paths outside any known worktree are rejected by alacritree and ignored by
+the hook, so `cd /tmp` moves nothing.
+
+**Shell follows the sidebar** — when an agent moved the session (e.g. via the
+`move_session` MCP tool), land the shell there at the next prompt. Only the
+shell can change its own cwd, which is why this is a hook and not an app
+feature (requires `jq`):
+
+```sh
+_alacritree_follow() {
+  [ -n "$ALACRITREE_SESSION_ID" ] || return 0
+  local ws
+  ws=$(alacritree session list --json 2>/dev/null | jq -r --arg id "$ALACRITREE_SESSION_ID" \
+    '.sessions[] | select((.id | tostring) == $id) | .workspace // empty')
+  [ -n "$ws" ] && [ "$ws" != "$PWD" ] && cd "$ws"
+}
+```
+
+Both hooks cost one local-socket round trip per prompt; running both at once
+is fine (last writer wins).
 
 ---
 
