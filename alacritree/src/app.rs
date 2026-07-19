@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use alacritty_terminal::tty::Shell;
 use eframe::CreationContext;
@@ -21,7 +22,9 @@ use crate::panel_filter::{self, PanelFilter};
 use crate::paste;
 use crate::pr_status::{PrCache, PrInfo, PrState};
 use crate::projects::{Project, Worktree, project_json};
-use crate::session::{Session, SessionId, SessionKind, TermSize};
+use crate::session::{
+    AttentionVerdict, Session, SessionId, SessionKind, TermSize, poll_attention_debounce,
+};
 use crate::shortcuts_window;
 use crate::sidebar_nav::{self, SidebarRow};
 use crate::state::{self, PersistedProject};
@@ -4194,6 +4197,7 @@ impl AlacritreeApp {
         // treat unknown as "focused" so we don't pile up stale attention dots.
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
 
+        let grace = self.config.ui.attention_grace;
         for idx in 0..self.sessions.len() {
             let outcome = self.sessions[idx].drain_events(&self.config.palette);
             // Ahead of the attention early-out: a background session copying
@@ -4201,20 +4205,34 @@ impl AlacritreeApp {
             for (target, text) in &outcome.clipboard {
                 clipboard::write(*target, text);
             }
-            if !outcome.attention {
-                continue;
-            }
             let is_visible_to_user = Some(idx) == visible_idx && focused;
             if is_visible_to_user {
+                // Nothing pending survives the user already looking at it.
+                self.sessions[idx].pending_attention = None;
                 continue;
             }
-            // Only toast on the *transition* into needs_attention — otherwise
-            // BEL + title-transition firing in the same idle cycle would
-            // produce two toasts for the same "Claude is done" event.
-            let was_attending = self.sessions[idx].needs_attention;
-            self.sessions[idx].needs_attention = true;
-            if !was_attending && self.config.ui.notifications {
-                notify_attention(&self.sessions[idx], ctx);
+            if outcome.attention && self.sessions[idx].pending_attention.is_none() {
+                self.sessions[idx].pending_attention = Some(Instant::now());
+            }
+            let Some(since) = self.sessions[idx].pending_attention else {
+                continue;
+            };
+            match poll_attention_debounce(since, Instant::now(), &self.sessions[idx].title, grace) {
+                AttentionVerdict::Cancel => self.sessions[idx].pending_attention = None,
+                // A quiet PTY repaints nothing on its own, so the wake-up
+                // that decides the ping has to be scheduled here.
+                AttentionVerdict::Wait(remaining) => ctx.request_repaint_after(remaining),
+                AttentionVerdict::Fire => {
+                    self.sessions[idx].pending_attention = None;
+                    // Only toast on the *transition* into needs_attention — otherwise
+                    // BEL + title-transition firing in the same idle cycle would
+                    // produce two toasts for the same "Claude is done" event.
+                    let was_attending = self.sessions[idx].needs_attention;
+                    self.sessions[idx].needs_attention = true;
+                    if !was_attending && self.config.ui.notifications {
+                        notify_attention(&self.sessions[idx], ctx);
+                    }
+                },
             }
         }
 

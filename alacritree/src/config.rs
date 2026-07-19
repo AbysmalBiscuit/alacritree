@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle, Rgb};
 use egui::Color32;
@@ -353,6 +354,9 @@ pub struct UiTheme {
     pub sidebar_accent: Option<Color32>,
     /// Fire a desktop notification when a non-visible session needs attention.
     pub notifications: bool,
+    /// How long an attention trigger must survive without the session going
+    /// back to work before it pings.  Zero pings on the trigger itself.
+    pub attention_grace: Duration,
     /// Ask before the sidebar's per-session `×` kills the PTY.
     pub confirm_session_close: ConfirmSessionClose,
     /// What closing the last session in the on-screen workspace does.
@@ -385,6 +389,7 @@ impl Default for UiTheme {
             sidebar_border: None,
             sidebar_accent: None,
             notifications: true,
+            attention_grace: Duration::ZERO,
             confirm_session_close: ConfirmSessionClose::Never,
             last_session_close: LastSessionClose::Respawn,
             session_display: SessionDisplay::default(),
@@ -1000,6 +1005,9 @@ struct RawUi {
     sidebar_border: Option<RgbStr>,
     sidebar_accent: Option<RgbStr>,
     notifications: Option<bool>,
+    /// Grace window in milliseconds before an attention trigger pings; a
+    /// session that resumes work inside it swallows the ping.  Default 0.
+    attention_grace_ms: Option<u64>,
     /// When the sidebar × on a session row asks before killing the PTY:
     /// "never" (default) | "busy" | "always".
     confirm_session_close: Option<String>,
@@ -1139,6 +1147,7 @@ impl RawConfig {
             sidebar_border: self.ui.sidebar_border.map(|v| rgb_to_color32(v.0)),
             sidebar_accent: self.ui.sidebar_accent.map(|v| rgb_to_color32(v.0)),
             notifications: self.ui.notifications.unwrap_or(true),
+            attention_grace: Duration::from_millis(self.ui.attention_grace_ms.unwrap_or(0)),
             confirm_session_close: parse_confirm_session_close(
                 self.ui.confirm_session_close.as_deref(),
             ),
