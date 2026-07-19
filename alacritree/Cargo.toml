@@ -76,9 +76,33 @@ winreg = "0.55"
 tauri-winrt-notification = "0.7"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# notify-rust's own macOS backend, used directly because notify-rust doesn't
-# expose click responses — needed to focus the pinging session on click.
-mac-notification-sys = "0.6"
+# UserNotifications framework, used instead of notify-rust because its
+# NSUserNotification backend is defunct on modern macOS: delivery silently
+# fails for unbundled processes and clicks are never surfaced.  Requires
+# running from an app bundle (see extra/osx) — same objc2 stack egui links.
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSBundle",
+    "NSDictionary",
+    "NSError",
+    "NSString",
+    "NSValue",
+] }
+objc2-user-notifications = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
+    "UNError",
+    "UNNotification",
+    "UNNotificationContent",
+    "UNNotificationRequest",
+    "UNNotificationResponse",
+    "UNNotificationSettings",
+    "UNNotificationSound",
+    "UNNotificationTrigger",
+    "UNUserNotificationCenter",
+] }
 
 [target.'cfg(windows)'.dev-dependencies]
 # Share-mode constants for tests that hold a file the way the loader holds a

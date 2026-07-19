@@ -549,6 +549,14 @@ impl AlacritreeApp {
             })
             .collect();
 
+        // Delegate installation and the permission prompt belong to startup:
+        // deferring them to the first toast would drop that toast (macOS
+        // won't deliver while the authorization sheet is pending).
+        #[cfg(target_os = "macos")]
+        if config.ui.notifications {
+            crate::notify_macos::init(cc.egui_ctx.clone());
+        }
+
         let (notify_tx, notify_rx) = mpsc::channel();
         // `set` may fail only if a previous instance already initialized the
         // static (e.g. tests).  In that case the old sender points at a dead
@@ -5489,7 +5497,7 @@ fn notify_attention(session: &Session, ctx: &egui::Context) {
 }
 
 /// Deliver a clicked notification's session id to the UI thread.
-fn notify_click(id: SessionId, ctx: &egui::Context) {
+pub(crate) fn notify_click(id: SessionId, ctx: &egui::Context) {
     if let Some(lock) = NOTIFY_TX.get() {
         if let Ok(tx) = lock.lock() {
             let _ = tx.send(id);
@@ -5541,18 +5549,10 @@ fn notify_worker(body: String, id: SessionId, ctx: egui::Context) {
 }
 
 #[cfg(target_os = "macos")]
-fn notify_worker(body: String, id: SessionId, ctx: egui::Context) {
-    use mac_notification_sys::{Notification, NotificationResponse};
-    // notify-rust doesn't surface click responses on macOS, so call its own
-    // backend crate directly; `wait_for_click` blocks this thread until the
-    // user reacts or the notification is dismissed.
-    let mut options = Notification::new();
-    options.wait_for_click(true);
-    match mac_notification_sys::send_notification("alacritree", None, &body, Some(&options)) {
-        Ok(NotificationResponse::Click) => notify_click(id, &ctx),
-        Ok(_) => {},
-        Err(e) => log::debug!("desktop notification failed: {e}"),
-    }
+fn notify_worker(body: String, id: SessionId, _ctx: egui::Context) {
+    // Clicks come back through the UNUserNotificationCenter delegate that
+    // `notify_macos::init` installed, not through this worker.
+    crate::notify_macos::notify(&body, id);
 }
 
 #[cfg(test)]
