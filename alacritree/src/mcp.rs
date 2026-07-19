@@ -186,7 +186,7 @@ fn tool_definitions() -> Value {
                     "path": { "type": "string", "description": "A path inside the target worktree." },
                 },
                 "required": ["session_id", "path"],
-            }
+            },
         },
         {
             "name": "read_screen",

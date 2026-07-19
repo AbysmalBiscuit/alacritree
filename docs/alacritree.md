@@ -365,13 +365,17 @@ _alacritree_follow() {
 PROMPT_COMMAND="_alacritree_follow${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
 
 # zsh (~/.zshrc)
-precmd_functions+=(_alacritree_follow)
+precmd_functions=(_alacritree_follow "${precmd_functions[@]}")
 ```
 
 Both hooks cost one local-socket round trip per prompt; running both at once
 is fine — `_alacritree_follow` only `cd`s when the session's workspace points
 outside the current worktree, so it doesn't fight `_alacritree_report_cwd`
-over ordinary subdirectory moves within the same worktree.
+over ordinary subdirectory moves within the same worktree. If you install
+both, `_alacritree_follow` must run before `_alacritree_report_cwd` in the
+same prompt (as shown above with `PROMPT_COMMAND`/`precmd_functions`
+prepending), so the follow hook `cd`s into an agent-moved workspace before
+report-cwd stamps the session with the (otherwise stale) `$PWD`.
 
 ---
 
