@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle, Rgb};
 use egui::Color32;
@@ -39,7 +40,14 @@ pub struct Config {
     /// Offer the IPC socket that `alacritree mcp` connects to.  Mirrors
     /// alacritty's `[general] ipc_socket` (default on).
     pub ipc_socket: bool,
+    /// Start dir for sessions with no explicit workspace (the home tab);
+    /// worktree tabs always use their checkout path.  Mirrors alacritty's
+    /// `[general] working_directory`, except a leading `~` expands to the
+    /// home directory (upstream only expands `~` in config imports) so one
+    /// shared config works on every platform.
+    pub working_directory: Option<PathBuf>,
     pub wsl_automount_root: String,
+    pub wsl_resident_helper: bool,
     /// Explicit `delta` program for the diff pane, from `[ui] delta_path`.
     /// When set it is used verbatim in git's `core.pager` on every platform
     /// and skips WSL delta autodiscovery; when unset, native diffs run bare
@@ -238,6 +246,29 @@ fn parse_confirm_session_close(raw: Option<&str>) -> ConfirmSessionClose {
     }
 }
 
+/// How the sidebar scroll areas draw their scrollbar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScrollbarStyle {
+    /// egui's default: a thin bar overlaying the content edge, expanding on
+    /// hover — which covers the icons at the right end of sidebar rows.
+    #[default]
+    Floating,
+    /// A reserved gutter right of the content; the bar never covers icons.
+    Solid,
+}
+
+fn parse_scrollbar(raw: Option<&str>) -> ScrollbarStyle {
+    match raw {
+        None => ScrollbarStyle::default(),
+        Some("floating") => ScrollbarStyle::Floating,
+        Some("solid") => ScrollbarStyle::Solid,
+        Some(other) => {
+            log::warn!("unknown ui.scrollbar value {other:?}, using \"floating\"");
+            ScrollbarStyle::default()
+        },
+    }
+}
+
 /// Text-presentation magnifier (U+2315).  Not in egui's bundled fonts; it
 /// resolves through the system fallback chain `fonts.rs` registers.
 const DEFAULT_SEARCH_ICON: &str = "⌕";
@@ -353,6 +384,9 @@ pub struct UiTheme {
     pub sidebar_accent: Option<Color32>,
     /// Fire a desktop notification when a non-visible session needs attention.
     pub notifications: bool,
+    /// How long an attention trigger must survive without the session going
+    /// back to work before it pings.  Zero pings on the trigger itself.
+    pub attention_grace: Duration,
     /// Ask before the sidebar's per-session `×` kills the PTY.
     pub confirm_session_close: ConfirmSessionClose,
     /// What closing the last session in the on-screen workspace does.
@@ -366,6 +400,9 @@ pub struct UiTheme {
     pub pr_status: bool,
     pub icons: Icons,
     pub focus_outline: FocusOutline,
+    /// `[ui] scrollbar`: sidebar scrollbar style, "floating" (default) or
+    /// "solid" (reserved gutter, never covers row icons).
+    pub scrollbar: ScrollbarStyle,
     /// `[ui] worktree_name`: template for worktree row labels (subst syntax:
     /// `$name`, `$branch`, `$path`, `${var:fallback}`; `$pr` is the branch's
     /// PR number as `#123`, absent when none is known — it needs
@@ -385,12 +422,14 @@ impl Default for UiTheme {
             sidebar_border: None,
             sidebar_accent: None,
             notifications: true,
+            attention_grace: Duration::ZERO,
             confirm_session_close: ConfirmSessionClose::Never,
             last_session_close: LastSessionClose::Respawn,
             session_display: SessionDisplay::default(),
             pr_status: false,
             icons: Icons::default(),
             focus_outline: FocusOutline::default(),
+            scrollbar: ScrollbarStyle::Floating,
             worktree_name: None,
             project_name: None,
         }
@@ -450,7 +489,9 @@ impl Default for Config {
             selection: SelectionConfig::default(),
             bindings: Vec::new(),
             ipc_socket: true,
+            working_directory: None,
             wsl_automount_root: "/mnt".to_string(),
+            wsl_resident_helper: true,
             delta_path: None,
             profiles: Vec::new(),
             default_profile: None,
@@ -737,6 +778,7 @@ struct RawConfig {
     selection: RawSelection,
     keyboard: RawKeyboard,
     general: RawGeneral,
+    wsl: RawWsl,
 }
 
 /// Subset of alacritty's `[general]` section that alacritree honors.  It
@@ -747,6 +789,7 @@ struct RawConfig {
 #[serde(default)]
 struct RawGeneral {
     ipc_socket: Option<bool>,
+    working_directory: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -915,9 +958,17 @@ struct RawIndexed {
     color: RgbStr,
 }
 
+/// Top-level `[wsl]`: platform-integration options.  Lives outside `[ui]`
+/// because nothing here is presentation — it governs how the app talks to
+/// distros.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
-struct RawUiWsl {
+struct RawWsl {
+    /// Keep a resident helper process per distro for foreground probes,
+    /// batched git queries, and tool discovery.  `false` restores one-shot
+    /// wsl.exe spawns everywhere; WSL sessions then always report "no
+    /// TUI", so FocusLeft/FocusRight always move panel focus.
+    resident_helper: Option<bool>,
     /// Distro-side mount point for Windows drives, mirroring wsl.conf's
     /// `[automount] root`.  Only used for paths *we* translate (git output
     /// from inside a distro); `wsl.exe --cd` translates with the distro's
@@ -969,6 +1020,14 @@ fn build_icons(raw: RawIcons) -> Icons {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
+struct RawUiWsl {
+    /// Deprecated location: `[wsl] automount_root` supersedes this and wins
+    /// when both are set; kept so existing configs keep working.
+    automount_root: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 struct RawSessionDisplay {
     /// Show a workspace's sidebar session row even with a single session.
     sidebar_always: Option<bool>,
@@ -1000,6 +1059,9 @@ struct RawUi {
     sidebar_border: Option<RgbStr>,
     sidebar_accent: Option<RgbStr>,
     notifications: Option<bool>,
+    /// Grace window in milliseconds before an attention trigger pings; a
+    /// session that resumes work inside it swallows the ping.  Default 0.
+    attention_grace_ms: Option<u64>,
     /// When the sidebar × on a session row asks before killing the PTY:
     /// "never" (default) | "busy" | "always".
     confirm_session_close: Option<String>,
@@ -1009,6 +1071,8 @@ struct RawUi {
     session_display: RawSessionDisplay,
     delta_path: Option<String>,
     icons: RawIcons,
+    /// Sidebar scrollbar style: "floating" (default) | "solid".
+    scrollbar: Option<String>,
     pr_status: Option<bool>,
     font: RawUiFont,
     worktree_name: Option<String>,
@@ -1139,6 +1203,7 @@ impl RawConfig {
             sidebar_border: self.ui.sidebar_border.map(|v| rgb_to_color32(v.0)),
             sidebar_accent: self.ui.sidebar_accent.map(|v| rgb_to_color32(v.0)),
             notifications: self.ui.notifications.unwrap_or(true),
+            attention_grace: Duration::from_millis(self.ui.attention_grace_ms.unwrap_or(0)),
             confirm_session_close: parse_confirm_session_close(
                 self.ui.confirm_session_close.as_deref(),
             ),
@@ -1155,6 +1220,7 @@ impl RawConfig {
                 color: self.ui.focus_outline.color.map(|v| rgb_to_color32(v.0)),
                 thickness: self.ui.focus_outline.thickness.map_or(1.0, |t| t.max(0.5)),
             },
+            scrollbar: parse_scrollbar(self.ui.scrollbar.as_deref()),
             worktree_name: self.ui.worktree_name.clone().filter(|t| !t.trim().is_empty()),
             project_name: self.ui.project_name.clone().filter(|t| !t.trim().is_empty()),
         };
@@ -1267,13 +1333,15 @@ impl RawConfig {
         };
 
         // ---- WSL ----
+        // `[wsl]` supersedes the deprecated `[ui.wsl]` location.
         let wsl_automount_root = self
-            .ui
             .wsl
             .automount_root
+            .or(self.ui.wsl.automount_root)
             .map(|r| r.trim_end_matches('/').to_string())
             .filter(|r| r.starts_with('/') && r.len() > 1)
             .unwrap_or_else(|| "/mnt".to_string());
+        let wsl_resident_helper = self.wsl.resident_helper.unwrap_or(true);
 
         // ---- UI Font ----
         let ui_font = UiFont {
@@ -1305,7 +1373,13 @@ impl RawConfig {
             selection,
             bindings,
             ipc_socket: self.general.ipc_socket.unwrap_or(true),
+            working_directory: self
+                .general
+                .working_directory
+                .as_deref()
+                .and_then(|raw| parse_config_path(raw, "general.working_directory")),
             wsl_automount_root,
+            wsl_resident_helper,
             delta_path: self.ui.delta_path.filter(|s| !s.trim().is_empty()),
             profiles,
             default_profile,
@@ -1401,6 +1475,29 @@ mod tests {
     }
 
     #[test]
+    fn wsl_section_wins_over_deprecated_ui_location() {
+        let raw: RawConfig = toml::from_str("[wsl]\nautomount_root = \"/drives\"").unwrap();
+        assert_eq!(raw.into_config().wsl_automount_root, "/drives");
+
+        let both = "[wsl]\nautomount_root = \"/new\"\n[ui.wsl]\nautomount_root = \"/old\"";
+        let raw: RawConfig = toml::from_str(both).unwrap();
+        assert_eq!(raw.into_config().wsl_automount_root, "/new");
+
+        // Existing configs keep working through the deprecated location.
+        let raw: RawConfig = toml::from_str("[ui.wsl]\nautomount_root = \"/old\"").unwrap();
+        assert_eq!(raw.into_config().wsl_automount_root, "/old");
+    }
+
+    #[test]
+    fn resident_helper_defaults_on() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        assert!(raw.into_config().wsl_resident_helper);
+
+        let raw: RawConfig = toml::from_str("[wsl]\nresident_helper = false").unwrap();
+        assert!(!raw.into_config().wsl_resident_helper);
+    }
+
+    #[test]
     fn delta_path_parses_and_blank_is_none() {
         let raw: RawConfig = toml::from_str("").unwrap();
         assert_eq!(raw.into_config().delta_path, None);
@@ -1435,6 +1532,28 @@ mod tests {
     fn confirm_session_close_invalid_falls_back_to_never() {
         let ui = ui_from_toml("[ui]\nconfirm_session_close = \"sometimes\"");
         assert_eq!(ui.confirm_session_close, ConfirmSessionClose::Never);
+    }
+
+    #[test]
+    fn scrollbar_defaults_to_floating() {
+        let ui = ui_from_toml("");
+        assert_eq!(ui.scrollbar, ScrollbarStyle::Floating);
+    }
+
+    #[test]
+    fn scrollbar_parses_all_values() {
+        for (raw, expected) in
+            [("floating", ScrollbarStyle::Floating), ("solid", ScrollbarStyle::Solid)]
+        {
+            let ui = ui_from_toml(&format!("[ui]\nscrollbar = \"{raw}\""));
+            assert_eq!(ui.scrollbar, expected, "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn scrollbar_invalid_falls_back_to_floating() {
+        let ui = ui_from_toml("[ui]\nscrollbar = \"chunky\"");
+        assert_eq!(ui.scrollbar, ScrollbarStyle::Floating);
     }
 
     #[test]
@@ -1501,6 +1620,45 @@ mod tests {
     fn relative_and_user_tilde_paths_are_rejected() {
         assert_eq!(parse_config_path("relative/dir", "test"), None);
         assert_eq!(parse_config_path("~user/dir", "test"), None);
+    }
+
+    #[test]
+    fn general_working_directory_defaults_to_none() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        assert_eq!(raw.into_config().working_directory, None);
+    }
+
+    #[test]
+    fn general_working_directory_expands_tilde_and_forward_slashes() {
+        let home = home::home_dir().unwrap();
+        let raw: RawConfig =
+            toml::from_str("[general]\nworking_directory = \"~/projects\"").unwrap();
+        assert_eq!(raw.into_config().working_directory, Some(home.join("projects")));
+    }
+
+    #[test]
+    fn general_working_directory_accepts_absolute_paths() {
+        let toml_src = format!(
+            "[general]\nworking_directory = \"{}\"",
+            abs("somewhere").replace('\\', "\\\\")
+        );
+        let raw: RawConfig = toml::from_str(&toml_src).unwrap();
+        assert_eq!(raw.into_config().working_directory, Some(PathBuf::from(abs("somewhere"))));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn general_working_directory_accepts_forward_slash_windows_paths() {
+        let raw: RawConfig =
+            toml::from_str("[general]\nworking_directory = \"C:/somewhere\"").unwrap();
+        assert_eq!(raw.into_config().working_directory, Some(PathBuf::from("C:/somewhere")));
+    }
+
+    #[test]
+    fn general_working_directory_rejects_relative_paths() {
+        let raw: RawConfig =
+            toml::from_str("[general]\nworking_directory = \"relative/dir\"").unwrap();
+        assert_eq!(raw.into_config().working_directory, None);
     }
 
     #[test]
