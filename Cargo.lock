@@ -50,6 +50,7 @@ dependencies = [
 name = "alacritree"
 version = "0.4.1"
 dependencies = [
+ "ab_glyph",
  "alacritty_terminal",
  "arboard",
  "base64",
@@ -64,6 +65,7 @@ dependencies = [
  "git2",
  "home",
  "interprocess",
+ "libc",
  "log",
  "memmap2",
  "notify-rust",

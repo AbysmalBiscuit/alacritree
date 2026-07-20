@@ -37,6 +37,10 @@ fontdb = { version = "0.23", default-features = false, features = ["fontconfig",
 # Reads cmap tables to build coverage sets for the Windows fallback chain.
 # Same major as the ttf-parser fontdb already pulls in, so no duplicate build.
 ttf-parser = "0.25"
+# The exact parse epaint applies to every registered face.  epaint aborts the
+# process on a face ab_glyph rejects, so registration must prove each face
+# parses first.  Same version epaint already links, so no duplicate build.
+ab_glyph = "0.2"
 # Font faces reach egui as mappings, not buffers.  Same version fontdb already
 # links, so no duplicate build.
 memmap2 = "0.9"
@@ -64,6 +68,12 @@ tempfile = "3"
 # against `yeslogic-fontconfig-sys = "^5"`, which is also what `crossfont`
 # (alacritty's font backend, present in this workspace) pulls in.
 fontconfig = "0.8"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Foreground-agent detection: `proc_pidinfo` supplies the process group,
+# foreground group, and command name Linux reads from /proc, and
+# `sysctl(KERN_PROCARGS2)` the command line.
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 # Restricts the DLL search path at startup (`harden_dll_search_path`) and
