@@ -298,6 +298,9 @@ pub struct AlacritreeApp {
     active_session: HashMap<WorkspaceKey, SessionId>,
     projects: Vec<Project>,
     git_status: HashMap<PathBuf, StatusCache>,
+    /// Per-worktree override of the git panel's diff base, keyed by worktree
+    /// path.  Mirrors `state.toml`; written through `state::set_base_branch`.
+    base_branch_overrides: HashMap<PathBuf, String>,
     pr_cache: PrCache,
     /// Renders `[ui] worktree_name` / `project_name` templates at paint time.
     row_labels: crate::row_label::LabelTemplates,
@@ -318,6 +321,8 @@ pub struct AlacritreeApp {
     /// off-thread and are adopted in `poll_pending_creates`.
     pending_creates: Vec<BackgroundCreate>,
     pending_rename: Option<RenameState>,
+    /// The base-branch picker modal.  Transient: never persisted.
+    pending_base_branch: Option<BaseBranchPicker>,
     pending_project_remove: Option<ProjectRemoveState>,
     /// Worktrees already given a Doppler scope pass this app run, so opening
     /// more shells there doesn't re-invoke the doppler CLI.
@@ -400,6 +405,17 @@ struct ProjectRemoveState {
     root: PathBuf,
     /// Display name, kept for the prompt after `projects` may have shifted.
     name: String,
+}
+
+/// Modal state for choosing a worktree's diff base.
+struct BaseBranchPicker {
+    worktree: PathBuf,
+    query: String,
+    /// `Err` is what git said when listing failed (not a repo, WSL down…).
+    branches: Result<Vec<String>, String>,
+    /// Auto-detected base shown on the "Auto" row.
+    detected: Option<String>,
+    cursor: usize,
 }
 
 /// Drag-and-drop payload for reordering the project list.  Carries the dragged
@@ -598,6 +614,11 @@ impl AlacritreeApp {
             active_session: HashMap::new(),
             projects,
             git_status: HashMap::new(),
+            base_branch_overrides: persisted
+                .base_branches
+                .iter()
+                .map(|b| (b.worktree.clone(), b.branch.clone()))
+                .collect(),
             pr_cache: PrCache::new(),
             row_labels,
             config,
@@ -610,6 +631,7 @@ impl AlacritreeApp {
             pending_create: None,
             pending_creates: Vec::new(),
             pending_rename: None,
+            pending_base_branch: None,
             pending_project_remove: None,
             doppler_synced: HashSet::new(),
             pending_session_close: None,
@@ -1105,6 +1127,7 @@ impl AlacritreeApp {
             || self.pending_create.is_some()
             || self.pending_session_close.is_some()
             || self.pending_rename.is_some()
+            || self.pending_base_branch.is_some()
             || self.pending_project_remove.is_some()
             || self.error_dialog.is_some()
     }
@@ -1843,6 +1866,22 @@ impl AlacritreeApp {
             BindingAction::Named(NamedAction::FocusRight) => {
                 self.move_focus(FocusDir::Right, origin);
             },
+            BindingAction::Named(NamedAction::SetBaseBranch) => {
+                let target = base_branch_target(
+                    self.focus == PaneFocus::ProjectsSidebar,
+                    self.sidebar_cursor.as_ref(),
+                    |id| {
+                        self.sessions
+                            .iter()
+                            .find(|s| s.id == id)
+                            .map(|s| s.working_directory.clone())
+                    },
+                    &self.current_workspace,
+                );
+                if let Some(path) = target {
+                    self.open_base_branch_picker(path);
+                }
+            },
             BindingAction::Named(other) => {
                 self.dispatch_scroll_or_other(other);
             },
@@ -2013,6 +2052,7 @@ impl AlacritreeApp {
         let activate_session_request: std::cell::Cell<Option<(WorkspaceKey, SessionId)>> =
             std::cell::Cell::new(None);
         let close_session_request: std::cell::Cell<Option<SessionId>> = std::cell::Cell::new(None);
+        let base_picker_request: std::cell::Cell<Option<PathBuf>> = std::cell::Cell::new(None);
         // Drag-to-reorder: (dragged root, insert-before display index).
         let reorder_request: std::cell::Cell<Option<(PathBuf, usize)>> = std::cell::Cell::new(None);
         let mut add_project_clicked = false;
@@ -2561,6 +2601,9 @@ impl AlacritreeApp {
                                 if action.spawn {
                                     spawn_shell_request.set(Some(Some(wt.path.clone())));
                                 }
+                                if action.set_base {
+                                    base_picker_request.set(Some(wt.path.clone()));
+                                }
                                 let session_rows = worktree_session_rows
                                     .get(idx)
                                     .and_then(|v| v.get(wt_idx))
@@ -2634,6 +2677,9 @@ impl AlacritreeApp {
         if let Some(path) = activate_request.take() {
             self.activate_worktree(ctx, &path);
         }
+        if let Some(path) = base_picker_request.take() {
+            self.open_base_branch_picker(path);
+        }
         if let Some(req) = delete_request.take() {
             self.pending_delete = Some(req);
         }
@@ -2677,12 +2723,39 @@ impl AlacritreeApp {
         None
     }
 
+    fn open_base_branch_picker(&mut self, worktree: PathBuf) {
+        let detected = self.project_default_branch_for(&worktree);
+        let branches = crate::worktree::list_branches(&worktree);
+        self.pending_base_branch = Some(BaseBranchPicker {
+            worktree,
+            query: String::new(),
+            branches,
+            detected,
+            cursor: 0,
+        });
+    }
+
+    fn apply_base_branch(&mut self, worktree: PathBuf, branch: Option<String>) {
+        match &branch {
+            Some(b) => {
+                self.base_branch_overrides.insert(worktree.clone(), b.clone());
+            },
+            None => {
+                self.base_branch_overrides.remove(&worktree);
+            },
+        }
+        // The next `StatusCache::poll` sees the changed hint and recomputes;
+        // nothing to invalidate by hand.
+        state::mutate(|s| state::set_base_branch(s, &worktree, branch));
+    }
+
     fn show_git_sidebar(&mut self, ctx: &Context, panel_frame: Frame) -> egui::Rect {
         let theme = self.theme;
         let scrollbar = self.config.ui.scrollbar;
         let palette = self.config.palette.clone();
         let active_diff_key = self.active_diff_key();
         let diff_request: std::cell::Cell<Option<DiffRequest>> = std::cell::Cell::new(None);
+        let open_picker: std::cell::Cell<Option<PathBuf>> = std::cell::Cell::new(None);
         let panel_resp = SidePanel::right("right_sidebar")
             .resizable(true)
             .default_width(300.0 * theme.ui_scale)
@@ -2737,10 +2810,11 @@ impl AlacritreeApp {
                 // be `None`, which `pr_cache.poll` handles by returning early.
                 let cached_branch = cache.current_branch().map(str::to_string);
                 let pr_info = self.pr_cache.poll(&path, cached_branch.as_deref(), ctx);
-                // PR base takes precedence over the repo's default branch so
-                // the sidebar diff matches what GitHub will review.
-                let effective_default =
-                    pr_info.as_ref().map(|p| p.base_branch.clone()).or(project_default);
+                let effective_default = effective_base_branch(
+                    self.base_branch_overrides.get(&path).map(String::as_str),
+                    pr_info.as_ref().map(|p| p.base_branch.as_str()),
+                    project_default.as_deref(),
+                );
                 // Single non-blocking poll: returns the last known status and
                 // kicks off a background refresh if stale or if the hint
                 // changed since the last completed compute.  Cloned so the
@@ -2839,12 +2913,21 @@ impl AlacritreeApp {
                             |ui| {
                                 if let Some(default) = default {
                                     // right_to_left: default sits rightmost, `vs` to its left.
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(default).color(theme.text_dim).small(),
+                                    let resp = ui
+                                        .add(
+                                            egui::Label::new(
+                                                RichText::new(default)
+                                                    .color(theme.text_dim)
+                                                    .small(),
+                                            )
+                                            .truncate()
+                                            .sense(egui::Sense::click()),
                                         )
-                                        .truncate(),
-                                    );
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                        .on_hover_text("Set the branch this panel diffs against");
+                                    if resp.clicked() {
+                                        open_picker.set(Some(path.clone()));
+                                    }
                                     ui.label(RichText::new("vs").color(theme.text_muted).small());
                                 }
                             },
@@ -2989,6 +3072,9 @@ impl AlacritreeApp {
             });
         if let Some(req) = diff_request.take() {
             self.open_diff(ctx, req);
+        }
+        if let Some(path) = open_picker.take() {
+            self.open_base_branch_picker(path);
         }
         panel_resp.response.rect
     }
@@ -3920,6 +4006,7 @@ struct WorktreeAction {
     activate: bool,
     delete: bool,
     spawn: bool,
+    set_base: bool,
 }
 
 /// Everything a sidebar session row needs, snapshotted before the panel
@@ -3991,6 +4078,62 @@ fn project_main_for(projects: &[Project], ws: &Path) -> Option<PathBuf> {
     let project = projects.iter().find(|p| p.worktrees.iter().any(|w| w.path == ws))?;
     let main = project.worktrees.iter().find(|w| w.is_main)?;
     if main.path == ws { None } else { Some(main.path.clone()) }
+}
+
+/// The branch the git panel diffs against: the user's explicit override,
+/// else the open PR's base (what GitHub will review), else the project's
+/// detected default branch.
+fn effective_base_branch(
+    override_branch: Option<&str>,
+    pr_base: Option<&str>,
+    project_default: Option<&str>,
+) -> Option<String> {
+    override_branch.or(pr_base).or(project_default).map(str::to_string)
+}
+
+/// The worktree a SetBaseBranch press targets: the sidebar cursor's worktree
+/// while the projects sidebar owns focus (a session row resolves to its
+/// workspace), otherwise the current workspace.  Home and project-header
+/// cursors, and the home workspace, have no base branch to override.
+fn base_branch_target(
+    sidebar_focused: bool,
+    cursor: Option<&SidebarRow>,
+    session_workspace: impl Fn(SessionId) -> Option<WorkspaceKey>,
+    current: &WorkspaceKey,
+) -> Option<PathBuf> {
+    if sidebar_focused {
+        return match cursor {
+            Some(SidebarRow::Worktree(p)) => Some(p.clone()),
+            Some(SidebarRow::Session(id)) => session_workspace(*id).flatten(),
+            _ => None,
+        };
+    }
+    current.clone()
+}
+
+/// Branches whose name contains `query`, case-insensitively.
+fn filter_branches(branches: &[String], query: &str) -> Vec<String> {
+    let query = query.to_lowercase();
+    branches.iter().filter(|b| b.to_lowercase().contains(&query)).cloned().collect()
+}
+
+/// Where the picker cursor lands after this frame's filter changes.  Row 0 is
+/// always Auto, so reseeding a query edit to 0 would apply Auto on the primary
+/// "type a branch name, press Enter" flow.  A non-empty query instead seeds
+/// the first branch row (1), clamped to 0 when nothing matches; an empty
+/// query seeds Auto.  With no query change, the previous cursor is kept,
+/// clamped to the (possibly shrunk) filtered length.
+fn picker_cursor(
+    query_changed: bool,
+    query_empty: bool,
+    prev: usize,
+    filtered_len: usize,
+) -> usize {
+    if query_changed {
+        if query_empty { 0 } else { 1.min(filtered_len) }
+    } else {
+        prev.min(filtered_len)
+    }
 }
 
 /// Agent glyphs usually come from the title's own leading char
@@ -4167,6 +4310,14 @@ fn worktree_row(
         }
     }
 
+    let mut set_base_clicked = false;
+    resp.context_menu(|ui| {
+        if ui.button("Set base branch…").clicked() {
+            set_base_clicked = true;
+            ui.close_menu();
+        }
+    });
+
     let bg = if is_active {
         theme.row_active_bg
     } else if resp.hovered() {
@@ -4188,6 +4339,7 @@ fn worktree_row(
         activate: !deleting && resp.clicked() && !delete_clicked && !spawn_clicked && !wt.prunable,
         delete: delete_clicked,
         spawn: spawn_clicked,
+        set_base: set_base_clicked,
     }
 }
 
@@ -4989,6 +5141,124 @@ impl AlacritreeApp {
         self.pending_rename = Some(RenameState { root, label });
     }
 
+    fn show_base_branch_picker(&mut self, ctx: &Context) {
+        let Some(mut picker) = self.pending_base_branch.take() else {
+            return;
+        };
+        let theme = self.theme;
+        let danger = rgb_to_color32(self.config.palette.normal[1]);
+        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (up, down) = ctx.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+            )
+        });
+        let frame = modal_frame(&theme);
+        let current = self.base_branch_overrides.get(&picker.worktree).cloned();
+        let s = theme.ui_scale;
+
+        // Row 0 is always "Auto"; branch rows follow, narrowed by the query.
+        // Populated inside the modal closure, after the TextEdit runs, so the
+        // rows reflect this frame's query rather than the previous one.
+        let mut filtered: Vec<String> = Vec::new();
+        let mut chosen: Option<Option<String>> = None; // Some(None) = Auto
+        let modal = egui::Modal::new(egui::Id::new("alacritree_base_branch_picker"))
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.set_width(380.0 * s);
+                ui.spacing_mut().item_spacing.y = 4.0 * s;
+                let name = picker
+                    .worktree
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| picker.worktree.display().to_string());
+                ui.label(
+                    RichText::new(format!("Base branch for `{name}`")).color(theme.text).strong(),
+                );
+                ui.label(
+                    RichText::new("The git panel diffs this worktree against it.")
+                        .color(theme.text_muted)
+                        .small(),
+                );
+                let input_id = egui::Id::new("alacritree_base_branch_query");
+                let edit = egui::TextEdit::singleline(&mut picker.query)
+                    .id(input_id)
+                    .hint_text("filter branches")
+                    .desired_width(f32::INFINITY);
+                let query_changed = ui.add(edit).changed();
+                focus_default(ui.ctx(), input_id);
+
+                if let Err(e) = &picker.branches {
+                    ui.label(RichText::new(e).color(danger).small());
+                }
+
+                filtered = match &picker.branches {
+                    Ok(branches) => filter_branches(branches, &picker.query),
+                    Err(_) => Vec::new(),
+                };
+                picker.cursor = picker_cursor(
+                    query_changed,
+                    picker.query.is_empty(),
+                    picker.cursor,
+                    filtered.len(),
+                );
+
+                let mark = |selected: bool| if selected { "• " } else { "   " };
+                egui::ScrollArea::vertical().max_height(240.0 * s).show(ui, |ui| {
+                    let auto_label = match &picker.detected {
+                        Some(d) => format!("{}Auto ({d})", mark(current.is_none())),
+                        None => format!("{}Auto", mark(current.is_none())),
+                    };
+                    let auto = ui.selectable_label(picker.cursor == 0, auto_label);
+                    if auto.clicked() {
+                        chosen = Some(None);
+                    }
+                    for (i, branch) in filtered.iter().enumerate() {
+                        let selected = current.as_deref() == Some(branch.as_str());
+                        let resp = ui.selectable_label(
+                            picker.cursor == i + 1,
+                            format!("{}{branch}", mark(selected)),
+                        );
+                        if resp.clicked() {
+                            chosen = Some(Some(branch.clone()));
+                        }
+                    }
+                });
+                ui.label(
+                    RichText::new("↑↓ move · Enter apply · Esc cancel")
+                        .color(theme.text_muted)
+                        .small(),
+                );
+            });
+
+        if up {
+            picker.cursor = picker.cursor.saturating_sub(1);
+        }
+        if down {
+            picker.cursor = (picker.cursor + 1).min(filtered.len());
+        }
+        // A failed branch listing leaves `filtered` empty, so cursor 0 would
+        // resolve to Auto — applying it on Enter would clear an existing
+        // override on a reflexive keypress rather than the no-op a listing
+        // failure should be. Clicks can't reach this path (no rows render).
+        if confirm_via_key && picker.branches.is_ok() {
+            chosen = Some(if picker.cursor == 0 {
+                None
+            } else {
+                filtered.get(picker.cursor - 1).cloned()
+            });
+        }
+        if cancel_via_key || modal.should_close() {
+            return;
+        }
+        if let Some(branch) = chosen {
+            self.apply_base_branch(picker.worktree, branch);
+            return;
+        }
+        self.pending_base_branch = Some(picker);
+    }
+
     fn show_create_dialog(&mut self, ctx: &Context) {
         let Some(state) = self.pending_create.take() else {
             return;
@@ -5568,6 +5838,9 @@ impl eframe::App for AlacritreeApp {
         if self.pending_rename.is_some() {
             self.show_rename_dialog(ctx);
         }
+        if self.pending_base_branch.is_some() {
+            self.show_base_branch_picker(ctx);
+        }
         if self.pending_project_remove.is_some() {
             self.show_remove_project_dialog(ctx);
         }
@@ -5743,6 +6016,39 @@ mod tests {
     fn session_ids_empty_for_unknown_workspace() {
         let pairs = vec![(None, 1)];
         assert!(sidebar_session_ids(&pairs, &ws("/missing"), false).is_empty());
+    }
+
+    #[test]
+    fn base_branch_precedence_is_override_then_pr_then_default() {
+        let f = effective_base_branch;
+        assert_eq!(f(Some("develop"), Some("main"), Some("master")), Some("develop".into()));
+        assert_eq!(f(None, Some("main"), Some("master")), Some("main".into()));
+        assert_eq!(f(None, None, Some("master")), Some("master".into()));
+        assert_eq!(f(None, None, None), None);
+    }
+
+    #[test]
+    fn picker_filter_is_a_case_insensitive_contains() {
+        let branches =
+            vec!["main".to_string(), "develop".to_string(), "origin/develop".to_string()];
+        assert_eq!(filter_branches(&branches, ""), branches);
+        assert_eq!(filter_branches(&branches, "DEV"), vec!["develop", "origin/develop"]);
+        assert!(filter_branches(&branches, "zz").is_empty());
+    }
+
+    #[test]
+    fn picker_cursor_seeds_the_first_match_on_a_non_empty_query_change() {
+        // Typing a query that matches something jumps past Auto to the first
+        // match, so Enter applies that match instead of Auto.
+        assert_eq!(picker_cursor(true, false, 0, 3), 1);
+        // A query with no matches has nothing to land on but Auto.
+        assert_eq!(picker_cursor(true, false, 0, 0), 0);
+        // Clearing the query back to empty returns the cursor to Auto.
+        assert_eq!(picker_cursor(true, true, 5, 3), 0);
+        // No query change this frame: clamp the previous cursor to the
+        // (possibly shrunk) filtered length instead of reseeding it.
+        assert_eq!(picker_cursor(false, false, 5, 3), 3);
+        assert_eq!(picker_cursor(false, false, 2, 3), 2);
     }
 
     #[test]
@@ -6183,5 +6489,43 @@ mod tests {
             16.0 * (crate::config::FontConfig::UI_HEADING_RATIO
                 / crate::config::FontConfig::UI_NORMAL_RATIO)
         );
+    }
+
+    #[test]
+    fn set_base_branch_targets_the_cursored_worktree_when_sidebar_focused() {
+        let wt = PathBuf::from("C:/repo/wt");
+        let none = |_id: SessionId| -> Option<WorkspaceKey> { None };
+        let cursor = SidebarRow::Worktree(wt.clone());
+        assert_eq!(
+            base_branch_target(true, Some(&cursor), none, &Some(PathBuf::from("C:/other"))),
+            Some(wt)
+        );
+    }
+
+    #[test]
+    fn set_base_branch_resolves_a_session_row_to_its_workspace() {
+        let wt = PathBuf::from("C:/repo/wt");
+        let ws = wt.clone();
+        let lookup = move |id: SessionId| (id == 7).then(|| Some(ws.clone()));
+        let cursor = SidebarRow::Session(7);
+        assert_eq!(base_branch_target(true, Some(&cursor), lookup, &None), Some(wt));
+    }
+
+    #[test]
+    fn set_base_branch_ignores_home_and_project_rows() {
+        let none = |_id: SessionId| -> Option<WorkspaceKey> { None };
+        assert_eq!(base_branch_target(true, Some(&SidebarRow::Home), none, &None), None);
+        let cursor = SidebarRow::Project(PathBuf::from("C:/repo"));
+        let none2 = |_id: SessionId| -> Option<WorkspaceKey> { None };
+        assert_eq!(base_branch_target(true, Some(&cursor), none2, &None), None);
+    }
+
+    #[test]
+    fn set_base_branch_falls_back_to_the_current_worktree() {
+        let wt = PathBuf::from("C:/repo/wt");
+        let none = |_id: SessionId| -> Option<WorkspaceKey> { None };
+        assert_eq!(base_branch_target(false, None, none, &Some(wt.clone())), Some(wt));
+        let none2 = |_id: SessionId| -> Option<WorkspaceKey> { None };
+        assert_eq!(base_branch_target(false, None, none2, &None), None, "home has no base branch");
     }
 }
