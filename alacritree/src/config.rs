@@ -40,6 +40,12 @@ pub struct Config {
     /// Offer the IPC socket that `alacritree mcp` connects to.  Mirrors
     /// alacritty's `[general] ipc_socket` (default on).
     pub ipc_socket: bool,
+    /// Start dir for sessions with no explicit workspace (the home tab);
+    /// worktree tabs always use their checkout path.  Mirrors alacritty's
+    /// `[general] working_directory`, except a leading `~` expands to the
+    /// home directory (upstream only expands `~` in config imports) so one
+    /// shared config works on every platform.
+    pub working_directory: Option<PathBuf>,
     pub wsl_automount_root: String,
     pub wsl_resident_helper: bool,
     /// Explicit `delta` program for the diff pane, from `[ui] delta_path`.
@@ -456,6 +462,7 @@ impl Default for Config {
             selection: SelectionConfig::default(),
             bindings: Vec::new(),
             ipc_socket: true,
+            working_directory: None,
             wsl_automount_root: "/mnt".to_string(),
             wsl_resident_helper: true,
             delta_path: None,
@@ -755,6 +762,7 @@ struct RawConfig {
 #[serde(default)]
 struct RawGeneral {
     ipc_socket: Option<bool>,
+    working_directory: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1335,6 +1343,11 @@ impl RawConfig {
             selection,
             bindings,
             ipc_socket: self.general.ipc_socket.unwrap_or(true),
+            working_directory: self
+                .general
+                .working_directory
+                .as_deref()
+                .and_then(|raw| parse_config_path(raw, "general.working_directory")),
             wsl_automount_root,
             wsl_resident_helper,
             delta_path: self.ui.delta_path.filter(|s| !s.trim().is_empty()),
@@ -1555,6 +1568,45 @@ mod tests {
     fn relative_and_user_tilde_paths_are_rejected() {
         assert_eq!(parse_config_path("relative/dir", "test"), None);
         assert_eq!(parse_config_path("~user/dir", "test"), None);
+    }
+
+    #[test]
+    fn general_working_directory_defaults_to_none() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        assert_eq!(raw.into_config().working_directory, None);
+    }
+
+    #[test]
+    fn general_working_directory_expands_tilde_and_forward_slashes() {
+        let home = home::home_dir().unwrap();
+        let raw: RawConfig =
+            toml::from_str("[general]\nworking_directory = \"~/projects\"").unwrap();
+        assert_eq!(raw.into_config().working_directory, Some(home.join("projects")));
+    }
+
+    #[test]
+    fn general_working_directory_accepts_absolute_paths() {
+        let toml_src = format!(
+            "[general]\nworking_directory = \"{}\"",
+            abs("somewhere").replace('\\', "\\\\")
+        );
+        let raw: RawConfig = toml::from_str(&toml_src).unwrap();
+        assert_eq!(raw.into_config().working_directory, Some(PathBuf::from(abs("somewhere"))));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn general_working_directory_accepts_forward_slash_windows_paths() {
+        let raw: RawConfig =
+            toml::from_str("[general]\nworking_directory = \"C:/somewhere\"").unwrap();
+        assert_eq!(raw.into_config().working_directory, Some(PathBuf::from("C:/somewhere")));
+    }
+
+    #[test]
+    fn general_working_directory_rejects_relative_paths() {
+        let raw: RawConfig =
+            toml::from_str("[general]\nworking_directory = \"relative/dir\"").unwrap();
+        assert_eq!(raw.into_config().working_directory, None);
     }
 
     #[test]
