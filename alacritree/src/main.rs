@@ -36,6 +36,7 @@ mod terminal_view;
 mod test_util;
 mod worktree;
 mod wsl;
+mod wsl_helper;
 
 use app::AlacritreeApp;
 use clap::Parser;
@@ -88,6 +89,7 @@ fn main() -> eframe::Result<()> {
 
     let config = config::load();
     wsl::set_automount_root(config.wsl_automount_root.clone());
+    wsl_helper::set_enabled(config.wsl_resident_helper);
     let translucent = config.window.opacity < 1.0;
 
     let mut viewport = egui::ViewportBuilder::default()

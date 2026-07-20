@@ -213,6 +213,9 @@ sidebar_border     = "#2a2a2a"
 sidebar_accent     = "#6a9fb5"
 notifications      = true   # desktop notification when a hidden session bells;
                             # clicking it focuses the session that pinged
+attention_grace_ms = 0      # hold pings this long and drop them if the session
+                            # resumes work (agents that continue between tasks);
+                            # 0 pings immediately
 
 [ui.icons]                  # sidebar glyph overrides (e.g. Nerd Font icons)
 search = "⌕"                # glyph prefixing the sidebar search prompt

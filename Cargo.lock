@@ -48,10 +48,12 @@ dependencies = [
 
 [[package]]
 name = "alacritree"
-version = "0.1.2"
+version = "0.4.1"
 dependencies = [
+ "ab_glyph",
  "alacritty_terminal",
  "arboard",
+ "base64",
  "block2 0.6.2",
  "clap",
  "clap_complete",
@@ -64,6 +66,7 @@ dependencies = [
  "git2",
  "home",
  "interprocess",
+ "libc",
  "log",
  "memmap2",
  "notify-rust",
