@@ -91,6 +91,9 @@ pub struct Session {
     pub events: mpsc::Receiver<TermEvent>,
     /// Latched attention flag, cleared when the user views this session.
     pub needs_attention: bool,
+    /// When a not-yet-surfaced attention trigger arrived.  `None` once it
+    /// fires, cancels, or the user views the session.
+    pub pending_attention: Option<Instant>,
     /// Sub-cell wheel residue (logical points), retained across frames so that
     /// trackpad pixel-deltas accumulate into whole-line scrolls instead of
     /// being dropped when each frame's delta is smaller than a cell.
@@ -281,6 +284,39 @@ fn is_spinner_title(title: &str) -> bool {
         let n = c as u32;
         (0x2800..=0x28FF).contains(&n)
     })
+}
+
+/// Outcome of polling a pending attention trigger.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AttentionVerdict {
+    /// Latch the flag and notify now.
+    Fire,
+    /// Still inside the grace window; poll again after the returned delay.
+    Wait(Duration),
+    /// The session went back to work — drop the trigger without notifying.
+    Cancel,
+}
+
+/// Debounce for attention triggers.  Agent CLIs driven by an orchestrator
+/// (e.g. Claude Code running a multi-task workflow) ring BEL and drop their
+/// spinner title at every task boundary, then resume on their own — an
+/// immediate ping per boundary is noise.  A trigger only fires if the title
+/// stays out of its spinner state for the whole grace window.  Zero grace
+/// disables the debounce and fires on the trigger frame, spinner or not.
+pub fn poll_attention_debounce(
+    since: Instant,
+    now: Instant,
+    title: &str,
+    grace: Duration,
+) -> AttentionVerdict {
+    if grace.is_zero() {
+        return AttentionVerdict::Fire;
+    }
+    if is_spinner_title(title) {
+        return AttentionVerdict::Cancel;
+    }
+    let elapsed = now.saturating_duration_since(since);
+    if elapsed >= grace { AttentionVerdict::Fire } else { AttentionVerdict::Wait(grace - elapsed) }
 }
 
 /// A session "looks busy" when its foreground process is a recognized
@@ -688,6 +724,7 @@ impl Session {
             term,
             events,
             needs_attention: false,
+            pending_attention: None,
             accumulated_scroll: (0.0, 0.0),
             last_report_cell: None,
             shell_pid,
@@ -976,6 +1013,47 @@ mod tests {
         apply_term_event(event, &mut title, &mut exited, &mut outcome);
 
         assert_eq!(outcome.clipboard, vec![(Target::Clipboard, "hello".to_owned())]);
+    }
+
+    /// Zero grace is the config default and must keep the pre-debounce
+    /// behavior: the trigger frame latches, even mid-spinner (a BEL from a
+    /// still-working agent latched before the debounce existed too).
+    #[test]
+    fn zero_grace_fires_on_the_trigger_frame() {
+        let now = Instant::now();
+        assert_eq!(
+            poll_attention_debounce(now, now, "⠋ working", Duration::ZERO),
+            AttentionVerdict::Fire
+        );
+    }
+
+    /// An orchestrated agent that resumes after a task boundary brings its
+    /// spinner title back — that resumption is what must eat the ping.
+    #[test]
+    fn a_returning_spinner_cancels_a_pending_trigger() {
+        let since = Instant::now();
+        let grace = Duration::from_secs(2);
+        assert_eq!(
+            poll_attention_debounce(since, since + grace, "⠋ working", grace),
+            AttentionVerdict::Cancel
+        );
+    }
+
+    /// A genuinely idle session pings, but only after waiting out the grace
+    /// window — the wait carries the remaining delay so the app can schedule
+    /// the deciding repaint.
+    #[test]
+    fn an_idle_session_waits_out_the_grace_window_then_fires() {
+        let since = Instant::now();
+        let grace = Duration::from_secs(2);
+        assert_eq!(
+            poll_attention_debounce(since, since + Duration::from_secs(1), "~/repo", grace),
+            AttentionVerdict::Wait(Duration::from_secs(1))
+        );
+        assert_eq!(
+            poll_attention_debounce(since, since + grace, "~/repo", grace),
+            AttentionVerdict::Fire
+        );
     }
 
     /// The wheel scrolls a diff pane only because its pager sits on the alternate
