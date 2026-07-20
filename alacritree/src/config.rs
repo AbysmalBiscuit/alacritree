@@ -403,6 +403,10 @@ pub struct UiTheme {
     /// `[ui] scrollbar`: sidebar scrollbar style, "floating" (default) or
     /// "solid" (reserved gutter, never covers row icons).
     pub scrollbar: ScrollbarStyle,
+    /// `[ui] sidebar_click_focus`: clicking a sidebar moves keyboard focus to
+    /// it (so filter typing works without the focus shortcut).  Off by default
+    /// so unmodified configs keep click-through-to-terminal behavior.
+    pub sidebar_click_focus: bool,
     /// `[ui] worktree_name`: template for worktree row labels (subst syntax:
     /// `$name`, `$branch`, `$path`, `${var:fallback}`; `$pr` is the branch's
     /// PR number as `#123`, absent when none is known — it needs
@@ -430,6 +434,7 @@ impl Default for UiTheme {
             icons: Icons::default(),
             focus_outline: FocusOutline::default(),
             scrollbar: ScrollbarStyle::Floating,
+            sidebar_click_focus: false,
             worktree_name: None,
             project_name: None,
         }
@@ -1081,6 +1086,8 @@ struct RawUi {
     profiles: Vec<RawProfile>,
     default_profile: Option<String>,
     focus_outline: RawFocusOutline,
+    /// Clicking a sidebar moves keyboard focus to it.  Default false.
+    sidebar_click_focus: Option<bool>,
 }
 
 /// One `[[ui.profiles]]` entry.  Fields are optional so a malformed entry
@@ -1221,6 +1228,7 @@ impl RawConfig {
                 thickness: self.ui.focus_outline.thickness.map_or(1.0, |t| t.max(0.5)),
             },
             scrollbar: parse_scrollbar(self.ui.scrollbar.as_deref()),
+            sidebar_click_focus: self.ui.sidebar_click_focus.unwrap_or(false),
             worktree_name: self.ui.worktree_name.clone().filter(|t| !t.trim().is_empty()),
             project_name: self.ui.project_name.clone().filter(|t| !t.trim().is_empty()),
         };
@@ -1921,6 +1929,16 @@ program = "second"
     fn focus_outline_thickness_clamps() {
         let fo = ui_from_toml("[ui.focus_outline]\nthickness = 0.1").focus_outline;
         assert_eq!(fo.thickness, 0.5);
+    }
+
+    #[test]
+    fn sidebar_click_focus_defaults_off() {
+        assert!(!ui_from_toml("").sidebar_click_focus);
+    }
+
+    #[test]
+    fn sidebar_click_focus_parses() {
+        assert!(ui_from_toml("[ui]\nsidebar_click_focus = true").sidebar_click_focus);
     }
 
     #[test]

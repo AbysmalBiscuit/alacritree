@@ -241,6 +241,7 @@ scrollbar          = "floating"  # sidebar scrollbar: "floating" (default, thin
                                  # overlay that expands over the row icons on
                                  # hover) or "solid" (reserved gutter that
                                  # never covers the icons)
+sidebar_click_focus = true  # clicking a sidebar moves keyboard focus to it (default false)
 
 [ui.icons]                  # sidebar glyph overrides (e.g. Nerd Font icons)
 search = "⌕"                # glyph prefixing the sidebar search prompt
