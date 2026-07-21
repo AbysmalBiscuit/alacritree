@@ -636,7 +636,17 @@ fn ensure_poller() {
                     std::thread::sleep(PROBE_POLL_INTERVAL);
                     let keys: Vec<(String, String)> = lock(probe_cache()).keys().cloned().collect();
                     for entry in keys {
-                        let comm = client(&entry.0).and_then(|c| c.probe(&entry.1).ok()).flatten();
+                        // Only a definitive reply overwrites the cache.  A missing
+                        // client (helper down or in respawn cooldown) or a transport
+                        // error means "unknown", not "no TUI" — clobbering to None
+                        // there would disable passthrough for a still-running TUI
+                        // until the next successful probe.  Still call client() every
+                        // tick so a cooled-down helper keeps getting nudged back up.
+                        let Some(client) = client(&entry.0) else { continue };
+                        let comm = match client.probe(&entry.1) {
+                            Ok(comm) => comm,
+                            Err(_) => continue,
+                        };
                         if let Some(slot) = lock(probe_cache()).get_mut(&entry) {
                             *slot = comm;
                         }
