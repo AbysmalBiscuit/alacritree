@@ -60,6 +60,18 @@ pub enum NamedAction {
     SidebarBottom,
     SidebarNextProject,
     SidebarPreviousProject,
+    /// Re-run worktree discovery for every project in the sidebar.
+    RefreshProjects,
+    /// Act on the sidebar-cursored row: a session closes, a worktree gets
+    /// the delete/prune dialog, a project gets the remove-from-sidebar
+    /// prompt.
+    DeleteSelected,
+    /// Rename the sidebar-cursored row: a session gets a custom display
+    /// name, a project gets the same rename dialog as its context menu.
+    RenameSelected,
+    /// Expand or collapse the sidebar-cursored project, showing or hiding
+    /// its worktrees and sessions.
+    ToggleProjectExpanded,
     /// Open (or close) the Ctrl+K command palette.
     TogglePalette,
     FocusProjectsSidebar,
@@ -87,10 +99,10 @@ pub enum NamedAction {
 }
 
 impl NamedAction {
-    /// Actions that drive the projects-sidebar cursor.  Their default keys
-    /// (unmodified Home/End/PageUp/PageDown) are terminal input the rest of
-    /// the time, so dispatch must not consume them unless the sidebar owns
-    /// focus.
+    /// Actions that only make sense while the projects sidebar owns focus.
+    /// Their default keys (unmodified Home/End/PageUp/PageDown/R/O/Delete and
+    /// Shift+R) are terminal input the rest of the time, so dispatch must
+    /// not consume them unless the sidebar owns focus.
     pub fn is_sidebar_scoped(&self) -> bool {
         matches!(
             self,
@@ -98,6 +110,10 @@ impl NamedAction {
                 | Self::SidebarBottom
                 | Self::SidebarNextProject
                 | Self::SidebarPreviousProject
+                | Self::RefreshProjects
+                | Self::DeleteSelected
+                | Self::RenameSelected
+                | Self::ToggleProjectExpanded
         )
     }
 
@@ -157,6 +173,14 @@ impl NamedAction {
             Self::SidebarPreviousProject => {
                 "Jump the sidebar cursor to the previous project".into()
             },
+            Self::RefreshProjects => "Rescan every project's worktrees".into(),
+            Self::DeleteSelected => {
+                "Close the selected session, delete the selected worktree, or remove the selected \
+                 project"
+                    .into()
+            },
+            Self::RenameSelected => "Rename the selected project".into(),
+            Self::ToggleProjectExpanded => "Expand or collapse the selected project".into(),
             Self::FocusProjectsSidebar => "Focus the projects sidebar".into(),
             Self::FocusGitSidebar => "Focus the git sidebar".into(),
             Self::FocusTerminal => "Focus the terminal".into(),
@@ -321,6 +345,26 @@ fn default_bindings() -> Vec<KeyBinding> {
             key: Key::PageUp,
             mods: Modifiers::NONE,
             action: BindingAction::Named(SidebarPreviousProject),
+        },
+        KeyBinding {
+            key: Key::R,
+            mods: Modifiers::NONE,
+            action: BindingAction::Named(RefreshProjects),
+        },
+        KeyBinding {
+            key: Key::Delete,
+            mods: Modifiers::NONE,
+            action: BindingAction::Named(DeleteSelected),
+        },
+        KeyBinding {
+            key: Key::R,
+            mods: Modifiers::SHIFT,
+            action: BindingAction::Named(RenameSelected),
+        },
+        KeyBinding {
+            key: Key::O,
+            mods: Modifiers::NONE,
+            action: BindingAction::Named(ToggleProjectExpanded),
         },
         KeyBinding { key: Key::K, mods: ctrl, action: BindingAction::Named(TogglePalette) },
         KeyBinding { key: Key::G, mods: ctrl_shift, action: BindingAction::Named(FocusGitSidebar) },
@@ -658,10 +702,11 @@ pub fn parse_action(name: &str) -> BindingAction {
         "SidebarBottom" => BindingAction::Named(SidebarBottom),
         "SidebarNextProject" => BindingAction::Named(SidebarNextProject),
         "SidebarPreviousProject" => BindingAction::Named(SidebarPreviousProject),
-        // `ShowShortcuts` is kept as an alias: the command palette is the
-        // shortcuts window's successor, so configs naming the old action still
-        // open it.
-        "TogglePalette" | "ShowShortcuts" => BindingAction::Named(TogglePalette),
+        "RefreshProjects" => BindingAction::Named(RefreshProjects),
+        "DeleteSelected" => BindingAction::Named(DeleteSelected),
+        "RenameSelected" => BindingAction::Named(RenameSelected),
+        "ToggleProjectExpanded" => BindingAction::Named(ToggleProjectExpanded),
+        "TogglePalette" => BindingAction::Named(TogglePalette),
         "FocusProjectsSidebar" => BindingAction::Named(FocusProjectsSidebar),
         "FocusGitSidebar" => BindingAction::Named(FocusGitSidebar),
         "FocusTerminal" => BindingAction::Named(FocusTerminal),
@@ -1090,17 +1135,80 @@ mod tests {
         }
     }
 
-    /// Only the four sidebar cursor actions are focus-scoped: everything
-    /// else (CloseSession included) must keep firing from the terminal.
+    /// Only the sidebar cursor actions and RefreshProjects are focus-scoped:
+    /// everything else (CloseSession included) must keep firing from the
+    /// terminal.
     #[test]
-    fn only_sidebar_cursor_actions_are_sidebar_scoped() {
+    fn only_sidebar_actions_are_sidebar_scoped() {
         use NamedAction::*;
-        for a in [SidebarTop, SidebarBottom, SidebarNextProject, SidebarPreviousProject] {
+        for a in [
+            SidebarTop,
+            SidebarBottom,
+            SidebarNextProject,
+            SidebarPreviousProject,
+            RefreshProjects,
+            DeleteSelected,
+            RenameSelected,
+            ToggleProjectExpanded,
+        ] {
             assert!(a.is_sidebar_scoped(), "{a:?}");
         }
         for a in [CloseSession, ScrollToTop, ScrollPageUp, ToggleSidebarFocus, Quit] {
             assert!(!a.is_sidebar_scoped(), "{a:?}");
         }
+    }
+
+    /// Delete is forward-delete inside a shell, so the default binding only
+    /// works because the action is sidebar-scoped.
+    #[test]
+    fn delete_selected_has_an_unmodified_delete_default_and_parses() {
+        let b = parse_bindings(vec![]);
+        assert_eq!(
+            named_matches(&b, Key::Delete, Modifiers::NONE),
+            vec![NamedAction::DeleteSelected]
+        );
+        assert!(matches!(
+            parse_action("DeleteSelected"),
+            BindingAction::Named(NamedAction::DeleteSelected)
+        ));
+    }
+
+    #[test]
+    fn refresh_projects_has_an_unmodified_r_default_and_parses() {
+        let b = parse_bindings(vec![]);
+        assert_eq!(named_matches(&b, Key::R, Modifiers::NONE), vec![NamedAction::RefreshProjects]);
+        assert!(matches!(
+            parse_action("RefreshProjects"),
+            BindingAction::Named(NamedAction::RefreshProjects)
+        ));
+    }
+
+    /// Shift+R types `R` inside a shell, so like Delete the default only
+    /// works because the action is sidebar-scoped.
+    #[test]
+    fn rename_selected_has_a_shift_r_default_and_parses() {
+        let b = parse_bindings(vec![]);
+        assert_eq!(named_matches(&b, Key::R, Modifiers::SHIFT), vec![NamedAction::RenameSelected]);
+        assert_eq!(named_matches(&b, Key::R, Modifiers::NONE), vec![NamedAction::RefreshProjects]);
+        assert!(matches!(
+            parse_action("RenameSelected"),
+            BindingAction::Named(NamedAction::RenameSelected)
+        ));
+    }
+
+    /// `o` is terminal input, so the unmodified default only works because
+    /// the action is sidebar-scoped.
+    #[test]
+    fn toggle_project_expanded_has_an_unmodified_o_default_and_parses() {
+        let b = parse_bindings(vec![]);
+        assert_eq!(
+            named_matches(&b, Key::O, Modifiers::NONE),
+            vec![NamedAction::ToggleProjectExpanded]
+        );
+        assert!(matches!(
+            parse_action("ToggleProjectExpanded"),
+            BindingAction::Named(NamedAction::ToggleProjectExpanded)
+        ));
     }
 
     #[test]
@@ -1111,10 +1219,8 @@ mod tests {
             parse_action("TogglePalette"),
             BindingAction::Named(NamedAction::TogglePalette)
         ));
-        // The old F1 action name still maps to the palette so configs survive.
-        assert!(matches!(
-            parse_action("ShowShortcuts"),
-            BindingAction::Named(NamedAction::TogglePalette)
-        ));
+        // The F1 shortcuts window is gone and the palette lists every action,
+        // so the old `ShowShortcuts` name is no longer recognized.
+        assert!(matches!(parse_action("ShowShortcuts"), BindingAction::Unsupported(_)));
     }
 }

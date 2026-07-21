@@ -752,6 +752,14 @@ impl AlacritreeApp {
         self.pending_project_refresh.insert(root, rx);
     }
 
+    /// Re-run worktree discovery for every project — the keyboard/IPC
+    /// equivalent of pressing each row's refresh button in turn.
+    fn refresh_all_projects(&mut self, ctx: &Context) {
+        for idx in 0..self.projects.len() {
+            self.refresh_project(ctx, idx);
+        }
+    }
+
     /// Adopt completed background discoveries.  Only worktrees and the
     /// default branch are copied — `expanded`, the shell override, and the
     /// label are user state that survives refreshes (mirrors
@@ -996,6 +1004,43 @@ impl AlacritreeApp {
         } else {
             self.close_session(ctx, id);
         }
+    }
+
+    /// Open the delete/prune confirm dialog for the worktree at `path`.
+    /// Main checkouts have no delete affordance, and a worktree whose
+    /// removal is already running is inert.
+    fn request_worktree_delete(&mut self, path: &Path) {
+        if self.pending_deletes.iter().any(|t| t.worktree_path == *path) {
+            return;
+        }
+        let Some((project_idx, wt)) =
+            self.projects.iter().enumerate().find_map(|(idx, p)| {
+                p.worktrees.iter().find(|w| w.path == *path).map(|w| (idx, w))
+            })
+        else {
+            return;
+        };
+        if wt.is_main {
+            return;
+        }
+        // Discovery marking can be stale; a dir deleted since the last
+        // refresh should still get the prune flow, not a doomed
+        // `git worktree remove`.
+        let prunable = wt.prunable || !wt.path.is_dir();
+        self.pending_delete = Some(DeleteRequest {
+            project_idx,
+            worktree_path: wt.path.clone(),
+            worktree_name: wt.name.clone(),
+            branch: wt.branch.clone(),
+            // A missing dir has nothing to be dirty; skip the status probe.
+            dirty: if prunable {
+                DirtyCounts::default()
+            } else {
+                git_status::dirty_counts(&wt.path)
+            },
+            prunable,
+            delete_branch: true,
+        });
     }
 
     /// Re-home `id` to `target`'s workspace.  A re-keying only: the PTY, its
@@ -1923,6 +1968,88 @@ impl AlacritreeApp {
             BindingAction::Named(NamedAction::SidebarPreviousProject) => {
                 self.sidebar_cursor_project_jump(-1)
             },
+            BindingAction::Named(NamedAction::RefreshProjects) => {
+                // While the fuzzy prompt is open an unmodified `r` is query
+                // input — its Text event already fed the filter — so only a
+                // browsing-mode press (or IPC) refreshes.
+                if origin == ActionOrigin::Ipc
+                    || self.project_filter.mode() == panel_filter::Mode::Browsing
+                {
+                    self.refresh_all_projects(ctx);
+                }
+            },
+            BindingAction::Named(NamedAction::DeleteSelected) => {
+                // While the fuzzy prompt is open a letter bound here is query
+                // input — its Text event already fed the filter — so only a
+                // browsing-mode press (or IPC) acts.  Mirrors RefreshProjects.
+                if origin != ActionOrigin::Ipc
+                    && self.project_filter.mode() != panel_filter::Mode::Browsing
+                {
+                    return;
+                }
+                match self.sidebar_cursor.clone() {
+                    Some(SidebarRow::Session(id)) => self.request_close_session(ctx, id),
+                    Some(SidebarRow::Worktree(path)) => self.request_worktree_delete(&path),
+                    Some(SidebarRow::Project(root)) => {
+                        if let Some(p) = self.projects.iter().find(|p| p.root == root) {
+                            self.pending_project_remove = Some(ProjectRemoveState {
+                                name: p.display_name().to_string(),
+                                root,
+                            });
+                        }
+                    },
+                    Some(SidebarRow::Home) | None => {},
+                }
+            },
+            BindingAction::Named(NamedAction::RenameSelected) => {
+                // Same browsing-mode guard as DeleteSelected: while the fuzzy
+                // prompt is open a letter bound here is query input.
+                if origin != ActionOrigin::Ipc
+                    && self.project_filter.mode() != panel_filter::Mode::Browsing
+                {
+                    return;
+                }
+                // Only project rows carry an editable label; sessions and
+                // worktrees take their names from the terminal title and the
+                // `[ui] worktree_name` template.
+                if let Some(SidebarRow::Project(root)) = self.sidebar_cursor.clone() {
+                    if let Some(p) = self.projects.iter().find(|p| p.root == root) {
+                        self.pending_rename =
+                            Some(RenameState { root, label: p.display_name().to_string() });
+                    }
+                }
+            },
+            BindingAction::Named(NamedAction::ToggleProjectExpanded) => {
+                // Same browsing-mode guard as DeleteSelected: while the fuzzy
+                // prompt is open a letter bound here is query input.
+                if origin != ActionOrigin::Ipc
+                    && self.project_filter.mode() != panel_filter::Mode::Browsing
+                {
+                    return;
+                }
+                let Some(cursor) = self.sidebar_cursor.clone() else {
+                    return;
+                };
+                let root = {
+                    let session_workspace = |id: SessionId| {
+                        self.sessions
+                            .iter()
+                            .find(|s| s.id == id)
+                            .map(|s| s.working_directory.clone())
+                    };
+                    row_project_root(&self.projects, session_workspace, &cursor)
+                };
+                if let Some(root) = root {
+                    let expanded =
+                        self.projects.iter().find(|p| p.root == root).is_some_and(|p| p.expanded);
+                    self.set_project_expanded(&root, !expanded);
+                    // Collapsing hides the cursored child; move the cursor to
+                    // the header so it doesn't point at a now-invisible row.
+                    if expanded && !matches!(cursor, SidebarRow::Project(_)) {
+                        self.set_sidebar_cursor(SidebarRow::Project(root));
+                    }
+                }
+            },
             BindingAction::Named(NamedAction::TogglePalette) => {
                 self.palette.toggle();
             },
@@ -2123,7 +2250,7 @@ impl AlacritreeApp {
 
     fn show_project_sidebar(&mut self, ctx: &Context, panel_frame: Frame) -> egui::Rect {
         let activate_request: std::cell::Cell<Option<PathBuf>> = std::cell::Cell::new(None);
-        let delete_request: std::cell::Cell<Option<DeleteRequest>> = std::cell::Cell::new(None);
+        let delete_request: std::cell::Cell<Option<PathBuf>> = std::cell::Cell::new(None);
         let create_request: std::cell::Cell<Option<usize>> = std::cell::Cell::new(None);
         let spawn_shell_request: std::cell::Cell<Option<WorkspaceKey>> = std::cell::Cell::new(None);
         let activate_session_request: std::cell::Cell<Option<(WorkspaceKey, SessionId)>> =
@@ -2654,26 +2781,7 @@ impl AlacritreeApp {
                                     activate_request.set(Some(wt.path.clone()));
                                 }
                                 if action.delete {
-                                    // Discovery marking can be stale; a dir
-                                    // deleted since the last refresh should
-                                    // still get the prune flow, not a doomed
-                                    // `git worktree remove`.
-                                    let prunable = wt.prunable || !wt.path.is_dir();
-                                    delete_request.set(Some(DeleteRequest {
-                                        project_idx: idx,
-                                        worktree_path: wt.path.clone(),
-                                        worktree_name: wt.name.clone(),
-                                        branch: wt.branch.clone(),
-                                        // A missing dir has nothing to be dirty;
-                                        // skip the status probe.
-                                        dirty: if prunable {
-                                            DirtyCounts::default()
-                                        } else {
-                                            git_status::dirty_counts(&wt.path)
-                                        },
-                                        prunable,
-                                        delete_branch: true,
-                                    }));
+                                    delete_request.set(Some(wt.path.clone()));
                                 }
                                 if action.spawn {
                                     spawn_shell_request.set(Some(Some(wt.path.clone())));
@@ -2748,17 +2856,20 @@ impl AlacritreeApp {
         if rename_request.is_some() {
             self.pending_rename = rename_request;
         }
+        let mut workspace_activated = false;
         if home_clicked {
             self.activate_home(ctx);
+            workspace_activated = true;
         }
         if let Some(path) = activate_request.take() {
             self.activate_worktree(ctx, &path);
+            workspace_activated = true;
         }
         if let Some(path) = base_picker_request.take() {
             self.open_base_branch_picker(path);
         }
-        if let Some(req) = delete_request.take() {
-            self.pending_delete = Some(req);
+        if let Some(path) = delete_request.take() {
+            self.request_worktree_delete(&path);
         }
         if let Some(idx) = create_request.take() {
             self.pending_create =
@@ -2770,6 +2881,7 @@ impl AlacritreeApp {
             // an existing shell, or the empty-workspace placeholder shows.
             self.current_workspace = ws.clone();
             self.active_session.insert(ws, id);
+            workspace_activated = true;
         }
         if let Some(id) = close_session_request.take() {
             self.request_close_session(ctx, id);
@@ -2781,12 +2893,21 @@ impl AlacritreeApp {
             if let Err(e) = self.spawn_session(ctx, ws) {
                 self.last_error = Some(format!("failed to spawn shell: {e}"));
             }
+            workspace_activated = true;
         }
-        if self.config.ui.sidebar_click_focus
-            && self.focus != PaneFocus::ProjectsSidebar
-            && pressed_on_panel(ctx, &panel_resp.response)
-        {
-            self.focus_sidebar();
+        if self.config.ui.sidebar_click_focus {
+            // A click that picks a workspace or session means "go work
+            // there", so it focuses the terminal; other panel clicks focus
+            // the sidebar for filter typing.  Row activations fire on the
+            // release frame, after the press already focused the sidebar,
+            // which is why this can't fold into the press test below.
+            if workspace_activated {
+                self.focus_terminal();
+            } else if self.focus != PaneFocus::ProjectsSidebar
+                && pressed_on_panel(ctx, &panel_resp.response)
+            {
+                self.focus_sidebar();
+            }
         }
         panel_resp.response.rect
     }
@@ -4305,6 +4426,27 @@ fn project_main_for(projects: &[Project], ws: &Path) -> Option<PathBuf> {
     let project = projects.iter().find(|p| p.worktrees.iter().any(|w| w.path == ws))?;
     let main = project.worktrees.iter().find(|w| w.is_main)?;
     if main.path == ws { None } else { Some(main.path.clone()) }
+}
+
+/// The root of the project owning `row`: a worktree resolves by its path, a
+/// session through its workspace.  `None` for Home or a row outside every
+/// known project.  Lets `ToggleProjectExpanded` act on the whole subtree, not
+/// just the header.
+fn row_project_root(
+    projects: &[Project],
+    session_workspace: impl Fn(SessionId) -> Option<WorkspaceKey>,
+    row: &SidebarRow,
+) -> Option<PathBuf> {
+    let workspace = match row {
+        SidebarRow::Project(root) => return Some(root.clone()),
+        SidebarRow::Worktree(path) => path.clone(),
+        SidebarRow::Session(id) => session_workspace(*id).flatten()?,
+        SidebarRow::Home => return None,
+    };
+    projects
+        .iter()
+        .find(|p| p.worktrees.iter().any(|w| w.path == workspace))
+        .map(|p| p.root.clone())
 }
 
 /// The branch the git panel diffs against: the user's explicit override,
@@ -6925,6 +7067,33 @@ mod tests {
         let cursor = SidebarRow::Project(PathBuf::from("C:/repo"));
         let none2 = |_id: SessionId| -> Option<WorkspaceKey> { None };
         assert_eq!(base_branch_target(true, Some(&cursor), none2, &None), None);
+    }
+
+    #[test]
+    fn toggle_expanded_resolves_child_rows_to_their_project_root() {
+        let projects = vec![project_with("/repo", &["/repo/wt"])];
+        let root = PathBuf::from("/repo");
+        let none = |_id: SessionId| -> Option<WorkspaceKey> { None };
+
+        // The project header resolves to itself.
+        assert_eq!(
+            row_project_root(&projects, none, &SidebarRow::Project(root.clone())),
+            Some(root.clone())
+        );
+        // A worktree child resolves to the owning project root — the case the
+        // old dispatch missed, leaving `o` inert inside an expanded project.
+        assert_eq!(
+            row_project_root(&projects, none, &SidebarRow::Worktree(PathBuf::from("/repo/wt"))),
+            Some(root.clone())
+        );
+        // A session resolves through its workspace to the project root.
+        let lookup = |id: SessionId| (id == 7).then(|| Some(PathBuf::from("/repo/wt")));
+        assert_eq!(
+            row_project_root(&projects, lookup, &SidebarRow::Session(7)),
+            Some(root.clone())
+        );
+        // Home belongs to no project.
+        assert_eq!(row_project_root(&projects, none, &SidebarRow::Home), None);
     }
 
     #[test]
