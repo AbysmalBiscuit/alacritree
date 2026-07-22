@@ -420,6 +420,21 @@ fn stat_pgrp_tpgid(stat: &str) -> Option<(i32, i32)> {
     Some((pgrp, tpgid))
 }
 
+/// `comm` (between the first `(` and last `)`) and `pgrp` from a
+/// `/proc/<pid>/stat` line — the two fields the foreground-group scan matches
+/// on.  `comm` is kernel-truncated to 15 bytes, so nav-TUI names match with
+/// `starts_with`, and it may itself contain spaces and parens, so the split is
+/// on the *last* `)`.
+#[cfg(any(target_os = "linux", test))]
+fn stat_comm_pgrp(stat: &str) -> Option<(&str, i32)> {
+    let open = stat.find('(')?;
+    let close = stat.rfind(')')?;
+    let comm = stat.get(open + 1..close)?;
+    // After `comm`: state(0) ppid(1) pgrp(2).
+    let pgrp = stat[close + 1..].split_whitespace().nth(2)?.parse::<i32>().ok()?;
+    Some((comm, pgrp))
+}
+
 #[cfg(target_os = "linux")]
 fn read_tpgid(shell_pid: u32) -> Option<i32> {
     let stat = std::fs::read_to_string(format!("/proc/{shell_pid}/stat")).ok()?;
@@ -556,15 +571,71 @@ fn shell_has_foreground_job(shell_pid: u32) -> bool {
         .is_some_and(|(pgid, tpgid)| foreground_group(tpgid).is_some_and(|t| t != pgid))
 }
 
+/// Same rule as Linux: the group leader first (nvim/tmux run directly), then
+/// the rest of the foreground process group, so an editor launched by another
+/// foreground program (`chezmoi edit`, `git commit`) is recognized even though
+/// the launcher, not the editor, leads the group.
 #[cfg(target_os = "macos")]
 fn foreground_nav_tui(shell_pid: u32) -> bool {
-    let Some((_, tpgid)) = pgid_tpgid(shell_pid) else {
+    let Some((pgid, tpgid)) = pgid_tpgid(shell_pid) else {
         return false;
     };
     let Some(tpgid) = foreground_group(tpgid) else {
         return false;
     };
-    comm_for_pid(tpgid).is_some_and(|comm| is_nav_tui_name(comm.trim()))
+    // No foreground job: the shell owns the terminal, nothing to forward to.
+    if tpgid == pgid {
+        return false;
+    }
+    if comm_for_pid(tpgid).is_some_and(|comm| is_nav_tui_name(comm.trim())) {
+        return true;
+    }
+    foreground_group_has_nav_tui(tpgid)
+}
+
+/// A nav TUI anywhere in foreground process group `pgid`.  `KERN_PROC_PGRP`
+/// returns a `kinfo_proc` per group member; `p_comm` is the same kernel-
+/// truncated command name the `/proc/<pid>/comm` read yields on Linux.
+#[cfg(target_os = "macos")]
+fn foreground_group_has_nav_tui(pgid: u32) -> bool {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PGRP, pgid as libc::c_int];
+    let mut size = 0usize;
+    let sized = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if sized != 0 || size == 0 {
+        return false;
+    }
+    let mut buf: Vec<libc::kinfo_proc> =
+        Vec::with_capacity(size / std::mem::size_of::<libc::kinfo_proc>());
+    let filled = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buf.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if filled != 0 {
+        return false;
+    }
+    // The set can shrink between the sizing and filling calls; trust the second
+    // byte count, never the first capacity.
+    unsafe { buf.set_len(size / std::mem::size_of::<libc::kinfo_proc>()) };
+    buf.iter().any(|kp| {
+        let bytes: Vec<u8> =
+            kp.kp_proc.p_comm.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+        !bytes.is_empty() && is_nav_tui_name(String::from_utf8_lossy(&bytes).trim())
+    })
 }
 
 /// Windows has no foreground process group, so "a job is running" is
@@ -597,18 +668,55 @@ fn foreground_process_glyph(_shell_pid: u32) -> Option<char> {
     None
 }
 
-/// Whether a split-managing TUI owns the terminal: the process holding the
-/// foreground group is one of the recognized names.
+/// Whether a split-managing TUI owns the terminal.  Checks the foreground
+/// group leader first (the common case: nvim/tmux run directly), then scans
+/// the rest of the foreground process group, so an editor launched by another
+/// foreground program — `chezmoi edit`, `git commit`, `sudoedit` — is still
+/// recognized even though that launcher, not the editor, leads the group.
 #[cfg(target_os = "linux")]
 fn foreground_nav_tui(shell_pid: u32) -> bool {
-    let Some(tpgid) = read_tpgid(shell_pid) else {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{shell_pid}/stat")) else {
         return false;
     };
-    if tpgid <= 0 {
+    let Some((pgrp, tpgid)) = stat_pgrp_tpgid(&stat) else {
+        return false;
+    };
+    // No foreground job: the shell owns the terminal, nothing to forward to.
+    if tpgid <= 0 || tpgid == pgrp {
         return false;
     }
-    std::fs::read_to_string(format!("/proc/{tpgid}/comm"))
+    let tpgid = tpgid as u32;
+    if std::fs::read_to_string(format!("/proc/{tpgid}/comm"))
         .is_ok_and(|comm| is_nav_tui_name(comm.trim()))
+    {
+        return true;
+    }
+    foreground_group_has_nav_tui(tpgid)
+}
+
+/// A nav TUI anywhere in foreground process group `pgid`, not just its leader.
+/// A launcher stays the group leader while the editor it spawned shares its
+/// group, so reading only the leader's `comm` would miss the nvim on screen.
+#[cfg(target_os = "linux")]
+fn foreground_group_has_nav_tui(pgid: u32) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        if let Some((comm, pgrp)) = stat_comm_pgrp(&stat) {
+            if pgrp >= 0 && pgrp as u32 == pgid && is_nav_tui_name(comm.trim()) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Windows has no foreground process group, so a nav TUI anywhere in the
@@ -1601,6 +1709,19 @@ mod tests {
     fn stat_parse_rejects_truncated_or_malformed_lines() {
         assert_eq!(stat_pgrp_tpgid("garbage with no paren"), None);
         assert_eq!(stat_pgrp_tpgid("1 (sh) S 1 2"), None);
+    }
+
+    #[test]
+    fn stat_comm_pgrp_reads_comm_and_group_for_the_group_scan() {
+        // A member of a launcher's foreground group: comm is the editor, pgrp
+        // is the launcher's group — how the scan spots nvim under chezmoi.
+        assert_eq!(stat_comm_pgrp("42 (nvim) S 1 900 900 34816 900"), Some(("nvim", 900)));
+        // comm may hold spaces and inner parens — split on the last `)`.
+        assert_eq!(
+            stat_comm_pgrp("7 (tmux: (server)) S 1 88 88 0 -1"),
+            Some(("tmux: (server)", 88))
+        );
+        assert_eq!(stat_comm_pgrp("garbage with no paren"), None);
     }
 
     #[test]
