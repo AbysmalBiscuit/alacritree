@@ -760,17 +760,16 @@ impl AlacritreeApp {
         }
     }
 
-    /// Adopt completed background discoveries.  Only worktrees and the
-    /// default branch are copied — `expanded`, the shell override, and the
-    /// label are user state that survives refreshes (mirrors
-    /// `Project::refresh`).
+    /// Adopt completed background discoveries.  `expanded`, the shell
+    /// override, and the label are user state that survives refreshes —
+    /// `Project::adopt_discovered` is what both this and `Project::refresh`
+    /// call to keep that guarantee in one place.
     fn poll_project_refreshes(&mut self) {
         let projects = &mut self.projects;
         self.pending_project_refresh.retain(|root, rx| match rx.try_recv() {
             Ok(fresh) => {
                 if let Some(project) = projects.iter_mut().find(|p| p.root == *root) {
-                    project.worktrees = fresh.worktrees;
-                    project.default_branch = fresh.default_branch;
+                    project.adopt_discovered(fresh);
                 }
                 false
             },
@@ -6871,6 +6870,7 @@ mod tests {
                 .collect(),
             expanded: true,
             shell_override: None,
+            home: None,
         }
     }
 
