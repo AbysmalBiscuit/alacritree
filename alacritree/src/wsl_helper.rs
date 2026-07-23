@@ -208,6 +208,21 @@ while IFS=$TAB read -r id kind rest; do
       case $tpgid in ''|*[!0-9]*) tpgid= ;; esac
       if [ -n "$tpgid" ] && [ "$tpgid" != "$pgrp" ]; then
         comm=$(cat "/proc/$tpgid/comm" 2>/dev/null)
+        # A launcher (chezmoi edit, git commit) stays the group leader while
+        # the editor it spawned shares its group; when the leader is not itself
+        # a nav TUI, scan the group so the nvim on screen is still recognized.
+        case $comm in
+        nvim*|vim*|tmux*) ;;
+        *)
+          for sf in /proc/[0-9]*/stat; do
+            gs=$(cat "$sf" 2>/dev/null) || continue
+            set -- ${gs##*')'}
+            [ "${3:-}" = "$tpgid" ] || continue
+            m=$(cat "${sf%/stat}/comm" 2>/dev/null)
+            case $m in nvim*|vim*|tmux*) comm=$m; break;; esac
+          done
+          ;;
+        esac
       fi
     fi
     printf %s "$comm" > "$t/$id.out"
