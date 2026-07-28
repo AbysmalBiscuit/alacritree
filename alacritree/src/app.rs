@@ -27,7 +27,7 @@ use crate::paste;
 use crate::path_style;
 use crate::path_style::PathStyle;
 use crate::pr_status::{PrCache, PrInfo, PrState};
-use crate::projects::{Discovered, Project, Worktree, project_json};
+use crate::projects::{Project, Worktree, project_json};
 use crate::scratchpad;
 use crate::session::{
     AttentionVerdict, Session, SessionId, SessionKind, TermSize, poll_attention_debounce,
@@ -359,10 +359,21 @@ pub struct AlacritreeApp {
     builtin_glyphs: crate::builtin_font::BuiltinGlyphCache,
     ime: crate::ime::Ime,
     color_glyphs: crate::color_glyph::ColorGlyphCache,
-    /// In-flight background re-discoveries, keyed by project root.  WSL
-    /// discovery shells out to wsl.exe and must never block paint; results
-    /// are adopted in `poll_project_refreshes`.
-    pending_project_refresh: HashMap<PathBuf, Receiver<Discovered>>,
+    glyph_cache: crate::glyph_cache::GlyphCache,
+    /// Scratch buffers the painter copies the visible grid into, so the
+    /// terminal lock is released before any shape is built.
+    grid_snapshot: crate::terminal_view::GridSnapshot,
+    /// Present only under `ALACRITREE_FRAME_LOG`; `None` is the normal run.
+    frame_log: Option<crate::frame_log::FrameLog>,
+    phases: crate::frame_log::Phases,
+    /// How much of the frame in progress went to painting the terminal grid,
+    /// as opposed to the sidebars and everything else sharing it.
+    grid_paint: std::time::Duration,
+    /// In-flight background re-discoveries, keyed by project root.  Neither
+    /// backend may block paint: wsl.exe takes seconds while the distro VM
+    /// boots, and git2 takes tens of milliseconds on a project with many
+    /// worktrees.  Results are adopted in `poll_project_refreshes`.
+    project_refreshes: crate::project_refresh::ProjectRefreshes,
     /// Resolved absolute path of `delta` inside each WSL distro, so diff panes
     /// stop re-sourcing a login profile on every open.  Successes only: a miss
     /// is never stored, so installing delta mid-session is picked up later.
@@ -677,7 +688,12 @@ impl AlacritreeApp {
                 font_chain,
                 color_glyph_budget_mb,
             ),
-            pending_project_refresh: HashMap::new(),
+            glyph_cache: crate::glyph_cache::GlyphCache::new(),
+            grid_snapshot: crate::terminal_view::GridSnapshot::new(),
+            frame_log: crate::frame_log::FrameLog::from_env(),
+            phases: crate::frame_log::Phases::new(),
+            grid_paint: std::time::Duration::ZERO,
+            project_refreshes: Default::default(),
             wsl_delta_paths: HashMap::new(),
             pending_delta: HashMap::new(),
             sidebar_rows_cache: None,
@@ -759,16 +775,12 @@ impl AlacritreeApp {
         Ok(idx)
     }
 
-    /// Windows projects re-discover synchronously (git2, fast).  WSL
-    /// projects re-discover on a worker thread: wsl.exe takes ~400 ms warm
-    /// and seconds while the distro VM boots.
+    /// Re-discovery always runs on a worker thread: wsl.exe takes ~400 ms warm
+    /// and seconds while the distro VM boots, and git2 discovery costs tens of
+    /// milliseconds on a project with many worktrees.
     fn refresh_project(&mut self, ctx: &Context, idx: usize) {
         let root = self.projects[idx].root.clone();
-        if matches!(wsl::classify(&root), wsl::Location::Windows(_)) {
-            self.projects[idx].refresh();
-            return;
-        }
-        if self.pending_project_refresh.contains_key(&root) {
+        if self.project_refreshes.is_running(&root) {
             return;
         }
         let (tx, rx) = mpsc::channel();
@@ -778,7 +790,7 @@ impl AlacritreeApp {
             let _ = tx.send(Project::discover(worker_root));
             ctx.request_repaint();
         });
-        self.pending_project_refresh.insert(root, rx);
+        self.project_refreshes.start(root, rx);
     }
 
     /// Re-run worktree discovery for every project — the keyboard/IPC
@@ -794,15 +806,14 @@ impl AlacritreeApp {
     /// the shell override, and the label either way.
     fn poll_project_refreshes(&mut self) {
         let projects = &mut self.projects;
-        self.pending_project_refresh.retain(|root, rx| match rx.try_recv() {
-            Ok(found) => {
-                if let Some(project) = projects.iter_mut().find(|p| p.root == *root) {
+        self.project_refreshes.poll(|root, found| {
+            match projects.iter_mut().find(|p| p.root == *root) {
+                Some(project) => {
                     project.apply(found);
-                }
-                false
-            },
-            Err(mpsc::TryRecvError::Empty) => true,
-            Err(mpsc::TryRecvError::Disconnected) => false,
+                    Ok(project_json(project))
+                },
+                None => Err(format!("{} is not a project in the sidebar", root.display())),
+            }
         });
     }
 
@@ -971,7 +982,7 @@ impl AlacritreeApp {
             if let Some(idx) =
                 self.projects.iter().position(|p| p.worktrees.iter().any(|w| w.path == path))
             {
-                self.projects[idx].refresh();
+                self.refresh_project(ctx, idx);
             }
             return;
         }
@@ -1499,7 +1510,10 @@ impl AlacritreeApp {
             actions
         });
         for action in actions {
+            let name = action.label();
+            let started = std::time::Instant::now();
             self.dispatch_action(ctx, action, ActionOrigin::Keyboard);
+            crate::frame_log::note_if_slow("action", name, started.elapsed());
         }
     }
 
@@ -5697,6 +5711,9 @@ impl AlacritreeApp {
 
         let grace = self.config.ui.attention_grace;
         for idx in 0..self.sessions.len() {
+            // Window focus is deliberately not part of this: an unfocused
+            // window still shows its grid, so its output still has to repaint.
+            self.sessions[idx].set_visible(Some(idx) == visible_idx);
             let outcome = self.sessions[idx].drain_events(&self.config.palette);
             // Ahead of the attention early-out: a background session copying
             // with OSC 52 still owns the clipboard.
@@ -6879,9 +6896,37 @@ impl AlacritreeApp {
         let Some(rx) = &self.ipc_rx else { return };
         let calls: Vec<ipc::AppCall> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         for call in calls {
-            let result = self.handle_ipc_request(ctx, call.request);
+            let ipc::AppCall { request, reply_tx } = call;
+            // Discovery is far too slow to run here, and the caller still has
+            // to be answered from the refreshed list rather than the stale
+            // one, so this request owns its reply channel until then.
+            if let ipc::IpcRequest::RefreshProject { root } = request {
+                self.defer_project_refresh(ctx, root, reply_tx);
+                continue;
+            }
+            let name = request.name();
+            let started = std::time::Instant::now();
+            let result = self.handle_ipc_request(ctx, request);
+            crate::frame_log::note_if_slow("ipc request", name, started.elapsed());
             // A send error means the client gave up waiting — nothing to do.
-            let _ = call.reply_tx.send(result);
+            let _ = reply_tx.send(result);
+        }
+    }
+
+    fn defer_project_refresh(
+        &mut self,
+        ctx: &Context,
+        root: PathBuf,
+        reply_tx: mpsc::Sender<ipc::IpcResult>,
+    ) {
+        let Some(idx) = self.projects.iter().position(|p| p.root == root) else {
+            let _ =
+                reply_tx.send(Err(format!("{} is not a project in the sidebar", root.display())));
+            return;
+        };
+        self.refresh_project(ctx, idx);
+        if let Some(reply_tx) = self.project_refreshes.watch(&root, reply_tx) {
+            let _ = reply_tx.send(Ok(project_json(&self.projects[idx])));
         }
     }
 
@@ -6984,14 +7029,10 @@ impl AlacritreeApp {
                 };
                 scratchpad::read_json(&workspace)
             },
-            Req::RefreshProject { root } => {
-                let project =
-                    self.projects.iter_mut().find(|p| p.root == root).ok_or_else(|| {
-                        format!("{} is not a project in the sidebar", root.display())
-                    })?;
-                project.refresh();
-                Ok(project_json(project))
-            },
+            // Claimed by `process_ipc_calls` before dispatch: the reply is
+            // held until the background discovery lands, which needs the
+            // reply channel this method does not have.
+            Req::RefreshProject { .. } => Err("refresh was not deferred".to_string()),
             Req::AddProject { path } => Ok(project_json(self.add_project(path))),
             Req::RemoveProject { root } => {
                 let idx =
@@ -7078,10 +7119,18 @@ impl eframe::App for AlacritreeApp {
         [n(bg.r()), n(bg.g()), n(bg.b()), self.config.window.opacity]
     }
 
-    fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
+        let frame_started = self
+            .frame_log
+            .as_ref()
+            .map(|_| (std::time::Instant::now(), crate::frame_log::output_wait()));
+        self.grid_paint = std::time::Duration::ZERO;
+        self.phases.restart();
+        self.glyph_cache.begin_frame(ctx);
         self.poll_project_refreshes();
         self.poll_pending_deletes(ctx);
         self.poll_pending_creates(ctx);
+        self.phases.mark("polls");
         let modal_open = self.is_modal_open();
         // Keys pressed mid-composition drive the IME's candidate window,
         // not the app — alacritty's key_input returns early the same way,
@@ -7097,13 +7146,18 @@ impl eframe::App for AlacritreeApp {
                     PaneFocus::GitSidebar => self.handle_git_sidebar_nav(ctx),
                     PaneFocus::Terminal => {},
                 }
+                self.phases.mark("sidebar-nav");
                 self.handle_shortcuts(ctx);
             }
         }
+        self.phases.mark("shortcuts");
         self.process_notification_actions(ctx);
         self.process_ipc_calls(ctx);
+        self.phases.mark("ipc");
         self.process_session_events(ctx);
+        self.phases.mark("session-events");
         self.reconcile_sidebar_focus(ctx);
+        self.phases.mark("focus");
         let theme = self.theme;
         // GL clear is the sole source of the bg when opacity < 1; painting any
         // panel fill on top would compound the alpha through egui's blend.
@@ -7124,6 +7178,8 @@ impl eframe::App for AlacritreeApp {
             }
         }
 
+        self.phases.mark("projects-sidebar");
+
         if self.show_right_sidebar {
             let r = self.show_git_sidebar(ctx, panel_frame);
             paint_panel_border(ctx, r.left(), r.y_range(), theme.sidebar_border);
@@ -7131,6 +7187,7 @@ impl eframe::App for AlacritreeApp {
                 paint_focus_outline(ctx, r, &theme);
             }
         }
+        self.phases.mark("git-sidebar");
 
         let central = egui::CentralPanel::default()
             .frame(Frame::default().fill(central_fill).inner_margin(Margin::same(0)))
@@ -7182,7 +7239,8 @@ impl eframe::App for AlacritreeApp {
                         editor_error,
                     )
                 } else {
-                    terminal_view::show(
+                    let started = std::time::Instant::now();
+                    let response = terminal_view::show(
                         ui,
                         session,
                         &self.config,
@@ -7190,7 +7248,11 @@ impl eframe::App for AlacritreeApp {
                         &mut self.builtin_glyphs,
                         &mut self.ime,
                         &mut self.color_glyphs,
-                    )
+                        &mut self.glyph_cache,
+                        &mut self.grid_snapshot,
+                    );
+                    self.grid_paint += started.elapsed();
+                    response
                 };
                 // egui fake-clicks the natively focused widget on Space/Enter,
                 // and the terminal keeps native focus while the sidebar owns
@@ -7204,6 +7266,7 @@ impl eframe::App for AlacritreeApp {
         if theme.focus_outline.terminal && !modal_open && self.focus == PaneFocus::Terminal {
             paint_focus_outline(ctx, central.response.rect, &theme);
         }
+        self.phases.mark("central");
 
         if self.pending_create.is_some() {
             self.show_create_dialog(ctx);
@@ -7232,6 +7295,7 @@ impl eframe::App for AlacritreeApp {
         if self.palette.is_open() && !modal_open {
             self.show_command_palette(ctx);
         }
+        self.phases.mark("dialogs");
 
         self.reap_exited_sessions(ctx);
         // A shell that exited on its own is only removed here, after paint.
@@ -7239,6 +7303,18 @@ impl eframe::App for AlacritreeApp {
         // input; with it, the repair is queued for the frame the repaint
         // request has already scheduled.
         self.reconcile_sidebar_focus(ctx);
+        self.phases.mark("reap");
+        self.phases.report_if_slow();
+
+        if let (Some(log), Some((started, waited))) = (self.frame_log.as_mut(), frame_started) {
+            log.record(crate::frame_log::Timings {
+                started,
+                grid: self.grid_paint,
+                cpu: frame.info().cpu_usage.map(std::time::Duration::from_secs_f32),
+                waited,
+                echo: crate::frame_log::echo(),
+            });
+        }
     }
 }
 

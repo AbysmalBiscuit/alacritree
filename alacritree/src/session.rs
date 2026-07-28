@@ -2,6 +2,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -25,19 +26,69 @@ use crate::wsl_helper::{self, WslProbe};
 pub struct EventProxy {
     ctx: egui::Context,
     sender: mpsc::Sender<TermEvent>,
+    /// Whether this session's grid is the one on screen.  Read from the PTY
+    /// thread on every event, written by the UI thread once per frame.
+    visible: Arc<AtomicBool>,
 }
 
 impl EventProxy {
     pub fn new(ctx: egui::Context) -> (Self, mpsc::Receiver<TermEvent>) {
         let (sender, receiver) = mpsc::channel();
-        (Self { ctx, sender }, receiver)
+        (Self { ctx, sender, visible: Arc::new(AtomicBool::new(true)) }, receiver)
+    }
+
+    pub fn set_visible(&self, visible: bool) {
+        self.visible.store(visible, Ordering::Relaxed);
     }
 }
 
+/// Whether an event carries something a frame has to act on, rather than just
+/// reporting that the grid changed.  `Wakeup` and `MouseCursorDirty` carry no
+/// payload: the grid they announce was already updated under the terminal
+/// lock, and the mouse icon is recomputed from hover state every frame, so a
+/// repaint is the whole of their effect.  Every other event has one a frame
+/// must observe: titles and bells reach the sidebar, exits close a tab, and
+/// PTY replies are what the asking program is blocked on until a frame drains
+/// them.
+fn carries_payload(event: &TermEvent) -> bool {
+    !matches!(event, TermEvent::Wakeup | TermEvent::MouseCursorDirty)
+}
+
+/// How long a background session's spinner frame may wait for the loop.
+///
+/// Agents animate a Braille spinner in the terminal title, so a busy one emits
+/// a title change several times a second.  Off screen that moves a sidebar
+/// glyph, and waking the loop for each one repaints the entire visible grid to
+/// do it — with a few agents running, enough to saturate the UI thread.
+/// Coalescing to this interval keeps the glyph turning without letting the
+/// animation set the frame rate.
+const SPINNER_COALESCE: Duration = Duration::from_millis(120);
+
 impl EventListener for EventProxy {
     fn send_event(&self, event: TermEvent) {
+        // A hidden session's grid is not on screen, so a repaint for it would
+        // redraw the *visible* session to the same pixels.  Nothing then
+        // drains the channel either, which is why the payload-free events must
+        // not enter it: a background agent streaming output would grow it for
+        // as long as the window stayed idle.
+        if !carries_payload(&event) {
+            if self.visible.load(Ordering::Relaxed) {
+                crate::frame_log::output_arrived();
+                self.ctx.request_repaint();
+            }
+            return;
+        }
+        // The frame that ends the animation is the one that matters — a
+        // spinner title giving way to a plain one is how an agent says it is
+        // done — so only the animation frames themselves are held back.
+        let spinner_frame = !self.visible.load(Ordering::Relaxed)
+            && matches!(&event, TermEvent::Title(title) if is_spinner_title(title));
         let _ = self.sender.send(event);
-        self.ctx.request_repaint();
+        if spinner_frame {
+            self.ctx.request_repaint_after(SPINNER_COALESCE);
+        } else {
+            self.ctx.request_repaint();
+        }
     }
 }
 
@@ -123,6 +174,9 @@ pub struct Session {
     wsl_probe: Option<WslProbe>,
     notifier: Option<Notifier>,
     sender: Option<EventLoopSender>,
+    /// Shares this session's on-screen flag with the `EventProxy` its PTY
+    /// thread posts events through.
+    proxy: EventProxy,
     exited: bool,
 }
 
@@ -781,50 +835,143 @@ fn pty_working_directory(explicit: Option<PathBuf>, config: &Config) -> Option<P
 
 #[cfg(windows)]
 mod windows_process_probe {
-    //! Shared, throttled process-table snapshot.  Every session probes at
-    //! its own `AGENT_CACHE_TTL` cadence; keeping one global `System` means
-    //! N sessions cost one enumeration per tick, not N.  Two-phase refresh:
-    //! names + parent pids for the whole table (one cheap system call
-    //! class), command lines only for the shell's descendants and only when
-    //! no name matched.
-    use std::sync::{Mutex, PoisonError};
-    use std::time::{Duration, Instant};
+    //! Background process-table scan behind the sidebar's agent signals.
+    //!
+    //! Enumerating the process table costs ~12 ms and fetching command lines
+    //! another ~15 ms, both far too much for the UI thread that asks for them.
+    //! A single refresher thread does the work for every shell the UI has
+    //! asked about and publishes the results; `probe` only reads what was last
+    //! published.  Sessions already tolerate an answer up to `AGENT_CACHE_TTL`
+    //! old, so nothing about the displayed result changes.
+    //!
+    //! The scan is two-phase: names and parent pids for the whole table (one
+    //! cheap system call class), command lines only for a shell's descendants
+    //! and only when no name matched.
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::{Condvar, Mutex, PoisonError};
+    use std::time::Duration;
 
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
     use super::{agent_glyph_by_cmdline, agent_glyph_by_name, is_nav_tui_name, process_tree_pids};
 
-    /// Slightly under `AGENT_CACHE_TTL` so the first session to tick
-    /// refreshes and the rest reuse the same table.
-    const SNAPSHOT_TTL: Duration = Duration::from_millis(900);
+    /// Slightly under `AGENT_CACHE_TTL`, so a session polling on its own clock
+    /// finds a result no older than one of its own cache windows.
+    pub(super) const REFRESH_INTERVAL: Duration = Duration::from_millis(900);
 
-    static SNAPSHOT: Mutex<Option<(Instant, System)>> = Mutex::new(None);
+    /// Agent glyph found in the shell's descendant tree, whether the shell has
+    /// any descendants at all, and whether one of them is a nav TUI.
+    pub(super) type Signals = (Option<char>, bool, bool);
 
-    /// Agent glyph found in the shell's descendant tree, whether the shell
-    /// has any descendants at all, and whether one of them is a nav TUI.
-    pub(super) fn probe(shell_pid: u32) -> (Option<char>, bool, bool) {
-        let mut guard = SNAPSHOT.lock().unwrap_or_else(PoisonError::into_inner);
-        if guard.as_ref().is_none_or(|(at, _)| at.elapsed() >= SNAPSHOT_TTL) {
-            let mut sys = guard.take().map(|(_, sys)| sys).unwrap_or_default();
+    /// Per shell: the descendant tree the last command-line scan ran on, and
+    /// the glyph it found there.
+    pub(super) type ScannedTrees = BTreeMap<u32, (Vec<u32>, Option<char>)>;
+
+    #[derive(Default)]
+    struct Shared {
+        /// Shells asked about since the last pass.  Taken rather than kept, so
+        /// a window nobody is drawing costs nothing: with no frames there are
+        /// no probes, and the refresher blocks instead of enumerating.
+        wanted: BTreeSet<u32>,
+        published: BTreeMap<u32, Signals>,
+        refresher_running: bool,
+    }
+
+    static SHARED: Mutex<Shared> = Mutex::new(Shared {
+        wanted: BTreeSet::new(),
+        published: BTreeMap::new(),
+        refresher_running: false,
+    });
+    /// Wakes the refresher when it is idling with nothing to scan.
+    static WANTED: Condvar = Condvar::new();
+
+    /// The last published signals for `shell_pid`, defaulting to "nothing
+    /// running" until the refresher has seen it.  Registers the shell so the
+    /// next pass covers it.
+    pub(super) fn probe(shell_pid: u32) -> Signals {
+        let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+        if !shared.refresher_running {
+            shared.refresher_running = true;
+            std::thread::Builder::new()
+                .name("alacritree-process-probe".into())
+                .spawn(refresh_loop)
+                .expect("spawn process probe thread");
+        }
+        let signals = shared.published.get(&shell_pid).copied();
+        if shared.wanted.insert(shell_pid) {
+            WANTED.notify_one();
+        }
+        signals.unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(super) fn published(shell_pid: u32) -> Option<Signals> {
+        SHARED.lock().unwrap_or_else(PoisonError::into_inner).published.get(&shell_pid).copied()
+    }
+
+    #[cfg(test)]
+    pub(super) fn nothing_wanted() -> bool {
+        SHARED.lock().unwrap_or_else(PoisonError::into_inner).wanted.is_empty()
+    }
+
+    fn refresh_loop() {
+        let mut sys = System::new();
+        let mut scanned = ScannedTrees::new();
+        loop {
+            let wanted = {
+                let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+                while shared.wanted.is_empty() {
+                    shared = WANTED.wait(shared).unwrap_or_else(PoisonError::into_inner);
+                }
+                std::mem::take(&mut shared.wanted)
+            };
+
+            // Everything below runs with no lock held: the UI thread must
+            // never wait on an enumeration.
             sys.refresh_processes_specifics(
                 ProcessesToUpdate::All,
                 true,
                 ProcessRefreshKind::nothing(),
             );
-            *guard = Some((Instant::now(), sys));
+            let table: Vec<(u32, Option<u32>)> = sys
+                .processes()
+                .iter()
+                .map(|(pid, p)| (pid.as_u32(), p.parent().map(|pp| pp.as_u32())))
+                .collect();
+            let alive: BTreeSet<u32> = table.iter().map(|(pid, _)| *pid).collect();
+            let published: BTreeMap<u32, Signals> = wanted
+                .iter()
+                .filter(|pid| alive.contains(pid))
+                .map(|&pid| (pid, scan(&mut sys, &table, pid, &mut scanned)))
+                .collect();
+            scanned.retain(|pid, _| alive.contains(pid));
+
+            {
+                // Merged, not replaced: a shell that happened not to be asked
+                // about this pass keeps its last answer instead of blinking
+                // back to "nothing running".
+                let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+                shared.published.retain(|pid, _| alive.contains(pid));
+                shared.published.extend(published);
+            }
+            std::thread::sleep(REFRESH_INTERVAL);
         }
-        let (_, sys) = guard.as_mut().expect("snapshot populated above");
+    }
 
-        let table: Vec<(u32, Option<u32>)> = sys
-            .processes()
-            .iter()
-            .map(|(pid, p)| (pid.as_u32(), p.parent().map(|pp| pp.as_u32())))
-            .collect();
-        let tree = process_tree_pids(&table, shell_pid);
+    fn scan(
+        sys: &mut System,
+        table: &[(u32, Option<u32>)],
+        shell_pid: u32,
+        scanned: &mut ScannedTrees,
+    ) -> Signals {
+        let mut tree = process_tree_pids(table, shell_pid);
         let has_children = tree.len() > 1;
-        let tree: Vec<Pid> = tree.into_iter().map(Pid::from_u32).collect();
+        // The table comes out of a hash map, so the tree has to be ordered
+        // before it can be compared against the one the last scan ran on.
+        tree.sort_unstable();
+        let pids: Vec<Pid> = tree.iter().copied().map(Pid::from_u32).collect();
 
-        let names: Vec<String> = tree
+        let names: Vec<String> = pids
             .iter()
             .filter_map(|pid| sys.process(*pid))
             .map(|p| p.name().to_string_lossy().into_owned())
@@ -833,19 +980,36 @@ mod windows_process_probe {
         if let Some(glyph) = agent_glyph_by_name(&names) {
             return (Some(glyph), has_children, nav_tui);
         }
+        if let Some(glyph) = remembered_glyph(scanned, shell_pid, &tree) {
+            return (glyph, has_children, nav_tui);
+        }
 
         // Names missed: fetch command lines for just the tree to catch
         // agents launched through node/python shims.
         sys.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&tree),
+            ProcessesToUpdate::Some(&pids),
             false,
             ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
         );
-        let cmds = tree
+        let cmds = pids
             .iter()
             .filter_map(|pid| sys.process(*pid))
             .map(|p| p.cmd().iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" "));
-        (agent_glyph_by_cmdline(cmds), has_children, nav_tui)
+        let glyph = agent_glyph_by_cmdline(cmds);
+        scanned.insert(shell_pid, (tree, glyph));
+        (glyph, has_children, nav_tui)
+    }
+
+    /// The glyph remembered for `shell_pid`, or `None` when the tree has
+    /// changed since it was taken and the scan has to run again.  Fetching
+    /// command lines is the expensive half of a pass, and its answer can only
+    /// change when the descendant set does.
+    pub(super) fn remembered_glyph(
+        cache: &ScannedTrees,
+        shell_pid: u32,
+        tree: &[u32],
+    ) -> Option<Option<char>> {
+        cache.get(&shell_pid).filter(|(scanned, _)| scanned == tree).map(|(_, glyph)| *glyph)
     }
 }
 
@@ -921,7 +1085,7 @@ impl Session {
     ) -> std::io::Result<Self> {
         let editor = scratchpad::Editor::open(path.clone())?;
         let (proxy, events) = EventProxy::new(ctx);
-        let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, proxy)));
+        let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, proxy.clone())));
         Ok(Self {
             id: next_session_id(),
             title: "scratchpad".to_string(),
@@ -941,6 +1105,7 @@ impl Session {
             wsl_probe: None,
             notifier: None,
             sender: None,
+            proxy,
             exited: false,
         })
     }
@@ -1020,7 +1185,10 @@ impl Session {
         let pty = tty::new(&pty_options, window_size, window_id)?;
         let shell_pid = pty_shell_pid(&pty);
 
-        let event_loop = EventLoop::new(term.clone(), proxy, pty, false, false)?;
+        #[cfg(windows)]
+        let pty = crate::pty_rearm::RearmingPty::new(pty);
+
+        let event_loop = EventLoop::new(term.clone(), proxy.clone(), pty, false, false)?;
         let sender = event_loop.channel();
         event_loop.spawn();
 
@@ -1046,8 +1214,16 @@ impl Session {
             wsl_probe,
             notifier: Some(Notifier(sender.clone())),
             sender: Some(sender),
+            proxy,
             exited: false,
         })
+    }
+
+    /// Mark whether this session's grid is the one being painted.  Output from
+    /// a session that isn't stops waking the egui loop, so a busy agent in a
+    /// background tab no longer costs a full repaint per chunk of output.
+    pub fn set_visible(&self, visible: bool) {
+        self.proxy.set_visible(visible);
     }
 
     pub fn write(&self, bytes: Vec<u8>) {
@@ -1340,6 +1516,208 @@ mod tests {
     use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 
     use super::*;
+
+    /// A repainted frame costs a full grid paint of whatever session is on
+    /// screen — milliseconds, at a maximized window.  Output from a session
+    /// the user cannot see changes nothing about that frame, so waking the UI
+    /// for it spends that cost to draw the same pixels again.  Several busy
+    /// agents in background tabs is enough to keep the loop saturated, which
+    /// is what typing then queues behind.
+    #[test]
+    fn a_hidden_sessions_output_does_not_wake_the_ui() {
+        let ctx = egui::Context::default();
+        let (proxy, _events) = EventProxy::new(ctx.clone());
+        proxy.set_visible(false);
+
+        proxy.send_event(TermEvent::Wakeup);
+
+        assert!(
+            !ctx.has_requested_repaint(),
+            "output from an off-screen session repainted the visible grid"
+        );
+    }
+
+    #[test]
+    fn a_visible_sessions_output_wakes_the_ui() {
+        let ctx = egui::Context::default();
+        let (proxy, _events) = EventProxy::new(ctx.clone());
+
+        proxy.send_event(TermEvent::Wakeup);
+
+        assert!(ctx.has_requested_repaint(), "the on-screen grid must repaint when it changes");
+    }
+
+    /// An agent animating a Braille spinner in its title emits one of these
+    /// several times a second.  Off screen it moves a sidebar glyph, and
+    /// waking the loop for each repaints the whole visible grid to do it —
+    /// with a few agents running, that alone saturates the UI thread.
+    #[test]
+    fn a_hidden_sessions_spinner_frame_does_not_force_a_repaint() {
+        let ctx = egui::Context::default();
+        let (proxy, events) = EventProxy::new(ctx.clone());
+        proxy.set_visible(false);
+
+        // The delay egui hands its repaint callback is what winit schedules
+        // the wakeup on, so it is the difference between "draw now" and "draw
+        // when convenient".  `has_requested_repaint` reports both alike.
+        let delays = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&delays);
+        ctx.set_request_repaint_callback(move |info| {
+            seen.lock().expect("delays").push(info.delay);
+        });
+
+        proxy.send_event(TermEvent::Title("⠋ claude".into()));
+
+        let delays = delays.lock().expect("delays");
+        assert_eq!(delays.len(), 1, "a spinner frame asked for more than one repaint");
+        assert!(
+            delays[0] > Duration::ZERO,
+            "a background spinner frame repainted the visible grid immediately"
+        );
+        assert!(
+            matches!(events.try_recv(), Ok(TermEvent::Title(_))),
+            "the title still has to reach the sidebar, just not this instant"
+        );
+    }
+
+    /// Only grid content is invisible while a session is off-screen.  Titles
+    /// and bells drive the sidebar, and PTY replies block the program that
+    /// asked until a frame drains them, so those still have to wake the loop.
+    /// A spinner giving way to a plain title is how an agent signals it is
+    /// done, so that transition is exactly the one that must not be held back.
+    #[test]
+    fn a_hidden_sessions_title_still_wakes_the_ui() {
+        let ctx = egui::Context::default();
+        let (proxy, _events) = EventProxy::new(ctx.clone());
+        proxy.set_visible(false);
+
+        proxy.send_event(TermEvent::Title("claude: thinking".into()));
+
+        assert!(ctx.has_requested_repaint(), "a background title change must reach the sidebar");
+    }
+
+    #[test]
+    fn a_hidden_sessions_pty_reply_still_wakes_the_ui() {
+        let ctx = egui::Context::default();
+        let (proxy, _events) = EventProxy::new(ctx.clone());
+        proxy.set_visible(false);
+
+        proxy.send_event(TermEvent::TextAreaSizeRequest(Arc::new(|_| String::new())));
+
+        assert!(
+            ctx.has_requested_repaint(),
+            "a program blocked on a terminal reply must not wait for unrelated input"
+        );
+    }
+
+    /// Events are queued whether or not they wake the loop, so a session that
+    /// was hidden while it produced output has all of it waiting the moment
+    /// something else draws a frame.
+    #[test]
+    fn a_hidden_sessions_events_are_still_queued() {
+        let ctx = egui::Context::default();
+        let (proxy, events) = EventProxy::new(ctx);
+        proxy.set_visible(false);
+
+        proxy.send_event(TermEvent::Title("claude: thinking".into()));
+
+        assert!(matches!(events.try_recv(), Ok(TermEvent::Title(_))));
+    }
+
+    /// Refreshing the process table costs ~12 ms — a dropped frame — and
+    /// `process_probe` runs on the UI thread.  The whole round trip: the call
+    /// registers what it wants and returns with whatever was last computed,
+    /// the refresher answers on its own clock, and it then stops scanning for
+    /// a shell nobody has asked about again.
+    #[cfg(windows)]
+    #[test]
+    fn the_probe_hands_the_scan_to_the_refresher() {
+        let pid = std::process::id();
+
+        let started = Instant::now();
+        let first = windows_process_probe::probe(pid);
+        let waited = started.elapsed();
+
+        assert_eq!(first, (None, false, false), "the first probe had an answer to give");
+        assert!(waited < Duration::from_millis(5), "the probe took {waited:?} to return");
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while windows_process_probe::published(pid).is_none() {
+            assert!(Instant::now() < deadline, "the background refresh never published a result");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            windows_process_probe::nothing_wanted(),
+            "the refresher would keep enumerating for a window nobody is drawing"
+        );
+    }
+
+    /// Starting an agent through a shim (`node`, `python`) is only visible in
+    /// its command line, and it always adds a process.  A remembered scan that
+    /// outlived the tree it ran on would leave the sidebar showing no agent
+    /// for as long as that shell lived.
+    #[cfg(windows)]
+    #[test]
+    fn a_remembered_cmdline_scan_expires_when_the_tree_changes() {
+        use std::collections::BTreeMap;
+
+        use super::windows_process_probe::remembered_glyph;
+
+        let mut cache = BTreeMap::new();
+        cache.insert(42, (vec![42, 100], None));
+
+        assert_eq!(remembered_glyph(&cache, 42, &[42, 100]), Some(None));
+        assert_eq!(remembered_glyph(&cache, 42, &[42, 100, 101]), None);
+        assert_eq!(remembered_glyph(&cache, 43, &[42, 100]), None);
+    }
+
+    /// Not a gate — run it by hand:
+    /// `cargo test -p alacritree --release -- --ignored --nocapture report_process_probe_cost`
+    ///
+    /// `process_probe` runs on the UI thread whenever a session's agent cache
+    /// goes stale, and every visible frame asks for the glyph.  What one call
+    /// costs is what a keystroke can queue behind.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "timing harness, not an assertion"]
+    fn report_process_probe_cost() {
+        let pid = std::process::id();
+        windows_process_probe::probe(pid);
+        // Let the refresher publish, so the reported cost is the steady state
+        // rather than the empty-map one.
+        std::thread::sleep(super::windows_process_probe::REFRESH_INTERVAL * 2);
+
+        let iterations = 1000;
+        let started = std::time::Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(windows_process_probe::probe(pid));
+        }
+        let each = started.elapsed() / iterations;
+
+        let (_, counts) = crate::steady_state::measure(|| windows_process_probe::probe(pid));
+        println!(
+            "probe on the calling thread: {each:?}, {} allocations ({} KiB)",
+            counts.allocs,
+            counts.bytes / 1024,
+        );
+    }
+
+    /// Nothing drains a hidden session's channel, because nothing wakes the
+    /// loop for it.  Payload-free wakeups therefore cannot go in: a background
+    /// agent streaming output would grow the channel for as long as the window
+    /// stays idle, and the next frame would have to pop all of it.
+    #[test]
+    fn a_hidden_sessions_wakeups_do_not_accumulate() {
+        let (proxy, events) = EventProxy::new(egui::Context::default());
+        proxy.set_visible(false);
+
+        for _ in 0..10_000 {
+            proxy.send_event(TermEvent::Wakeup);
+            proxy.send_event(TermEvent::MouseCursorDirty);
+        }
+
+        assert_eq!(events.try_iter().count(), 0);
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -1650,6 +2028,84 @@ mod tests {
         // Paired with ALT_SCREEN this is what `apply_scroll` keys off; it is on by
         // default, so a pager resetting it would silently break the wheel too.
         assert!(session.term.lock().mode().contains(TermMode::ALTERNATE_SCROLL));
+    }
+
+    /// A burst bigger than one read must keep flowing with nothing typed.
+    ///
+    /// Windows has no real readiness for the console pipe, so the reader
+    /// emulates it: a completion packet is posted from the waker `piper`
+    /// holds, and `piper` installs that waker only when a drain comes up
+    /// empty.  A read burst that stops at `MAX_LOCKED_READ` with more still
+    /// buffered therefore leaves nothing able to announce the rest, and the
+    /// loop sleeps until an unrelated event arrives.  A keystroke is one; a
+    /// benchmark writing megabytes is not, so its output stalls until the
+    /// user types.
+    #[cfg(windows)]
+    #[test]
+    fn a_burst_bigger_than_one_read_keeps_flowing_without_input() {
+        crate::harden_dll_search_path();
+
+        const MARKER: &str = "BURST-COMPLETE";
+
+        // Writing to the standard output handle rather than `Console.Out`,
+        // because the stall needs one drain to come back holding more than
+        // `MAX_LOCKED_READ`.  `Console.Out` is a `StreamWriter` and hands the
+        // console a few hundred bytes at a time however large the string is,
+        // which the reader keeps up with; the handle takes the whole buffer in
+        // one write.  This is also why a program printing line by line never
+        // stalls and an ordinary shell session looks fine.
+        let script =
+            std::env::temp_dir().join(format!("alacritree-burst-{}.ps1", std::process::id()));
+        std::fs::write(
+            &script,
+            format!(
+                "$out = [Console]::OpenStandardOutput()\n\
+                 $block = [Text.Encoding]::ASCII.GetBytes([string]::new('x', 262144))\n\
+                 for ($i = 0; $i -lt 32; $i++) {{\n\
+                 $out.Write($block, 0, $block.Length)\n\
+                 }}\n\
+                 $tail = [Text.Encoding]::ASCII.GetBytes(\"`n{MARKER}`n\")\n\
+                 $out.Write($tail, 0, $tail.Length)\n\
+                 $out.Flush()\n\
+                 Start-Sleep -Seconds 600\n"
+            ),
+        )
+        .unwrap();
+
+        // The producer sleeps rather than exits: a child that exits would end
+        // the read loop through its own watcher, which is exactly the
+        // unrelated event this has to do without.
+        let session = Session::spawn_command(
+            egui::Context::default(),
+            &Config::default(),
+            std::env::current_dir().ok(),
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            "powershell".to_string(),
+            vec!["-NoProfile".to_string(), "-File".to_string(), script.display().to_string()],
+            "probe".to_string(),
+            SessionKind::Shell,
+        )
+        .unwrap();
+
+        let start = Instant::now();
+        let arrived = loop {
+            if session.screen_snapshot(0).lines.iter().any(|line| line.contains(MARKER)) {
+                break Some(start.elapsed());
+            }
+            if start.elapsed() > Duration::from_secs(60) {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        };
+        let _ = std::fs::remove_file(&script);
+
+        let screen = session.screen_snapshot(0).lines.join("\n");
+        assert!(
+            arrived.is_some(),
+            "the pane was written 8 MiB back to back and the last line never arrived: the read \
+             loop is waiting for input it should not need.\nScreen was:\n{screen}"
+        );
     }
 
     /// A pane must not wait on the console host's startup handshake.

@@ -12,8 +12,10 @@ mod command_palette;
 mod config;
 mod doppler;
 mod fonts;
+mod frame_log;
 mod git_nav;
 mod git_status;
+mod glyph_cache;
 mod ime;
 mod input;
 mod ipc;
@@ -26,7 +28,10 @@ mod panel_filter;
 mod paste;
 mod path_style;
 mod pr_status;
+mod project_refresh;
 mod projects;
+#[cfg(windows)]
+mod pty_rearm;
 mod row_label;
 mod scratchpad;
 mod session;
@@ -106,7 +111,8 @@ fn main() -> eframe::Result<()> {
         viewport = viewport.with_icon(icon);
     }
 
-    let native_options = eframe::NativeOptions { viewport, ..Default::default() };
+    let native_options =
+        eframe::NativeOptions { viewport, vsync: config.ui.vsync, ..Default::default() };
 
     eframe::run_native(
         "Alacritree",

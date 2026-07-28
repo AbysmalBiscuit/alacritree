@@ -17,12 +17,14 @@ use crate::color_glyph::{CachedColorGlyph, ColorGlyphCache};
 use crate::colors::{background, foreground, resolve, rgb_to_color32};
 use crate::config::Config;
 use crate::fonts::{BOLD_FAMILY, BOLD_ITALIC_FAMILY, ITALIC_FAMILY};
+use crate::glyph_cache::{Face, GlyphCache};
 use crate::input::event_to_bytes;
 use crate::links::{self, Link};
 use crate::mouse;
 use crate::paste;
 use crate::session::{EventProxy, Session, SessionKind, TermSize};
 
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut Ui,
     session: &mut Session,
@@ -31,6 +33,8 @@ pub fn show(
     builtin_glyphs: &mut BuiltinGlyphCache,
     ime: &mut crate::ime::Ime,
     color_glyphs: &mut ColorGlyphCache,
+    glyphs: &mut GlyphCache,
+    snapshot: &mut GridSnapshot,
 ) -> Response {
     let font_id = FontId::monospace(config.font.egui_size());
     let (cell_w_pt, cell_h_pt) = ui.ctx().fonts(|f| {
@@ -108,6 +112,7 @@ pub fn show(
         );
     }
     handle_wheel_scroll(ui, &response, session, config, rect, cell_w, cell_h, cols, rows);
+    dispatch_input(ui, &response, session, ime, allow_focus);
     // Built-in renderer expects the *unadjusted* pixel cell size so it can
     // re-apply `font.offset` itself — passing `cell_w * ppp` (which already
     // includes the offset) would double-add it.  Descent is zero here: the
@@ -119,10 +124,20 @@ pub fn show(
         line_height: (cell_h_pt * ppp).floor() as f64,
         descent: 0.0,
     };
+    // The guard is a temporary so it is dropped at the end of this statement:
+    // nothing below may run while the terminal is locked.
+    snapshot.capture(
+        &session.term.lock(),
+        config,
+        hovered_link.as_ref().map(|l| &l.bounds),
+        // The preedit overlay replaces the cursor while composing
+        // (alacritty hides it the same way, display/content.rs).
+        ime.preedit().is_some(),
+    );
     paint_grid(
         &painter,
         rect,
-        session,
+        snapshot,
         config,
         &font_id,
         cell_w,
@@ -131,11 +146,8 @@ pub fn show(
         &metrics,
         builtin_glyphs,
         color_glyphs,
+        glyphs,
         ui.ctx(),
-        hovered_link.as_ref().map(|l| &l.bounds),
-        // The preedit overlay replaces the cursor while composing
-        // (alacritty hides it the same way, display/content.rs).
-        ime.preedit().is_some(),
     );
 
     let preedit_caret = ime
@@ -143,6 +155,39 @@ pub fn show(
         .map(|p| p.to_owned())
         .and_then(|p| paint_preedit(&painter, rect, session, config, &font_id, cell_w, cell_h, &p));
 
+    if allow_focus && response.has_focus() {
+        // Setting `PlatformOutput::ime` is what makes egui-winit call
+        // `set_ime_allowed(true)` — without it the OS IME never engages.
+        // The rect drives `set_ime_cursor_area`, so the candidate window
+        // follows the caret like alacritty's `update_ime_position`
+        // (TextEdit passes its whole widget rect there, which for a
+        // fullscreen terminal would pin the popup to the window corner).
+        let caret = preedit_caret
+            .or_else(|| cursor_cell_rect(session, rect, cell_w, cell_h))
+            .unwrap_or(rect);
+        ui.ctx().output_mut(|o| {
+            o.ime = Some(egui::output::IMEOutput { rect: caret, cursor_rect: caret });
+        });
+    }
+
+    response
+}
+
+/// Drain this frame's keyboard and IME events into the terminal.
+///
+/// Runs ahead of the paint so a keystroke reaches the PTY without queueing
+/// behind a full-screen grid walk, and so the selection clear and snap-to-
+/// prompt that typing triggers are visible in the frame the user typed in
+/// rather than the next one.  The preedit is likewise resolved before the grid
+/// is built, so a composition starting or ending this frame is painted this
+/// frame.
+fn dispatch_input(
+    ui: &Ui,
+    response: &Response,
+    session: &mut Session,
+    ime: &mut crate::ime::Ime,
+    allow_focus: bool,
+) {
     if allow_focus && response.has_focus() {
         // Kitty-protocol and mouse modes negotiated by the running app decide
         // how events encode, so the encoder needs the live terminal mode.
@@ -183,22 +228,11 @@ pub fn show(
                     // so the user sees their input — matches alacritty's
                     // on_terminal_input_start.
                     paste::on_terminal_input_start(session);
+                    crate::frame_log::keystroke_sent();
                     session.write(bytes);
                 },
             }
         }
-        // Setting `PlatformOutput::ime` is what makes egui-winit call
-        // `set_ime_allowed(true)` — without it the OS IME never engages.
-        // The rect drives `set_ime_cursor_area`, so the candidate window
-        // follows the caret like alacritty's `update_ime_position`
-        // (TextEdit passes its whole widget rect there, which for a
-        // fullscreen terminal would pin the popup to the window corner).
-        let caret = preedit_caret
-            .or_else(|| cursor_cell_rect(session, rect, cell_w, cell_h))
-            .unwrap_or(rect);
-        ui.ctx().output_mut(|o| {
-            o.ime = Some(egui::output::IMEOutput { rect: caret, cursor_rect: caret });
-        });
     } else {
         // IMEs commonly auto-commit an in-progress composition when focus
         // moves away (winit pairs the `Commit` with an immediate
@@ -230,8 +264,6 @@ pub fn show(
         // backstop that drops the painted preedit either way.
         ime.clear();
     }
-
-    response
 }
 
 /// Whether the grid owns the pointer at `pos`: inside `rect` with no floating
@@ -734,11 +766,209 @@ impl Style {
     }
 }
 
+/// The visible grid, copied out from under the terminal lock.
+///
+/// The PTY thread applies output under the same `FairMutex` the painter needs,
+/// so every microsecond a frame holds it is a microsecond the terminal cannot
+/// parse — and the echo of a keystroke waits behind that.  Mirrors alacritty's
+/// `Display::draw`, which collects its renderable cells and drops the terminal
+/// guard before rendering anything.
+///
+/// Both buffers are reused across frames, and colours are resolved during the
+/// copy, so painting from a snapshot needs neither the lock nor the palette.
+#[derive(Default)]
+pub struct GridSnapshot {
+    text: String,
+    runs: Vec<Run>,
+    cursor: Option<CursorSnapshot>,
+}
+
+/// A span of cells sharing one resolved style, indexing into
+/// `GridSnapshot::text`.
+struct Run {
+    text: std::ops::Range<usize>,
+    start_col: usize,
+    row: i32,
+    flags: Flags,
+    fg: Color32,
+    bg: Color32,
+    selected: bool,
+}
+
+struct CursorSnapshot {
+    shape: CursorShape,
+    column: usize,
+    row: i32,
+    color: Color32,
+    /// The glyph a solid block covers, with the colour that keeps it legible.
+    glyph: Option<(char, Flags, Color32)>,
+}
+
+impl GridSnapshot {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn capture(
+        &mut self,
+        term: &Term<EventProxy>,
+        config: &Config,
+        link_bounds: Option<&Match>,
+        cursor_hidden: bool,
+    ) {
+        self.text.clear();
+        self.runs.clear();
+        self.cursor = None;
+
+        let runtime_palette = term.colors();
+        let grid = term.grid();
+        let display_offset = grid.display_offset() as i32;
+        let screen_lines = grid.screen_lines() as i32;
+        let cols = grid.columns();
+
+        // Resolve the active selection once per frame; the per-cell range checks
+        // are cheap and avoid re-deriving it for every run.
+        let selection_range = term.selection.as_ref().and_then(|s| s.to_range(term));
+        let in_link = |line: Line, column: Column| {
+            link_bounds.is_some_and(|b| b.contains(&Point::new(line, column)))
+        };
+
+        for row in 0..screen_lines {
+            let line = Line(row - display_offset);
+            let cells = &grid[line];
+
+            let mut col = 0;
+            while col < cols {
+                let start = col;
+                let style = Style::from_cell(&cells[Column(col)], in_link(line, Column(col)));
+                let selected = is_selected(selection_range.as_ref(), line, Column(col));
+                let text_start = self.text.len();
+                while col < cols {
+                    let cell = &cells[Column(col)];
+                    if Style::from_cell(cell, in_link(line, Column(col))) != style
+                        || is_selected(selection_range.as_ref(), line, Column(col)) != selected
+                    {
+                        break;
+                    }
+                    if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                        col += 1;
+                        continue;
+                    }
+                    let ch = if cell.c == '\0' || cell.flags.contains(Flags::HIDDEN) {
+                        ' '
+                    } else {
+                        cell.c
+                    };
+                    self.text.push(ch);
+                    col += 1;
+                }
+                if self.text.len() == text_start {
+                    continue;
+                }
+                let (fg, bg) = run_colors(style, selected, runtime_palette, config);
+                self.runs.push(Run {
+                    text: text_start..self.text.len(),
+                    start_col: start,
+                    row,
+                    flags: style.flags,
+                    fg,
+                    bg,
+                    selected,
+                });
+            }
+        }
+
+        let cursor_point: Point = grid.cursor.point;
+        let cursor_row = cursor_point.line.0 + display_offset;
+        let shape = cursor_shape(term);
+        if cursor_hidden
+            || matches!(shape, CursorShape::Hidden)
+            || cursor_row < 0
+            || cursor_row >= screen_lines
+        {
+            return;
+        }
+
+        let cell = &grid[Line(cursor_point.line.0)][cursor_point.column];
+        let color = runtime_palette[alacritty_terminal::vte::ansi::NamedColor::Cursor]
+            .map(rgb_to_color32)
+            .or_else(|| config.palette.cursor_bg.map(rgb_to_color32))
+            .unwrap_or_else(|| foreground(&config.palette));
+        // Only the solid block covers the glyph underneath it.
+        let glyph = (matches!(shape, CursorShape::Block)
+            && cell.c != '\0'
+            && !cell.flags.contains(Flags::HIDDEN))
+        .then(|| {
+            let glyph_color = config.palette.cursor_fg.map(rgb_to_color32).unwrap_or_else(|| {
+                rgb_to_color32(resolve(
+                    cell.bg,
+                    cell.flags,
+                    runtime_palette,
+                    &config.palette,
+                    false,
+                ))
+            });
+            let glyph_color =
+                if glyph_color == color { background(&config.palette) } else { glyph_color };
+            (cell.c, cell.flags, glyph_color)
+        });
+
+        self.cursor = Some(CursorSnapshot {
+            shape,
+            column: cursor_point.column.0,
+            row: cursor_row,
+            color,
+            glyph,
+        });
+    }
+}
+
+/// Foreground and background a run is drawn with, after INVERSE and the
+/// selection highlight.
+fn run_colors(
+    style: Style,
+    selected: bool,
+    runtime: &alacritty_terminal::term::color::Colors,
+    config: &Config,
+) -> (Color32, Color32) {
+    let inverse = style.flags.contains(Flags::INVERSE);
+    let cell_fg = resolve(
+        if inverse { style.bg } else { style.fg },
+        style.flags,
+        runtime,
+        &config.palette,
+        true,
+    );
+    let cell_bg = resolve(
+        if inverse { style.fg } else { style.bg },
+        style.flags,
+        runtime,
+        &config.palette,
+        false,
+    );
+    if !selected {
+        return (rgb_to_color32(cell_fg), rgb_to_color32(cell_bg));
+    }
+    // When `colors.selection.background` is set we honor it; otherwise we swap
+    // fg/bg of the underlying cell so the highlight is always visible without
+    // requiring a config entry.
+    let sel_bg =
+        config.palette.selection_bg.map(rgb_to_color32).unwrap_or_else(|| rgb_to_color32(cell_fg));
+    let sel_fg = config.palette.selection_fg.map(rgb_to_color32).unwrap_or_else(|| {
+        if config.palette.selection_bg.is_some() {
+            rgb_to_color32(cell_fg)
+        } else {
+            rgb_to_color32(cell_bg)
+        }
+    });
+    (sel_fg, sel_bg)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_grid(
     painter: &egui::Painter,
     rect: Rect,
-    session: &Session,
+    snapshot: &GridSnapshot,
     config: &Config,
     font_id: &FontId,
     cell_w: f32,
@@ -747,92 +977,34 @@ fn paint_grid(
     metrics: &Metrics,
     builtin_glyphs: &mut BuiltinGlyphCache,
     color_glyphs: &mut ColorGlyphCache,
+    glyphs: &mut GlyphCache,
     ctx: &egui::Context,
-    link_bounds: Option<&Match>,
-    cursor_hidden: bool,
 ) {
-    let term = session.term.lock();
-    let runtime_palette = term.colors();
-    let grid = term.grid();
-    let display_offset = grid.display_offset() as i32;
-    let screen_lines = grid.screen_lines() as i32;
-    let cols = grid.columns();
-
-    let cursor_point: Point = grid.cursor.point;
-    let cursor_visible_line = cursor_point.line.0 + display_offset;
     let bg_color = background(&config.palette);
-
-    // Resolve the active selection once per frame; the per-cell range checks
-    // are cheap and avoid relocking inside paint_run.
-    let selection_range = term.selection.as_ref().and_then(|s| s.to_range(&term));
-    let in_link = |line: Line, column: Column| {
-        link_bounds.is_some_and(|b| b.contains(&Point::new(line, column)))
-    };
-
-    for row_idx in 0..screen_lines {
-        let line = Line(row_idx - display_offset);
-        let row = &grid[line];
-        let y = rect.min.y + row_idx as f32 * cell_h;
-
-        let mut col = 0;
-        while col < cols {
-            let start = col;
-            let style = Style::from_cell(&row[Column(col)], in_link(line, Column(col)));
-            let selected = is_selected(selection_range.as_ref(), line, Column(col));
-            let mut run = String::new();
-            while col < cols {
-                let cell = &row[Column(col)];
-                if Style::from_cell(cell, in_link(line, Column(col))) != style
-                    || is_selected(selection_range.as_ref(), line, Column(col)) != selected
-                {
-                    break;
-                }
-                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                    col += 1;
-                    continue;
-                }
-                let ch =
-                    if cell.c == '\0' || cell.flags.contains(Flags::HIDDEN) { ' ' } else { cell.c };
-                run.push(ch);
-                col += 1;
-            }
-            paint_run(
-                painter,
-                rect,
-                &run,
-                start,
-                y,
-                cell_w,
-                cell_h,
-                style,
-                runtime_palette,
-                config,
-                font_id,
-                bg_color,
-                selected,
-                ppp,
-                metrics,
-                builtin_glyphs,
-                color_glyphs,
-                ctx,
-            );
-        }
-    }
-
-    if !cursor_hidden && cursor_visible_line >= 0 && cursor_visible_line < screen_lines {
-        let cursor_shape = cursor_shape(&term);
-        paint_cursor(
+    for run in &snapshot.runs {
+        paint_run(
             painter,
             rect,
-            &term,
-            config,
-            cursor_point,
-            cursor_visible_line,
+            &snapshot.text[run.text.clone()],
+            run.start_col,
+            rect.min.y + run.row as f32 * cell_h,
             cell_w,
             cell_h,
+            run,
+            config,
             font_id,
-            cursor_shape,
+            bg_color,
+            ppp,
+            metrics,
+            builtin_glyphs,
+            color_glyphs,
+            glyphs,
+            ctx,
         );
+    }
+
+    if let Some(cursor) = &snapshot.cursor {
+        paint_cursor(painter, rect, cursor, cell_w, cell_h, font_id);
     }
 }
 
@@ -875,71 +1047,32 @@ fn paint_run(
     y: f32,
     cell_w: f32,
     cell_h: f32,
-    style: Style,
-    runtime: &alacritty_terminal::term::color::Colors,
+    style: &Run,
     config: &Config,
     font_id: &FontId,
     default_bg: Color32,
-    selected: bool,
     ppp: f32,
     metrics: &Metrics,
     builtin_glyphs: &mut BuiltinGlyphCache,
     color_glyphs: &mut ColorGlyphCache,
+    glyphs: &mut GlyphCache,
     ctx: &egui::Context,
 ) {
-    if run.is_empty() {
-        return;
-    }
-    let inverse = style.flags.contains(Flags::INVERSE);
-    let cell_fg = resolve(
-        if inverse { style.bg } else { style.fg },
-        style.flags,
-        runtime,
-        &config.palette,
-        true,
-    );
-    let cell_bg = resolve(
-        if inverse { style.fg } else { style.bg },
-        style.flags,
-        runtime,
-        &config.palette,
-        false,
-    );
-    // When `colors.selection.background` is set we honor it; otherwise we swap
-    // fg/bg of the underlying cell so the highlight is always visible without
-    // requiring a config entry.
-    let (fg, bg) = if selected {
-        let sel_bg = config
-            .palette
-            .selection_bg
-            .map(rgb_to_color32)
-            .unwrap_or_else(|| rgb_to_color32(cell_fg));
-        let sel_fg = config.palette.selection_fg.map(rgb_to_color32).unwrap_or_else(|| {
-            if config.palette.selection_bg.is_some() {
-                rgb_to_color32(cell_fg)
-            } else {
-                rgb_to_color32(cell_bg)
-            }
-        });
-        (sel_fg, sel_bg)
-    } else {
-        (rgb_to_color32(cell_fg), rgb_to_color32(cell_bg))
-    };
-
+    let (fg, bg) = (style.fg, style.bg);
     let width = run.chars().count() as f32 * cell_w;
     let x = rect.min.x + start_col as f32 * cell_w;
     let bg_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(width, cell_h));
 
-    if bg != default_bg || selected {
+    if bg != default_bg || style.selected {
         painter.rect_filled(bg_rect, 0.0, bg);
     }
 
     if !style.flags.contains(Flags::HIDDEN) {
         // Per-glyph paint: egui's run layout drifts off the cursor's `col * cell_w` grid (worse with zoom).
-        let glyph_font = font_for_flags(style.flags, font_id);
+        let face =
+            Face::new(style.flags.contains(Flags::BOLD), style.flags.contains(Flags::ITALIC));
         let glyph_dx = config.font.glyph_offset.x as f32;
         let glyph_dy = config.font.glyph_offset.y as f32;
-        let mut buf = [0u8; 4];
         for (i, ch) in run.chars().enumerate() {
             if ch == ' ' {
                 continue;
@@ -967,12 +1100,14 @@ fn paint_run(
                 paint_color_glyph(painter, cached, cell_x, y, ppp);
                 continue;
             }
-            painter.text(
-                Pos2::new(cell_x + glyph_dx, y + glyph_dy),
-                egui::Align2::LEFT_TOP,
-                ch.encode_utf8(&mut buf).to_string(),
-                glyph_font.clone(),
-                fg,
+            let galley = glyphs.get(ctx, ch, face, font_id.size);
+            painter.add(
+                egui::epaint::TextShape::new(
+                    Pos2::new(cell_x + glyph_dx, y + glyph_dy),
+                    galley,
+                    fg,
+                )
+                .with_override_text_color(fg),
             );
         }
     }
@@ -989,73 +1124,51 @@ fn paint_run(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn paint_cursor(
     painter: &egui::Painter,
     rect: Rect,
-    term: &Term<EventProxy>,
-    config: &Config,
-    cursor_point: Point,
-    cursor_visible_line: i32,
+    cursor: &CursorSnapshot,
     cell_w: f32,
     cell_h: f32,
     font_id: &FontId,
-    shape: alacritty_terminal::vte::ansi::CursorShape,
 ) {
     use alacritty_terminal::vte::ansi::CursorShape::*;
-    if matches!(shape, Hidden) {
-        return;
-    }
 
-    let runtime_palette = term.colors();
-    let grid = term.grid();
-    let cell = &grid[Line(cursor_point.line.0)][cursor_point.column];
-
-    let x = rect.min.x + cursor_point.column.0 as f32 * cell_w;
-    let y = rect.min.y + cursor_visible_line as f32 * cell_h;
+    let x = rect.min.x + cursor.column as f32 * cell_w;
+    let y = rect.min.y + cursor.row as f32 * cell_h;
     let cursor_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell_w, cell_h));
 
-    let cursor_color = runtime_palette[alacritty_terminal::vte::ansi::NamedColor::Cursor]
-        .map(rgb_to_color32)
-        .or_else(|| config.palette.cursor_bg.map(rgb_to_color32))
-        .unwrap_or_else(|| foreground(&config.palette));
-
-    match shape {
+    match cursor.shape {
         Block => {
-            painter.rect_filled(cursor_rect, 0.0, cursor_color);
+            painter.rect_filled(cursor_rect, 0.0, cursor.color);
         },
         HollowBlock => {
             painter.rect_stroke(
                 cursor_rect,
                 0.0,
-                Stroke::new(1.0_f32, cursor_color),
+                Stroke::new(1.0_f32, cursor.color),
                 egui::StrokeKind::Inside,
             );
         },
         Beam => {
             let bar = Rect::from_min_size(Pos2::new(x, y), Vec2::new(2.0, cell_h));
-            painter.rect_filled(bar, 0.0, cursor_color);
+            painter.rect_filled(bar, 0.0, cursor.color);
         },
         Underline => {
             let bar = Rect::from_min_size(Pos2::new(x, y + cell_h - 2.0), Vec2::new(cell_w, 2.0));
-            painter.rect_filled(bar, 0.0, cursor_color);
+            painter.rect_filled(bar, 0.0, cursor.color);
         },
         Hidden => return,
     }
 
     // The solid block covers the glyph; redraw it in inverted color so it stays legible.
-    if matches!(shape, Block) && cell.c != '\0' && !cell.flags.contains(Flags::HIDDEN) {
-        let glyph_color = config.palette.cursor_fg.map(rgb_to_color32).unwrap_or_else(|| {
-            rgb_to_color32(resolve(cell.bg, cell.flags, runtime_palette, &config.palette, false))
-        });
-        let glyph_color =
-            if glyph_color == cursor_color { background(&config.palette) } else { glyph_color };
+    if let Some((ch, flags, color)) = cursor.glyph {
         painter.text(
             Pos2::new(x, y),
             egui::Align2::LEFT_TOP,
-            cell.c.to_string(),
-            font_for_flags(cell.flags, font_id),
-            glyph_color,
+            ch.to_string(),
+            font_for_flags(flags, font_id),
+            color,
         );
     }
 }
@@ -1185,6 +1298,772 @@ mod tests {
         let mut term = Term::new(TermConfig::default(), &TermSize::new(80, 24), proxy);
         Processor::<StdSyncHandler>::new().advance(&mut term, output);
         term
+    }
+
+    /// A PTY-less session whose grid can be driven straight from a byte
+    /// stream.  `spawn_scratchpad` is the only constructor that builds a
+    /// `Session` without a child process; dropping the editor afterwards
+    /// leaves a plain terminal session behind.
+    fn headless_session(ctx: &egui::Context, config: &Config) -> (Session, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("scratch.md");
+        std::fs::write(&path, "").expect("write scratch file");
+        let mut session = Session::spawn_scratchpad(
+            ctx.clone(),
+            config,
+            Some(dir.path().to_path_buf()),
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            path,
+        )
+        .expect("scratchpad session");
+        session.scratchpad = None;
+        (session, dir)
+    }
+
+    /// Everything the painter reuses between frames, as the app holds it.
+    struct Caches {
+        builtin: BuiltinGlyphCache,
+        colors: ColorGlyphCache,
+        glyphs: GlyphCache,
+        ime: crate::ime::Ime,
+        snapshot: GridSnapshot,
+    }
+
+    impl Caches {
+        fn new() -> Self {
+            Self {
+                builtin: BuiltinGlyphCache::new(),
+                colors: ColorGlyphCache::new(Vec::new(), 0),
+                glyphs: GlyphCache::new(),
+                ime: crate::ime::Ime::default(),
+                snapshot: GridSnapshot::new(),
+            }
+        }
+    }
+
+    /// One full paint of the grid: layout, shape building, and tessellation —
+    /// everything between a PTY wakeup and the vertex buffer the GPU gets.
+    fn paint_one_frame(
+        ctx: &egui::Context,
+        session: &mut Session,
+        config: &Config,
+        caches: &mut Caches,
+        screen: Vec2,
+    ) -> FrameCost {
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, screen)),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let out = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(
+                    ui,
+                    session,
+                    config,
+                    false,
+                    &mut caches.builtin,
+                    &mut caches.ime,
+                    &mut caches.colors,
+                    &mut caches.glyphs,
+                    &mut caches.snapshot,
+                );
+            });
+        });
+        let build = started.elapsed();
+        let ppp = out.pixels_per_point;
+        let started = std::time::Instant::now();
+        let primitives = ctx.tessellate(out.shapes, ppp);
+        let tessellate = started.elapsed();
+        let vertices = primitives
+            .iter()
+            .map(|p| match &p.primitive {
+                egui::epaint::Primitive::Mesh(mesh) => mesh.vertices.len(),
+                _ => 0,
+            })
+            .sum();
+        FrameCost { build, tessellate, vertices }
+    }
+
+    /// Every glyph a focused frame painted, in paint order, after feeding it
+    /// `events`.  Reading the frame's own shapes is the only way to tell what
+    /// the user saw *that* frame rather than what the terminal state became by
+    /// the end of it.
+    fn painted_text(
+        ctx: &egui::Context,
+        session: &mut Session,
+        config: &Config,
+        caches: &mut Caches,
+        screen: Vec2,
+        events: Vec<Event>,
+    ) -> String {
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, screen)),
+            events,
+            ..Default::default()
+        };
+        let out = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(
+                    ui,
+                    session,
+                    config,
+                    true,
+                    &mut caches.builtin,
+                    &mut caches.ime,
+                    &mut caches.colors,
+                    &mut caches.glyphs,
+                    &mut caches.snapshot,
+                );
+            });
+        });
+        let mut text = String::new();
+        for clipped in &out.shapes {
+            collect_text(&clipped.shape, &mut text);
+        }
+        // Tessellate as the real loop does: nothing is on screen until the
+        // shapes have become vertices, so a caller timing a frame that skipped
+        // this would be timing half of one.
+        ctx.tessellate(out.shapes, out.pixels_per_point);
+        text
+    }
+
+    fn collect_text(shape: &egui::Shape, out: &mut String) {
+        match shape {
+            egui::Shape::Text(text) => out.push_str(text.galley.text()),
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect_text(s, out)),
+            _ => {},
+        }
+    }
+
+    /// A context with the three named terminal families bound, as
+    /// `fonts::install_terminal_fonts` leaves it in the app.  egui panics on a
+    /// family it was never given, so any fixture with a bold or italic cell
+    /// needs them.
+    fn ctx_with_terminal_faces() -> egui::Context {
+        let ctx = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        let mono = fonts.families[&FontFamily::Monospace].clone();
+        for name in [BOLD_FAMILY, ITALIC_FAMILY, BOLD_ITALIC_FAMILY] {
+            fonts.families.insert(FontFamily::Name(name.into()), mono.clone());
+        }
+        ctx.set_fonts(fonts);
+        ctx
+    }
+
+    /// A glyph as it was painted: which character, in what colour, and from
+    /// which font family.
+    #[derive(Debug, PartialEq)]
+    struct PaintedGlyph {
+        ch: String,
+        color: Color32,
+        family: FontFamily,
+    }
+
+    /// Every glyph and every filled rectangle a focused frame painted.  The
+    /// snapshot resolves colours and faces before the painter ever runs, so
+    /// this is where a mistake in that resolution becomes visible.
+    fn painted_cells(
+        ctx: &egui::Context,
+        session: &mut Session,
+        config: &Config,
+        caches: &mut Caches,
+        screen: Vec2,
+    ) -> (Vec<PaintedGlyph>, Vec<Color32>) {
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, screen)),
+            ..Default::default()
+        };
+        let out = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(
+                    ui,
+                    session,
+                    config,
+                    true,
+                    &mut caches.builtin,
+                    &mut caches.ime,
+                    &mut caches.colors,
+                    &mut caches.glyphs,
+                    &mut caches.snapshot,
+                );
+            });
+        });
+        let (mut glyphs, mut fills) = (Vec::new(), Vec::new());
+        for clipped in &out.shapes {
+            collect_cells(&clipped.shape, &mut glyphs, &mut fills);
+        }
+        (glyphs, fills)
+    }
+
+    fn collect_cells(
+        shape: &egui::Shape,
+        glyphs: &mut Vec<PaintedGlyph>,
+        fills: &mut Vec<Color32>,
+    ) {
+        match shape {
+            egui::Shape::Text(text) => glyphs.push(PaintedGlyph {
+                ch: text.galley.text().to_owned(),
+                color: text.override_text_color.unwrap_or(text.fallback_color),
+                family: text.galley.job.sections[0].format.font_id.family.clone(),
+            }),
+            egui::Shape::Rect(rect) => fills.push(rect.fill),
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect_cells(s, glyphs, fills)),
+            _ => {},
+        }
+    }
+
+    /// The snapshot resolves every cell's foreground, background and face
+    /// before the terminal lock is released, so a cell that reverses video,
+    /// picks a palette colour, or asks for bold has to come out of that copy
+    /// looking the way the terminal asked.
+    #[test]
+    fn styled_cells_keep_their_colours_and_faces_through_the_snapshot() {
+        let config = Config::default();
+        let ctx = ctx_with_terminal_faces();
+        let (mut session, _dir) = headless_session(&ctx, &config);
+        let mut caches = Caches::new();
+        let screen = Vec2::new(640.0, 480.0);
+
+        painted_cells(&ctx, &mut session, &config, &mut caches, screen);
+        let (cols, rows) = (session.size.columns, session.size.screen_lines);
+        {
+            let mut term = session.term.lock();
+            term.resize(TermSize::new(cols, rows));
+            Processor::<StdSyncHandler>::new().advance(
+                &mut *term,
+                b"\x1b[0mP\x1b[7mR\x1b[0m\x1b[1mB\x1b[0m\x1b[3mI\x1b[0m\x1b[31mC",
+            );
+        }
+
+        let (glyphs, fills) = painted_cells(&ctx, &mut session, &config, &mut caches, screen);
+        let at = |ch: &str| glyphs.iter().find(|g| g.ch == ch).expect("glyph was not painted");
+
+        let fg = rgb_to_color32(resolve(
+            AnsiColor::Named(alacritty_terminal::vte::ansi::NamedColor::Foreground),
+            Flags::empty(),
+            session.term.lock().colors(),
+            &config.palette,
+            true,
+        ));
+        let bg = background(&config.palette);
+
+        assert_eq!(at("P").color, fg, "a plain cell");
+        assert_eq!(at("P").family, FontFamily::Monospace);
+
+        // Reverse video swaps the pair, so the glyph takes the default
+        // background and the run paints the default foreground behind it.
+        assert_eq!(at("R").color, bg, "a reverse-video cell");
+        assert!(fills.contains(&fg), "reverse video painted no background behind the glyph");
+
+        assert_eq!(at("B").family, FontFamily::Name(BOLD_FAMILY.into()), "a bold cell");
+        assert_eq!(at("I").family, FontFamily::Name(ITALIC_FAMILY.into()), "an italic cell");
+
+        assert_ne!(at("C").color, fg, "SGR 31 painted in the default foreground");
+    }
+
+    /// Typing snaps the view back to the prompt (`on_terminal_input_start`), so
+    /// the frame carrying the keystroke has to paint the bottom of the buffer.
+    /// Consuming input only after the grid is built paints the stale
+    /// scrolled-back view for one more frame, and delays the bytes reaching the
+    /// PTY by a whole paint.
+    #[test]
+    fn a_keystroke_reaches_the_terminal_before_the_grid_is_painted() {
+        let config = Config::default();
+        let ctx = egui::Context::default();
+        let (mut session, _dir) = headless_session(&ctx, &config);
+        let mut caches = Caches::new();
+        let screen = Vec2::new(640.0, 480.0);
+
+        // The first frame is what tells the session how big the grid is, and
+        // `Session::resize` forwards to the `Term` only when a PTY sender
+        // exists, so a headless session needs the grid resized by hand.
+        painted_text(&ctx, &mut session, &config, &mut caches, screen, Vec::new());
+        let (cols, rows) = (session.size.columns, session.size.screen_lines);
+        {
+            let mut term = session.term.lock();
+            term.resize(TermSize::new(cols, rows));
+            let mut output = Vec::new();
+            for line in 0..rows * 4 {
+                output.extend_from_slice(format!("L{line}\r\n").as_bytes());
+            }
+            Processor::<StdSyncHandler>::new().advance(&mut *term, &output);
+            term.scroll_display(Scroll::Delta(rows as i32));
+        }
+        let last = format!("L{}", rows * 4 - 1);
+
+        let scrolled_back =
+            painted_text(&ctx, &mut session, &config, &mut caches, screen, Vec::new());
+        assert!(!scrolled_back.contains(&last), "the grid is not scrolled back to begin with");
+
+        let typed = painted_text(
+            &ctx,
+            &mut session,
+            &config,
+            &mut caches,
+            screen,
+            vec![Event::Text("a".to_owned())],
+        );
+
+        assert!(
+            typed.contains(&last),
+            "the frame carrying the keystroke painted the stale scrolled-back view"
+        );
+    }
+
+    /// The snapshot's run text and run list are reused frame to frame, so an
+    /// unchanged grid has to paint the same thing twice — a missed clear would
+    /// append the second frame's runs to the first's.
+    #[test]
+    fn a_reused_snapshot_paints_an_unchanged_grid_the_same_way() {
+        let config = Config::default();
+        let ctx = egui::Context::default();
+        let (mut session, _dir) = headless_session(&ctx, &config);
+        let mut caches = Caches::new();
+        let screen = Vec2::new(640.0, 480.0);
+
+        painted_text(&ctx, &mut session, &config, &mut caches, screen, Vec::new());
+        let (cols, rows) = (session.size.columns, session.size.screen_lines);
+        {
+            let mut term = session.term.lock();
+            term.resize(TermSize::new(cols, rows));
+            Processor::<StdSyncHandler>::new().advance(&mut *term, &dense_screen(cols, rows));
+        }
+
+        let first = painted_text(&ctx, &mut session, &config, &mut caches, screen, Vec::new());
+        let second = painted_text(&ctx, &mut session, &config, &mut caches, screen, Vec::new());
+
+        assert!(!first.is_empty(), "the fixture painted nothing");
+        assert_eq!(first, second);
+    }
+
+    /// Where a frame's time goes.  `build` is the grid walk that turns cells
+    /// into shapes — the part damage tracking can skip; `tessellate` turns
+    /// those shapes into vertices and runs whether or not anything changed.
+    #[derive(Default, Clone, Copy)]
+    struct FrameCost {
+        build: std::time::Duration,
+        tessellate: std::time::Duration,
+        vertices: usize,
+    }
+
+    /// How much of the grid `Term` reports as damaged, as a renderer that
+    /// wanted to repaint only what changed would see it.
+    fn damage_extent(term: &mut Term<EventProxy>) -> String {
+        let extent = match term.damage() {
+            alacritty_terminal::term::TermDamage::Full => "FULL".to_string(),
+            alacritty_terminal::term::TermDamage::Partial(lines) => {
+                format!("{} lines", lines.count())
+            },
+        };
+        term.reset_damage();
+        extent
+    }
+
+    /// Not a gate — run it by hand:
+    /// `cargo test -p alacritree --release -- --ignored --nocapture report_damage`
+    ///
+    /// Decides whether damage can drive a partial repaint at all.  Scrolling
+    /// the screen marks the whole terminal damaged (`Term::scroll_up_relative`
+    /// calls `mark_fully_damaged`), and a program appending output to a full
+    /// screen scrolls on every line.
+    #[test]
+    #[ignore = "reporting harness, not an assertion"]
+    fn report_damage_under_output() {
+        let (proxy, _events) = EventProxy::new(egui::Context::default());
+        let mut term = Term::new(TermConfig::default(), &TermSize::new(80, 24), proxy);
+        let mut parser = Processor::<StdSyncHandler>::new();
+
+        parser.advance(&mut term, &dense_screen(80, 24));
+        term.reset_damage();
+
+        parser.advance(&mut term, b"\x1b[5;1Hin-place edit");
+        println!("write inside the screen, no scroll: {}", damage_extent(&mut term));
+
+        // The cursor is parked on the last row by the fill, so a newline here
+        // scrolls — the steady state for any program streaming output.
+        parser.advance(&mut term, b"\x1b[24;1H");
+        term.reset_damage();
+        parser.advance(&mut term, b"one appended line\r\n");
+        println!("append one line at the bottom: {}", damage_extent(&mut term));
+
+        parser.advance(&mut term, b"another line\r\n");
+        term.reset_damage();
+        parser.advance(&mut term, b"and another\r\n");
+        println!("append again: {}", damage_extent(&mut term));
+
+        term.scroll_display(Scroll::Delta(5));
+        term.reset_damage();
+        parser.advance(&mut term, b"output while scrolled back\r\n");
+        println!("append while scrolled back: {}", damage_extent(&mut term));
+    }
+
+    /// Not a gate — run it by hand:
+    /// `cargo test -p alacritree --release -- --ignored --nocapture report_lock_contention`
+    ///
+    /// The PTY thread applies output under the same `FairMutex` the painter
+    /// holds, so whatever a frame holds it for is time the terminal cannot
+    /// parse — and the echo of a keystroke waits behind it.  Measured from the
+    /// PTY thread's side: how long acquiring the lock takes while frames paint.
+    #[test]
+    #[ignore = "timing harness, not an assertion"]
+    fn report_lock_contention() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let config = Config::default();
+        for screen in [Vec2::new(1280.0, 720.0), Vec2::new(2560.0, 1440.0)] {
+            let ctx = egui::Context::default();
+            let (mut session, _dir) = headless_session(&ctx, &config);
+            let mut caches = Caches::new();
+
+            paint_one_frame(&ctx, &mut session, &config, &mut caches, screen);
+            let (cols, rows) = (session.size.columns, session.size.screen_lines);
+            {
+                let mut term = session.term.lock();
+                term.resize(TermSize::new(cols, rows));
+                Processor::<StdSyncHandler>::new().advance(&mut *term, &dense_screen(cols, rows));
+            }
+
+            let term = Arc::clone(&session.term);
+            let stop = Arc::new(AtomicBool::new(false));
+            let locker = {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let (mut waits, mut total, mut worst) =
+                        (0u32, std::time::Duration::ZERO, std::time::Duration::ZERO);
+                    while !stop.load(Ordering::Relaxed) {
+                        let started = std::time::Instant::now();
+                        let guard = term.lock();
+                        let waited = started.elapsed();
+                        drop(guard);
+                        waits += 1;
+                        total += waited;
+                        worst = worst.max(waited);
+                        std::thread::yield_now();
+                    }
+                    (waits, total, worst)
+                })
+            };
+
+            let iterations = 60;
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                paint_one_frame(&ctx, &mut session, &config, &mut caches, screen);
+            }
+            let elapsed = started.elapsed();
+            stop.store(true, Ordering::Relaxed);
+            let (waits, total, worst) = locker.join().expect("locker thread");
+
+            println!(
+                "{}x{} logical px = {cols}x{rows} cells: {:?} per frame, PTY-side lock waits \
+                 {waits} × {:?} mean (worst {worst:?}), {:.0}% of the run blocked",
+                screen.x,
+                screen.y,
+                elapsed / iterations,
+                total / waits.max(1),
+                100.0 * total.as_secs_f64() / elapsed.as_secs_f64(),
+            );
+        }
+    }
+
+    /// Not a gate — run it by hand:
+    /// `cargo test -p alacritree --release -- --ignored --nocapture --test-threads=1 report_echo_latency`
+    ///
+    /// What the user actually waits for: output reaching the terminal, and
+    /// that output reaching the screen.  The frame loop is modelled the way
+    /// eframe drives it — a frame runs only when something asked for a repaint
+    /// — and the sample is written from another thread so it lands mid-frame
+    /// the way real PTY output does.  The paint harnesses time one frame in
+    /// isolation; this times the wait a frame is only part of.
+    #[test]
+    #[ignore = "timing harness, not an assertion"]
+    fn report_echo_latency() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use alacritty_terminal::event::{Event as TermEvent, EventListener};
+
+        /// Written to a fixed cell, so each sample overwrites the last and a
+        /// stale marker can never be mistaken for the pending one.
+        const MARKERS: [char; 2] = ['§', '¶'];
+        const SAMPLES: usize = 150;
+
+        let config = Config::default();
+        let screen = Vec2::new(2560.0, 1440.0);
+
+        // The last row is the control: the same background load with the
+        // sessions left marked visible, which is what every session looked
+        // like before off-screen output stopped waking the loop.
+        for (load, background, mark_hidden, stream_visible) in [
+            ("idle", 0, true, false),
+            ("visible session streaming", 0, true, true),
+            ("8 background sessions streaming", 8, true, false),
+            ("8 background sessions, none marked hidden", 8, false, false),
+        ] {
+            let ctx = egui::Context::default();
+            let (mut session, _dir) = headless_session(&ctx, &config);
+            let mut caches = Caches::new();
+            painted_text(&ctx, &mut session, &config, &mut caches, screen, Vec::new());
+            let (cols, rows) = (session.size.columns, session.size.screen_lines);
+            {
+                let mut term = session.term.lock();
+                term.resize(TermSize::new(cols, rows));
+                Processor::<StdSyncHandler>::new().advance(&mut *term, &dense_screen(cols, rows));
+            }
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut threads = Vec::new();
+
+            // A background session reaches the loop through `send_event` and
+            // nothing else, so its proxy is the whole of what matters here.
+            for _ in 0..background {
+                let (proxy, events) = EventProxy::new(ctx.clone());
+                proxy.set_visible(!mark_hidden);
+                let stop = Arc::clone(&stop);
+                threads.push(std::thread::spawn(move || {
+                    let _events = events;
+                    while !stop.load(Ordering::Relaxed) {
+                        proxy.send_event(TermEvent::Wakeup);
+                        std::thread::sleep(std::time::Duration::from_micros(500));
+                    }
+                }));
+            }
+
+            if stream_visible {
+                let term = Arc::clone(&session.term);
+                let ctx = ctx.clone();
+                let stop = Arc::clone(&stop);
+                threads.push(std::thread::spawn(move || {
+                    let mut parser = Processor::<StdSyncHandler>::new();
+                    while !stop.load(Ordering::Relaxed) {
+                        // In place rather than appending: the load under test
+                        // is repaint pressure and parse work, and scrolling
+                        // would carry the marker cell off screen.
+                        parser.advance(&mut *term.lock(), b"\x1b[20;1Hstreaming output");
+                        ctx.request_repaint();
+                        std::thread::sleep(std::time::Duration::from_micros(500));
+                    }
+                }));
+            }
+
+            // Timestamped before the lock is taken: waiting for the terminal
+            // is part of what the output waits through.
+            let pending: Arc<std::sync::Mutex<Option<(char, std::time::Instant)>>> =
+                Arc::new(std::sync::Mutex::new(None));
+            {
+                let (term, ctx, stop, pending) = (
+                    Arc::clone(&session.term),
+                    ctx.clone(),
+                    Arc::clone(&stop),
+                    Arc::clone(&pending),
+                );
+                threads.push(std::thread::spawn(move || {
+                    let mut parser = Processor::<StdSyncHandler>::new();
+                    let mut next = 0;
+                    while !stop.load(Ordering::Relaxed) {
+                        if pending.lock().expect("pending").is_some() {
+                            std::thread::yield_now();
+                            continue;
+                        }
+                        // Settle first, by an interval that does not divide
+                        // the frame period: injecting the moment the last
+                        // sample landed would phase-lock to the loop and
+                        // measure how fast it can cycle rather than how long
+                        // an arbitrary write waits.  Spun rather than slept
+                        // because Windows rounds a sleep up to the timer tick.
+                        let gap = std::time::Duration::from_micros(2000 + (next as u64 % 7) * 1500);
+                        let until = std::time::Instant::now() + gap;
+                        while std::time::Instant::now() < until {
+                            std::hint::spin_loop();
+                        }
+
+                        let marker = MARKERS[next % MARKERS.len()];
+                        next += 1;
+                        let at = std::time::Instant::now();
+                        parser.advance(&mut *term.lock(), format!("\x1b[1;1H{marker}").as_bytes());
+                        *pending.lock().expect("pending") = Some((marker, at));
+                        ctx.request_repaint();
+                    }
+                }));
+            }
+
+            let mut samples: Vec<std::time::Duration> = Vec::with_capacity(SAMPLES);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while samples.len() < SAMPLES && std::time::Instant::now() < deadline {
+                if !ctx.has_requested_repaint() {
+                    std::thread::yield_now();
+                    continue;
+                }
+                let painted =
+                    painted_text(&ctx, &mut session, &config, &mut caches, screen, Vec::new());
+                let mut slot = pending.lock().expect("pending");
+                if let Some((marker, at)) = *slot
+                    && painted.contains(marker)
+                {
+                    samples.push(at.elapsed());
+                    *slot = None;
+                }
+            }
+
+            stop.store(true, Ordering::Relaxed);
+            for thread in threads {
+                let _ = thread.join();
+            }
+
+            samples.sort_unstable();
+            let at = |q: f64| samples[((samples.len() as f64 * q) as usize).min(samples.len() - 1)];
+            println!(
+                "{load}: {} samples, p50 {:?}, p95 {:?}, p99 {:?}, worst {:?}",
+                samples.len(),
+                at(0.50),
+                at(0.95),
+                at(0.99),
+                samples[samples.len() - 1],
+            );
+        }
+    }
+
+    /// Not a gate — run it by hand:
+    /// `cargo test -p alacritree --release -- --ignored --nocapture --test-threads=1 report_cost_by_rows`
+    ///
+    /// A full-screen app repaints in place, so its damage is a handful of rows
+    /// rather than the whole grid — the one workload where skipping unchanged
+    /// rows is possible at all.  What that would be worth is how much of a
+    /// frame the rows carry: blank rows emit no glyphs, so painting `filled`
+    /// of `rows` approximates repainting only that many.
+    #[test]
+    #[ignore = "timing harness, not an assertion"]
+    fn report_cost_by_rows() {
+        let config = Config::default();
+        let screen = Vec2::new(2560.0, 1440.0);
+        let ctx = egui::Context::default();
+        let (mut session, _dir) = headless_session(&ctx, &config);
+        let mut caches = Caches::new();
+        paint_one_frame(&ctx, &mut session, &config, &mut caches, screen);
+        let (cols, rows) = (session.size.columns, session.size.screen_lines);
+        session.term.lock().resize(TermSize::new(cols, rows));
+
+        for filled in [rows, rows / 2, 8, 3, 1] {
+            {
+                let mut term = session.term.lock();
+                let mut parser = Processor::<StdSyncHandler>::new();
+                parser.advance(&mut *term, b"\x1b[2J");
+                parser.advance(&mut *term, &dense_screen(cols, filled));
+            }
+
+            let mut cost = FrameCost::default();
+            for _ in 0..10 {
+                cost = paint_one_frame(&ctx, &mut session, &config, &mut caches, screen);
+            }
+            let iterations = 40;
+            let (mut build, mut tessellate) =
+                (std::time::Duration::ZERO, std::time::Duration::ZERO);
+            for _ in 0..iterations {
+                cost = std::hint::black_box(paint_one_frame(
+                    &ctx,
+                    &mut session,
+                    &config,
+                    &mut caches,
+                    screen,
+                ));
+                build += cost.build;
+                tessellate += cost.tessellate;
+            }
+
+            println!(
+                "{filled:>3} of {rows} rows with content: build {:?} + tessellate {:?}, {} vertices",
+                build / iterations,
+                tessellate / iterations,
+                cost.vertices,
+            );
+        }
+    }
+
+    /// Dense output that fills every visible cell, with a colour change every
+    /// few columns so the run-splitting in `paint_grid` behaves like it does
+    /// under real program output rather than collapsing to one run per line.
+    fn dense_screen(cols: usize, rows: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for row in 0..rows {
+            out.extend_from_slice(format!("\x1b[{};1H", row + 1).as_bytes());
+            for col in 0..cols {
+                if col % 7 == 0 {
+                    out.extend_from_slice(format!("\x1b[3{}m", 1 + (col / 7) % 7).as_bytes());
+                }
+                out.push(b'a' + (col % 26) as u8);
+            }
+        }
+        out
+    }
+
+    /// Not a gate — run it by hand:
+    /// `cargo test -p alacritree --release -- --ignored --nocapture paint_cost`
+    ///
+    /// Every PTY wakeup requests a repaint, and a repaint runs this whole path
+    /// for the visible session.  What it costs is what a keystroke queues
+    /// behind while a session is streaming output.
+    #[test]
+    #[ignore = "timing harness, not an assertion"]
+    fn report_paint_cost() {
+        #[cfg(windows)]
+        crate::harden_dll_search_path();
+
+        let config = Config::default();
+        for screen in [Vec2::new(1280.0, 720.0), Vec2::new(2560.0, 1440.0)] {
+            let ctx = egui::Context::default();
+            let (mut session, _dir) = headless_session(&ctx, &config);
+            let mut caches = Caches::new();
+
+            // The first frame is what tells the session how big the grid is.
+            paint_one_frame(&ctx, &mut session, &config, &mut caches, screen);
+            // `Session::resize` forwards to the `Term` only when a PTY sender
+            // exists, so a headless session needs the grid resized by hand.
+            let (cols, rows) = (session.size.columns, session.size.screen_lines);
+            {
+                let mut term = session.term.lock();
+                term.resize(TermSize::new(cols, rows));
+                Processor::<StdSyncHandler>::new().advance(&mut *term, &dense_screen(cols, rows));
+            }
+
+            let mut cost = FrameCost::default();
+            for _ in 0..10 {
+                cost = paint_one_frame(&ctx, &mut session, &config, &mut caches, screen);
+            }
+
+            let iterations = 60;
+            let start = std::time::Instant::now();
+            let (mut build, mut tessellate) =
+                (std::time::Duration::ZERO, std::time::Duration::ZERO);
+            for _ in 0..iterations {
+                cost = std::hint::black_box(paint_one_frame(
+                    &ctx,
+                    &mut session,
+                    &config,
+                    &mut caches,
+                    screen,
+                ));
+                build += cost.build;
+                tessellate += cost.tessellate;
+            }
+            let each = start.elapsed() / iterations;
+            let (build, tessellate) = (build / iterations, tessellate / iterations);
+
+            let (_, counts) = crate::steady_state::measure(|| {
+                paint_one_frame(&ctx, &mut session, &config, &mut caches, screen)
+            });
+
+            println!(
+                "{}x{} logical px = {cols}x{rows} cells: {each:?} per frame (build {build:?} + \
+                 tessellate {tessellate:?}), {} allocations ({} KiB), {} vertices",
+                screen.x,
+                screen.y,
+                counts.allocs,
+                counts.bytes / 1024,
+                cost.vertices,
+            );
+        }
     }
 
     /// Full-screen apps hide the cursor with DECTCEM while they repaint, then
