@@ -14,13 +14,18 @@ use crate::bindings::{self, BindingAction, KeyBinding, NamedAction};
 use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
 use crate::command_palette::{self, CommandPalette, PaletteAction, PaletteItem};
-use crate::config::{Config, FontConfig, Icons, LastSessionClose, ScrollbarStyle, UiFont};
+use crate::config::{
+    Config, FontConfig, Icons, LastSessionClose, PathStyleConfig, ScrollbarStyle, TextEmphasis,
+    UiFont,
+};
 use crate::doppler;
 use crate::git_nav::{self, GitSection, SectionCount};
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, GitStatus, StatusCache};
 use crate::ipc;
 use crate::panel_filter::{self, PanelFilter};
 use crate::paste;
+use crate::path_style;
+use crate::path_style::PathStyle;
 use crate::pr_status::{PrCache, PrInfo, PrState};
 use crate::projects::{Discovered, Project, Worktree, project_json};
 use crate::scratchpad;
@@ -83,6 +88,9 @@ struct Theme {
     /// existing layout proportions.
     ui_scale: f32,
     focus_outline: FocusOutlineTheme,
+    /// Per-site path abbreviation, so free-standing row painters can spell a
+    /// path without taking a `&Config`.
+    path_style: PathStyleConfig,
 }
 
 /// Logical-pixel (normal, heading) sizes for UI text.  `[ui.font] size`
@@ -135,6 +143,7 @@ impl Theme {
                 color: config.ui.focus_outline.color.unwrap_or(accent),
                 thickness: config.ui.focus_outline.thickness,
             },
+            path_style: config.ui.path_style,
         }
     }
 }
@@ -3119,6 +3128,20 @@ impl AlacritreeApp {
         self.current_workspace.clone()
     }
 
+    /// The home directory a workspace path should collapse to.  A WSL path's
+    /// home lives inside the distro and is only known through discovery, so a
+    /// project that has not finished discovering yet simply gets no `~`.
+    fn workspace_home(&self, path: &Path) -> Option<String> {
+        match wsl::classify(path) {
+            wsl::Location::Wsl { .. } => self
+                .projects
+                .iter()
+                .find(|p| p.worktrees.iter().any(|w| w.path == path))
+                .and_then(|p| p.home.clone()),
+            wsl::Location::Windows(_) => home::home_dir().map(|h| h.display().to_string()),
+        }
+    }
+
     fn project_default_branch_for(&self, path: &Path) -> Option<String> {
         for project in &self.projects {
             for wt in &project.worktrees {
@@ -3205,6 +3228,7 @@ impl AlacritreeApp {
                         return;
                     },
                 };
+                let workspace_home = self.workspace_home(&path);
 
                 let project_default = self.project_default_branch_for(&path);
                 let cache = self
@@ -3286,13 +3310,15 @@ impl AlacritreeApp {
                         return;
                     }
 
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(path.display().to_string())
-                                .color(theme.text_muted)
-                                .small(),
-                        )
-                        .truncate(),
+                    path_label(
+                        ui,
+                        &wsl::display_path(&path),
+                        theme.text_muted,
+                        &theme,
+                        theme.path_style.git_header,
+                        egui::FontFamily::Proportional,
+                        workspace_home.as_deref(),
+                        true,
                     );
                     if let Some(branch) = &status.branch {
                         // A greedy `truncate()` label in a plain `horizontal` row
@@ -3534,7 +3560,10 @@ impl AlacritreeApp {
                 build_diff_command(delta_override.as_deref().unwrap_or("delta"), &req)
             },
         };
-        let title = format!("diff: {}", req.file);
+        let title = format!(
+            "diff: {}",
+            path_style::render(&req.file, self.config.ui.path_style.diff_title, None)
+        );
         match Session::spawn_command(
             ctx.clone(),
             &self.config,
@@ -4201,12 +4230,15 @@ fn file_row(
                     )
                     .selectable(false),
                 );
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(&change.path).color(path_color).monospace().small(),
-                    )
-                    .truncate()
-                    .selectable(false),
+                path_label(
+                    ui,
+                    &change.path,
+                    path_color,
+                    theme,
+                    theme.path_style.git_rows,
+                    egui::FontFamily::Proportional,
+                    None,
+                    false,
                 );
                 fill_row(ui);
             },
@@ -4269,12 +4301,15 @@ fn branch_diff_row(
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
                             ui.set_min_height(row_h);
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(&stat.path).color(path_color).monospace().small(),
-                                )
-                                .truncate()
-                                .selectable(false),
+                            path_label(
+                                ui,
+                                &stat.path,
+                                path_color,
+                                theme,
+                                theme.path_style.git_rows,
+                                egui::FontFamily::Proportional,
+                                None,
+                                false,
                             );
                             fill_row(ui);
                         },
@@ -4286,6 +4321,92 @@ fn branch_diff_row(
         .interact(egui::Sense::click());
     paint_row_bg(ui, &resp, bg_idx, panel_x, theme, is_active);
     resp
+}
+
+/// Bold and italic are real faces rather than a colour swap, but only the
+/// terminal font registers them — an emphasized span at a proportional site
+/// keeps the weight and shifts family rather than losing the weight.
+fn emphasis_family(e: &TextEmphasis, base: &egui::FontFamily) -> egui::FontFamily {
+    match (e.bold, e.italic) {
+        (true, true) => egui::FontFamily::Name(crate::fonts::BOLD_ITALIC_FAMILY.into()),
+        (true, false) => egui::FontFamily::Name(crate::fonts::BOLD_FAMILY.into()),
+        (false, true) => egui::FontFamily::Name(crate::fonts::ITALIC_FAMILY.into()),
+        (false, false) => base.clone(),
+    }
+}
+
+/// Paint a path as one truncating label.
+///
+/// `Zed` needs two differently-formatted spans, and one `LayoutJob` is the
+/// only way to get them without an `item_spacing` gap between two labels, a
+/// second response competing for the row's click, and a filename that can
+/// overflow the width `row_with_trailing` is managing.  Putting the filename
+/// first only *prioritizes* it: epaint truncates the tail of one linear glyph
+/// stream, so a row narrower than the filename still elides it.
+fn path_label(
+    ui: &mut egui::Ui,
+    path: &str,
+    base: Color32,
+    theme: &Theme,
+    style: PathStyle,
+    family: egui::FontFamily,
+    home: Option<&str>,
+    selectable: bool,
+) -> egui::Response {
+    if style != PathStyle::Zed {
+        return ui.add(
+            egui::Label::new(
+                RichText::new(path_style::render(path, style, home))
+                    .color(base)
+                    .family(family)
+                    .small(),
+            )
+            .truncate()
+            .selectable(selectable),
+        );
+    }
+
+    let size = egui::TextStyle::Small.resolve(ui.style()).size;
+    // A hand-built job does not inherit the ui's text valign the way RichText
+    // does, so it must be carried across or the path sits off-centre against
+    // the change glyph beside it.
+    let valign = ui.text_valign();
+    let parts = path_style::split(path, style, home);
+    let mut job = egui::text::LayoutJob::default();
+    let mut push = |text: String, e: &TextEmphasis| {
+        if text.is_empty() {
+            return;
+        }
+        job.append(
+            &text,
+            0.0,
+            egui::TextFormat {
+                font_id: egui::FontId::new(size, emphasis_family(e, &family)),
+                color: e.color.unwrap_or(base),
+                valign,
+                ..Default::default()
+            },
+        );
+    };
+    let emphases = [&theme.path_style.filename, &theme.path_style.parent];
+    for (text, e) in zed_spans(&parts).into_iter().zip(emphases) {
+        push(text, e);
+    }
+    ui.add(egui::Label::new(job).truncate().selectable(selectable))
+}
+
+/// The Zed style's span decomposition: the filename text, then — when there
+/// is a parent to show — the parent text with its separating space already
+/// folded in. Position carries the emphasis: span 0 always paints with the
+/// filename emphasis, span 1 (if present) with the parent emphasis. Shared by
+/// `path_label`'s job builder and its fidelity test so a regression in the
+/// split logic fails the test that exercises the real render path.
+fn zed_spans(parts: &path_style::Parts) -> Vec<String> {
+    if parts.parent.is_empty() {
+        vec![format!("{}{}", parts.root, parts.name)]
+    } else {
+        vec![parts.name.clone(), format!(" {}{}", parts.root, parts.parent)]
+    }
 }
 
 /// Extend a row's bounding rect to its parent's full width so the response
@@ -5773,7 +5894,7 @@ impl AlacritreeApp {
             items.push(PaletteItem::create_worktree(
                 project.root.clone(),
                 format!("{}: new worktree", project.display_name()),
-                format!("project · {}", project.root.display()),
+                format!("project · {}", wsl::display_path(&project.root)),
             ));
         }
         items
@@ -5794,14 +5915,14 @@ impl AlacritreeApp {
         }
         path.file_name()
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string())
+            .unwrap_or_else(|| wsl::display_path(path))
     }
 
     /// The (primary, secondary) a workspace palette row shows.
     fn workspace_entry_label(&self, ws: &WorkspaceKey) -> (String, String) {
         let secondary = match ws {
             None => "workspace · home".to_string(),
-            Some(path) => format!("workspace · {}", path.display()),
+            Some(path) => format!("workspace · {}", wsl::display_path(path)),
         };
         (self.workspace_label(ws), secondary)
     }
@@ -6027,7 +6148,7 @@ impl AlacritreeApp {
                     .worktree
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| picker.worktree.display().to_string());
+                    .unwrap_or_else(|| wsl::display_path(&picker.worktree));
                 ui.label(
                     RichText::new(format!("Base branch for `{name}`")).color(theme.text).strong(),
                 );
@@ -7174,6 +7295,7 @@ mod tests {
                 .collect(),
             expanded: true,
             shell_override: None,
+            home: None,
         }
     }
 
@@ -7708,5 +7830,125 @@ mod tests {
         assert_eq!(base_branch_target(false, None, none, &Some(wt.clone())), Some(wt));
         let none2 = |_id: SessionId| -> Option<WorkspaceKey> { None };
         assert_eq!(base_branch_target(false, None, none2, &None), None, "home has no base branch");
+    }
+
+    /// The row painters are free functions that only ever see a `Theme`, so the
+    /// configured style has to survive the trip through it.
+    #[test]
+    fn the_theme_carries_the_configured_path_style() {
+        let mut config = Config::default();
+        config.ui.path_style.git_rows = PathStyle::Fish;
+        config.ui.path_style.filename.bold = true;
+
+        let theme = Theme::from_config(&config);
+        assert_eq!(theme.path_style.git_rows, PathStyle::Fish);
+        assert_eq!(theme.path_style.git_header, PathStyle::Full);
+        assert!(theme.path_style.filename.bold);
+    }
+
+    /// The header is the one site whose path is absolute, so it is the one that
+    /// must convert before it abbreviates: fish-abbreviating the UNC spelling
+    /// would produce `\\w\k\h\l\monorepo` instead of `~/G/monorepo`.
+    #[cfg(windows)]
+    #[test]
+    fn the_git_header_converts_before_it_abbreviates() {
+        let unc = std::path::Path::new(r"\\wsl.localhost\kali-linux\home\lev\Git\monorepo");
+        let shown = crate::path_style::render(
+            &crate::wsl::display_path(unc),
+            crate::path_style::PathStyle::Fish,
+            Some("/home/lev"),
+        );
+        assert_eq!(shown, "~/G/monorepo");
+    }
+
+    /// Every emphasis combination must resolve to a registered face; falling back
+    /// to the base family for, say, bold-italic would silently drop the weight.
+    /// An unemphasized span keeps whatever family the site already paints in.
+    #[test]
+    fn emphasis_resolves_to_the_registered_faces() {
+        let plain = TextEmphasis::default();
+        let bold = TextEmphasis { bold: true, ..Default::default() };
+        let italic = TextEmphasis { italic: true, ..Default::default() };
+        let both = TextEmphasis { bold: true, italic: true, ..Default::default() };
+
+        for base in [egui::FontFamily::Monospace, egui::FontFamily::Proportional] {
+            assert_eq!(emphasis_family(&plain, &base), base);
+            assert_eq!(
+                emphasis_family(&bold, &base),
+                egui::FontFamily::Name(crate::fonts::BOLD_FAMILY.into())
+            );
+            assert_eq!(
+                emphasis_family(&italic, &base),
+                egui::FontFamily::Name(crate::fonts::ITALIC_FAMILY.into())
+            );
+            assert_eq!(
+                emphasis_family(&both, &base),
+                egui::FontFamily::Name(crate::fonts::BOLD_ITALIC_FAMILY.into())
+            );
+        }
+    }
+
+    /// The job's spans, as `path_label` itself builds them via `zed_spans`,
+    /// must reassemble into exactly what `render` produces, so the emphasis
+    /// only changes how the text looks, never what it says.
+    #[test]
+    fn the_zed_job_spells_the_same_text_as_render() {
+        for (path, home) in [
+            ("path/to/file.txt", None),
+            ("/a/b/c.txt", None),
+            ("f.txt", None),
+            ("/f.txt", None),
+            ("/home/lev/Git/x/y.rs", Some("/home/lev")),
+        ] {
+            let parts = crate::path_style::split(path, PathStyle::Zed, home);
+            let spans = zed_spans(&parts).concat();
+            assert_eq!(spans, crate::path_style::render(path, PathStyle::Zed, home), "{path:?}");
+        }
+    }
+
+    /// The header must stay text-selectable exactly as it was before
+    /// `path_label` existed; a row must stay non-selectable so its own click
+    /// wins the hit test instead of a text drag-select. Both the plain and
+    /// the `Zed` `LayoutJob` branch build their own label, so both are
+    /// checked here.
+    #[test]
+    fn path_label_selectability_matches_the_caller() {
+        let theme = Theme::from_config(&Config::default());
+        let ctx = egui::Context::default();
+
+        for style in [PathStyle::Full, PathStyle::Zed] {
+            for selectable in [true, false] {
+                let mut sense = None;
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::Vec2::new(400.0, 100.0),
+                    )),
+                    ..Default::default()
+                };
+                let _ = ctx.run(input, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let resp = path_label(
+                            ui,
+                            "path/to/file.txt",
+                            theme.text,
+                            &theme,
+                            style,
+                            egui::FontFamily::Proportional,
+                            None,
+                            selectable,
+                        );
+                        sense = Some(resp.sense);
+                    });
+                });
+
+                let sense = sense.expect("path_label must run inside the panel closure");
+                assert_eq!(
+                    sense.senses_drag(),
+                    selectable,
+                    "style {style:?} selectable {selectable}: {sense:?}"
+                );
+            }
+        }
     }
 }
