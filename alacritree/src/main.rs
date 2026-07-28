@@ -30,9 +30,12 @@ mod projects;
 mod row_label;
 mod scratchpad;
 mod session;
+mod sidebar_focus;
 mod sidebar_nav;
 mod stale_exe;
 mod state;
+#[cfg(test)]
+mod steady_state;
 mod terminal_view;
 #[cfg(test)]
 mod test_util;

@@ -15,8 +15,8 @@ use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
 use crate::command_palette::{self, CommandPalette, PaletteAction, PaletteItem};
 use crate::config::{
-    Config, FontConfig, Icons, LastSessionClose, PathStyleConfig, ScrollbarStyle, TextEmphasis,
-    UiFont,
+    Config, FontConfig, Icons, LastSessionClose, PathStyleConfig, ScrollbarStyle, SidebarFocus,
+    TextEmphasis, UiFont,
 };
 use crate::doppler;
 use crate::git_nav::{self, GitSection, SectionCount};
@@ -32,6 +32,7 @@ use crate::scratchpad;
 use crate::session::{
     AttentionVerdict, Session, SessionId, SessionKind, TermSize, poll_attention_debounce,
 };
+use crate::sidebar_focus;
 use crate::sidebar_nav::{self, SidebarRow};
 use crate::state::{self, PersistedProject};
 use crate::terminal_view;
@@ -370,6 +371,19 @@ pub struct AlacritreeApp {
     /// `pending_project_refresh` — resolved off the UI thread, adopted in
     /// `wsl_delta_path`.
     pending_delta: HashMap<String, Receiver<Option<String>>>,
+    /// Rows behind the last-built focus snapshot. Paint reuses this until the
+    /// next rebuild instead of recomputing the projection every frame.
+    sidebar_rows_cache: Option<Vec<SidebarRow>>,
+    /// Last reconciled snapshot, the baseline for the next cursor repair.
+    sidebar_focus_prev: Option<sidebar_focus::TreeSnapshot>,
+    /// The deepest row a filter hid, restored when it becomes visible again.
+    sidebar_anchor: Option<SidebarRow>,
+    /// What the reconciler itself last wrote.  Different values on the next
+    /// pass mean the user navigated — a click, session cycling, the palette, a
+    /// notification, IPC — and the anchor has been overtaken.
+    sidebar_focus_written: Option<SidebarFocusWrite>,
+    /// A close verdict the reconciler still owes the terminal.
+    sidebar_deferred_close: Option<DeferredClose>,
 }
 
 struct DeleteRequest {
@@ -666,6 +680,11 @@ impl AlacritreeApp {
             pending_project_refresh: HashMap::new(),
             wsl_delta_paths: HashMap::new(),
             pending_delta: HashMap::new(),
+            sidebar_rows_cache: None,
+            sidebar_focus_prev: None,
+            sidebar_anchor: None,
+            sidebar_focus_written: None,
+            sidebar_deferred_close: None,
         };
 
         let wsl_indices: Vec<usize> = app
@@ -975,7 +994,10 @@ impl AlacritreeApp {
         }
         if let Err(e) = self.spawn_session(ctx, self.current_workspace.clone()) {
             self.last_error = Some(format!("failed to spawn shell: {e}"));
+            return;
         }
+        // Filling in a missing active entry is self-healing, not navigation.
+        self.mark_sidebar_focus_write();
     }
 
     /// Re-attach to an existing session when the active id went stale
@@ -987,6 +1009,8 @@ impl AlacritreeApp {
         if let Some(&idx) = ws_idx.first() {
             let id = self.sessions[idx].id;
             self.active_session.insert(self.current_workspace.clone(), id);
+            // Filling in a missing active entry is self-healing, not navigation.
+            self.mark_sidebar_focus_write();
         }
     }
 
@@ -1026,15 +1050,26 @@ impl AlacritreeApp {
             }
             return;
         }
+        if defers_close_navigation(self.config.ui.sidebar_focus) && verdict != CloseFallback::Stay {
+            self.sidebar_deferred_close = Some(DeferredClose { verdict, removed_worktree: None });
+            // `reap_exited_sessions` runs after paint, so a shell that exited
+            // on its own has no reconciler pass left this frame; without this
+            // the deferral would wait for unrelated input.
+            ctx.request_repaint();
+            return;
+        }
+        self.apply_close_fallback(ctx, verdict);
+    }
+
+    /// Act on a close verdict: stay put, move to the project's main checkout,
+    /// or go home.
+    fn apply_close_fallback(&mut self, ctx: &Context, verdict: CloseFallback) {
         match verdict {
             CloseFallback::Stay => {},
             CloseFallback::Activate(main) => {
-                // The fallback verified a session exists there, so this
-                // adopts rather than spawns.
-                self.current_workspace = Some(main);
-                self.ensure_active_session(ctx);
-                // Adopting an existing session produces no PTY events, so
-                // nothing else would wake the next paint.
+                self.activate_worktree(ctx, &main);
+                // Adopting an existing idle session produces no PTY event, so
+                // nothing else would wake the paint that shows it.
                 ctx.request_repaint();
             },
             CloseFallback::Home => {
@@ -1337,6 +1372,10 @@ impl AlacritreeApp {
         let rows = self.current_project_rows();
         self.sidebar_cursor = sidebar_nav::ensure_cursor(&rows, self.sidebar_cursor.as_ref());
         self.sidebar_cursor_moved = true;
+        // Seeding rewrites the cursor from terminal state, which the overtaken
+        // check would otherwise read as the user navigating.  The anchor
+        // outlives a trip through the terminal by design.
+        self.mark_sidebar_focus_write();
     }
 
     fn focus_git_sidebar(&mut self) {
@@ -1501,21 +1540,13 @@ impl AlacritreeApp {
     fn apply_filter_outcome(&mut self, outcome: panel_filter::Outcome) {
         use panel_filter::Outcome;
         match outcome {
-            Outcome::FilterChanged => self.after_filter_changed(),
+            // The reconciler repairs the cursor later in this same update, from
+            // a snapshot that still knows which row the filter hid.  Repairing
+            // here would reset it before anything could observe that.
+            Outcome::FilterChanged => {},
             Outcome::Consumed => {},
             Outcome::MoveCursor(delta) => self.move_sidebar_cursor(delta),
             Outcome::LeavePanel => self.focus_terminal(),
-        }
-    }
-
-    /// Repair the cursor after the row set narrows or widens: keep it where it
-    /// is when still visible, otherwise fall to the first surviving row.
-    fn after_filter_changed(&mut self) {
-        let rows = self.current_project_rows();
-        let next = sidebar_nav::ensure_cursor(&rows, self.sidebar_cursor.as_ref());
-        if next != self.sidebar_cursor {
-            self.sidebar_cursor = next;
-            self.sidebar_cursor_moved = true;
         }
     }
 
@@ -1620,6 +1651,139 @@ impl AlacritreeApp {
 
     fn workspace_has_sessions(&self, key: &WorkspaceKey) -> bool {
         self.sessions.iter().any(|s| s.working_directory == *key)
+    }
+
+    /// Every live session as a `(workspace, id)` pair — the same shape
+    /// `close_fallback` and `sidebar_session_ids` take, and the model the
+    /// focus reconciler observes.
+    fn session_pairs(&self) -> Vec<(WorkspaceKey, SessionId)> {
+        self.sessions.iter().map(|s| (s.working_directory.clone(), s.id)).collect()
+    }
+
+    /// Live sessions borrowed for the unchanged-inputs check, which runs on
+    /// every frame and must not allocate.
+    fn session_inputs(&self) -> impl Iterator<Item = sidebar_focus::SessionInput<'_>> {
+        self.sessions.iter().map(|s| sidebar_focus::SessionInput {
+            workspace: &s.working_directory,
+            id: s.id,
+            attention: s.needs_attention,
+        })
+    }
+
+    fn sidebar_snapshot(&mut self, skip_worktree: Option<&Path>) -> sidebar_focus::TreeSnapshot {
+        let inputs = sidebar_focus::ObservedInputs::capture(
+            &self.projects,
+            self.session_inputs(),
+            sidebar_focus::UiInputs {
+                session_rows_always: self.session_rows_always,
+                query: self.project_filter.query(),
+                toggles: self.project_filter.toggle_bits(),
+            },
+        );
+        let rows = self.current_project_rows();
+        let live = self.session_pairs();
+        let snapshot = build_sidebar_snapshot(&self.projects, &live, &rows, skip_worktree, inputs);
+        // Paint reuses these until the next rebuild, so an unchanged filtering
+        // frame runs no fuzzy matching at all.
+        self.sidebar_rows_cache = Some(rows);
+        snapshot
+    }
+
+    /// Repair the sidebar cursor against what changed since the last pass.
+    /// Called twice per `update` — before paint for everything the input and
+    /// background drains produced, and again at the end for what only
+    /// `reap_exited_sessions` and paint-time clicks can produce.  A pass with
+    /// nothing to do costs one `ObservedInputs` compare, which is the whole
+    /// steady-state budget: there is no setting that skips this.
+    fn reconcile_sidebar_focus(&mut self, ctx: &Context) {
+        if sidebar_focus_overtaken(
+            &self.sidebar_focus_written,
+            self.sidebar_cursor.as_ref(),
+            &self.current_workspace,
+            self.active_session.get(&self.current_workspace).copied(),
+        ) {
+            self.sidebar_anchor = None;
+        }
+
+        let deferred = self.sidebar_deferred_close.take();
+        let skip = deferred.as_ref().and_then(|d| d.removed_worktree.clone());
+
+        if deferred.is_none() {
+            if let Some(prev) = &self.sidebar_focus_prev {
+                let unchanged = prev.inputs.matches(
+                    &self.projects,
+                    self.session_inputs(),
+                    sidebar_focus::UiInputs {
+                        session_rows_always: self.session_rows_always,
+                        query: self.project_filter.query(),
+                        toggles: self.project_filter.toggle_bits(),
+                    },
+                );
+                if unchanged {
+                    return;
+                }
+            }
+        }
+
+        let next = self.sidebar_snapshot(skip.as_deref());
+        let prev = self.sidebar_focus_prev.take().unwrap_or_else(|| next.clone());
+        let outcome = sidebar_focus::repair(
+            &prev,
+            &next,
+            self.sidebar_cursor.as_ref(),
+            self.sidebar_anchor.as_ref(),
+        );
+
+        if outcome.cursor != self.sidebar_cursor {
+            self.sidebar_cursor = outcome.cursor;
+            self.sidebar_cursor_moved = true;
+        }
+        self.sidebar_anchor = outcome.anchor;
+        self.sidebar_focus_prev = Some(next);
+
+        if self.config.ui.sidebar_focus.follows() {
+            match (outcome.follow, deferred) {
+                (Some(target), _) => self.apply_follow_target(ctx, target),
+                // Nothing live to land on, so the verdict this pass took over
+                // from still decides where the terminal goes.
+                (None, Some(deferred)) => self.apply_close_fallback(ctx, deferred.verdict),
+                (None, None) => {},
+            }
+        }
+
+        self.mark_sidebar_focus_write();
+    }
+
+    /// Record the current focus triple as the reconciler's own, so the next
+    /// pass does not mistake it for the user navigating.
+    fn mark_sidebar_focus_write(&mut self) {
+        self.sidebar_focus_written = Some(SidebarFocusWrite {
+            cursor: self.sidebar_cursor.clone(),
+            workspace: self.current_workspace.clone(),
+            active: self.active_session.get(&self.current_workspace).copied(),
+        });
+    }
+
+    /// Move the terminal to a removal landing.  A workspace target adopts its
+    /// active session, or its first live one when that entry went stale.
+    fn apply_follow_target(&mut self, ctx: &Context, target: sidebar_focus::FollowTarget) {
+        match target {
+            sidebar_focus::FollowTarget::Session(id) => self.activate_session_by_id(id),
+            sidebar_focus::FollowTarget::Workspace(ws) => {
+                let id = self
+                    .active_session
+                    .get(&ws)
+                    .copied()
+                    .filter(|id| self.sessions.iter().any(|s| s.id == *id))
+                    .or_else(|| {
+                        self.sessions.iter().find(|s| s.working_directory == ws).map(|s| s.id)
+                    });
+                if let Some(id) = id {
+                    self.activate_session_by_id(id);
+                }
+            },
+        }
+        ctx.request_repaint();
     }
 
     fn apply_sidebar_nav(&mut self, ctx: &Context, key: egui::Key) {
@@ -2492,7 +2656,11 @@ impl AlacritreeApp {
         let mut visible_worktrees: HashSet<PathBuf> = HashSet::new();
         if filtering {
             home_visible = false;
-            for row in self.current_project_rows() {
+            let rows = match &self.sidebar_rows_cache {
+                Some(rows) => rows.clone(),
+                None => self.current_project_rows(),
+            };
+            for row in rows {
                 match row {
                     SidebarRow::Home => home_visible = true,
                     SidebarRow::Project(root) => {
@@ -3942,11 +4110,10 @@ fn single_line_galley(
     max_w: f32,
 ) -> std::sync::Arc<egui::Galley> {
     use egui::text::{LayoutJob, TextFormat};
-    let mut job = LayoutJob::single_section(text.to_owned(), TextFormat {
-        font_id: egui::FontId::new(size, family),
-        color,
-        ..Default::default()
-    });
+    let mut job = LayoutJob::single_section(
+        text.to_owned(),
+        TextFormat { font_id: egui::FontId::new(size, family), color, ..Default::default() },
+    );
     job.wrap.max_width = max_w.max(0.0);
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
@@ -3965,11 +4132,10 @@ fn wrapped_galley(
     max_w: f32,
 ) -> std::sync::Arc<egui::Galley> {
     use egui::text::{LayoutJob, TextFormat};
-    let mut job = LayoutJob::single_section(text.to_owned(), TextFormat {
-        font_id: egui::FontId::new(size, family),
-        color,
-        ..Default::default()
-    });
+    let mut job = LayoutJob::single_section(
+        text.to_owned(),
+        TextFormat { font_id: egui::FontId::new(size, family), color, ..Default::default() },
+    );
     job.wrap.max_width = max_w.max(0.0);
     ctx.fonts(|f| f.layout_job(job))
 }
@@ -4104,8 +4270,12 @@ fn paint_palette_row(
     let painter = ui.painter().clone();
 
     if selected {
-        let wash =
-            Color32::from_rgba_unmultiplied(theme.accent.r(), theme.accent.g(), theme.accent.b(), 46);
+        let wash = Color32::from_rgba_unmultiplied(
+            theme.accent.r(),
+            theme.accent.g(),
+            theme.accent.b(),
+            46,
+        );
         painter.rect_filled(rect, 5.0 * s, wash);
         let bar = egui::Rect::from_min_size(rect.left_top(), egui::vec2(2.5 * s, rect.height()));
         painter.rect_filled(bar, 0.0, theme.accent);
@@ -4861,6 +5031,141 @@ fn sidebar_session_ids(
     if ids.len() < threshold { Vec::new() } else { ids }
 }
 
+/// Step the lockstep index over the rows a skipped worktree owns.
+///
+/// The projection is built before the deletion is known, so it still lists
+/// the worktree and any sessions under it.  Leaving the index parked on a row
+/// no node will match again would mark every later node unprojected, and the
+/// cursor repair reads an unprojected row as one that has gone away.
+fn skip_projected_rows(
+    rows: &[SidebarRow],
+    next_row: &mut usize,
+    live: &[(WorkspaceKey, SessionId)],
+    path: &Path,
+) {
+    if rows.get(*next_row) != Some(&SidebarRow::Worktree(path.to_path_buf())) {
+        return;
+    }
+    *next_row += 1;
+    while let Some(SidebarRow::Session(id)) = rows.get(*next_row) {
+        if !live.iter().any(|(ws, live_id)| live_id == id && ws.as_deref() == Some(path)) {
+            break;
+        }
+        *next_row += 1;
+    }
+}
+
+/// Assemble the model arena and the projection.  `rows` is the projection —
+/// exactly what the cursor steps over — and `live` is the model: every running
+/// session, whatever the listing threshold or the filter says.  Building
+/// membership from `listed` instead would make the last session in a workspace
+/// read as deleted the moment its sibling closed.
+///
+/// `skip_worktree` drops a worktree whose deletion is already committed but
+/// whose git operation has not finished, so nothing lands the cursor — or a
+/// new shell — inside a directory on its way out.
+///
+/// Nodes are pushed in exactly the order `sidebar_nav::visible_rows` emits,
+/// with unprojected nodes interleaved, so one forward index into `rows`
+/// classifies every node.  Asking `rows.contains` per node instead would be
+/// quadratic in path comparisons on a path that runs whenever the user types.
+fn build_sidebar_snapshot(
+    projects: &[Project],
+    live: &[(WorkspaceKey, SessionId)],
+    rows: &[SidebarRow],
+    skip_worktree: Option<&Path>,
+    inputs: sidebar_focus::ObservedInputs,
+) -> sidebar_focus::TreeSnapshot {
+    use sidebar_focus::Parent;
+
+    let mut b = sidebar_focus::SnapshotBuilder::default();
+    let mut next_row = 0usize;
+    let mut placed = vec![false; live.len()];
+
+    // Consume `rows` in lockstep: a node is projected exactly when it is the
+    // row the projection expects next.
+    let push = |b: &mut sidebar_focus::SnapshotBuilder,
+                next_row: &mut usize,
+                row: SidebarRow,
+                parent: Parent| {
+        let projected = rows.get(*next_row) == Some(&row);
+        if projected {
+            *next_row += 1;
+        }
+        b.push(row, parent, projected)
+    };
+
+    let home_id = push(&mut b, &mut next_row, SidebarRow::Home, Parent::Root);
+    for (i, (ws, id)) in live.iter().enumerate() {
+        if ws.is_none() {
+            push(&mut b, &mut next_row, SidebarRow::Session(*id), Parent::Node(home_id));
+            placed[i] = true;
+        }
+    }
+
+    for p in projects {
+        let project_id =
+            push(&mut b, &mut next_row, SidebarRow::Project(p.root.clone()), Parent::Root);
+        for wt in &p.worktrees {
+            if skip_worktree == Some(wt.path.as_path()) {
+                skip_projected_rows(rows, &mut next_row, live, &wt.path);
+                continue;
+            }
+            let wt_id = push(
+                &mut b,
+                &mut next_row,
+                SidebarRow::Worktree(wt.path.clone()),
+                Parent::Node(project_id),
+            );
+            for (i, (ws, id)) in live.iter().enumerate() {
+                if ws.as_deref() == Some(wt.path.as_path()) {
+                    push(&mut b, &mut next_row, SidebarRow::Session(*id), Parent::Node(wt_id));
+                    placed[i] = true;
+                }
+            }
+        }
+    }
+
+    // Sessions whose workspace has no row left — a removed project, or a
+    // worktree already treated as gone.  They are running, so they belong in
+    // the model; they have no place in the tree, so they are nobody's sibling.
+    for (i, (_, id)) in live.iter().enumerate() {
+        if !placed[i] {
+            b.push(SidebarRow::Session(*id), Parent::Detached, false);
+        }
+    }
+
+    debug_assert_eq!(next_row, rows.len(), "every projected row must be in the arena");
+    b.finish(inputs)
+}
+
+/// The cursor, workspace, and active session the reconciler last wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SidebarFocusWrite {
+    cursor: Option<SidebarRow>,
+    workspace: WorkspaceKey,
+    active: Option<SessionId>,
+}
+
+/// Whether focus moved behind the reconciler's back.  The active session is
+/// part of the comparison because the tab and session cycling actions can
+/// switch sessions without leaving the workspace, changing nothing else.
+/// Comparing the resulting state rather than matching on action names covers
+/// every route to them — rebound keys, the command palette, MCP — at the price
+/// of `ensure_active_session` and `adopt_active_session` marking their own
+/// writes so their self-healing does not read as navigation.
+fn sidebar_focus_overtaken(
+    written: &Option<SidebarFocusWrite>,
+    cursor: Option<&SidebarRow>,
+    workspace: &WorkspaceKey,
+    active: Option<SessionId>,
+) -> bool {
+    match written {
+        None => false,
+        Some(w) => w.cursor.as_ref() != cursor || w.workspace != *workspace || w.active != active,
+    }
+}
+
 /// Where the view goes after a session's removal.
 #[derive(Debug, PartialEq)]
 enum CloseFallback {
@@ -4892,6 +5197,26 @@ fn close_fallback(
         },
         _ => CloseFallback::Home,
     }
+}
+
+/// A close-fallback verdict the reconciler owes the terminal, and the worktree
+/// whose rows must already read as gone.  The verdict is carried rather than
+/// recomputed because only `close_fallback` knows the difference between
+/// staying put, hopping to the project's main checkout, and going home.
+#[derive(Debug)]
+struct DeferredClose {
+    verdict: CloseFallback,
+    /// Set when an asynchronous worktree deletion is in flight: `projects`
+    /// still lists it, so without this the reconciler would see an intact row
+    /// and could spawn a shell inside the directory being removed.
+    removed_worktree: Option<PathBuf>,
+}
+
+/// Whether the reconciler owns post-removal navigation.  Under `"follow"` the
+/// landing row decides where the terminal goes, so acting here first would
+/// show one workspace for a frame and another the next.
+fn defers_close_navigation(mode: SidebarFocus) -> bool {
+    mode.follows()
 }
 
 /// What re-homing a session does to the active-session maps and the view.
@@ -5949,8 +6274,11 @@ impl AlacritreeApp {
             },
             PaletteAction::CreateWorktree(root) => {
                 if let Some(project_idx) = self.projects.iter().position(|p| p.root == root) {
-                    self.pending_create =
-                        Some(CreateState::Prompt { project_idx, branch: String::new(), error: None });
+                    self.pending_create = Some(CreateState::Prompt {
+                        project_idx,
+                        branch: String::new(),
+                        error: None,
+                    });
                 }
             },
         }
@@ -5967,10 +6295,18 @@ impl AlacritreeApp {
         self.sessions.retain(|s| s.working_directory.as_deref() != Some(&req.worktree_path));
         self.active_session.remove(&Some(req.worktree_path.clone()));
         if self.current_workspace.as_deref() == Some(&req.worktree_path) {
-            // Deleting the on-screen worktree is an explicit user action, so
-            // home should greet with a live shell rather than the "no
-            // session" placeholder.
-            self.activate_home(ctx);
+            if defers_close_navigation(self.config.ui.sidebar_focus) {
+                self.sidebar_deferred_close = Some(DeferredClose {
+                    verdict: CloseFallback::Home,
+                    removed_worktree: Some(req.worktree_path.clone()),
+                });
+                ctx.request_repaint();
+            } else {
+                // Deleting the on-screen worktree is an explicit user action,
+                // so home should greet with a live shell rather than the "no
+                // session" placeholder.
+                self.activate_home(ctx);
+            }
         }
 
         // The git removal (shellouts, branch delete, doppler cleanup) is slow
@@ -6767,6 +7103,7 @@ impl eframe::App for AlacritreeApp {
         self.process_notification_actions(ctx);
         self.process_ipc_calls(ctx);
         self.process_session_events(ctx);
+        self.reconcile_sidebar_focus(ctx);
         let theme = self.theme;
         // GL clear is the sole source of the bg when opacity < 1; painting any
         // panel fill on top would compound the alpha through egui's blend.
@@ -6897,6 +7234,11 @@ impl eframe::App for AlacritreeApp {
         }
 
         self.reap_exited_sessions(ctx);
+        // A shell that exited on its own is only removed here, after paint.
+        // Without this pass its deferred verdict would wait for unrelated
+        // input; with it, the repair is queued for the frame the repaint
+        // request has already scheduled.
+        self.reconcile_sidebar_focus(ctx);
     }
 }
 
@@ -7019,6 +7361,38 @@ mod tests {
     }
 
     #[test]
+    fn the_sentinel_sees_a_same_workspace_session_switch() {
+        let written =
+            SidebarFocusWrite { cursor: Some(SidebarRow::Home), workspace: None, active: Some(1) };
+        let written = Some(written);
+
+        // The reconciler's own values still stand.
+        assert!(!sidebar_focus_overtaken(&written, Some(&SidebarRow::Home), &None, Some(1)));
+
+        // Any action that switches sessions without leaving the workspace —
+        // SelectNextTab, SelectNextSession, SelectTab(n) — changes neither the
+        // cursor nor the workspace, only the active session.
+        assert!(sidebar_focus_overtaken(&written, Some(&SidebarRow::Home), &None, Some(2)));
+
+        // A different workspace, and a different cursor, each count too.
+        assert!(sidebar_focus_overtaken(
+            &written,
+            Some(&SidebarRow::Home),
+            &Some(PathBuf::from("/a/wt1")),
+            Some(1),
+        ));
+        assert!(sidebar_focus_overtaken(
+            &written,
+            Some(&SidebarRow::Project(PathBuf::from("/a"))),
+            &None,
+            Some(1),
+        ));
+
+        // Nothing written yet cannot have been overtaken.
+        assert!(!sidebar_focus_overtaken(&None, Some(&SidebarRow::Home), &None, Some(1)));
+    }
+
+    #[test]
     fn search_enter_escape_and_shift_escape_dispatch_distinct_actions() {
         let binds = crate::bindings::parse_bindings(vec![]);
         let mut f = searching_filter();
@@ -7033,25 +7407,28 @@ mod tests {
             egui::Modifiers::NONE,
         );
         assert!(!retain, "a matched search action consumes the key");
-        assert!(matches!(steps.as_slice(), [SidebarNavStep::SearchAction(
-            NamedAction::SidebarSearchConfirm
-        )]));
+        assert!(matches!(
+            steps.as_slice(),
+            [SidebarNavStep::SearchAction(NamedAction::SidebarSearchConfirm)]
+        ));
         // The filter is untouched by the drain — the action does the exit.
         assert_eq!(f.mode(), panel_filter::Mode::Search);
         assert_eq!(f.query(), "foo");
 
         let mut steps = Vec::new();
         drain_search_or_nav(&mut steps, &mut f, &binds, egui::Key::Escape, egui::Modifiers::NONE);
-        assert!(matches!(steps.as_slice(), [SidebarNavStep::SearchAction(
-            NamedAction::SidebarSearchCancel
-        )]));
+        assert!(matches!(
+            steps.as_slice(),
+            [SidebarNavStep::SearchAction(NamedAction::SidebarSearchCancel)]
+        ));
 
         let mut steps = Vec::new();
         drain_search_or_nav(&mut steps, &mut f, &binds, egui::Key::Escape, egui::Modifiers::SHIFT);
         assert!(
-            matches!(steps.as_slice(), [SidebarNavStep::SearchAction(
-                NamedAction::SidebarSearchCancelToTerminal
-            )]),
+            matches!(
+                steps.as_slice(),
+                [SidebarNavStep::SearchAction(NamedAction::SidebarSearchCancelToTerminal)]
+            ),
             "Shift+Esc is a distinct search action from plain Esc"
         );
     }
@@ -7069,9 +7446,10 @@ mod tests {
             egui::Key::ArrowDown,
             egui::Modifiers::NONE,
         );
-        assert!(matches!(steps.as_slice(), [SidebarNavStep::Filter(
-            panel_filter::Outcome::MoveCursor(1)
-        )]));
+        assert!(matches!(
+            steps.as_slice(),
+            [SidebarNavStep::Filter(panel_filter::Outcome::MoveCursor(1))]
+        ));
 
         // Space stays consumed as a no-op nav even in search (fake-click guard).
         let mut steps = Vec::new();
@@ -7359,6 +7737,34 @@ mod tests {
             ),
             CloseFallback::Stay
         );
+    }
+
+    #[test]
+    fn a_deferred_verdict_survives_instead_of_being_re_derived() {
+        // `close_fallback` is the only thing that knows to hop to the project's
+        // main checkout; a generic "spawn something" fallback would strand
+        // last_session_close = "navigate" in the workspace that just emptied.
+        let main = PathBuf::from("/p/main");
+        let removed = Some(PathBuf::from("/p/feature"));
+        let remaining = vec![(Some(main.clone()), 1)];
+
+        let verdict = close_fallback(&removed, &removed, &remaining, Some(main.clone()));
+        assert_eq!(verdict, CloseFallback::Activate(main.clone()));
+
+        let deferred = DeferredClose { verdict, removed_worktree: None };
+        assert_eq!(
+            deferred.verdict,
+            CloseFallback::Activate(main),
+            "the verdict is carried, not recomputed from whatever state remains"
+        );
+    }
+
+    #[test]
+    fn only_follow_defers_close_navigation() {
+        use crate::config::SidebarFocus;
+
+        assert!(defers_close_navigation(SidebarFocus::Follow));
+        assert!(!defers_close_navigation(SidebarFocus::Preserve));
     }
 
     #[test]
@@ -7950,5 +8356,149 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn snapshot_parents_agree_with_the_row_model() {
+        use crate::sidebar_focus::Parent;
+        use crate::sidebar_nav::{self, SidebarRow};
+
+        // Two projects, one collapsed, with sessions under the expanded one.
+        let projects = vec![
+            sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2"]),
+            sidebar_nav::tests::project("/b", false, &["/b/wt1"]),
+        ];
+        let live =
+            vec![(None, 1), (Some(PathBuf::from("/a/wt1")), 2), (Some(PathBuf::from("/a/wt1")), 3)];
+        let listed = sidebar_nav::ListedSessions::from([
+            (None, vec![1]),
+            (Some(PathBuf::from("/a/wt1")), vec![2, 3]),
+        ]);
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let snapshot = build_sidebar_snapshot(&projects, &live, &rows, None, Default::default());
+
+        for row in &rows {
+            let id = snapshot.find(row).expect("every projected row is in the model");
+            let arena_parent = match snapshot.parent(id) {
+                Parent::Root => None,
+                Parent::Node(p) => Some(snapshot.row(p).clone()),
+                Parent::Detached => panic!("a projected row is never detached: {row:?}"),
+            };
+            assert_eq!(
+                arena_parent,
+                sidebar_nav::left_target(&rows, row),
+                "arena parent must agree with the row model for {row:?}"
+            );
+        }
+
+        // The collapsed project's worktree is in the model but not projected.
+        let hidden = snapshot
+            .find(&SidebarRow::Worktree(PathBuf::from("/b/wt1")))
+            .expect("collapsed worktrees stay in the model");
+        assert!(!snapshot.is_projected(hidden));
+    }
+
+    #[test]
+    fn a_session_below_the_listing_threshold_is_still_in_the_model() {
+        use crate::sidebar_nav::{self, SidebarRow};
+
+        let projects = vec![sidebar_nav::tests::project("/a", true, &["/a/wt1"])];
+        // One live session in the worktree.  The real rule needs two before it
+        // lists any, so this one is live but unprojected.
+        let live = vec![(Some(PathBuf::from("/a/wt1")), 7)];
+        let listed = {
+            let mut l = sidebar_nav::ListedSessions::new();
+            let ids = sidebar_session_ids(&live, &Some(PathBuf::from("/a/wt1")), false);
+            assert!(ids.is_empty(), "the threshold rule must actually drop this session");
+            if !ids.is_empty() {
+                l.insert(Some(PathBuf::from("/a/wt1")), ids);
+            }
+            l
+        };
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let snapshot = build_sidebar_snapshot(&projects, &live, &rows, None, Default::default());
+
+        let id = snapshot
+            .find(&SidebarRow::Session(7))
+            .expect("a live session is in the model whatever the listing threshold says");
+        assert!(!snapshot.is_projected(id), "but it is not a navigable row");
+    }
+
+    #[test]
+    fn a_session_whose_project_is_gone_is_detached_not_deleted() {
+        use crate::sidebar_focus::Parent;
+        use crate::sidebar_nav::{self, SidebarRow};
+
+        // `remove_project` drops the project but keeps its sessions running.
+        let projects: Vec<crate::projects::Project> = vec![];
+        let live = vec![(Some(PathBuf::from("/orphan/wt1")), 5)];
+        let listed = sidebar_nav::ListedSessions::new();
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let snapshot = build_sidebar_snapshot(&projects, &live, &rows, None, Default::default());
+
+        let id = snapshot.find(&SidebarRow::Session(5)).expect("the session is still running");
+        assert_eq!(
+            snapshot.parent(id),
+            Parent::Detached,
+            "an orphan must not become a sibling of Home"
+        );
+    }
+
+    #[test]
+    fn a_worktree_being_deleted_reads_as_gone_immediately() {
+        use crate::sidebar_nav::{self, SidebarRow};
+
+        let projects = vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2"])];
+        let listed = sidebar_nav::ListedSessions::new();
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let doomed = PathBuf::from("/a/wt2");
+        let snapshot = build_sidebar_snapshot(
+            &projects,
+            &[],
+            &rows,
+            Some(doomed.as_path()),
+            Default::default(),
+        );
+
+        assert_eq!(
+            snapshot.find(&SidebarRow::Worktree(doomed)),
+            None,
+            "the async git delete has not finished, but the row must not read as present"
+        );
+        assert!(snapshot.find(&SidebarRow::Worktree(PathBuf::from("/a/wt1"))).is_some());
+    }
+
+    /// The rows below a worktree being deleted must stay navigable.
+    ///
+    /// The projection is built before the deletion is known, so it still
+    /// lists the doomed worktree.  The builder consumes that projection in
+    /// lockstep, so skipping the worktree without stepping the index leaves
+    /// it parked on a row nothing will ever match again — every later node
+    /// reads as unprojected, and the cursor repair treats an unprojected row
+    /// as one that has gone away.
+    #[test]
+    fn rows_below_a_deleted_worktree_stay_navigable() {
+        use crate::sidebar_nav::{self, SidebarRow};
+
+        let projects =
+            vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2", "/a/wt3"])];
+        let listed = sidebar_nav::ListedSessions::new();
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let doomed = PathBuf::from("/a/wt2");
+        let snapshot = build_sidebar_snapshot(
+            &projects,
+            &[],
+            &rows,
+            Some(doomed.as_path()),
+            Default::default(),
+        );
+
+        let below = snapshot
+            .find(&SidebarRow::Worktree(PathBuf::from("/a/wt3")))
+            .expect("the worktree below the deleted one is still in the tree");
+        assert!(
+            snapshot.is_projected(below),
+            "a row below the one being deleted must still be navigable"
+        );
     }
 }
