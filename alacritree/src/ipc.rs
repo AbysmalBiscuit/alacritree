@@ -37,6 +37,11 @@ use crate::worktree::{self as wt, CreateRequest, Progress};
 
 pub const SOCKET_ENV: &str = "ALACRITREE_SOCKET";
 
+/// Absolute path to the running binary.  A shell can exec the CLI through it
+/// without a PATH lookup — which is the only reliable way in a distro, where
+/// the Windows binary is reachable through interop but is not on `$PATH`.
+pub const EXE_ENV: &str = "ALACRITREE_EXE";
+
 /// How long a connection waits for the UI thread before giving up — long
 /// enough for a busy frame, short enough that a wedged app doesn't hang
 /// clients forever.
@@ -146,13 +151,18 @@ pub fn spawn_listener(ctx: egui::Context) -> std::io::Result<(SocketHandle, Rece
     // no other thread is reading the environment concurrently.
     unsafe { std::env::set_var(SOCKET_ENV, listener.0.path()) };
 
+    match std::env::current_exe() {
+        Ok(exe) => unsafe { std::env::set_var(EXE_ENV, exe) },
+        Err(e) => log::warn!("cannot advertise {EXE_ENV}: {e}"),
+    }
+
     // Only WSLENV-listed variables cross the wsl.exe boundary — in either
     // direction.  Listing the socket lets programs in a distro find this
     // instance, whether they read the variable themselves or exec the
     // Windows CLI through interop (which inherits the distro's view); the
-    // session id lets them name their own session in requests.  No
-    // conversion flags: neither a pipe name nor an id is a path WSL should
-    // translate.
+    // session id lets them name their own session in requests; the binary
+    // path lets them exec the CLI at all, since the Windows image is not on
+    // the distro's `$PATH`.
     #[cfg(windows)]
     unsafe {
         std::env::set_var(
@@ -164,19 +174,24 @@ pub fn spawn_listener(ctx: egui::Context) -> std::io::Result<(SocketHandle, Rece
     Ok(listener)
 }
 
-/// `WSLENV` extended with the variables alacritree exports — [`SOCKET_ENV`]
-/// and [`crate::session::SESSION_ID_ENV`] — preserving whatever the user
-/// already shares across the boundary.
+/// `WSLENV` extended with the variables alacritree exports — [`SOCKET_ENV`],
+/// [`crate::session::SESSION_ID_ENV`] and [`EXE_ENV`] — preserving whatever
+/// the user already shares across the boundary.
+///
+/// Only the binary path carries a conversion flag: `/p` has WSL rewrite it
+/// into the distro's view of the drive, honouring whatever automount root
+/// that distro uses.  A pipe name and an id are not paths.
 #[cfg(any(test, windows))]
 fn wslenv_with_alacritree_vars(current: Option<&str>) -> String {
     let mut wslenv = current.unwrap_or("").to_string();
-    for name in [SOCKET_ENV, crate::session::SESSION_ID_ENV] {
+    for (name, flags) in [(SOCKET_ENV, ""), (crate::session::SESSION_ID_ENV, ""), (EXE_ENV, "/p")] {
         let listed = wslenv.split(':').any(|entry| entry.split('/').next() == Some(name));
         if !listed {
             if !wslenv.is_empty() {
                 wslenv.push(':');
             }
             wslenv.push_str(name);
+            wslenv.push_str(flags);
         }
     }
     wslenv
@@ -490,7 +505,7 @@ mod tests {
 
     #[test]
     fn wslenv_gains_the_socket_exactly_once() {
-        let ours = format!("{SOCKET_ENV}:{SESSION_ID_ENV}");
+        let ours = format!("{SOCKET_ENV}:{SESSION_ID_ENV}:{EXE_ENV}/p");
         assert_eq!(wslenv_with_alacritree_vars(None), ours);
         assert_eq!(wslenv_with_alacritree_vars(Some("")), ours);
         assert_eq!(wslenv_with_alacritree_vars(Some("LESS:FOO/p")), format!("LESS:FOO/p:{ours}"));
@@ -499,7 +514,20 @@ mod tests {
         let flagged = format!("{SOCKET_ENV}/u:LESS");
         assert_eq!(
             wslenv_with_alacritree_vars(Some(&flagged)),
-            format!("{flagged}:{SESSION_ID_ENV}")
+            format!("{flagged}:{SESSION_ID_ENV}:{EXE_ENV}/p")
+        );
+    }
+
+    /// The binary path is the one variable WSL must rewrite: a distro sees the
+    /// Windows image through its automount root, not at `C:\…`.
+    #[test]
+    fn wslenv_lists_the_exe_path_for_conversion() {
+        assert!(wslenv_with_alacritree_vars(None).ends_with(&format!("{EXE_ENV}/p")));
+        // A user who already shares it, however flagged, keeps their spelling.
+        let theirs = format!("{EXE_ENV}/up");
+        assert_eq!(
+            wslenv_with_alacritree_vars(Some(&theirs)),
+            format!("{theirs}:{SOCKET_ENV}:{SESSION_ID_ENV}")
         );
     }
 
@@ -507,9 +535,15 @@ mod tests {
     /// socket, it only crosses wsl.exe if listed.
     #[test]
     fn wslenv_gains_the_session_id_exactly_once() {
-        assert_eq!(wslenv_with_alacritree_vars(None), format!("{SOCKET_ENV}:{SESSION_ID_ENV}"));
+        assert_eq!(
+            wslenv_with_alacritree_vars(None),
+            format!("{SOCKET_ENV}:{SESSION_ID_ENV}:{EXE_ENV}/p")
+        );
         let flagged = format!("{SESSION_ID_ENV}/u");
-        assert_eq!(wslenv_with_alacritree_vars(Some(&flagged)), format!("{flagged}:{SOCKET_ENV}"));
+        assert_eq!(
+            wslenv_with_alacritree_vars(Some(&flagged)),
+            format!("{flagged}:{SOCKET_ENV}:{EXE_ENV}/p")
+        );
     }
 
     /// The client/server round trip over whatever transport the platform uses:
@@ -535,5 +569,10 @@ mod tests {
         // The advertised path has to be connectable: it is how a shell running
         // inside a session reaches its own instance.
         assert_eq!(std::env::var_os(SOCKET_ENV).map(PathBuf::from).as_deref(), Some(handle.path()));
+        assert_eq!(
+            std::env::var_os(EXE_ENV).map(PathBuf::from),
+            std::env::current_exe().ok(),
+            "a shell needs the binary path to exec the CLI back"
+        );
     }
 }
