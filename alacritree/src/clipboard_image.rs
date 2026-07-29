@@ -4,6 +4,11 @@
 //! and it returns a path.  That is what keeps it testable without a window.
 
 use std::fmt;
+use std::fs::{self, File};
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
 use arboard::ImageData;
 
@@ -63,11 +68,158 @@ pub fn file_name(png: &[u8]) -> String {
     format!("clipboard-{:016x}.png", crate::digest::stable_digest(png))
 }
 
+/// Write `png` into `dir` under its content-addressed name and return the path.
+///
+/// `cap` bounds the directory to that many generated files and is `Some` only
+/// for a directory alacritree owns — a directory the user named may hold files
+/// alacritree never wrote, and a filename pattern is no proof of ownership.
+pub fn store(dir: &Path, png: &[u8], cap: Option<usize>) -> io::Result<PathBuf> {
+    fs::create_dir_all(dir)?;
+    let path = dir.join(file_name(png));
+    if !reusable(&path, png.len() as u64) {
+        write_atomically(dir, &path, png)?;
+    }
+    if let Some(keep) = cap {
+        apply_cap(dir, keep, &path);
+    }
+    Ok(path)
+}
+
+/// Whether the destination already holds these bytes *and* its timestamp was
+/// refreshed.  Content addressing makes equal names strong evidence of equal
+/// bytes, not proof, so the length is checked too; a link, a directory or a
+/// timestamp that would not move all mean "write it again".
+fn reusable(path: &Path, len: u64) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() != len {
+        return false;
+    }
+    File::options().write(true).open(path).and_then(|f| f.set_modified(SystemTime::now())).is_ok()
+}
+
+/// Write through a uniquely named temporary in the same directory so a reader
+/// never opens a half-written PNG.
+fn write_atomically(dir: &Path, path: &Path, png: &[u8]) -> io::Result<()> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let tmp = dir.join(format!(
+        "{}.{}.{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    match place(&tmp, path, png) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            // Another instance writing the same content first is a success, not
+            // a collision — but only once the destination is checked the same
+            // way the reuse path checks it, since a racing writer can equally
+            // have left something of the wrong length behind.
+            if reusable(path, png.len() as u64) { Ok(()) } else { Err(e) }
+        },
+    }
+}
+
+/// Every fallible step between creating `tmp` and it landing at `path`, kept
+/// in one function so `write_atomically` has a single place to clean up on
+/// any of their failures.
+fn place(tmp: &Path, path: &Path, png: &[u8]) -> io::Result<()> {
+    fs::write(tmp, png)?;
+    clear_directory_at(path);
+    fs::rename(tmp, path)
+}
+
+/// `rename` replaces a file but cannot replace a directory, so a directory
+/// squatting on a generated name would fail that image's every paste forever.
+///
+/// Only an empty one is removed.  A populated directory is something this
+/// module did not create, and losing its contents to a name collision is a
+/// far worse outcome than the paste failing.
+fn clear_directory_at(path: &Path) {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if !meta.is_dir() {
+        return;
+    }
+    if let Err(e) = fs::remove_dir(path) {
+        log::debug!("could not clear the directory at {}: {e}", path.display());
+    }
+}
+
+/// Keep the `keep` newest generated files, `in_use` always among them.
+///
+/// Failures are logged and skipped: a file that outlives its turn costs a few
+/// hundred kilobytes, while giving up here would abandon the rest of the sweep.
+fn apply_cap(dir: &Path, keep: usize, in_use: &Path) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            log::debug!("cannot sweep {}: {e}", dir.display());
+            return;
+        },
+    };
+    let mut generated: Vec<(SystemTime, PathBuf)> = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                log::debug!("skipping an unreadable entry in {}: {e}", dir.display());
+                continue;
+            },
+        };
+        if !is_generated_name(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        let path = entry.path();
+        if path == in_use {
+            continue;
+        }
+        match fs::metadata(&path).and_then(|meta| meta.modified()) {
+            Ok(when) => generated.push((when, path)),
+            // Unranked means unswept: a file whose age cannot be read is never
+            // the one chosen for deletion.
+            Err(e) => log::debug!("cannot age {}: {e}", path.display()),
+        }
+    }
+
+    let others = keep.saturating_sub(1);
+    if generated.len() <= others {
+        return;
+    }
+    generated.sort_by_key(|(when, _)| std::cmp::Reverse(*when));
+    for (_, stale) in generated.into_iter().skip(others) {
+        if let Err(e) = fs::remove_file(&stale) {
+            log::debug!("could not remove {}: {e}", stale.display());
+        }
+    }
+}
+
+/// Only names this module produces are ever deleted.  The `.tmp` suffix a
+/// half-finished write leaves behind fails this too, so a crashed process
+/// cannot have its leftovers swept by a later one — a trade for never
+/// deleting something a user put here.
+fn is_generated_name(name: &str) -> bool {
+    name.strip_prefix("clipboard-")
+        .and_then(|rest| rest.strip_suffix(".png"))
+        .is_some_and(|hex| hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
+    use std::fs;
+    use std::path::Path;
+    use std::time::{Duration, SystemTime};
 
     use super::*;
+
+    fn age(path: &Path, seconds: u64) {
+        let when = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 - seconds);
+        fs::File::options().write(true).open(path).unwrap().set_modified(when).unwrap();
+    }
 
     fn image(width: usize, height: usize) -> ImageData<'static> {
         let bytes = (0..width * height * 4).map(|i| (i % 251) as u8).collect::<Vec<_>>();
@@ -118,5 +270,163 @@ mod tests {
         assert_eq!(hex.len(), 16);
         assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()));
         assert!(crate::file_drop::is_terminal_safe(&name));
+    }
+
+    #[test]
+    fn store_creates_a_missing_directory_and_writes_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("nested").join("clipboard");
+
+        let path = store(&dir, b"png bytes", None).unwrap();
+
+        assert_eq!(path.file_name().unwrap(), file_name(b"png bytes").as_str());
+        assert_eq!(fs::read(&path).unwrap(), b"png bytes");
+    }
+
+    #[test]
+    fn storing_the_same_bytes_twice_leaves_one_file() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let first = store(tmp.path(), b"same", None).unwrap();
+        let second = store(tmp.path(), b"same", None).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    /// Reuse must refresh the timestamp.  Without it a re-pasted old screenshot
+    /// keeps its original mtime, and the next sweep — by which time it is no
+    /// longer the returned path and so no longer exempt — deletes a file the
+    /// user pasted moments ago.
+    ///
+    /// The sweep therefore has to run against a *later* store, not the reusing
+    /// one: while `old` is the returned path `apply_cap` skips it outright, so
+    /// a cap applied there would pass with or without the refresh.
+    #[test]
+    fn reuse_refreshes_the_timestamp_so_a_later_sweep_spares_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = store(tmp.path(), b"old", None).unwrap();
+        age(&old, 9_000);
+        for i in 0..3u8 {
+            age(&store(tmp.path(), &[i], None).unwrap(), 1_000);
+        }
+
+        store(tmp.path(), b"old", None).unwrap();
+        store(tmp.path(), b"newest", Some(2)).unwrap();
+
+        assert!(old.is_file(), "a reused file was swept as though it were stale");
+    }
+
+    #[test]
+    fn the_cap_keeps_the_newest_and_always_the_returned_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..6u8 {
+            let path = store(tmp.path(), &[i], None).unwrap();
+            age(&path, u64::from(6 - i) * 100);
+        }
+
+        let path = store(tmp.path(), b"newest", Some(3)).unwrap();
+
+        assert!(path.is_file());
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 3);
+    }
+
+    /// A cap smaller than one still has to return a usable path.
+    #[test]
+    fn a_cap_of_one_keeps_only_the_returned_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..4u8 {
+            store(tmp.path(), &[i], None).unwrap();
+        }
+
+        let path = store(tmp.path(), b"last", Some(1)).unwrap();
+
+        assert!(path.is_file());
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    /// The guarantee that makes pointing image_dir at a pictures folder safe.
+    #[test]
+    fn no_cap_deletes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..5u8 {
+            store(tmp.path(), &[i], None).unwrap();
+        }
+
+        store(tmp.path(), b"another", None).unwrap();
+
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 6);
+    }
+
+    #[test]
+    fn the_cap_never_touches_a_file_it_did_not_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let keeper = tmp.path().join("holiday.png");
+        fs::write(&keeper, b"a real photo").unwrap();
+        age(&keeper, 9_000);
+        for i in 0..4u8 {
+            store(tmp.path(), &[i], None).unwrap();
+        }
+
+        store(tmp.path(), b"newest", Some(1)).unwrap();
+
+        assert!(keeper.is_file(), "a foreign file was deleted");
+    }
+
+    #[test]
+    fn a_destination_of_the_wrong_length_is_rewritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(file_name(b"payload"));
+        fs::write(&path, b"truncated").unwrap();
+
+        let stored = store(tmp.path(), b"payload", None).unwrap();
+
+        assert_eq!(stored, path);
+        assert_eq!(fs::read(&path).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn a_destination_that_is_a_directory_is_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join(file_name(b"payload"))).unwrap();
+
+        let stored = store(tmp.path(), b"payload", None).unwrap();
+
+        assert_eq!(fs::read(&stored).unwrap(), b"payload");
+    }
+
+    /// The limit of that replacement.  Whatever a populated directory on this
+    /// name is, it is not something this module wrote, and its contents are
+    /// worth more than one paste succeeding.
+    #[test]
+    fn a_populated_directory_on_the_name_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let squatter = tmp.path().join(file_name(b"payload"));
+        fs::create_dir(&squatter).unwrap();
+        fs::write(squatter.join("precious.txt"), b"keep me").unwrap();
+
+        assert!(store(tmp.path(), b"payload", None).is_err());
+        assert_eq!(fs::read(squatter.join("precious.txt")).unwrap(), b"keep me");
+
+        let leftovers: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn no_temp_file_survives_a_completed_store() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        store(tmp.path(), b"payload", None).unwrap();
+
+        let leftovers: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 }
