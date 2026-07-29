@@ -174,6 +174,26 @@ pub fn document_payload(
     out
 }
 
+/// The text a pasted path list becomes for the sink that is about to receive
+/// it.
+///
+/// The shell form is a drop's, character for character.  The document form is
+/// deliberately not `document_payload`'s: a drop frames its paths as their own
+/// block, while a paste lands wherever the cursor is and must leave the
+/// surrounding line alone.
+pub fn paste_payload(
+    paths: &[PathBuf],
+    scratchpad: bool,
+    distro: Option<&str>,
+    spelling: &PathSpelling,
+) -> String {
+    if scratchpad {
+        paths.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>().join("\n")
+    } else {
+        shell_payload(paths, distro, spelling)
+    }
+}
+
 /// The project roots a set of dropped paths names.  A directory is its own
 /// root; a file means the directory holding it, which is what dragging a file
 /// out of a checkout is asking for.  Dragging several files from one folder is
@@ -511,6 +531,61 @@ mod tests {
         let paths = [PathBuf::from("/a/one.png")];
         assert_eq!(document_payload(&paths, None, Some('d')), "/a/one.png\n");
         assert_eq!(document_payload(&paths, Some('c'), None), "\n/a/one.png");
+    }
+
+    /// A pasted path reaches a shell exactly as a dropped one does.
+    #[test]
+    fn a_pasted_path_is_a_shell_word_for_a_terminal() {
+        let spelling = PathSpelling { quote: Quoting::Posix, wsl_translate: false };
+        let paths = [PathBuf::from("/a/my pic.png")];
+        assert_eq!(paste_payload(&paths, false, None, &spelling), "'/a/my pic.png' ");
+    }
+
+    /// A scratchpad is a text document: quoting a path into it would put
+    /// literal quote characters in the user's notes.
+    #[test]
+    fn a_pasted_path_is_bare_for_a_scratchpad() {
+        let spelling = PathSpelling { quote: Quoting::Posix, wsl_translate: false };
+        let paths = [PathBuf::from("/a/my pic.png"), PathBuf::from("/a/two.png")];
+        assert_eq!(paste_payload(&paths, true, None, &spelling), "/a/my pic.png\n/a/two.png");
+    }
+
+    /// Unlike `document_payload`, which frames a drop as its own block, a paste
+    /// lands at the cursor — so it adds no surrounding newline of its own.
+    #[test]
+    fn a_pasted_path_adds_no_newline_of_its_own() {
+        let text =
+            paste_payload(&[PathBuf::from("/a/one.png")], true, None, &PathSpelling::default());
+        assert_eq!(text, "/a/one.png");
+    }
+
+    #[test]
+    fn a_pasted_path_is_translated_for_a_wsl_shell() {
+        let paths = [PathBuf::from(r"C:\pics\a.png")];
+        assert_eq!(
+            paste_payload(&paths, false, Some("Ubuntu"), &PathSpelling::default()),
+            "/mnt/c/pics/a.png "
+        );
+    }
+
+    /// The scratchpad runs on the Windows side whatever the session's shell is,
+    /// so a path pasted into it keeps the spelling that opens it there.
+    #[test]
+    fn a_pasted_path_is_not_translated_for_a_scratchpad() {
+        let paths = [PathBuf::from(r"C:\pics\a.png")];
+        assert_eq!(
+            paste_payload(&paths, true, Some("Ubuntu"), &PathSpelling::default()),
+            r"C:\pics\a.png"
+        );
+    }
+
+    /// The control-character filter is what `shell_payload` is for; routing
+    /// through it is what keeps a pasted path from submitting a command.
+    #[test]
+    fn a_pasted_path_carrying_control_characters_is_filtered_for_a_terminal() {
+        let spelling = PathSpelling { quote: Quoting::None, wsl_translate: false };
+        let paths = [PathBuf::from("/a/evil\nrm -rf ~"), PathBuf::from("/a/ok.png")];
+        assert_eq!(paste_payload(&paths, false, None, &spelling), "/a/ok.png ");
     }
 
     #[test]

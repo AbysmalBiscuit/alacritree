@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 
 use crate::bindings::{self, BindingAction, KeyBinding, NamedAction};
 use crate::clipboard::{self, Target};
+use crate::clipboard_image;
 use crate::colors::rgb_to_color32;
 use crate::command_palette::{self, CommandPalette, PaletteAction, PaletteItem};
 use crate::config::{
@@ -2187,28 +2188,10 @@ impl AlacritreeApp {
                 }
             },
             BindingAction::Named(NamedAction::Paste) => {
-                if let (Some(text), Some(idx)) =
-                    (clipboard::read(Target::Clipboard), self.active_session_index())
-                {
-                    let id = self.sessions[idx].id;
-                    if let Some(editor) = self.sessions[idx].scratchpad.as_mut() {
-                        editor.insert_at_cursor(ctx, id, &text);
-                    } else {
-                        paste::paste(&self.sessions[idx], &text, true);
-                    }
-                }
+                self.paste_from_clipboard(ctx, Target::Clipboard);
             },
             BindingAction::Named(NamedAction::PasteSelection) => {
-                if let (Some(text), Some(idx)) =
-                    (clipboard::read(Target::Primary), self.active_session_index())
-                {
-                    let id = self.sessions[idx].id;
-                    if let Some(editor) = self.sessions[idx].scratchpad.as_mut() {
-                        editor.insert_at_cursor(ctx, id, &text);
-                    } else {
-                        paste::paste(&self.sessions[idx], &text, true);
-                    }
-                }
+                self.paste_from_clipboard(ctx, Target::Primary);
             },
             BindingAction::Named(NamedAction::Copy) => {
                 if let Some(idx) = self.active_session_index() {
@@ -2480,6 +2463,79 @@ impl AlacritreeApp {
             },
             BindingAction::Unsupported(name) => {
                 log::debug!("unsupported keyboard binding action: {name}");
+            },
+        }
+    }
+
+    /// The target is resolved before the clipboard so a paste with nowhere to
+    /// go opens nothing.  Only the regular clipboard carries files and images:
+    /// PRIMARY is a text selection, so its probes are skipped outright.
+    fn paste_from_clipboard(&mut self, ctx: &Context, target: Target) {
+        let Some(idx) = self.active_session_index() else {
+            return;
+        };
+        let extras = target == Target::Clipboard;
+        let payload = clipboard::resolve(
+            &self.config.ui.paste,
+            || clipboard::read_text(target),
+            || if extras { clipboard::read_files() } else { clipboard::Probe::Absent },
+            || if extras { clipboard::read_image() } else { clipboard::Probe::Absent },
+        );
+
+        let paths = match payload {
+            clipboard::Payload::Text(text) => {
+                self.insert_paste(ctx, idx, &text);
+                return;
+            },
+            clipboard::Payload::Paths(paths) => paths,
+            clipboard::Payload::Image(image) => match self.store_clipboard_image(&image) {
+                Some(path) => vec![path],
+                None => return,
+            },
+            clipboard::Payload::Nothing => return,
+        };
+
+        let session = &self.sessions[idx];
+        let scratchpad = session.scratchpad.is_some();
+        let text = file_drop::paste_payload(
+            &paths,
+            scratchpad,
+            session.wsl_distro(),
+            &self.config.ui.drop.spelling,
+        );
+        // An empty payload means every path was filtered out; pasting it would
+        // send a bare space to the shell.
+        if !text.is_empty() {
+            self.insert_paste(ctx, idx, &text);
+        }
+    }
+
+    fn insert_paste(&mut self, ctx: &Context, idx: usize, text: &str) {
+        let id = self.sessions[idx].id;
+        if let Some(editor) = self.sessions[idx].scratchpad.as_mut() {
+            editor.insert_at_cursor(ctx, id, text);
+        } else {
+            paste::paste(&self.sessions[idx], text, true);
+        }
+    }
+
+    /// The clipboard bitmap as a file something else can open, or `None` with
+    /// the reason logged.
+    fn store_clipboard_image(&self, image: &arboard::ImageData<'_>) -> Option<PathBuf> {
+        let png = match clipboard_image::encode_png(image) {
+            Ok(png) => png,
+            Err(e) => {
+                log::warn!("cannot encode the clipboard image: {e}");
+                return None;
+            },
+        };
+        let cfg = &self.config.ui.paste;
+        let (dir, owned) = cfg.image_target();
+        match clipboard_image::store(&dir, &png, owned.then_some(cfg.image_keep)) {
+            Ok(path) => Some(path),
+            Err(e) => {
+                log::warn!("cannot write the clipboard image to {}: {e}", dir.display());
+                None
             },
         }
     }

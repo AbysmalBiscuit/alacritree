@@ -392,6 +392,23 @@ quote         = "auto"      # "auto" (POSIX inside a distro, otherwise the host
 wsl_translate = true        # rewrite C:\x as /mnt/c/x for a WSL session
 highlight     = true        # tint the region a drop would land on
 
+[ui.paste]                  # what Paste does when the clipboard holds no text
+files       = true          # paste the paths of files and folders copied in a
+                            # file manager, as Windows Terminal does
+image       = true          # write a clipboard bitmap (a Win+Shift+S capture)
+                            # to a PNG and paste its path
+image_dir   = "~/shots"     # where those PNGs go (default: a temp subdirectory).
+                            # A directory you name here is never swept — set it
+                            # and you keep every image and clean up yourself
+image_keep  = 20            # how many PNGs the default directory keeps.
+                            # Minimum 1 — the image a paste just handed to the
+                            # shell always survives the sweep
+
+Text always wins: a clipboard carrying both text and an image pastes the text.
+Only the regular clipboard is checked for files and images — the X11 PRIMARY
+selection is text, so middle-click paste is unchanged. Both options `false`
+restores the original behavior exactly, where a paste with no text does nothing.
+
 [workspace]
 worktree_dir = "~/dev/worktrees"   # base dir for new worktrees (default ~/.alacritree/worktrees)
 
