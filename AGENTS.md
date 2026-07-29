@@ -1,12 +1,13 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to coding agents when working with code in this repository.
+`CLAUDE.md` imports it so Claude Code picks it up too.
 
 ## Repository layout
 
 This is a Cargo workspace. There are five crates, but only one is original work:
 
-- `alacritree/` — **the only crate this fork actually changes.** A small egui/eframe app that hosts `alacritty_terminal` and adds a worktree-aware sidebar. All Claude-edited code should live here unless the user explicitly says otherwise.
+- `alacritree/` — **the only crate this fork actually changes.** A small egui/eframe app that hosts `alacritty_terminal` and adds a worktree-aware sidebar. All agent-edited code should live here unless the user explicitly says otherwise.
 - `alacritty/`, `alacritty_terminal/`, `alacritty_config/`, `alacritty_config_derive/` — vendored upstream alacritty. Treat as read-only dependencies. The `alacritty` GUI binary (winit/OpenGL) is **not** what this fork ships; we only use `alacritty_terminal` (the headless PTY + VT parser + grid).
 
 `CONTRIBUTING.md` is the upstream alacritty contributing guide, kept for the vendored crates' historical context. It does not constrain work on `alacritree/`.
