@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::config::{DropConfig, ShellQuoting};
+use crate::config::{DropConfig, PathSpelling, ShellQuoting};
 use crate::wsl;
 
 /// Which region a drop landed on.
@@ -89,10 +89,10 @@ pub fn is_terminal_safe(path: &str) -> bool {
 ///
 /// `distro` names the WSL distro the receiving session runs in, `None` for a
 /// native session.  Paths that would act as terminal input are left out.
-pub fn shell_payload(paths: &[PathBuf], distro: Option<&str>, cfg: &DropConfig) -> String {
+pub fn shell_payload(paths: &[PathBuf], distro: Option<&str>, spelling: &PathSpelling) -> String {
     let mut out = String::new();
     for path in paths {
-        let (word, quoting) = shell_word(path, distro, cfg);
+        let (word, quoting) = shell_word(path, distro, spelling);
         if !is_terminal_safe(&word) {
             log::warn!("dropped path {word:?} carries terminal control characters, skipping it");
             continue;
@@ -107,14 +107,18 @@ pub fn shell_payload(paths: &[PathBuf], distro: Option<&str>, cfg: &DropConfig) 
 /// spelling implies.  A path rewritten for a distro is a POSIX shell word even
 /// when the configured mode says otherwise — `windows` quoting fed to `bash` is
 /// broken by construction.
-fn shell_word(path: &Path, distro: Option<&str>, cfg: &DropConfig) -> (String, ShellQuoting) {
-    if let Some(distro) = distro.filter(|_| cfg.wsl_translate) {
+fn shell_word(
+    path: &Path,
+    distro: Option<&str>,
+    spelling: &PathSpelling,
+) -> (String, ShellQuoting) {
+    if let Some(distro) = distro.filter(|_| spelling.wsl_translate) {
         if let Some(linux) = distro_path(path, distro) {
             return (linux, ShellQuoting::Posix);
         }
         log::debug!("no path in {distro} for {}, pasting it as-is", path.display());
     }
-    (path.to_string_lossy().into_owned(), cfg.quote.resolve(distro.is_some()))
+    (path.to_string_lossy().into_owned(), spelling.quote.resolve(distro.is_some()))
 }
 
 /// The path as `distro` resolves it, or `None` when it has no spelling there.
@@ -244,7 +248,7 @@ mod tests {
     use egui::{Rect, pos2};
 
     use super::*;
-    use crate::config::{DropConfig, Quoting};
+    use crate::config::{DropConfig, PathSpelling, Quoting};
 
     fn regions() -> Regions {
         Regions {
@@ -337,24 +341,31 @@ mod tests {
 
     #[test]
     fn a_shell_payload_joins_paths_with_spaces_and_ends_with_one() {
-        let cfg =
-            DropConfig { quote: Quoting::None, wsl_translate: false, ..DropConfig::default() };
+        let spelling = PathSpelling { quote: Quoting::None, wsl_translate: false };
         let paths = [PathBuf::from("/a/one.png"), PathBuf::from("/a/two.png")];
-        assert_eq!(shell_payload(&paths, None, &cfg), "/a/one.png /a/two.png ");
+        assert_eq!(shell_payload(&paths, None, &spelling), "/a/one.png /a/two.png ");
     }
 
     #[test]
     fn a_shell_payload_quotes_a_path_containing_spaces() {
-        let cfg =
-            DropConfig { quote: Quoting::Posix, wsl_translate: false, ..DropConfig::default() };
+        let spelling = PathSpelling { quote: Quoting::Posix, wsl_translate: false };
         let paths = [PathBuf::from("/a/my pic.png")];
-        assert_eq!(shell_payload(&paths, None, &cfg), "'/a/my pic.png' ");
+        assert_eq!(shell_payload(&paths, None, &spelling), "'/a/my pic.png' ");
+    }
+
+    /// A paste spells paths without ever holding a drop config, which is the
+    /// whole reason the spelling is its own type.
+    #[test]
+    fn a_path_is_spelled_without_a_drop_config() {
+        let spelling = PathSpelling { quote: Quoting::Posix, wsl_translate: false };
+        let paths = [PathBuf::from("/a/my pic.png")];
+        assert_eq!(shell_payload(&paths, None, &spelling), "'/a/my pic.png' ");
     }
 
     #[test]
     fn an_empty_drop_produces_no_payload() {
-        let cfg = DropConfig::default();
-        assert_eq!(shell_payload(&[], None, &cfg), "");
+        let spelling = PathSpelling::default();
+        assert_eq!(shell_payload(&[], None, &spelling), "");
     }
 
     /// `\x0f` is readline's `operate-and-get-next`, which accepts the line as
@@ -381,32 +392,30 @@ mod tests {
     /// still fires.
     #[test]
     fn an_unsafe_path_is_dropped_and_the_rest_of_the_batch_survives() {
-        let cfg =
-            DropConfig { quote: Quoting::None, wsl_translate: false, ..DropConfig::default() };
+        let spelling = PathSpelling { quote: Quoting::None, wsl_translate: false };
         let paths = [
             PathBuf::from("/a/one.png"),
             PathBuf::from("/a/evil\nrm -rf ~"),
             PathBuf::from("/a/two.png"),
         ];
-        assert_eq!(shell_payload(&paths, None, &cfg), "/a/one.png /a/two.png ");
+        assert_eq!(shell_payload(&paths, None, &spelling), "/a/one.png /a/two.png ");
     }
 
     /// The guard in `app.rs` skips the paste on an empty payload, so a batch
     /// where nothing survives the filter must produce exactly that.
     #[test]
     fn a_batch_of_only_unsafe_paths_produces_no_payload() {
-        let cfg =
-            DropConfig { quote: Quoting::None, wsl_translate: false, ..DropConfig::default() };
+        let spelling = PathSpelling { quote: Quoting::None, wsl_translate: false };
         let paths = [PathBuf::from("/a/evil\nrm -rf ~"), PathBuf::from("/a/accept\x0frm -rf ~")];
-        assert_eq!(shell_payload(&paths, None, &cfg), "");
+        assert_eq!(shell_payload(&paths, None, &spelling), "");
     }
 
     #[cfg(windows)]
     #[test]
     fn a_drive_path_becomes_a_distro_path_for_a_wsl_shell() {
-        let cfg = DropConfig::default();
+        let spelling = PathSpelling::default();
         let paths = [PathBuf::from(r"C:\pics\a.png")];
-        assert_eq!(shell_payload(&paths, Some("Ubuntu"), &cfg), "/mnt/c/pics/a.png ");
+        assert_eq!(shell_payload(&paths, Some("Ubuntu"), &spelling), "/mnt/c/pics/a.png ");
     }
 
     /// Translation forces POSIX rules even under `quote = "windows"`: the
@@ -414,18 +423,17 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_translated_path_is_quoted_posix_style_whatever_the_mode_says() {
-        let cfg = DropConfig { quote: Quoting::Windows, ..DropConfig::default() };
+        let spelling = PathSpelling { quote: Quoting::Windows, wsl_translate: true };
         let paths = [PathBuf::from(r"C:\pics\my pic.png")];
-        assert_eq!(shell_payload(&paths, Some("Ubuntu"), &cfg), "'/mnt/c/pics/my pic.png' ");
+        assert_eq!(shell_payload(&paths, Some("Ubuntu"), &spelling), "'/mnt/c/pics/my pic.png' ");
     }
 
     #[cfg(windows)]
     #[test]
     fn translation_off_leaves_the_windows_path_alone() {
-        let cfg =
-            DropConfig { wsl_translate: false, quote: Quoting::None, ..DropConfig::default() };
+        let spelling = PathSpelling { wsl_translate: false, quote: Quoting::None };
         let paths = [PathBuf::from(r"C:\pics\a.png")];
-        assert_eq!(shell_payload(&paths, Some("Ubuntu"), &cfg), "C:\\pics\\a.png ");
+        assert_eq!(shell_payload(&paths, Some("Ubuntu"), &spelling), "C:\\pics\\a.png ");
     }
 
     /// `auto` follows the receiving shell, not the path: a WSL session gets
@@ -435,10 +443,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn an_untranslated_path_for_a_wsl_shell_is_still_quoted_posix_style() {
-        let cfg =
-            DropConfig { wsl_translate: false, quote: Quoting::Auto, ..DropConfig::default() };
+        let spelling = PathSpelling { wsl_translate: false, quote: Quoting::Auto };
         let paths = [PathBuf::from(r"C:\pics\my pic.png")];
-        assert_eq!(shell_payload(&paths, Some("Ubuntu"), &cfg), r#""C:\\pics\\my pic.png" "#);
+        assert_eq!(shell_payload(&paths, Some("Ubuntu"), &spelling), r#""C:\\pics\\my pic.png" "#);
     }
 
     /// A plain UNC share has no distro-side spelling.  Pasting the raw path is
@@ -446,18 +453,21 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn an_untranslatable_path_falls_back_to_the_raw_spelling() {
-        let cfg = DropConfig { quote: Quoting::None, ..DropConfig::default() };
+        let spelling = PathSpelling { quote: Quoting::None, wsl_translate: true };
         let paths = [PathBuf::from(r"\\fileserver\share\a.png")];
-        assert_eq!(shell_payload(&paths, Some("Ubuntu"), &cfg), "\\\\fileserver\\share\\a.png ");
+        assert_eq!(
+            shell_payload(&paths, Some("Ubuntu"), &spelling),
+            "\\\\fileserver\\share\\a.png "
+        );
     }
 
     /// The distro is compared the way Windows compares the UNC share name.
     #[cfg(windows)]
     #[test]
     fn a_unc_path_for_this_distro_strips_to_its_linux_form() {
-        let cfg = DropConfig { quote: Quoting::None, ..DropConfig::default() };
+        let spelling = PathSpelling { quote: Quoting::None, wsl_translate: true };
         let paths = [PathBuf::from(r"\\wsl.localhost\Ubuntu\home\lev\a.png")];
-        assert_eq!(shell_payload(&paths, Some("ubuntu"), &cfg), "/home/lev/a.png ");
+        assert_eq!(shell_payload(&paths, Some("ubuntu"), &spelling), "/home/lev/a.png ");
     }
 
     /// `windows_to_linux` throws the distro away (`wsl.rs:141`), so stripping a
@@ -466,10 +476,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_unc_path_for_another_distro_is_never_stripped() {
-        let cfg = DropConfig { quote: Quoting::None, ..DropConfig::default() };
+        let spelling = PathSpelling { quote: Quoting::None, wsl_translate: true };
         let paths = [PathBuf::from(r"\\wsl.localhost\Ubuntu\home\lev\a.png")];
         assert_eq!(
-            shell_payload(&paths, Some("kali-linux"), &cfg),
+            shell_payload(&paths, Some("kali-linux"), &spelling),
             "\\\\wsl.localhost\\Ubuntu\\home\\lev\\a.png "
         );
     }
@@ -565,10 +575,10 @@ mod tests {
         ];
 
         for quote in [Quoting::None, Quoting::Auto] {
-            let cfg = DropConfig { quote, wsl_translate: false, ..DropConfig::default() };
+            let spelling = PathSpelling { quote, wsl_translate: false };
 
             let on_the_pty =
-                crate::paste::paste_bytes(&shell_payload(&paths, None, &cfg), true, false);
+                crate::paste::paste_bytes(&shell_payload(&paths, None, &spelling), true, false);
 
             assert!(
                 !on_the_pty.contains(&b'\r'),

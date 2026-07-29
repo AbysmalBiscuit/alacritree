@@ -326,6 +326,23 @@ fn parse_quoting(raw: Option<&str>) -> Quoting {
     }
 }
 
+/// How a path is written for the shell that receives it.  Separate from
+/// `DropConfig` because a paste spells paths too, and must not be handed flags
+/// about whether drops are accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathSpelling {
+    pub quote: Quoting,
+    /// Rewrite a Windows path to its distro-side spelling before it reaches a
+    /// WSL shell, where a `C:\` path resolves to nothing.
+    pub wsl_translate: bool,
+}
+
+impl Default for PathSpelling {
+    fn default() -> Self {
+        Self { quote: Quoting::Auto, wsl_translate: true }
+    }
+}
+
 /// `[ui.drop]`: what dragging files onto the window does.  Every target
 /// accepts drops by default; each one can be switched off on its own, and
 /// `enabled` turns the lot off.
@@ -336,10 +353,7 @@ pub struct DropConfig {
     pub terminal: bool,
     pub sidebar: bool,
     pub scratchpad: bool,
-    pub quote: Quoting,
-    /// Rewrite a Windows path to its distro-side spelling before it reaches a
-    /// WSL shell, where a `C:\` path resolves to nothing.
-    pub wsl_translate: bool,
+    pub spelling: PathSpelling,
     /// Tint the region a drop would land on while files hover.
     pub highlight: bool,
 }
@@ -351,8 +365,7 @@ impl Default for DropConfig {
             terminal: true,
             sidebar: true,
             scratchpad: true,
-            quote: Quoting::Auto,
-            wsl_translate: true,
+            spelling: PathSpelling::default(),
             highlight: true,
         }
     }
@@ -1547,8 +1560,10 @@ impl RawConfig {
                 terminal: self.ui.drop.terminal.unwrap_or(true),
                 sidebar: self.ui.drop.sidebar.unwrap_or(true),
                 scratchpad: self.ui.drop.scratchpad.unwrap_or(true),
-                quote: parse_quoting(self.ui.drop.quote.as_deref()),
-                wsl_translate: self.ui.drop.wsl_translate.unwrap_or(true),
+                spelling: PathSpelling {
+                    quote: parse_quoting(self.ui.drop.quote.as_deref()),
+                    wsl_translate: self.ui.drop.wsl_translate.unwrap_or(true),
+                },
                 highlight: self.ui.drop.highlight.unwrap_or(true),
             },
             paste: PasteConfig {
@@ -2443,8 +2458,7 @@ program = "second"
                 terminal: true,
                 sidebar: true,
                 scratchpad: true,
-                quote: Quoting::Auto,
-                wsl_translate: true,
+                spelling: PathSpelling { quote: Quoting::Auto, wsl_translate: true },
                 highlight: true,
             }
         );
@@ -2469,8 +2483,7 @@ program = "second"
                 terminal: false,
                 sidebar: false,
                 scratchpad: false,
-                quote: Quoting::Posix,
-                wsl_translate: false,
+                spelling: PathSpelling { quote: Quoting::Posix, wsl_translate: false },
                 highlight: false,
             }
         );
@@ -2546,13 +2559,13 @@ program = "second"
             ("windows_always_quoted", Quoting::WindowsAlwaysQuoted),
         ] {
             let ui = ui_from_toml(&format!("[ui.drop]\nquote = \"{raw}\""));
-            assert_eq!(ui.drop.quote, expected, "{raw}");
+            assert_eq!(ui.drop.spelling.quote, expected, "{raw}");
         }
     }
 
     #[test]
     fn an_unknown_quoting_name_falls_back_to_auto() {
         let ui = ui_from_toml("[ui.drop]\nquote = \"shell\"");
-        assert_eq!(ui.drop.quote, Quoting::Auto);
+        assert_eq!(ui.drop.spelling.quote, Quoting::Auto);
     }
 }

@@ -1391,8 +1391,11 @@ impl AlacritreeApp {
                     return;
                 };
                 let session = &self.sessions[idx];
-                let text =
-                    file_drop::shell_payload(&paths, session.wsl_distro(), &self.config.ui.drop);
+                let text = file_drop::shell_payload(
+                    &paths,
+                    session.wsl_distro(),
+                    &self.config.ui.drop.spelling,
+                );
                 if !text.is_empty() {
                     paste::paste(session, &text, true);
                 }
