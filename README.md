@@ -210,11 +210,10 @@ that always carries a warning is a report nobody reads.
   compares against worktree CLIs, AI-agent orchestrators, and other native
   terminals in the space.
 - [`docs/keyboard-shortcuts.md`](docs/keyboard-shortcuts.md) — every key
-  binding the app understands, split between hard-coded app shortcuts
-  (sidebar toggles, workspace and session switching, modals) and the
-  configurable `[[keyboard.bindings]]` layer, including the full list of
-  supported `action = "…"` values and which Alacritty actions are
-  intentionally not wired up.
+  binding the app understands: the defaults it ships with (sidebar toggles,
+  workspace and session switching, palette), the full list of supported
+  `action = "…"` values for the `[[keyboard.bindings]]` layer, and which
+  Alacritty actions are intentionally not wired up.
 - [`docs/features.md`](docs/features.md) — upstream Alacritty's feature
   overview (vi mode, search, hints, selection expansion). Kept for reference;
   not everything listed is implemented in the egui shell yet.

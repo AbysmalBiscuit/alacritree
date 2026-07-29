@@ -241,12 +241,13 @@ active.
 
 Input handling is layered:
 
-1. **Built-in app shortcuts** — sidebar toggles, workspace switches, session
-   spawn / cycle, modal Enter/Escape. Hard-coded today.
-2. **Configurable terminal bindings** — parsed from `[[keyboard.bindings]]`
-   in the TOML config. Alacritty's default set is preloaded; your entries are
-   checked first so any default can be overridden or unbound (`action =
+1. **Key bindings** — parsed from `[[keyboard.bindings]]` in the TOML config.
+   Alacritty's default set is preloaded, and so are alacritree's own (sidebar
+   toggles, workspace switches, session spawn / cycle, palette); your entries
+   are checked first so any default can be overridden or unbound (`action =
    "None"`).
+2. **Modal Enter/Escape** — consumed by whichever dialog is open. These are
+   not bindings and cannot be rebound.
 3. **Egui text events** — preferred for printable input because they handle
    dead keys and IME correctly. Control bytes (`Ctrl-<letter>`), CSI sequences
    for arrows / function keys, and `ESC + key` for `Alt+<key>` are derived
@@ -354,8 +355,11 @@ being rendered — by a filter, or by deleting a session or worktree. It now
 climbs or slides instead, under `sidebar_focus = "preserve"`. There is no
 setting that restores the old drop-to-first-row behavior.
 
-Everything Alacritty's TOML accepts for palette, cursor, scrolling, window
-padding, shell, env, and bindings is parsed by the same `Raw*` structs.
+Alacritty's palette, cursor, scrolling, window padding, shell, env, and binding
+tables are read by the same `Raw*` structs, so those parts of an existing
+`alacritty.toml` carry over. The structs cover the fields alacritree acts on
+rather than Alacritty's full schema — see `config.rs` for what a given table
+actually accepts.
 
 ### Shell launch profiles
 
@@ -438,8 +442,9 @@ Tools:
 the editor tab is closed. Because the built-in editor writes every change
 immediately, MCP clients see the same auto-saved contents as the editor.
 
-Under the hood this mirrors Alacritty's IPC design (unix only): the app
-listens on `$XDG_RUNTIME_DIR/alacritree/alacritree-<pid>.sock` and advertises
+Under the hood this mirrors Alacritty's IPC design, on every platform: the app
+listens on a unix socket at `$XDG_RUNTIME_DIR/alacritree/alacritree-<pid>.sock`,
+or on Windows a named pipe at `\\.\pipe\alacritree-<pid>.sock`, and advertises
 the path to child PTYs via `ALACRITREE_SOCKET` — so an agent running *inside*
 an Alacritree session automatically targets the instance hosting it. Other
 clients fall back to scanning the socket directory, or can pass

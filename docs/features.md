@@ -2,7 +2,13 @@
 
 This document gives an overview over Alacritty's features beyond its terminal
 emulation capabilities. To get a list with supported control sequences take a
-look at [Alacritty's escape sequence support](./escape_support.md).
+look at [Alacritty's escape sequence support](https://github.com/alacritty/alacritty/blob/master/docs/escape_support.md).
+
+> **Scope:** this is upstream Alacritty's document, kept for reference. It
+> describes the winit/OpenGL binary, not the egui shell Alacritree ships.
+> Vi mode, search mode, and hints are among the features Alacritree does not
+> implement — see [`keyboard-shortcuts.md`](./keyboard-shortcuts.md) for what
+> it actually supports.
 
 ## Vi Mode
 
