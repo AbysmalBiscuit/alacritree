@@ -66,31 +66,38 @@ pub enum Payload {
     Nothing,
 }
 
-fn classify<T>(result: Result<T, arboard::Error>) -> Probe<T> {
+/// Turns an arboard result into a `Probe`, logging `label` (what was being
+/// read, e.g. "clipboard text") against any error that isn't a plain absence.
+fn classify<T>(label: &str, result: Result<T, arboard::Error>) -> Probe<T> {
     match result {
         Ok(value) => Probe::Found(value),
         Err(arboard::Error::ContentNotAvailable) => Probe::Absent,
         Err(e) => {
-            log::warn!("clipboard read failed: {e}");
+            log::warn!("clipboard read ({label}) failed: {e}");
             Probe::Failed
         },
     }
 }
 
 fn with_clipboard<T>(
+    label: &str,
     read: impl FnOnce(&mut arboard::Clipboard) -> Result<T, arboard::Error>,
 ) -> Probe<T> {
     match arboard::Clipboard::new() {
-        Ok(mut clip) => classify(read(&mut clip)),
+        Ok(mut clip) => classify(label, read(&mut clip)),
         Err(e) => {
-            log::warn!("clipboard unavailable: {e}");
+            log::warn!("clipboard unavailable ({label}): {e}");
             Probe::Failed
         },
     }
 }
 
 pub fn read_text(target: Target) -> Probe<String> {
-    with_clipboard(|clip| match target {
+    let label = match target {
+        Target::Clipboard => "clipboard text",
+        Target::Primary => "primary selection",
+    };
+    with_clipboard(label, |clip| match target {
         Target::Clipboard => clip.get_text(),
         #[cfg(target_os = "linux")]
         Target::Primary => clip.get().clipboard(LinuxClipboardKind::Primary).text(),
@@ -103,11 +110,11 @@ pub fn read_text(target: Target) -> Probe<String> {
 /// effect alongside the same list; reading the paths neither performs nor
 /// completes that move, so Cut and Copy paste identically.
 pub fn read_files() -> Probe<Vec<PathBuf>> {
-    with_clipboard(|clip| clip.get().file_list())
+    with_clipboard("file list", |clip| clip.get().file_list())
 }
 
 pub fn read_image() -> Probe<arboard::ImageData<'static>> {
-    with_clipboard(|clip| clip.get_image())
+    with_clipboard("image", |clip| clip.get_image())
 }
 
 /// Resolve the clipboard in priority order, probing lazily: text outright, then
@@ -242,10 +249,13 @@ mod tests {
     #[test]
     fn an_absent_format_maps_to_absent_and_other_errors_to_failed() {
         assert!(matches!(
-            classify(Err::<(), _>(arboard::Error::ContentNotAvailable)),
+            classify("test", Err::<(), _>(arboard::Error::ContentNotAvailable)),
             Probe::Absent
         ));
-        assert!(matches!(classify(Err::<(), _>(arboard::Error::ClipboardOccupied)), Probe::Failed));
-        assert!(matches!(classify(Ok::<_, arboard::Error>(7)), Probe::Found(7)));
+        assert!(matches!(
+            classify("test", Err::<(), _>(arboard::Error::ClipboardOccupied)),
+            Probe::Failed
+        ));
+        assert!(matches!(classify("test", Ok::<_, arboard::Error>(7)), Probe::Found(7)));
     }
 }

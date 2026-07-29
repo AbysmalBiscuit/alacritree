@@ -2503,8 +2503,9 @@ impl AlacritreeApp {
             session.wsl_distro(),
             &self.config.ui.drop.spelling,
         );
-        // An empty payload means every path was filtered out; pasting it would
-        // send a bare space to the shell.
+        // Every path was filtered out.  A paste of nothing still clears the
+        // selection and snaps the view to the bottom, or drops the scratchpad's
+        // selection — side effects with nothing to show for them.
         if !text.is_empty() {
             self.insert_paste(ctx, idx, &text);
         }

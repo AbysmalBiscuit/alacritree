@@ -404,11 +404,6 @@ image_keep  = 20            # how many PNGs the default directory keeps.
                             # Minimum 1 — the image a paste just handed to the
                             # shell always survives the sweep
 
-Text always wins: a clipboard carrying both text and an image pastes the text.
-Only the regular clipboard is checked for files and images — the X11 PRIMARY
-selection is text, so middle-click paste is unchanged. Both options `false`
-restores the original behavior exactly, where a paste with no text does nothing.
-
 [workspace]
 worktree_dir = "~/dev/worktrees"   # base dir for new worktrees (default ~/.alacritree/worktrees)
 
@@ -431,6 +426,16 @@ automount_root = "/mnt"     # distro-side mount point for Windows drives,
 [window]
 opacity = 0.92   # restart required — transparency is a ViewportBuilder flag
 ```
+
+Text always wins: a clipboard carrying both text and an image pastes the text.
+Only the regular clipboard is checked for files and images — the X11 PRIMARY
+selection is text, so middle-click paste is unchanged. Both options `false`
+restores the original behavior exactly, where a paste with no text does nothing.
+A pasted path is quoted and, inside a WSL session, translated exactly as a
+dropped one — both follow `[ui.drop]`'s `quote` and `wsl_translate`, so those
+keys still apply even with `[ui.drop] enabled = false`. `quote = "posix"` is
+the only mode that makes an arbitrary filename inert; see the comment on
+`[ui.drop] quote` above for why.
 
 The sidebar cursor used to drop to the first row whenever its own row stopped
 being rendered — by a filter, or by deleting a session or worktree. It now
