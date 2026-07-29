@@ -16,6 +16,7 @@ use egui::{
 use serde_json::{Value, json};
 
 use crate::app::WorkspaceKey;
+use crate::digest::stable_digest;
 use crate::state;
 
 // A scratchpad is normally a few notes. Bounding an MCP response keeps an
@@ -227,18 +228,6 @@ fn slug(input: &str) -> String {
         }
     }
     out.trim_matches('-').to_string()
-}
-
-/// FNV-1a is small, deterministic across Rust versions, and sufficient here:
-/// the digest disambiguates human-readable file names rather than protecting
-/// an adversarial namespace.
-fn stable_digest(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
 }
 
 pub fn read_json(workspace: &WorkspaceKey) -> Result<Value, String> {

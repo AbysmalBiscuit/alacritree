@@ -10,6 +10,7 @@ mod colors;
 mod command_ext;
 mod command_palette;
 mod config;
+mod digest;
 mod doppler;
 mod file_drop;
 mod fonts;
