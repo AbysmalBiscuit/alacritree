@@ -5,6 +5,7 @@ mod bindings;
 mod builtin_font;
 mod cli;
 mod clipboard;
+mod clipboard_image;
 mod color_glyph;
 mod colors;
 mod command_ext;

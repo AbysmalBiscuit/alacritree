@@ -47,7 +47,7 @@ ab_glyph = "0.2"
 # Font faces reach egui as mappings, not buffers.  Same version fontdb already
 # links, so no duplicate build.
 memmap2 = "0.9"
-arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+arboard = { version = "3", default-features = false, features = ["wayland-data-control", "image-data"] }
 # Rasterizes COLR/CBDT/sbix/SVG emoji, which egui's outline-only glyph pipeline
 # cannot draw.  ttf-parser could cover COLRv0 with no new dependency, but the
 # COLRv1 gradient painting that Noto Color Emoji needs is not worth hand-rolling.
