@@ -320,9 +320,61 @@ vsync              = true   # restart required — wait for the display's refres
                             # before showing a finished frame (default true).
                             # false presents each frame as soon as it is drawn,
                             # trading tearing for lower keystroke-to-screen delay
+confirm_session_close = "never"  # when the sidebar × asks before killing a PTY:
+                                 # "never" (default) | "busy" | "always"
+last_session_close = "respawn"   # closing the on-screen workspace's last
+                                 # session: "respawn" (default) starts a fresh
+                                 # one, "navigate" moves to another workspace
+pr_status          = false  # poll `gh` for each branch's open PR, which drives
+                            # the PR row icons and $pr below (default false)
+delta_path         = "delta"     # explicit delta binary for the diff pane;
+                                 # unset discovers it on PATH
+worktree_name      = "$name ${pr: }"  # template for worktree row labels:
+                            # $name, $branch, $path, $pr (as #123, needs
+                            # pr_status), and ${var:fallback}. Unset keeps the
+                            # plain worktree name
+project_name       = "$name"     # same for project rows ($name, $path). A
+                                 # manual rename always wins over the template
+
+[ui.font]                   # chrome only — sidebars and modals, not the grid
+family = "Inter"            # unset derives from [font]
+size   = 12.0               # points, same unit as [font] size
+
+[ui.session_display]        # startup defaults; key bindings toggle both at runtime
+sidebar_always = false      # keep a sidebar session row even with one session
+tabs_always    = false      # keep a tab-strip segment even with one session
+
+[ui.focus_outline]          # off by default, which keeps the current look
+sidebar   = false           # outline the projects sidebar when it has focus
+terminal  = false           # outline the terminal when it has focus
+color     = "#6a9fb5"       # unset falls back to the theme accent
+thickness = 1.0             # logical pixels, not scaled by ui_scale
+
+[ui.path_style]             # per-site path abbreviation, all "full" by default
+diff_title = "full"         # "full" | "fish" (a/b/c) | "zed" (leading dirs cut)
+git_rows   = "full"
+git_header = "full"
+
+[ui.path_style.filename]    # emphasis for the last path segment
+color  = "#d8d8d8"
+bold   = true
+italic = false
+
+[ui.path_style.parent]      # emphasis for the leading directories
+color  = "#8a8a8a"
 
 [ui.icons]                  # sidebar glyph overrides (e.g. Nerd Font icons)
 search = "⌕"                # glyph prefixing the sidebar search prompt
+worktree_main = "●"         # the project's main checkout
+worktree = "○"
+session = "▪"
+home = "⌂"
+project_expanded = "▾"
+project_collapsed = "▸"
+pr_open = "⬤"               # the four PR glyphs need pr_status = true; they
+pr_draft = "◯"              # differ by colour, so overriding one shape is
+pr_merged = "⬤"             # usually not what you want
+pr_closed = "⬤"
 
 [ui.drop]                   # what dragging files onto the window does
 enabled       = true        # master switch; false ignores every drop
@@ -345,6 +397,18 @@ worktree_dir = "~/dev/worktrees"   # base dir for new worktrees (default ~/.alac
 [[workspace.overrides]]            # optional per-project override
 project = "~/Git/github/alacritree"
 worktree_dir = "D:/wt"
+
+[wsl]                       # how the app talks to distros, not presentation
+resident_helper = true      # keep one helper process per distro for foreground
+                            # probes, batched git queries, and tool discovery
+                            # (default true). false restores one-shot wsl.exe
+                            # spawns; WSL sessions then always report "no TUI",
+                            # so FocusLeft/FocusRight always move panel focus
+automount_root = "/mnt"     # distro-side mount point for Windows drives,
+                            # mirroring wsl.conf's [automount] root. Only
+                            # applies to paths alacritree translates itself;
+                            # `wsl.exe --cd` uses the distro's real mount table
+                            # either way. Supersedes the older [ui.wsl] key
 
 [window]
 opacity = 0.92   # restart required — transparency is a ViewportBuilder flag
