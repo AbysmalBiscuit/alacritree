@@ -19,6 +19,7 @@ use crate::config::{
     TextEmphasis, UiFont,
 };
 use crate::doppler;
+use crate::file_drop;
 use crate::git_nav::{self, GitSection, SectionCount};
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, GitStatus, StatusCache};
 use crate::ipc;
@@ -1289,7 +1290,14 @@ impl AlacritreeApp {
         let Some(path) = rfd::FileDialog::new().pick_folder() else {
             return;
         };
-        let path = wsl::normalize_root(path);
+        self.add_project_off_thread(ctx, wsl::normalize_root(path));
+    }
+
+    /// Put a project in the sidebar without stalling the frame: `wsl.exe` takes
+    /// hundreds of milliseconds warm and seconds while the distro VM boots, so
+    /// a WSL root goes in as a placeholder and discovers on a worker.  Native
+    /// roots spawn nothing and are cheap enough to discover in place.
+    fn add_project_off_thread(&mut self, ctx: &Context, path: PathBuf) {
         if self.projects.iter().any(|p| p.root == path) {
             return;
         }
@@ -1309,8 +1317,8 @@ impl AlacritreeApp {
     /// Put a project in the sidebar, discovering its worktrees.  A project that
     /// is already there is left alone rather than duplicated, so callers that
     /// cannot see the sidebar (IPC) need not check first.  WSL roots discover
-    /// synchronously here (no `ctx` for a worker); the folder picker uses the
-    /// async path in `add_project_via_dialog`.
+    /// synchronously here (no `ctx` for a worker); callers holding one use
+    /// `add_project_off_thread`.
     fn add_project(&mut self, path: PathBuf) -> &Project {
         if let Some(idx) = self.projects.iter().position(|p| p.root == path) {
             return &self.projects[idx];
@@ -1318,6 +1326,103 @@ impl AlacritreeApp {
         self.projects.push(Project::discover(path.clone()).project);
         self.persist_project(&path);
         self.projects.last().expect("just pushed")
+    }
+
+    /// Tint whichever region a drop would land on while files are hovering, so
+    /// three targets do not become a guessing game.  Silent off Windows: no
+    /// cursor position is available there, so the tint would be a lie.
+    fn paint_drop_hover(&self, ctx: &Context, regions: &file_drop::Regions) {
+        let cfg = &self.config.ui.drop;
+        if !cfg.enabled || !cfg.highlight || ctx.input(|i| i.raw.hovered_files.is_empty()) {
+            return;
+        }
+        let Some(pointer) = file_drop::screen_pointer(ctx) else {
+            return;
+        };
+        // winit's `DragOver` handler emits no event, so moving the cursor
+        // mid-drag wakes nothing and the polled position would stay frozen at
+        // wherever the drag entered.  This is the only place the feature drives
+        // the loop, and it stops when the drag leaves or drops.
+        ctx.request_repaint();
+        let active_is_scratchpad =
+            self.active_session_index().is_some_and(|idx| self.sessions[idx].scratchpad.is_some());
+        let Some(target) = file_drop::route(Some(pointer), regions, active_is_scratchpad, cfg)
+        else {
+            return;
+        };
+        let rect = match target {
+            file_drop::Target::ProjectsSidebar => match regions.sidebar {
+                Some(rect) => rect,
+                None => return,
+            },
+            file_drop::Target::Terminal | file_drop::Target::Scratchpad => regions.central,
+        };
+        // `Theme::accent` is already resolved (config accent, else ANSI blue);
+        // `UiTheme::sidebar_accent` is the raw `Option` and would paint nothing
+        // on an unconfigured palette.
+        let accent = self.theme.accent;
+        ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop_hover")))
+            .rect_filled(rect, 0.0, accent.linear_multiply(0.15));
+    }
+
+    /// Send this frame's dropped files wherever they landed.  All of the
+    /// deciding happens in `file_drop`; this only reaches the sinks.
+    fn handle_dropped_files(&mut self, ctx: &Context, regions: &file_drop::Regions) {
+        let paths: Vec<PathBuf> =
+            ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        if paths.is_empty() {
+            return;
+        }
+        let active_is_scratchpad =
+            self.active_session_index().is_some_and(|idx| self.sessions[idx].scratchpad.is_some());
+        let pointer = file_drop::screen_pointer(ctx);
+        let Some(target) =
+            file_drop::route(pointer, regions, active_is_scratchpad, &self.config.ui.drop)
+        else {
+            log::debug!("drop at {pointer:?} lands on no enabled target, discarding {paths:?}");
+            return;
+        };
+        match target {
+            file_drop::Target::Terminal => {
+                let Some(idx) = self.active_session_index() else {
+                    log::debug!(
+                        "drop on the terminal with no active session, discarding {paths:?}"
+                    );
+                    return;
+                };
+                let session = &self.sessions[idx];
+                let text =
+                    file_drop::shell_payload(&paths, session.wsl_distro(), &self.config.ui.drop);
+                if !text.is_empty() {
+                    paste::paste(session, &text, true);
+                }
+            },
+            file_drop::Target::Scratchpad => {
+                let Some(idx) = self.active_session_index() else {
+                    log::debug!(
+                        "drop on the scratchpad with no active session, discarding {paths:?}"
+                    );
+                    return;
+                };
+                let id = self.sessions[idx].id;
+                let Some(editor) = self.sessions[idx].scratchpad.as_mut() else {
+                    return;
+                };
+                let (preceding, following) = editor.cursor_boundary(ctx, id);
+                let text = file_drop::document_payload(&paths, preceding, following);
+                editor.insert_at_cursor(ctx, id, &text);
+            },
+            file_drop::Target::ProjectsSidebar => {
+                for root in file_drop::project_roots(&paths) {
+                    self.add_project_off_thread(ctx, wsl::normalize_root(root));
+                }
+            },
+        }
+
+        // This runs after the sidebar and central panel have painted for the
+        // frame, and eframe here is reactive, so the mutation above would
+        // otherwise sit invisible until some unrelated event wakes the loop.
+        ctx.request_repaint();
     }
 
     /// Drop a project from the sidebar.  Nothing on disk is touched, and
@@ -7167,6 +7272,7 @@ impl eframe::App for AlacritreeApp {
 
         let panel_frame = Frame::default().fill(sidebar_fill).inner_margin(Margin::same(8));
 
+        let mut sidebar_rect = None;
         if self.show_left_sidebar {
             let r = self.show_project_sidebar(ctx, panel_frame.clone());
             paint_panel_border(ctx, r.right(), r.y_range(), theme.sidebar_border);
@@ -7176,6 +7282,7 @@ impl eframe::App for AlacritreeApp {
             {
                 paint_focus_outline(ctx, r, &theme);
             }
+            sidebar_rect = Some(r);
         }
 
         self.phases.mark("projects-sidebar");
@@ -7265,6 +7372,15 @@ impl eframe::App for AlacritreeApp {
             });
         if theme.focus_outline.terminal && !modal_open && self.focus == PaneFocus::Terminal {
             paint_focus_outline(ctx, central.response.rect, &theme);
+        }
+
+        // A modal or the palette owns input while it is up; a drop landing
+        // behind one would act on a surface the user cannot see.
+        if !modal_open && !self.palette.is_open() {
+            let regions =
+                file_drop::Regions::new(sidebar_rect, central.response.rect, &self.config.ui.drop);
+            self.paint_drop_hover(ctx, &regions);
+            self.handle_dropped_files(ctx, &regions);
         }
         self.phases.mark("central");
 

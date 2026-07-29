@@ -25,6 +25,9 @@ git2 = { version = "0.20", default-features = false }
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# POSIX shell word quoting for dropped file paths, the same crate wezterm
+# uses for its `quote_dropped_files = "Posix"` mode.
+shlex = "1.3"
 # Shell-style $var / ${var} / ${var:fallback} substitution for the sidebar's
 # templated row names.  Chosen over a template engine: the fallback syntax is
 # the whole feature, and its deps are already in the workspace lockfile.
@@ -74,13 +77,14 @@ fontconfig = "0.8"
 # mid-burst (`pty_rearm`).  Must resolve to the same version alacritty_terminal
 # links, or the `Poller` handed to the registration is a different type.
 polling = "3.11"
-# Restricts the DLL search path at startup (`harden_dll_search_path`) and
-# borrows the launching shell's console so the CLI can print
-# (`attach_parent_console`).
+# Restricts the DLL search path at startup (`harden_dll_search_path`), borrows
+# the launching shell's console so the CLI can print (`attach_parent_console`),
+# and reads the cursor during a file drag, which winit discards.
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Console",
     "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 # Foreground-agent detection: walks the shell's descendant process tree.
 # Linux reads /proc directly, so the dependency is Windows-only.
