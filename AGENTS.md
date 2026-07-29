@@ -10,6 +10,8 @@ This is a Cargo workspace. There are five crates, but only one is original work:
 - `alacritree/` — **the only crate this fork actually changes.** A small egui/eframe app that hosts `alacritty_terminal` and adds a worktree-aware sidebar. All agent-edited code should live here unless the user explicitly says otherwise.
 - `alacritty/`, `alacritty_terminal/`, `alacritty_config/`, `alacritty_config_derive/` — vendored upstream alacritty. Treat as read-only dependencies. The `alacritty` GUI binary (winit/OpenGL) is **not** what this fork ships; we only use `alacritty_terminal` (the headless PTY + VT parser + grid).
 
+`egui-winit/` sits alongside them but is not a workspace member — it is a vendored `egui-winit` carrying a one-line change, wired in through `[patch.crates-io]` in the root `Cargo.toml` so Ctrl+V falls through to a key event when the clipboard holds something other than text.
+
 `CONTRIBUTING.md` is the upstream alacritty contributing guide, kept for the vendored crates' historical context. It does not constrain work on `alacritree/`.
 
 ## Build / run
@@ -19,7 +21,7 @@ cargo run -p alacritree            # debug build of the GUI
 cargo build -p alacritree --release
 cargo check -p alacritree          # fast type-check loop
 cargo fmt                          # rustfmt is enforced (see rustfmt.toml)
-cargo test -p alacritree           # the alacritree crate currently has no tests
+cargo test -p alacritree           # unit tests live in-module under #[cfg(test)]
 ```
 
 The workspace MSRV is 1.85 (edition 2024). The root `Makefile` is upstream alacritty's macOS bundling script; it is **not** wired up to alacritree.
@@ -30,7 +32,8 @@ There is a `[patch.crates-io]` pin on `x11-clipboard` in the root `Cargo.toml` (
 
 `alacritree` is an egui app that owns N PTY-backed terminal sessions and routes input/paint through a custom grid renderer. The pieces:
 
-- `main.rs` — `eframe::run_native`, env_logger setup. Window opacity comes from config; transparency is a `ViewportBuilder` flag, so toggling it requires restart. The `alacritree mcp` subcommand runs `mcp.rs` instead of opening a window.
+- `main.rs` — `eframe::run_native`, env_logger setup. Window opacity comes from config; transparency is a `ViewportBuilder` flag, so toggling it requires restart. Running with a subcommand hands off to `cli/` instead of opening a window.
+- `cli/` — the clap CLI (`mcp`, `project`, `session`, `workspace`, `git-status`, `worktree`, `action`, `doctor`, `install`, `completions`). Every command is one `IpcRequest`, the same enum the MCP bridge speaks, so an agent that shells out reaches exactly the surface an agent with an MCP client does. Dispatch is hybrid: a request goes to a running instance when one is listening, and otherwise to `cli/offline.rs`, which serves what it can from `state.toml` and git directly — commands that are meaningless without a window fail there rather than pretending. `cli/render.rs` turns replies into human-readable output; `--json` prints the raw reply instead.
 - `ipc.rs` — local-socket IPC mirroring alacritty's `polling/ipc.rs`: a unix socket at `$XDG_RUNTIME_DIR/alacritree/alacritree-<pid>.sock` or, on Windows, a named pipe at `\\.\pipe\alacritree-<pid>.sock` (`interprocess` addresses both as a path). Advertised via `ALACRITREE_SOCKET`, one newline-delimited JSON request per connection with an `{"ok"}/{"error"}` reply. A client with no env var finds an instance by listing the socket directory — on Windows the pipe filesystem is itself listable. Requests that touch app state are forwarded to the UI thread as `AppCall`s (drained in `update`, woken by `request_repaint`); slow ones (git status, worktree creation) run on the connection thread. Disabled via `[general] ipc_socket = false`. Named pipes have no receive timeout, so the client bounds each request from its own side (worker thread + `recv_timeout`) rather than with `set_recv_timeout`.
 - `mcp.rs` — `alacritree mcp`: a hand-rolled stdio MCP server (newline-delimited JSON-RPC, tools only) whose tool names/arguments map 1:1 onto `ipc::IpcRequest` serde tags. Deliberately SDK-free to keep the crate synchronous. Platform-agnostic — it only speaks stdio and `ipc::send_request`.
 - `app.rs` — `AlacritreeApp` is the `eframe::App`. Owns `Vec<Session>`, the project list, the per-workspace active-session map, and the cached `Theme`. **Workspace model:** a `WorkspaceKey = Option<PathBuf>` — `None` is the "home" tab (sessions inherit `$PWD`), `Some(path)` is a worktree. The active session for a workspace persists across switches; sessions are *not* killed when you switch away. Sidebars: left = projects/worktrees, right = git status. Both are toggleable and persisted. Cursor repair for the left sidebar is reconciled once per frame in `sidebar_focus.rs` by diffing a snapshot of the tree, rather than by each mutation site reporting what it removed. The reconcile runs unconditionally, so its unchanged-frame path must stay allocation-free — `steady_state.rs` asserts that.
@@ -43,7 +46,15 @@ There is a `[patch.crates-io]` pin on `x11-clipboard` in the root `Cargo.toml` (
 - `fonts.rs` — loads a system monospace font via `fontdb` and registers it with egui.
 - `projects.rs` — `Project::discover(path)` opens with `git2`, lists worktrees via `repo.worktrees()`, and detects the default branch (config `init.defaultBranch` → `refs/remotes/origin/HEAD` → fallback to `main`/`master`). Non-git roots get a single pseudo-worktree pointing at themselves so the user can still spawn a shell there.
 - `git_status.rs` — `StatusCache` per worktree, throttled to 1.5 s. Computes staged/unstaged file lists and a diff-stat against the project's default branch for the right sidebar.
-- `state.rs` — minimal persistence to `$XDG_CONFIG_HOME/alacritree/state.toml`: project roots, expanded state, sidebar visibility. Serialized with `toml`. Failures are logged and ignored — never panic on missing/corrupt state.
+- `state.rs` — minimal persistence to `$XDG_CONFIG_HOME/alacritree/state.toml`: project roots, expanded state, sidebar visibility, per-worktree base branches. Serialized with `toml`. Failures are logged and ignored — never panic on missing/corrupt state.
+- `pr_status.rs` — shells out to `gh` to find the open PR for a branch and cache its base, so the git panel diffs against the PR's base instead of the repo's default branch. Best-effort: missing or unauthenticated `gh` silently falls back.
+- `command_palette.rs` — data model and fuzzy ranking for the Ctrl+K palette. `panel_filter.rs` holds the equivalent per-panel search state for the sidebars.
+- `scratchpad.rs` — persistent per-workspace notes and their built-in editor. Closing the tab or deleting a worktree must never delete the notes.
+- `wsl.rs` — the only module that knows WSL exists: distro enumeration, Windows ↔ Linux path translation, `wsl.exe` command construction. `wsl_helper.rs` keeps one long-lived `sh` per distro so batch scripts don't pay process startup per call.
+- `clipboard.rs`, `paste.rs`, `links.rs`, `mouse.rs`, `ime.rs`, `file_drop.rs` — the input/interaction surface around the grid: the two clipboards, bracketed paste, link detection, mouse-report encodings mirroring alacritty's, IME composition state, and where a dropped file goes.
+- `glyph_cache.rs`, `color_glyph.rs`, `builtin_font.rs` — the paint path's caches: reused single-character galleys, emoji rasterized from a font's colour tables, and hand-drawn box-drawing glyphs that must fully cover their cell.
+- `sidebar_nav.rs`, `git_nav.rs`, `row_label.rs`, `path_style.rs` — pure models behind the sidebars (cursor movement, row templating, abbreviated paths), deliberately free of egui so they can be unit-tested.
+- `command_ext.rs` — alacritree is a GUI-subsystem binary with no console, so every `git`/`gh`/`cmd` child needs a flag to avoid flashing a console window on Windows. Spawn children through this, not `Command` directly.
 
 ## Conventions specific to this fork
 
