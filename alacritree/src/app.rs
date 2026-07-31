@@ -4908,6 +4908,23 @@ fn emphasis_family(e: &TextEmphasis, base: &egui::FontFamily) -> egui::FontFamil
     }
 }
 
+/// Add a truncating label and report whether it had to ellipsize.
+///
+/// egui offers an elided label's full text as a tooltip by itself, but only to
+/// a widget the hit test marks hovered — and a row that senses its click
+/// retroactively, once its labels are already laid out, takes that mark away
+/// from them.  Those rows carry the tooltip on their own response instead, and
+/// this flag is how they know the name is worth spelling out.
+fn truncating_label(ui: &mut egui::Ui, text: RichText, color: Color32) -> bool {
+    let (pos, galley, response) = egui::Label::new(text.color(color)).truncate().layout_in_ui(ui);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), galley.text())
+    });
+    let elided = galley.elided;
+    ui.painter().galley(pos, galley, color);
+    elided
+}
+
 /// Paint a path as one truncating label.
 ///
 /// `Zed` needs two differently-formatted spans, and one `LayoutJob` is the
@@ -5920,6 +5937,7 @@ fn worktree_row(
     let mut delete_rect: Option<egui::Rect> = None;
     let mut spawn_clicked = false;
     let mut spawn_rect: Option<egui::Rect> = None;
+    let mut name_elided = false;
     // right: 0 keeps the worktree `×` at the same x as the project row's `×`,
     // which has no frame margin and sits flush against the panel's outer padding.
     let frame = Frame::default().inner_margin(Margin { left: 16, right: 0, top: 3, bottom: 3 });
@@ -5944,10 +5962,8 @@ fn worktree_row(
                         default_icon,
                         is_active,
                     );
-                    ui.add(
-                        egui::Label::new(RichText::new(display_name).color(name_color).small())
-                            .truncate(),
-                    );
+                    name_elided =
+                        truncating_label(ui, RichText::new(display_name).small(), name_color);
                 },
                 |ui| {
                     // Mid-removal the row is inert: swap its controls for a
@@ -5999,6 +6015,8 @@ fn worktree_row(
         .interact(egui::Sense::click());
     let resp = if wt.prunable {
         resp.on_hover_text("worktree directory is missing — × prunes it")
+    } else if name_elided {
+        resp.on_hover_text(display_name)
     } else {
         resp
     };
@@ -6069,6 +6087,7 @@ fn session_row(
 
     let mut close_clicked = false;
     let mut close_rect: Option<egui::Rect> = None;
+    let mut title_elided = false;
     // One indent level deeper than worktree rows (16); right: 0 keeps the ×
     // at the same x as the other rows' trailing icons.
     let frame = Frame::default().inner_margin(Margin { left: 28, right: 0, top: 3, bottom: 3 });
@@ -6086,10 +6105,8 @@ fn session_row(
                         &icons.session,
                         row.is_active,
                     );
-                    ui.add(
-                        egui::Label::new(RichText::new(&row.title).color(title_color).small())
-                            .truncate(),
-                    );
+                    title_elided =
+                        truncating_label(ui, RichText::new(&row.title).small(), title_color);
                 },
                 |ui| {
                     let btn = icon_button(ui, "×", theme.text_muted, theme)
@@ -6103,6 +6120,7 @@ fn session_row(
         })
         .response
         .interact(egui::Sense::click());
+    let resp = if title_elided { resp.on_hover_text(row.title.as_str()) } else { resp };
 
     // Frame allocates its space at end-of-show, so its retroactive `interact`
     // registers *after* the inner button in egui's z-order — meaning clicks on
@@ -9269,6 +9287,135 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Every text a frame painted and whether it had to ellipsize, tooltips
+    /// included — tooltips live in their own layer, so the only way to see one
+    /// from a headless run is to read the shapes back out. A galley keeps the
+    /// whole text even when it paints an ellipsis, so `elided` is what
+    /// separates a clipped row from the tooltip spelling it out in full.
+    fn painted_texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, bool)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, bool)>) {
+            match shape {
+                egui::Shape::Text(t) => out.push((t.galley.text().to_owned(), t.galley.elided)),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {},
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    /// Rest the pointer over a row and collect every text painted while it
+    /// lingers there, tooltip included. The frames advance the clock past
+    /// `tooltip_delay` and keep the pointer still, which is what egui waits
+    /// for before opening one.
+    ///
+    /// The row is squeezed to `row_width` inside a roomy window, the way a
+    /// narrow sidebar sits beside a wide terminal: the row must ellipsize
+    /// while the tooltip still has space to spell the name out.
+    fn texts_while_hovering(
+        row_width: f32,
+        mut row: impl FnMut(&mut egui::Ui),
+    ) -> Vec<(String, bool)> {
+        let ctx = egui::Context::default();
+        let hover = egui::Pos2::new(row_width / 2.0, 20.0);
+        let mut seen = Vec::new();
+        for frame in 0..8 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::Vec2::new(600.0, 200.0),
+                )),
+                time: Some(frame as f64 * 0.25),
+                events: if frame == 0 {
+                    vec![egui::Event::PointerMoved(hover)]
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            };
+            let output = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    // The sidebars turn label selection off, which drops the
+                    // labels out of the interactive set — the harness has to
+                    // match that or it tests a widget the app never builds.
+                    ui.style_mut().interaction.selectable_labels = false;
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(row_width, 60.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| row(ui),
+                    );
+                });
+            });
+            seen.extend(painted_texts(&output.shapes));
+        }
+        seen
+    }
+
+    /// A sidebar row too narrow for its name elides it, and egui offers the
+    /// full text as a tooltip — but only to a widget the hit test marks
+    /// hovered. The worktree row senses its click on the frame *around* the
+    /// name, which takes that mark away from the label. Resting the pointer
+    /// on such a row must still surface the whole name.
+    #[test]
+    fn hovering_an_elided_worktree_row_reveals_the_full_name() {
+        let theme = Theme::from_config(&Config::default());
+        let icons = crate::config::Icons::default();
+        let wt = crate::projects::Worktree {
+            name: "feature/a-branch-name-far-too-long-for-the-sidebar".to_owned(),
+            path: PathBuf::from("/repo/wt"),
+            branch: None,
+            is_main: false,
+            prunable: false,
+        };
+
+        let texts = texts_while_hovering(140.0, |ui| {
+            worktree_row(
+                ui, &wt, &wt.name, None, true, false, false, false, None, false, &icons, &theme,
+            );
+        });
+
+        assert!(
+            texts.iter().any(|(t, elided)| *t == wt.name && *elided),
+            "the row must be too narrow for the name, or the test proves nothing: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|(t, elided)| *t == wt.name && !*elided),
+            "hovering the elided row painted no tooltip with the full name: {texts:?}"
+        );
+    }
+
+    /// Session rows sense their click the same retroactive way, so a long
+    /// shell title has to reach the pointer through the row too.
+    #[test]
+    fn hovering_an_elided_session_row_reveals_the_full_title() {
+        let theme = Theme::from_config(&Config::default());
+        let icons = crate::config::Icons::default();
+        let row = SessionRowData {
+            id: 1,
+            title: "cargo test --workspace --all-features -- --nocapture".to_owned(),
+            needs_attention: false,
+            agent_glyph: None,
+            is_active: true,
+            is_displayed: true,
+        };
+
+        let texts = texts_while_hovering(140.0, |ui| {
+            session_row(ui, &row, false, false, &icons, &theme);
+        });
+
+        assert!(
+            texts.iter().any(|(t, elided)| *t == row.title && *elided),
+            "the row must be too narrow for the title, or the test proves nothing: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|(t, elided)| *t == row.title && !*elided),
+            "hovering the elided row painted no tooltip with the full title: {texts:?}"
+        );
     }
 
     #[test]
