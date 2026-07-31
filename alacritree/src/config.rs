@@ -558,6 +558,34 @@ fn parse_search_scope(raw: Option<&str>) -> SearchScope {
     }
 }
 
+/// `[ui] sidebar_tooltips`: when a sidebar row offers its full name on hover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SidebarTooltips {
+    /// Never — a name the panel cut off stays cut off.
+    Off,
+    /// Only where the row had to ellipsize the name.
+    #[default]
+    Elided,
+    /// On every row.  egui opens the next tooltip instantly while one was just
+    /// shown, so a row that offers none breaks that chain and the name after it
+    /// has to wait out the delay again; offering one everywhere keeps a sweep
+    /// down the list from stalling on the short names.
+    Always,
+}
+
+fn parse_sidebar_tooltips(raw: Option<&str>) -> SidebarTooltips {
+    match raw {
+        None => SidebarTooltips::default(),
+        Some("off") => SidebarTooltips::Off,
+        Some("elided") => SidebarTooltips::Elided,
+        Some("always") => SidebarTooltips::Always,
+        Some(other) => {
+            log::warn!("unknown ui.sidebar_tooltips value {other:?}, using \"elided\"");
+            SidebarTooltips::default()
+        },
+    }
+}
+
 /// Whether per-session UI (sidebar session rows, tab-strip segments) renders
 /// for a single-session workspace instead of waiting for the two-session
 /// threshold.  These are startup defaults only: the app copies them into
@@ -681,6 +709,8 @@ pub struct UiTheme {
     pub sidebar_focus: SidebarFocus,
     /// Whether a fuzzy query is confined by the panel's active toggle filters.
     pub search_scope: SearchScope,
+    /// When a sidebar row spells its full name out on hover.
+    pub sidebar_tooltips: SidebarTooltips,
     /// Show single-session sidebar rows / tab segments ([`SessionDisplay`]).
     pub session_display: SessionDisplay,
     /// Paint PR-status badges on worktree rows (and poll `gh` for expanded
@@ -738,6 +768,7 @@ impl Default for UiTheme {
             last_session_close: LastSessionClose::Respawn,
             sidebar_focus: SidebarFocus::default(),
             search_scope: SearchScope::default(),
+            sidebar_tooltips: SidebarTooltips::default(),
             session_display: SessionDisplay::default(),
             pr_status: false,
             pr_status_concurrency: DEFAULT_CONCURRENCY,
@@ -1414,6 +1445,9 @@ struct RawUi {
     /// Whether a fuzzy query is confined by the panel's active toggle filters:
     /// "filtered" (default) | "all".
     search_scope: Option<String>,
+    /// When a sidebar row spells its full name out on hover:
+    /// "elided" (default) | "always" | "off".
+    sidebar_tooltips: Option<String>,
     session_display: RawSessionDisplay,
     delta_path: Option<String>,
     icons: RawIcons,
@@ -1586,6 +1620,7 @@ impl RawConfig {
             last_session_close: parse_last_session_close(self.ui.last_session_close.as_deref()),
             sidebar_focus: parse_sidebar_focus(self.ui.sidebar_focus.as_deref()),
             search_scope: parse_search_scope(self.ui.search_scope.as_deref()),
+            sidebar_tooltips: parse_sidebar_tooltips(self.ui.sidebar_tooltips.as_deref()),
             session_display: SessionDisplay {
                 sidebar_always: self.ui.session_display.sidebar_always.unwrap_or(false),
                 tabs_always: self.ui.session_display.tabs_always.unwrap_or(false),
@@ -2071,6 +2106,29 @@ mod tests {
     fn only_follow_moves_the_terminal() {
         assert!(!SidebarFocus::Preserve.follows());
         assert!(SidebarFocus::Follow.follows());
+    }
+
+    #[test]
+    fn sidebar_tooltips_defaults_to_elided() {
+        assert_eq!(ui_from_toml("").sidebar_tooltips, SidebarTooltips::Elided);
+    }
+
+    #[test]
+    fn sidebar_tooltips_parses_every_value() {
+        for (raw, expected) in [
+            ("off", SidebarTooltips::Off),
+            ("elided", SidebarTooltips::Elided),
+            ("always", SidebarTooltips::Always),
+        ] {
+            let ui = ui_from_toml(&format!("[ui]\nsidebar_tooltips = \"{raw}\""));
+            assert_eq!(ui.sidebar_tooltips, expected, "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn sidebar_tooltips_invalid_falls_back_to_elided() {
+        let ui = ui_from_toml("[ui]\nsidebar_tooltips = \"hover\"");
+        assert_eq!(ui.sidebar_tooltips, SidebarTooltips::Elided);
     }
 
     #[test]

@@ -17,7 +17,7 @@ use crate::colors::rgb_to_color32;
 use crate::command_palette::{self, CommandPalette, PaletteAction, PaletteItem};
 use crate::config::{
     Config, FontConfig, Icons, LastSessionClose, PathStyleConfig, ScrollbarStyle, SearchScope,
-    SidebarFocus, TextEmphasis, UiFont,
+    SidebarFocus, SidebarTooltips, TextEmphasis, UiFont,
 };
 use crate::doppler;
 use crate::file_drop;
@@ -94,6 +94,8 @@ struct Theme {
     /// Per-site path abbreviation, so free-standing row painters can spell a
     /// path without taking a `&Config`.
     path_style: PathStyleConfig,
+    /// When a row spells its full name out on hover.
+    sidebar_tooltips: SidebarTooltips,
 }
 
 /// Logical-pixel (normal, heading) sizes for UI text.  `[ui.font] size`
@@ -147,6 +149,7 @@ impl Theme {
                 thickness: config.ui.focus_outline.thickness,
             },
             path_style: config.ui.path_style,
+            sidebar_tooltips: config.ui.sidebar_tooltips,
         }
     }
 }
@@ -3349,23 +3352,22 @@ impl AlacritreeApp {
                                     project.expanded = !project.expanded;
                                     expand_toggled = Some((project.root.clone(), project.expanded));
                                 }
-                                name_resp = Some(
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(
-                                                project_labels
-                                                    .get(idx)
-                                                    .map(String::as_str)
-                                                    .unwrap_or(project.display_name()),
-                                            )
-                                            .color(theme.text)
-                                            .strong()
-                                            .small(),
-                                        )
-                                        .truncate()
-                                        .sense(egui::Sense::click()),
-                                    ),
+                                let name = project_labels
+                                    .get(idx)
+                                    .map(String::as_str)
+                                    .unwrap_or(project.display_name());
+                                let (resp, elided) = truncating_label(
+                                    ui,
+                                    RichText::new(name).strong().small(),
+                                    theme.text,
+                                    egui::Sense::click(),
                                 );
+                                name_resp = Some(name_tooltip(
+                                    resp,
+                                    name,
+                                    elided,
+                                    theme.sidebar_tooltips,
+                                ));
                             },
                             |ui| {
                                 if icon_button(ui, "×", theme.text_muted, &theme)
@@ -4908,21 +4910,43 @@ fn emphasis_family(e: &TextEmphasis, base: &egui::FontFamily) -> egui::FontFamil
     }
 }
 
-/// Add a truncating label and report whether it had to ellipsize.
+/// Add a truncating label, reporting its response and whether it had to
+/// ellipsize.
 ///
-/// egui offers an elided label's full text as a tooltip by itself, but only to
-/// a widget the hit test marks hovered — and a row that senses its click
+/// `egui::Label` offers an elided name as a tooltip by itself, but only to a
+/// widget the hit test marks hovered — and a row that senses its click
 /// retroactively, once its labels are already laid out, takes that mark away
-/// from them.  Those rows carry the tooltip on their own response instead, and
-/// this flag is how they know the name is worth spelling out.
-fn truncating_label(ui: &mut egui::Ui, text: RichText, color: Color32) -> bool {
-    let (pos, galley, response) = egui::Label::new(text.color(color)).truncate().layout_in_ui(ui);
+/// from them.  Laying the galley out here keeps both decisions with the row:
+/// which response carries the tooltip, and whether `[ui] sidebar_tooltips`
+/// wants one at all.
+fn truncating_label(
+    ui: &mut egui::Ui,
+    text: RichText,
+    color: Color32,
+    sense: egui::Sense,
+) -> (egui::Response, bool) {
+    let (pos, galley, response) =
+        egui::Label::new(text.color(color)).truncate().sense(sense).layout_in_ui(ui);
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), galley.text())
     });
     let elided = galley.elided;
     ui.painter().galley(pos, galley, color);
-    elided
+    (response, elided)
+}
+
+/// Offer `name` as `resp`'s tooltip, as far as the configured mode allows.
+fn name_tooltip(
+    resp: egui::Response,
+    name: &str,
+    elided: bool,
+    mode: SidebarTooltips,
+) -> egui::Response {
+    match mode {
+        SidebarTooltips::Off => resp,
+        SidebarTooltips::Elided if !elided => resp,
+        _ => resp.on_hover_text(name),
+    }
 }
 
 /// Paint a path as one truncating label.
@@ -5962,8 +5986,12 @@ fn worktree_row(
                         default_icon,
                         is_active,
                     );
-                    name_elided =
-                        truncating_label(ui, RichText::new(display_name).small(), name_color);
+                    (_, name_elided) = truncating_label(
+                        ui,
+                        RichText::new(display_name).small(),
+                        name_color,
+                        egui::Sense::hover(),
+                    );
                 },
                 |ui| {
                     // Mid-removal the row is inert: swap its controls for a
@@ -6015,10 +6043,8 @@ fn worktree_row(
         .interact(egui::Sense::click());
     let resp = if wt.prunable {
         resp.on_hover_text("worktree directory is missing — × prunes it")
-    } else if name_elided {
-        resp.on_hover_text(display_name)
     } else {
-        resp
+        name_tooltip(resp, display_name, name_elided, theme.sidebar_tooltips)
     };
 
     // Frame allocates its space at end-of-show, so its retroactive `interact`
@@ -6105,8 +6131,12 @@ fn session_row(
                         &icons.session,
                         row.is_active,
                     );
-                    title_elided =
-                        truncating_label(ui, RichText::new(&row.title).small(), title_color);
+                    (_, title_elided) = truncating_label(
+                        ui,
+                        RichText::new(&row.title).small(),
+                        title_color,
+                        egui::Sense::hover(),
+                    );
                 },
                 |ui| {
                     let btn = icon_button(ui, "×", theme.text_muted, theme)
@@ -6120,7 +6150,7 @@ fn session_row(
         })
         .response
         .interact(egui::Sense::click());
-    let resp = if title_elided { resp.on_hover_text(row.title.as_str()) } else { resp };
+    let resp = name_tooltip(resp, &row.title, title_elided, theme.sidebar_tooltips);
 
     // Frame allocates its space at end-of-show, so its retroactive `interact`
     // registers *after* the inner button in egui's z-order — meaning clicks on
@@ -9320,7 +9350,7 @@ mod tests {
     fn texts_while_hovering(
         row_width: f32,
         mut row: impl FnMut(&mut egui::Ui),
-    ) -> Vec<(String, bool)> {
+    ) -> Vec<Vec<(String, bool)>> {
         let ctx = egui::Context::default();
         let hover = egui::Pos2::new(row_width / 2.0, 20.0);
         let mut seen = Vec::new();
@@ -9351,9 +9381,23 @@ mod tests {
                     );
                 });
             });
-            seen.extend(painted_texts(&output.shapes));
+            seen.push(painted_texts(&output.shapes));
         }
         seen
+    }
+
+    /// Whether a tooltip spelled `name` out over the row that already paints
+    /// it. The row paints the name once a frame, so a second paint in the same
+    /// frame is the tooltip — true whether or not the row had room for it,
+    /// which a plain "the full text appeared" check cannot tell apart.
+    fn tooltip_shown(frames: &[Vec<(String, bool)>], name: &str) -> bool {
+        frames.iter().any(|f| f.iter().filter(|(t, _)| t == name).count() >= 2)
+    }
+
+    /// Whether the row had to ellipsize `name` — the precondition every
+    /// tooltip assertion below rests on.
+    fn row_elided(frames: &[Vec<(String, bool)>], name: &str) -> bool {
+        frames.iter().flatten().any(|(t, elided)| t == name && *elided)
     }
 
     /// A sidebar row too narrow for its name elides it, and egui offers the
@@ -9380,13 +9424,56 @@ mod tests {
         });
 
         assert!(
-            texts.iter().any(|(t, elided)| *t == wt.name && *elided),
+            row_elided(&texts, &wt.name),
             "the row must be too narrow for the name, or the test proves nothing: {texts:?}"
         );
         assert!(
-            texts.iter().any(|(t, elided)| *t == wt.name && !*elided),
+            tooltip_shown(&texts, &wt.name),
             "hovering the elided row painted no tooltip with the full name: {texts:?}"
         );
+    }
+
+    /// `[ui] sidebar_tooltips` bounds the row tooltip on both sides: `off`
+    /// withholds a name the panel cut off, and `always` offers one even for a
+    /// name that fits — which is what keeps a sweep down the list from losing
+    /// egui's instant-reopen grace every time a short name goes by.
+    #[test]
+    fn sidebar_tooltips_modes_bound_the_row_tooltip() {
+        let icons = crate::config::Icons::default();
+        let long = "feature/a-branch-name-far-too-long-for-the-sidebar";
+        let short = "main";
+
+        for (mode, name, want) in [
+            (SidebarTooltips::Off, long, false),
+            (SidebarTooltips::Elided, long, true),
+            (SidebarTooltips::Elided, short, false),
+            (SidebarTooltips::Always, long, true),
+            (SidebarTooltips::Always, short, true),
+        ] {
+            let mut config = Config::default();
+            config.ui.sidebar_tooltips = mode;
+            let theme = Theme::from_config(&config);
+            let wt = crate::projects::Worktree {
+                name: name.to_owned(),
+                path: PathBuf::from("/repo/wt"),
+                branch: None,
+                is_main: false,
+                prunable: false,
+            };
+
+            let texts = texts_while_hovering(140.0, |ui| {
+                worktree_row(
+                    ui, &wt, name, None, true, false, false, false, None, false, &icons, &theme,
+                );
+            });
+
+            assert_eq!(
+                row_elided(&texts, name),
+                name == long,
+                "{mode:?} on {name:?}: the harness must elide exactly the long name: {texts:?}"
+            );
+            assert_eq!(tooltip_shown(&texts, name), want, "{mode:?} on {name:?}: {texts:?}");
+        }
     }
 
     /// Session rows sense their click the same retroactive way, so a long
@@ -9409,11 +9496,11 @@ mod tests {
         });
 
         assert!(
-            texts.iter().any(|(t, elided)| *t == row.title && *elided),
+            row_elided(&texts, &row.title),
             "the row must be too narrow for the title, or the test proves nothing: {texts:?}"
         );
         assert!(
-            texts.iter().any(|(t, elided)| *t == row.title && !*elided),
+            tooltip_shown(&texts, &row.title),
             "hovering the elided row painted no tooltip with the full title: {texts:?}"
         );
     }

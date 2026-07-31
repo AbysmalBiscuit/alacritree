@@ -329,6 +329,15 @@ search_scope       = "filtered"  # whether a sidebar search is confined by the
                                  # the toggles already allow
                                  # "all": a query reaches every row; the
                                  # toggles resume when it empties
+sidebar_tooltips   = "elided"    # when a sidebar row spells its full name out
+                                 # on hover
+                                 # "elided" (default): only where the row had
+                                 # to cut the name off
+                                 # "always": on every row — a row without a
+                                 # tooltip ends the run in which egui reopens
+                                 # the next one instantly, so a sweep down the
+                                 # list stalls on each name that fits
+                                 # "off": never
 confirm_session_close = "never"  # when the sidebar × asks before killing a PTY:
                                  # "never" (default) | "busy" | "always"
 last_session_close = "respawn"   # closing the on-screen workspace's last
