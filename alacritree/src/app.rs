@@ -5227,7 +5227,7 @@ fn icon_button(ui: &mut egui::Ui, glyph: &str, color: Color32, theme: &Theme) ->
 /// table styles a key without setting `glyph`.  `default_px` and `slot_px`
 /// are deliberately separate: `icon_button` paints its glyph at `12.0 *
 /// ui_scale` inside a `16.0 * ui_scale` slot, and conflating the two would
-/// resize every unconfigured icon while claiming pixel-identity.
+/// resize every unconfigured icon.
 ///
 /// One resolver, not one paint helper: `RichText` participates in layout
 /// while painter text draws into preallocated geometry, so each site keeps
@@ -5421,10 +5421,10 @@ fn panel_header_filter_ui(
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.x = 3.0 * s;
                 // `TextStyle::Small`'s logical size is `font_normal`, unscaled —
-                // the same size `.small()` painted before this icon was
-                // configurable. The slot is generous (double that) since the
-                // icon sits in a frame that grows with its content rather
-                // than a fixed-pixel button.
+                // `resolve_icon` multiplies by `ui_scale` internally, so dividing
+                // it out here keeps the resolved size at `font_normal`. The slot
+                // is generous (double that) since the icon sits in a frame that
+                // grows with its content rather than a fixed-pixel button.
                 let default_px = theme.font_normal / s;
                 let (glyph, font, color) = resolve_icon(
                     search_icon,
@@ -9792,8 +9792,8 @@ mod tests {
         assert_eq!(color, Color32::RED);
     }
 
-    /// An unstyled icon must render `FontFamily::Proportional`, exactly what
-    /// every pre-existing call site painted before icons became configurable.
+    /// An unstyled icon must render `FontFamily::Proportional`, matching
+    /// every icon call site with no `bold`/`italic` configured.
     #[test]
     fn an_unconfigured_icon_resolves_to_the_proportional_family() {
         let theme = Theme::from_config(&Config::default());
@@ -9811,27 +9811,6 @@ mod tests {
         let style = IconStyle { italic: true, ..Default::default() };
         let (_, font, _) = resolve_icon(&style, "○", Color32::WHITE, 10.0, 10.0, &theme);
         assert_eq!(font.family, egui::FontFamily::Name(crate::fonts::UI_ITALIC_FAMILY.into()));
-    }
-
-    /// The search prompt derives its `resolve_icon` inputs from
-    /// `theme.font_normal` rather than a literal constant, since it used to
-    /// paint through `.small()`.  An unconfigured icon must still land on
-    /// exactly `font_normal`, matching what `TextStyle::Small` painted before
-    /// the icon became configurable.
-    #[test]
-    fn an_unconfigured_search_icon_matches_the_small_text_style_size() {
-        let theme = Theme::from_config(&Config::default());
-        let s = theme.ui_scale;
-        let default_px = theme.font_normal / s;
-        let (_, font, _) = resolve_icon(
-            &IconStyle::default(),
-            DEFAULT_SEARCH_ICON,
-            theme.text_dim,
-            default_px,
-            default_px * 2.0,
-            &theme,
-        );
-        assert_eq!(font.size, theme.font_normal);
     }
 
     /// A context with the three chrome variant families bound, as
@@ -9853,19 +9832,23 @@ mod tests {
         ctx
     }
 
-    /// The font family and paint color of the first shape whose text matches
-    /// `text`, or `None` if nothing painted it.
+    /// The font family, size, and paint color of the first shape whose text
+    /// matches `text`, or `None` if nothing painted it.
     fn painted_glyph_style(
         shapes: &[egui::epaint::ClippedShape],
         text: &str,
-    ) -> Option<(egui::FontFamily, Color32)> {
-        fn walk(shape: &egui::Shape, text: &str, out: &mut Option<(egui::FontFamily, Color32)>) {
+    ) -> Option<(egui::FontFamily, f32, Color32)> {
+        fn walk(
+            shape: &egui::Shape,
+            text: &str,
+            out: &mut Option<(egui::FontFamily, f32, Color32)>,
+        ) {
             match shape {
                 egui::Shape::Text(t) => {
                     if out.is_none() && t.galley.text() == text {
-                        let family = t.galley.job.sections[0].format.font_id.family.clone();
+                        let font_id = t.galley.job.sections[0].format.font_id.clone();
                         let color = t.override_text_color.unwrap_or(t.fallback_color);
-                        *out = Some((family, color));
+                        *out = Some((font_id.family, font_id.size, color));
                     }
                 },
                 egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, text, out)),
@@ -9917,7 +9900,7 @@ mod tests {
                 );
             });
         });
-        let (family, color) =
+        let (family, _, color) =
             painted_glyph_style(&output.shapes, "✕").expect("the configured glyph painted");
         assert_eq!(family, egui::FontFamily::Name(crate::fonts::UI_BOLD_FAMILY.into()));
         assert_eq!(color, Color32::RED);
@@ -9928,10 +9911,81 @@ mod tests {
     #[test]
     fn an_unconfigured_upstream_badge_keeps_its_built_in_color_and_family() {
         let theme = Theme::from_config(&Config::default());
-        let (family, color) = painted_glyph_style(&render_worktree_row_with_badges(), "✓")
+        let (family, _, color) = painted_glyph_style(&render_worktree_row_with_badges(), "✓")
             .expect("the default glyph painted");
         assert_eq!(family, egui::FontFamily::Proportional);
         assert_eq!(color, theme.upstream_level);
+    }
+
+    /// End-to-end: an unconfigured search icon painted through
+    /// `panel_header_filter_ui` must land at exactly `theme.font_normal`,
+    /// what `TextStyle::Small` painted at that call site. Pins the
+    /// production `default_px`/`slot_px` expression, not a copy of it.
+    #[test]
+    fn an_unconfigured_search_icon_paints_at_the_small_text_style_size() {
+        let theme = Theme::from_config(&Config::default());
+        let mut filter = PanelFilter::new(&[]);
+        filter.on_text("/");
+        let icons = crate::config::Icons::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(400.0, 100.0),
+            )),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                panel_header_filter_ui(ui, "Projects", &filter, &icons.search, &theme, true);
+            });
+        });
+        let (_, size, _) = painted_glyph_style(&output.shapes, DEFAULT_SEARCH_ICON)
+            .expect("the search icon painted");
+        assert_eq!(size, theme.font_normal);
+    }
+
+    /// The expand/collapse arrow is the sidebar's only `styled_icon_button`
+    /// call site. It must keep `icon_button`'s 16x16 slot while painting a
+    /// glyph, color, and weight from config.
+    #[test]
+    fn styled_icon_button_paints_a_configured_glyph_in_its_16px_slot() {
+        let theme = Theme::from_config(&Config::default());
+        let ctx = ctx_with_ui_variant_faces();
+        let s = theme.ui_scale;
+        let style = IconStyle {
+            glyph: Some("▶".to_string()),
+            color: Some(Color32::RED),
+            bold: true,
+            italic: false,
+            size: None,
+        };
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(100.0, 100.0),
+            )),
+            ..Default::default()
+        };
+        let mut rect = None;
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                rect = Some(styled_icon_button(ui, &style, "▸", theme.text_dim, &theme).rect);
+            });
+        });
+
+        let painted_size = rect.expect("the button painted").size();
+        let expected_size = egui::vec2(16.0 * s, 16.0 * s);
+        assert!(
+            (painted_size - expected_size).length() < 0.01,
+            "styled_icon_button must keep icon_button's 16x16 slot: got {painted_size:?}, \
+             expected {expected_size:?}"
+        );
+        let (family, size, color) =
+            painted_glyph_style(&output.shapes, "▶").expect("the configured glyph painted");
+        assert_eq!(family, egui::FontFamily::Name(crate::fonts::UI_BOLD_FAMILY.into()));
+        assert_eq!(size, 12.0 * s, "a button glyph paints at 12px inside its 16px slot");
+        assert_eq!(color, Color32::RED);
     }
 
     /// `[ui] sidebar_tooltips` bounds the row tooltip on both sides: `off`

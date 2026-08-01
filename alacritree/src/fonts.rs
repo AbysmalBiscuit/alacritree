@@ -776,8 +776,30 @@ pub fn install_terminal_fonts(ctx: &Context, font: &FontConfig, ui: &UiFont) -> 
             ctx.set_fonts(defs);
             chain
         },
-        None => Vec::new(),
+        None => {
+            install_unresolvable_font_fallback(ctx);
+            Vec::new()
+        },
     }
+}
+
+/// Bind every chrome and terminal variant family to a family egui's own
+/// defaults always provide, for the case where `[font.normal]` cannot be
+/// resolved at all and `build_font_definitions` returns `None`. Without
+/// this, `ctx.set_fonts` is never called, so `alacritree_*`/`alacritree_ui_*`
+/// are unbound names — egui panics the moment anything paints a bold or
+/// italic cell or icon, rather than just falling back to the wrong face.
+fn install_unresolvable_font_fallback(ctx: &Context) {
+    let mut defs = FontDefinitions::default();
+    let monospace = defs.families[&FontFamily::Monospace].clone();
+    let proportional = defs.families[&FontFamily::Proportional].clone();
+    for name in [BOLD_FAMILY, ITALIC_FAMILY, BOLD_ITALIC_FAMILY] {
+        defs.families.insert(FontFamily::Name(name.into()), monospace.clone());
+    }
+    for name in [UI_BOLD_FAMILY, UI_ITALIC_FAMILY, UI_BOLD_ITALIC_FAMILY] {
+        defs.families.insert(FontFamily::Name(name.into()), proportional.clone());
+    }
+    ctx.set_fonts(defs);
 }
 
 /// Resolve and register every face for `install_terminal_fonts`, separated
@@ -1607,6 +1629,48 @@ mod tests {
         // The first pass is what forces epaint to parse every face.
         ctx.begin_pass(Default::default());
         let _ = ctx.end_pass();
+    }
+
+    // Unix-excluded: fontconfig substitutes *some* font for any family name,
+    // so `[font.normal]` never fails to resolve there and `None` is
+    // unreachable through this path on that platform.
+    #[cfg(not(unix))]
+    #[test]
+    fn an_unresolvable_normal_font_still_binds_every_chrome_family() {
+        let ctx = Context::default();
+        let config = FontConfig {
+            normal: crate::config::FontFace {
+                family: Some("alacritree-no-such-terminal-family-9f3a".to_string()),
+                style: None,
+            },
+            ..Default::default()
+        };
+        let chain = install_terminal_fonts(&ctx, &config, &UiFont::default());
+        assert!(chain.is_empty(), "an unresolvable family produces no fallback chain");
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(200.0, 200.0),
+            )),
+            ..Default::default()
+        };
+        // egui panics on an unbound `FontFamily::Name`; painting each one and
+        // reaching the assertion below is the proof that all six are bound.
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                for family in [
+                    FontFamily::Name(BOLD_FAMILY.into()),
+                    FontFamily::Name(ITALIC_FAMILY.into()),
+                    FontFamily::Name(BOLD_ITALIC_FAMILY.into()),
+                    FontFamily::Name(UI_BOLD_FAMILY.into()),
+                    FontFamily::Name(UI_ITALIC_FAMILY.into()),
+                    FontFamily::Name(UI_BOLD_ITALIC_FAMILY.into()),
+                ] {
+                    ui.label(egui::RichText::new("x").font(egui::FontId::new(12.0, family)));
+                }
+            });
+        });
     }
 
     // Unix-excluded: fontconfig substitutes *some* font for any family name,

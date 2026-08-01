@@ -2700,9 +2700,14 @@ program = "second"
 
     #[test]
     fn blank_icon_override_falls_back() {
+        // `build_icons` stores a blank override's glyph as-is (blank, not
+        // `None`) and defers filtering to `or_glyph` at the paint site — the
+        // same deferral a table with no `glyph` key gets. A sentinel default
+        // that differs from both the raw blank input and every built-in
+        // glyph makes the assertion fail if that filtering ever breaks.
         let ui = ui_from_toml("[ui.icons]\nworktree_main = \"   \"\nsession = \"\"");
-        assert_eq!(ui.icons.worktree_main.or_glyph("●"), "●");
-        assert_eq!(ui.icons.session.or_glyph("▪"), "▪");
+        assert_eq!(ui.icons.worktree_main.or_glyph("sentinel"), "sentinel");
+        assert_eq!(ui.icons.session.or_glyph("sentinel"), "sentinel");
     }
 
     #[test]
