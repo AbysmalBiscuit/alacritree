@@ -473,28 +473,79 @@ fn text_emphasis(raw: &RawTextEmphasis) -> TextEmphasis {
     }
 }
 
-/// Text-presentation magnifier (U+2315).  Not in egui's bundled fonts; it
-/// resolves through the system fallback chain `fonts.rs` registers.
-pub(crate) const DEFAULT_SEARCH_ICON: &str = "⌕";
+/// A glyph alacritree ships and guarantees coverage for.  Paint helpers take
+/// this rather than `&str` so a built-in glyph cannot be introduced as a bare
+/// literal that the baked subset never learns about.  User-configured
+/// `[ui.icons]` overrides stay plain strings — they are outside the guarantee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BakedGlyph(&'static str);
 
-/// Default glyphs for every other `[ui.icons]` key, shared between
-/// `Icons::default()` and the paint sites' `resolve_icon` fallback — a table
-/// override that styles a key without setting `glyph` still needs the real
-/// default to fall back to, not a blank string.
-pub(crate) const DEFAULT_WORKTREE_MAIN_ICON: &str = "●";
-pub(crate) const DEFAULT_WORKTREE_ICON: &str = "○";
-pub(crate) const DEFAULT_SESSION_ICON: &str = "▪";
-pub(crate) const DEFAULT_HOME_ICON: &str = "⌂";
-pub(crate) const DEFAULT_PROJECT_EXPANDED_ICON: &str = "▾";
-pub(crate) const DEFAULT_PROJECT_COLLAPSED_ICON: &str = "▸";
-pub(crate) const DEFAULT_PR_OPEN_ICON: &str = "⬤";
-pub(crate) const DEFAULT_PR_DRAFT_ICON: &str = "◯";
-pub(crate) const DEFAULT_PR_MERGED_ICON: &str = "⬤";
-pub(crate) const DEFAULT_PR_CLOSED_ICON: &str = "⬤";
-pub(crate) const DEFAULT_UPSTREAM_LEVEL_ICON: &str = "✓";
-pub(crate) const DEFAULT_UPSTREAM_DIVERGED_ICON: &str = "⇅";
-pub(crate) const DEFAULT_UPSTREAM_GONE_ICON: &str = "⌫";
-pub(crate) const DEFAULT_UPSTREAM_UNTRACKED_ICON: &str = "↑";
+impl BakedGlyph {
+    pub(crate) const fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
+impl std::ops::Deref for BakedGlyph {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.0
+    }
+}
+
+/// Declares a glyph constant and enrols it in `$slice` in one step, so the
+/// aggregate cannot drift from the constants it describes.
+macro_rules! baked_glyphs {
+    ($slice:ident: $($(#[$m:meta])* $name:ident = $glyph:literal;)*) => {
+        $($(#[$m])* pub(crate) const $name: BakedGlyph = BakedGlyph($glyph);)*
+        pub(crate) const $slice: &[BakedGlyph] = &[$(BakedGlyph($glyph)),*];
+    };
+}
+
+baked_glyphs! {
+    DEFAULT_ICON_GLYPHS:
+    /// Text-presentation magnifier (U+2315).  Not in egui's bundled fonts; it
+    /// resolves through the system fallback chain `fonts.rs` registers.
+    DEFAULT_SEARCH_ICON = "⌕";
+    /// Default glyphs for every other `[ui.icons]` key, shared between
+    /// `Icons::default()` and the paint sites' `resolve_icon` fallback — a
+    /// table override that styles a key without setting `glyph` still needs
+    /// the real default to fall back to, not a blank string.
+    DEFAULT_WORKTREE_MAIN_ICON = "●";
+    DEFAULT_WORKTREE_ICON = "○";
+    DEFAULT_SESSION_ICON = "▪";
+    DEFAULT_HOME_ICON = "⌂";
+    DEFAULT_PROJECT_EXPANDED_ICON = "▾";
+    DEFAULT_PROJECT_COLLAPSED_ICON = "▸";
+    DEFAULT_PR_OPEN_ICON = "⬤";
+    DEFAULT_PR_DRAFT_ICON = "◯";
+    DEFAULT_PR_MERGED_ICON = "⬤";
+    DEFAULT_PR_CLOSED_ICON = "⬤";
+    DEFAULT_UPSTREAM_LEVEL_ICON = "✓";
+    DEFAULT_UPSTREAM_DIVERGED_ICON = "⇅";
+    DEFAULT_UPSTREAM_GONE_ICON = "⌫";
+    DEFAULT_UPSTREAM_UNTRACKED_ICON = "↑";
+}
+
+baked_glyphs! {
+    CHROME_GLYPHS:
+    /// Action buttons.  Task 5 gives each of these a config key; the glyphs
+    /// are declared here because coverage is owed regardless of who names them.
+    DEFAULT_ADD_ICON = "+";
+    DEFAULT_CLOSE_ICON = "×";
+    DEFAULT_REFRESH_ICON = "↻";
+    DEFAULT_REORDER_ICON = "⇅";
+    /// Painted inline in labels and hover text rather than through any icon
+    /// key.  They earn coverage the same way, so they are declared the same way.
+    DEFAULT_MIDDOT_GLYPH = "·";
+    DEFAULT_EMDASH_GLYPH = "—";
+    DEFAULT_BULLET_GLYPH = "•";
+    DEFAULT_ELLIPSIS_GLYPH = "…";
+    DEFAULT_DOWN_ARROW_GLYPH = "↓";
+    DEFAULT_DRAG_HANDLE_GLYPH = "⠿";
+    DEFAULT_CURSOR_BLOCK_GLYPH = "▌";
+}
 
 /// What happens when the on-screen workspace's last session closes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -683,8 +734,8 @@ impl Default for FocusOutline {
 }
 
 /// A default icon: just the glyph, no styling.
-fn glyph(g: &str) -> IconStyle {
-    IconStyle { glyph: Some(g.to_string()), ..Default::default() }
+fn glyph(g: BakedGlyph) -> IconStyle {
+    IconStyle { glyph: Some(g.as_str().to_string()), ..Default::default() }
 }
 
 impl Default for Icons {
@@ -2186,7 +2237,7 @@ mod tests {
 
     #[test]
     fn search_icon_defaults_and_overrides() {
-        assert_eq!(ui_from_toml("").icons.search.or_glyph(""), DEFAULT_SEARCH_ICON);
+        assert_eq!(ui_from_toml("").icons.search.or_glyph(""), DEFAULT_SEARCH_ICON.as_str());
         assert_eq!(
             ui_from_toml("[ui.icons]\nsearch = \"\u{f002}\"").icons.search.or_glyph(""),
             "\u{f002}"
@@ -3012,5 +3063,45 @@ program = "second"
     fn an_unknown_quoting_name_falls_back_to_auto() {
         let ui = ui_from_toml("[ui.drop]\nquote = \"shell\"");
         assert_eq!(ui.drop.spelling.quote, Quoting::Auto);
+    }
+
+    /// A glyph reachable from config must be reachable from the aggregate, or
+    /// the baked subset can silently omit it.
+    #[test]
+    fn every_default_icon_appears_in_the_aggregate_slice() {
+        let aggregate: Vec<&str> = DEFAULT_ICON_GLYPHS.iter().map(|g| g.as_str()).collect();
+        for g in [
+            DEFAULT_SEARCH_ICON,
+            DEFAULT_WORKTREE_MAIN_ICON,
+            DEFAULT_WORKTREE_ICON,
+            DEFAULT_SESSION_ICON,
+            DEFAULT_HOME_ICON,
+            DEFAULT_PROJECT_EXPANDED_ICON,
+            DEFAULT_PROJECT_COLLAPSED_ICON,
+            DEFAULT_PR_OPEN_ICON,
+            DEFAULT_PR_DRAFT_ICON,
+            DEFAULT_PR_MERGED_ICON,
+            DEFAULT_PR_CLOSED_ICON,
+            DEFAULT_UPSTREAM_LEVEL_ICON,
+            DEFAULT_UPSTREAM_DIVERGED_ICON,
+            DEFAULT_UPSTREAM_GONE_ICON,
+            DEFAULT_UPSTREAM_UNTRACKED_ICON,
+        ] {
+            assert!(
+                aggregate.contains(&g.as_str()),
+                "{} is missing from the aggregate",
+                g.as_str()
+            );
+        }
+    }
+
+    /// The action-button and decorative glyphs are painted from literals that no
+    /// config key names, so nothing else would notice their absence.
+    #[test]
+    fn the_chrome_slice_carries_the_action_and_decorative_glyphs() {
+        let chrome: Vec<&str> = CHROME_GLYPHS.iter().map(|g| g.as_str()).collect();
+        for g in ["+", "×", "↻", "⇅", "·", "—", "•", "…", "↓", "⠿", "▌"] {
+            assert!(chrome.contains(&g), "{g} is missing from CHROME_GLYPHS");
+        }
     }
 }

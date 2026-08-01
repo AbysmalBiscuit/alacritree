@@ -215,6 +215,10 @@ pub fn agent_name_for_glyph(glyph: char) -> Option<&'static str> {
     AGENT_PROCESS_GLYPHS.iter().find(|(_, g)| *g == glyph).map(|(name, _)| *name)
 }
 
+/// The agent glyphs alone, for the coverage check that proves the baked font
+/// can draw every glyph alacritree ships.
+pub(crate) const AGENT_GLYPHS: &[char] = &['✳', '◇', '✦', '▲', '❖', '⊕'];
+
 /// Plain-text dump of a session's grid for IPC clients.
 pub struct ScreenSnapshot {
     /// Requested scrollback (top) followed by the full visible screen, one

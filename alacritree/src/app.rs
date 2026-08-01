@@ -3375,13 +3375,13 @@ impl AlacritreeApp {
                                 let (arrow_style, arrow_default, arrow_hint) = if project.expanded {
                                     (
                                         &icons.project_expanded,
-                                        DEFAULT_PROJECT_EXPANDED_ICON,
+                                        DEFAULT_PROJECT_EXPANDED_ICON.as_str(),
                                         "collapse project",
                                     )
                                 } else {
                                     (
                                         &icons.project_collapsed,
-                                        DEFAULT_PROJECT_COLLAPSED_ICON,
+                                        DEFAULT_PROJECT_COLLAPSED_ICON.as_str(),
                                         "expand project",
                                     )
                                 };
@@ -5492,7 +5492,7 @@ fn panel_header_filter_ui(
                 let default_px = theme.font_normal / s;
                 let (glyph, font, color) = resolve_icon(
                     search_icon,
-                    DEFAULT_SEARCH_ICON,
+                    DEFAULT_SEARCH_ICON.as_str(),
                     theme.text_dim,
                     default_px,
                     default_px * 2.0,
@@ -5641,7 +5641,7 @@ fn home_row(
                         attention,
                         agent_glyph,
                         &icons.home,
-                        DEFAULT_HOME_ICON,
+                        DEFAULT_HOME_ICON.as_str(),
                         is_active,
                     );
                     ui.label(
@@ -6146,7 +6146,7 @@ fn creating_row(ui: &mut egui::Ui, branch: &str, icons: &Icons, theme: &Theme) {
             |ui| {
                 let (glyph, font, color) = resolve_icon(
                     &icons.worktree,
-                    DEFAULT_WORKTREE_ICON,
+                    DEFAULT_WORKTREE_ICON.as_str(),
                     theme.text_muted,
                     10.0,
                     10.0,
@@ -6175,10 +6175,16 @@ fn pr_badge<'a>(
     state: PrState,
 ) -> (&'a IconStyle, &'static str, Color32, &'static str) {
     match state {
-        PrState::Open => (&icons.pr_open, DEFAULT_PR_OPEN_ICON, theme.pr_open, "open"),
-        PrState::Draft => (&icons.pr_draft, DEFAULT_PR_DRAFT_ICON, theme.pr_draft, "draft"),
-        PrState::Merged => (&icons.pr_merged, DEFAULT_PR_MERGED_ICON, theme.pr_merged, "merged"),
-        PrState::Closed => (&icons.pr_closed, DEFAULT_PR_CLOSED_ICON, theme.pr_closed, "closed"),
+        PrState::Open => (&icons.pr_open, DEFAULT_PR_OPEN_ICON.as_str(), theme.pr_open, "open"),
+        PrState::Draft => {
+            (&icons.pr_draft, DEFAULT_PR_DRAFT_ICON.as_str(), theme.pr_draft, "draft")
+        },
+        PrState::Merged => {
+            (&icons.pr_merged, DEFAULT_PR_MERGED_ICON.as_str(), theme.pr_merged, "merged")
+        },
+        PrState::Closed => {
+            (&icons.pr_closed, DEFAULT_PR_CLOSED_ICON.as_str(), theme.pr_closed, "closed")
+        },
     }
 }
 
@@ -6192,25 +6198,25 @@ fn upstream_badge<'a>(
     match state {
         UpstreamState::Level { upstream } => (
             &icons.upstream_level,
-            DEFAULT_UPSTREAM_LEVEL_ICON,
+            DEFAULT_UPSTREAM_LEVEL_ICON.as_str(),
             theme.upstream_level,
             format!("tracks {upstream}"),
         ),
         UpstreamState::Diverged { upstream, ahead, behind } => (
             &icons.upstream_diverged,
-            DEFAULT_UPSTREAM_DIVERGED_ICON,
+            DEFAULT_UPSTREAM_DIVERGED_ICON.as_str(),
             theme.upstream_diverged,
             format!("tracks {upstream} — {ahead} ahead, {behind} behind"),
         ),
         UpstreamState::Gone { upstream } => (
             &icons.upstream_gone,
-            DEFAULT_UPSTREAM_GONE_ICON,
+            DEFAULT_UPSTREAM_GONE_ICON.as_str(),
             theme.upstream_gone,
             format!("{upstream} is missing locally"),
         ),
         UpstreamState::Untracked => (
             &icons.upstream_untracked,
-            DEFAULT_UPSTREAM_UNTRACKED_ICON,
+            DEFAULT_UPSTREAM_UNTRACKED_ICON.as_str(),
             theme.upstream_untracked,
             "no upstream configured".to_string(),
         ),
@@ -6250,9 +6256,9 @@ fn worktree_row(
     let resp = frame
         .show(ui, |ui| {
             let (default_icon, default_glyph) = if wt.is_main {
-                (&icons.worktree_main, DEFAULT_WORKTREE_MAIN_ICON)
+                (&icons.worktree_main, DEFAULT_WORKTREE_MAIN_ICON.as_str())
             } else {
-                (&icons.worktree, DEFAULT_WORKTREE_ICON)
+                (&icons.worktree, DEFAULT_WORKTREE_ICON.as_str())
             };
             let name_color = if wt.prunable || deleting {
                 theme.text_muted
@@ -6445,7 +6451,7 @@ fn session_row(
                         row.needs_attention,
                         row.agent_glyph,
                         &icons.session,
-                        DEFAULT_SESSION_ICON,
+                        DEFAULT_SESSION_ICON.as_str(),
                         row.is_active,
                     );
                     let (_, galley) = truncating_label(
@@ -10046,7 +10052,7 @@ mod tests {
                 panel_header_filter_ui(ui, "Projects", &filter, &icons.search, &theme, true);
             });
         });
-        let (_, size, _) = painted_glyph_style(&output.shapes, DEFAULT_SEARCH_ICON)
+        let (_, size, _) = painted_glyph_style(&output.shapes, DEFAULT_SEARCH_ICON.as_str())
             .expect("the search icon painted");
         assert_eq!(size, theme.font_normal);
     }
