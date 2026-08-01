@@ -252,30 +252,57 @@ mod git2_tests {
         assert_eq!(map["dead"], UpstreamState::Gone { upstream: "origin/dead".into() });
     }
 
-    /// The divergence matrix the spec requires.  `set_upstream` against a
-    /// local ref also covers `remote = "."`, where the upstream is another
-    /// local branch rather than a remote-tracking one.
+    /// Exercises every value `graph_ahead_behind` can return: level (0, 0),
+    /// ahead-only, behind-only, and diverged (both nonzero), with the exact
+    /// counts asserted so the tuple order is pinned in both directions.
+    /// `level`/`ahead` share a static upstream (`main`, never advanced) and
+    /// so only ever probe the ahead side; `behind` and `diverged` each get
+    /// their own upstream branch that advances independently of the local
+    /// branch, which is what actually exercises the behind side. Also
+    /// covers `remote = "."`, where `set_upstream` points at another local
+    /// branch rather than a remote-tracking one.
     #[test]
     fn classifies_level_ahead_behind_and_diverged() {
         let dir = tempfile::tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
         let base = commit_empty(&repo);
 
-        // `base` is the upstream; each branch diverges from it differently.
+        // `main` never moves, so `level` stays level and `ahead` only grows
+        // its own side of the pair.
         for (name, extra) in [("level", 0), ("ahead", 2)] {
             let mut b = repo.branch(name, &repo.find_commit(base).unwrap(), false).unwrap();
             b.set_upstream(Some("main")).unwrap();
-            let mut parent = base;
-            for i in 0..extra {
-                parent = commit_onto(&repo, parent, &format!("refs/heads/{name}"), i);
-            }
+            advance(&repo, base, &format!("refs/heads/{name}"), extra);
         }
+
+        // `behind` never commits itself; only its dedicated upstream moves.
+        repo.branch("upstream-behind", &repo.find_commit(base).unwrap(), false).unwrap();
+        let mut behind = repo.branch("behind", &repo.find_commit(base).unwrap(), false).unwrap();
+        behind.set_upstream(Some("upstream-behind")).unwrap();
+        advance(&repo, base, "refs/heads/upstream-behind", 3);
+
+        // `diverged` and its dedicated upstream each grow from `base` along
+        // their own line, so neither is an ancestor of the other.
+        repo.branch("upstream-diverged", &repo.find_commit(base).unwrap(), false).unwrap();
+        let mut diverged =
+            repo.branch("diverged", &repo.find_commit(base).unwrap(), false).unwrap();
+        diverged.set_upstream(Some("upstream-diverged")).unwrap();
+        advance(&repo, base, "refs/heads/diverged", 2);
+        advance(&repo, base, "refs/heads/upstream-diverged", 4);
 
         let map = map_from_repo(&repo);
         assert_eq!(map["level"], UpstreamState::Level { upstream: "main".into() });
         assert_eq!(
             map["ahead"],
             UpstreamState::Diverged { upstream: "main".into(), ahead: 2, behind: 0 }
+        );
+        assert_eq!(
+            map["behind"],
+            UpstreamState::Diverged { upstream: "upstream-behind".into(), ahead: 0, behind: 3 }
+        );
+        assert_eq!(
+            map["diverged"],
+            UpstreamState::Diverged { upstream: "upstream-diverged".into(), ahead: 2, behind: 4 }
         );
     }
 
@@ -285,10 +312,23 @@ mod git2_tests {
         repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap()
     }
 
+    fn advance(repo: &Repository, from: git2::Oid, refname: &str, extra: usize) -> git2::Oid {
+        let mut parent = from;
+        for i in 0..extra {
+            parent = commit_onto(repo, parent, refname, i);
+        }
+        parent
+    }
+
     fn commit_onto(repo: &Repository, parent: git2::Oid, refname: &str, n: usize) -> git2::Oid {
         let sig = git2::Signature::now("t", "t@t").unwrap();
         let tree = repo.find_tree(repo.treebuilder(None).unwrap().write().unwrap()).unwrap();
         let parent = repo.find_commit(parent).unwrap();
-        repo.commit(Some(refname), &sig, &sig, &format!("c{n}"), &tree, &[&parent]).unwrap()
+        // The message folds in `refname` so two chains started from the same
+        // `base` at the same wall-clock second never produce identical
+        // (parent, tree, message) commits, which git would collapse into one
+        // shared object and silently merge the two branches' histories.
+        repo.commit(Some(refname), &sig, &sig, &format!("{refname} c{n}"), &tree, &[&parent])
+            .unwrap()
     }
 }
