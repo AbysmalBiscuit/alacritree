@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use git2::{BranchType, Repository};
+use git2::{BranchType, ErrorCode, Repository};
 
 /// What a branch's configured upstream is doing.  Nothing here contacts a
 /// remote, so every state describes local refs only.
@@ -98,12 +98,17 @@ pub fn map_from_repo(repo: &Repository) -> HashMap<String, UpstreamState> {
         let refname = format!("refs/heads/{name}");
         let state = match branch.upstream() {
             Ok(upstream) => tracked_state(repo, &branch, &upstream),
-            // The tracking ref did not resolve.  Config still decides whether
-            // an upstream was ever configured.
-            Err(_) => Some(match repo.branch_upstream_name(&refname) {
-                Ok(buf) => UpstreamState::Gone { upstream: shorten(buf.as_str().unwrap_or("")) },
-                Err(_) => UpstreamState::Untracked,
-            }),
+            // The tracking ref is absent.  Config still decides whether an
+            // upstream was ever configured.
+            Err(e) if e.code() == ErrorCode::NotFound => {
+                let configured = repo.branch_upstream_name(&refname);
+                configured_upstream(match &configured {
+                    Ok(buf) => Ok(buf.as_str().unwrap_or("")),
+                    Err(e) => Err(e.code()),
+                })
+            },
+            // Any other libgit2 failure says nothing about the upstream.
+            Err(_) => None,
         };
         // A branch we could not answer for gets no entry, so the row paints
         // no badge rather than a wrong one.
@@ -133,8 +138,29 @@ fn tracked_state(
     }
 }
 
+/// Classify a branch whose tracking ref did not resolve.  A name in config
+/// means an upstream was configured and its ref is gone; `NotFound` means
+/// none was ever configured.  Every other failure leaves the question
+/// unanswered, and an unanswered branch gets no entry — the same rule
+/// `tracked_state` applies to a graph walk it could not complete.
+fn configured_upstream(name: Result<&str, ErrorCode>) -> Option<UpstreamState> {
+    match name {
+        Ok(name) => Some(UpstreamState::Gone { upstream: shorten(name) }),
+        Err(ErrorCode::NotFound) => Some(UpstreamState::Untracked),
+        Err(_) => None,
+    }
+}
+
+/// Tracking a local branch through remote `"."` yields a `refs/heads/` name,
+/// so both namespaces have to come off for the badge to read the way the
+/// `for-each-ref` path renders the same upstream.
 fn shorten(refname: &str) -> String {
-    refname.strip_prefix("refs/remotes/").unwrap_or(refname).to_string()
+    for prefix in ["refs/remotes/", "refs/heads/"] {
+        if let Some(rest) = refname.strip_prefix(prefix) {
+            return rest.to_string();
+        }
+    }
+    refname.to_string()
 }
 
 #[cfg(test)]
@@ -165,6 +191,30 @@ mod tests {
         );
         assert_eq!(map["dead"], UpstreamState::Gone { upstream: "origin/dead".into() });
         assert_eq!(map["solo"], UpstreamState::Untracked);
+    }
+
+    /// A libgit2 failure other than `NotFound` says nothing about whether an
+    /// upstream was configured, so it must not resolve to `Untracked` — that
+    /// would paint a definite badge from an unreadable repository.
+    #[test]
+    fn only_a_not_found_config_lookup_means_untracked() {
+        assert_eq!(
+            configured_upstream(Ok("refs/remotes/origin/x")),
+            Some(UpstreamState::Gone { upstream: "origin/x".into() })
+        );
+        assert_eq!(configured_upstream(Err(ErrorCode::NotFound)), Some(UpstreamState::Untracked));
+        for code in [ErrorCode::GenericError, ErrorCode::Invalid, ErrorCode::Locked] {
+            assert_eq!(configured_upstream(Err(code)), None, "{code:?} must not fabricate a state");
+        }
+    }
+
+    /// A branch tracking another local branch through remote `"."` has a
+    /// `refs/heads/…` upstream.  The badge shows this name to the user, so it
+    /// must read the way the WSL and live paths render it.
+    #[test]
+    fn a_local_tracking_upstream_shortens_like_a_remote_one() {
+        assert_eq!(shorten("refs/heads/main"), "main");
+        assert_eq!(shorten("refs/remotes/origin/main"), "origin/main");
     }
 
     /// `|` is legal in a ref name, which is why the format is tab-delimited —
