@@ -686,6 +686,37 @@ worktree /home/lev/wt/tmp\0HEAD 0011223344556677\0detached\0\0";
         );
     }
 
+    /// Proves the `upstream` flag gates the git2 branch walk itself, not just
+    /// whether the result gets painted: build a branch with a genuinely
+    /// resolvable upstream, discover the same repo with the flag on and off,
+    /// and require the two runs to disagree. A test that only checked the
+    /// off case would pass against code that never looked anything up at all.
+    #[test]
+    fn the_upstream_flag_gates_whether_the_walk_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        let repo = init_repo(&repo_dir);
+
+        let head_name = repo.head().unwrap().shorthand().unwrap().to_string();
+        let head_commit = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("upstream-branch", &head_commit, false).unwrap();
+        let mut head_branch = repo.find_branch(&head_name, git2::BranchType::Local).unwrap();
+        head_branch.set_upstream(Some("upstream-branch")).unwrap();
+
+        let with_flag = Project::discover(repo_dir.clone(), true).project;
+        let without_flag = Project::discover(repo_dir, false).project;
+
+        assert_eq!(
+            with_flag.worktrees[0].upstream,
+            Some(crate::upstream::UpstreamState::Level { upstream: "upstream-branch".to_string() }),
+            "a real upstream must be found when the flag is on"
+        );
+        assert_eq!(
+            without_flag.worktrees[0].upstream, None,
+            "the same upstream must not be found when the flag is off"
+        );
+    }
+
     /// Discovery is adopted through one method by both refresh paths.  Two paths
     /// each listing fields by hand is what lets a newly discovered field land in
     /// one and be dropped by the other — and the folder-picker path, which starts
