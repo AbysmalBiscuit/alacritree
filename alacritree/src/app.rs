@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use alacritty_terminal::tty::Shell;
@@ -3356,16 +3356,16 @@ impl AlacritreeApp {
                                     .get(idx)
                                     .map(String::as_str)
                                     .unwrap_or(project.display_name());
-                                let (resp, elided) = truncating_label(
+                                let (resp, galley) = truncating_label(
                                     ui,
-                                    RichText::new(name).strong().small(),
+                                    RichText::new(name).strong().small().color(theme.text),
                                     theme.text,
                                     egui::Sense::click(),
                                 );
                                 name_resp = Some(name_tooltip(
                                     resp,
                                     name,
-                                    elided,
+                                    galley.elided,
                                     theme.sidebar_tooltips,
                                 ));
                             },
@@ -3883,15 +3883,13 @@ impl AlacritreeApp {
                         return;
                     }
 
-                    path_label(
+                    path_header_label(
                         ui,
                         &wsl::display_path(&path),
                         theme.text_muted,
                         &theme,
                         theme.path_style.git_header,
-                        egui::FontFamily::Proportional,
                         workspace_home.as_deref(),
-                        true,
                     );
                     if let Some(branch) = &status.branch {
                         // A greedy `truncate()` label in a plain `horizontal` row
@@ -4783,6 +4781,7 @@ fn file_row(
         ChangeKind::Conflicted => rgb_to_color32(palette.bright[1]),
     };
     let path_color = if is_active { theme.text } else { theme.text_dim };
+    let mut path_galley = None;
     // `ui.horizontal` sizes its response rect to the (often short) path text,
     // leaving most of the row's width as a dead zone — and short labels make
     // the row barely taller than the text, so vertical misses are easy too.
@@ -4805,21 +4804,14 @@ fn file_row(
                     )
                     .selectable(false),
                 );
-                path_label(
-                    ui,
-                    &change.path,
-                    path_color,
-                    theme,
-                    theme.path_style.git_rows,
-                    egui::FontFamily::Proportional,
-                    None,
-                    false,
-                );
+                let (_, galley) = git_path_label(ui, &change.path, path_color, theme);
+                path_galley = Some(galley);
                 fill_row(ui);
             },
         )
         .response
         .interact(egui::Sense::click());
+    let resp = git_path_tooltip(resp, path_galley.as_deref(), theme);
     paint_row_bg(ui, &resp, bg_idx, panel_x, theme, is_active);
     resp
 }
@@ -4837,6 +4829,7 @@ fn branch_diff_row(
     let added = rgb_to_color32(palette.normal[2]);
     let removed = rgb_to_color32(palette.normal[1]);
     let path_color = if is_active { theme.text } else { theme.text_dim };
+    let mut path_galley = None;
 
     // Same shape as row_with_trailing (right_to_left wrapping a left_to_right)
     // so +/- counts pin to the right edge while the path truncates cleanly;
@@ -4876,16 +4869,8 @@ fn branch_diff_row(
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
                             ui.set_min_height(row_h);
-                            path_label(
-                                ui,
-                                &stat.path,
-                                path_color,
-                                theme,
-                                theme.path_style.git_rows,
-                                egui::FontFamily::Proportional,
-                                None,
-                                false,
-                            );
+                            let (_, galley) = git_path_label(ui, &stat.path, path_color, theme);
+                            path_galley = Some(galley);
                             fill_row(ui);
                         },
                     );
@@ -4894,6 +4879,7 @@ fn branch_diff_row(
         )
         .response
         .interact(egui::Sense::click());
+    let resp = git_path_tooltip(resp, path_galley.as_deref(), theme);
     paint_row_bg(ui, &resp, bg_idx, panel_x, theme, is_active);
     resp
 }
@@ -4910,8 +4896,9 @@ fn emphasis_family(e: &TextEmphasis, base: &egui::FontFamily) -> egui::FontFamil
     }
 }
 
-/// Add a truncating label, reporting its response and whether it had to
-/// ellipsize.
+/// Add a truncating label, reporting its response and the galley it painted —
+/// `elided` says whether the row had to ellipsize, `text()` spells the name out
+/// in full however the label abbreviated it.
 ///
 /// `egui::Label` offers an elided name as a tooltip by itself, but only to a
 /// widget the hit test marks hovered — and a row that senses its click
@@ -4919,20 +4906,23 @@ fn emphasis_family(e: &TextEmphasis, base: &egui::FontFamily) -> egui::FontFamil
 /// from them.  Laying the galley out here keeps both decisions with the row:
 /// which response carries the tooltip, and whether `[ui] sidebar_tooltips`
 /// wants one at all.
+///
+/// `fallback_color` paints whatever spans the text left uncolored.  Selection
+/// stays off whatever the surrounding style says: a selectable label unions
+/// drag into `sense` and takes the click its row is waiting for.
 fn truncating_label(
     ui: &mut egui::Ui,
-    text: RichText,
-    color: Color32,
+    text: impl Into<egui::WidgetText>,
+    fallback_color: Color32,
     sense: egui::Sense,
-) -> (egui::Response, bool) {
+) -> (egui::Response, Arc<egui::Galley>) {
     let (pos, galley, response) =
-        egui::Label::new(text.color(color)).truncate().sense(sense).layout_in_ui(ui);
+        egui::Label::new(text).truncate().selectable(false).sense(sense).layout_in_ui(ui);
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), galley.text())
     });
-    let elided = galley.elided;
-    ui.painter().galley(pos, galley, color);
-    (response, elided)
+    ui.painter().galley(pos, galley.clone(), fallback_color);
+    (response, galley)
 }
 
 /// Offer `name` as `resp`'s tooltip, as far as the configured mode allows.
@@ -4949,7 +4939,7 @@ fn name_tooltip(
     }
 }
 
-/// Paint a path as one truncating label.
+/// Lay a path out as the text of one truncating label.
 ///
 /// `Zed` needs two differently-formatted spans, and one `LayoutJob` is the
 /// only way to get them without an `item_spacing` gap between two labels, a
@@ -4957,27 +4947,21 @@ fn name_tooltip(
 /// overflow the width `row_with_trailing` is managing.  Putting the filename
 /// first only *prioritizes* it: epaint truncates the tail of one linear glyph
 /// stream, so a row narrower than the filename still elides it.
-fn path_label(
-    ui: &mut egui::Ui,
+fn path_text(
+    ui: &egui::Ui,
     path: &str,
     base: Color32,
     theme: &Theme,
     style: PathStyle,
     family: egui::FontFamily,
     home: Option<&str>,
-    selectable: bool,
-) -> egui::Response {
+) -> egui::WidgetText {
     if style != PathStyle::Zed {
-        return ui.add(
-            egui::Label::new(
-                RichText::new(path_style::render(path, style, home))
-                    .color(base)
-                    .family(family)
-                    .small(),
-            )
-            .truncate()
-            .selectable(selectable),
-        );
+        return RichText::new(path_style::render(path, style, home))
+            .color(base)
+            .family(family)
+            .small()
+            .into();
     }
 
     let size = egui::TextStyle::Small.resolve(ui.style()).size;
@@ -5006,7 +4990,59 @@ fn path_label(
     for (text, e) in zed_spans(&parts).into_iter().zip(emphases) {
         push(text, e);
     }
-    ui.add(egui::Label::new(job).truncate().selectable(selectable))
+    job.into()
+}
+
+/// The git panel's header path.  It stays selectable although the panel turns
+/// label selection off, and — being a header rather than a row — keeps
+/// `egui::Label`'s own elided-text tooltip instead of answering to
+/// `[ui] sidebar_tooltips`.
+fn path_header_label(
+    ui: &mut egui::Ui,
+    path: &str,
+    base: Color32,
+    theme: &Theme,
+    style: PathStyle,
+    home: Option<&str>,
+) -> egui::Response {
+    let text = path_text(ui, path, base, theme, style, egui::FontFamily::Proportional, home);
+    ui.add(egui::Label::new(text).truncate().selectable(true))
+}
+
+/// A git panel row's path, laid out rather than added as an `egui::Label` so
+/// its tooltip is the row's to give: the label covers only the text, and a
+/// pointer sweeping down the panel spends most of its time past the end of
+/// short paths, where a label-borne tooltip would go quiet.  The row passes the
+/// galley back through `git_path_tooltip` once it has its full-width response.
+fn git_path_label(
+    ui: &mut egui::Ui,
+    path: &str,
+    base: Color32,
+    theme: &Theme,
+) -> (egui::Response, Arc<egui::Galley>) {
+    let text = path_text(
+        ui,
+        path,
+        base,
+        theme,
+        theme.path_style.git_rows,
+        egui::FontFamily::Proportional,
+        None,
+    );
+    truncating_label(ui, text, base, egui::Sense::hover())
+}
+
+/// Offer the row's own response the path its label painted, once the row has
+/// one to hang it off.
+fn git_path_tooltip(
+    resp: egui::Response,
+    galley: Option<&egui::Galley>,
+    theme: &Theme,
+) -> egui::Response {
+    match galley {
+        Some(galley) => name_tooltip(resp, galley.text(), galley.elided, theme.sidebar_tooltips),
+        None => resp,
+    }
 }
 
 /// The Zed style's span decomposition: the filename text, then — when there
@@ -5913,10 +5949,13 @@ fn creating_row(ui: &mut egui::Ui, branch: &str, icons: &Icons, theme: &Theme) {
             ui,
             |ui| {
                 ui.label(RichText::new(&icons.worktree).color(theme.text_muted).size(10.0 * s));
-                ui.add(
-                    egui::Label::new(RichText::new(branch).color(theme.text_muted).small())
-                        .truncate(),
+                let (resp, galley) = truncating_label(
+                    ui,
+                    RichText::new(branch).color(theme.text_muted).small(),
+                    theme.text_muted,
+                    egui::Sense::hover(),
                 );
+                let _ = name_tooltip(resp, branch, galley.elided, theme.sidebar_tooltips);
             },
             |ui| {
                 ui.add(egui::Spinner::new().size(12.0 * s).color(theme.text_muted));
@@ -5986,12 +6025,13 @@ fn worktree_row(
                         default_icon,
                         is_active,
                     );
-                    (_, name_elided) = truncating_label(
+                    let (_, galley) = truncating_label(
                         ui,
-                        RichText::new(display_name).small(),
+                        RichText::new(display_name).small().color(name_color),
                         name_color,
                         egui::Sense::hover(),
                     );
+                    name_elided = galley.elided;
                 },
                 |ui| {
                     // Mid-removal the row is inert: swap its controls for a
@@ -6131,12 +6171,13 @@ fn session_row(
                         &icons.session,
                         row.is_active,
                     );
-                    (_, title_elided) = truncating_label(
+                    let (_, galley) = truncating_label(
                         ui,
-                        RichText::new(&row.title).small(),
+                        RichText::new(&row.title).small().color(title_color),
                         title_color,
                         egui::Sense::hover(),
                     );
+                    title_elided = galley.elided;
                 },
                 |ui| {
                     let btn = icon_button(ui, "×", theme.text_muted, theme)
@@ -9274,17 +9315,21 @@ mod tests {
     }
 
     /// The header must stay text-selectable exactly as it was before
-    /// `path_label` existed; a row must stay non-selectable so its own click
+    /// `path_text` existed; a row must stay non-selectable so its own click
     /// wins the hit test instead of a text drag-select. Both the plain and
     /// the `Zed` `LayoutJob` branch build their own label, so both are
     /// checked here.
     #[test]
-    fn path_label_selectability_matches_the_caller() {
-        let theme = Theme::from_config(&Config::default());
+    fn only_the_header_path_is_selectable() {
+        let mut config = Config::default();
         let ctx = egui::Context::default();
 
         for style in [PathStyle::Full, PathStyle::Zed] {
-            for selectable in [true, false] {
+            config.ui.path_style.git_header = style;
+            config.ui.path_style.git_rows = style;
+            let theme = Theme::from_config(&config);
+
+            for header in [true, false] {
                 let mut sense = None;
                 let input = egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
@@ -9295,25 +9340,29 @@ mod tests {
                 };
                 let _ = ctx.run(input, |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        let resp = path_label(
-                            ui,
-                            "path/to/file.txt",
-                            theme.text,
-                            &theme,
-                            style,
-                            egui::FontFamily::Proportional,
-                            None,
-                            selectable,
-                        );
-                        sense = Some(resp.sense);
+                        if header {
+                            let resp = path_header_label(
+                                ui,
+                                "path/to/file.txt",
+                                theme.text,
+                                &theme,
+                                style,
+                                None,
+                            );
+                            sense = Some(resp.sense);
+                        } else {
+                            let (resp, _) =
+                                git_path_label(ui, "path/to/file.txt", theme.text, &theme);
+                            sense = Some(resp.sense);
+                        }
                     });
                 });
 
-                let sense = sense.expect("path_label must run inside the panel closure");
+                let sense = sense.expect("the label must run inside the panel closure");
                 assert_eq!(
                     sense.senses_drag(),
-                    selectable,
-                    "style {style:?} selectable {selectable}: {sense:?}"
+                    header,
+                    "style {style:?} header {header}: {sense:?}"
                 );
             }
         }
@@ -9503,6 +9552,58 @@ mod tests {
             tooltip_shown(&texts, &row.title),
             "hovering the elided row painted no tooltip with the full title: {texts:?}"
         );
+    }
+
+    /// The git panel's rows answer to the same mode as the left sidebar's, so
+    /// a path the panel cut off is withheld under `off` and a path that fits
+    /// is still offered under `always`. Both row kinds are checked: the diff
+    /// row nests its path in a second layout to pin the +/- counts right, and
+    /// that is exactly the kind of nesting that can cost a row its hover.
+    #[test]
+    fn sidebar_tooltips_modes_bound_the_git_row_tooltip() {
+        let long = "alacritree/src/some/deeply/nested/module/file_name.rs";
+        let short = "README.md";
+
+        for (mode, path, want) in [
+            (SidebarTooltips::Off, long, false),
+            (SidebarTooltips::Elided, long, true),
+            (SidebarTooltips::Elided, short, false),
+            (SidebarTooltips::Always, long, true),
+            (SidebarTooltips::Always, short, true),
+        ] {
+            let mut config = Config::default();
+            config.ui.sidebar_tooltips = mode;
+            let theme = Theme::from_config(&config);
+            let palette = config.palette.clone();
+            let change = crate::git_status::FileChange {
+                path: path.to_owned(),
+                kind: crate::git_status::ChangeKind::Modified,
+            };
+            let stat =
+                crate::git_status::DiffStat { path: path.to_owned(), additions: 3, deletions: 1 };
+
+            for (kind, is_diff) in [("file", false), ("diff", true)] {
+                let texts = texts_while_hovering(140.0, |ui| {
+                    if is_diff {
+                        let _ = branch_diff_row(ui, &stat, &theme, &palette, false);
+                    } else {
+                        let _ = file_row(ui, &change, &theme, &palette, false);
+                    }
+                });
+
+                assert_eq!(
+                    row_elided(&texts, path),
+                    path == long,
+                    "{mode:?} on {kind} {path:?}: the harness must elide exactly the long \
+                     path: {texts:?}"
+                );
+                assert_eq!(
+                    tooltip_shown(&texts, path),
+                    want,
+                    "{mode:?} on {kind} {path:?}: {texts:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -559,6 +559,8 @@ fn parse_search_scope(raw: Option<&str>) -> SearchScope {
 }
 
 /// `[ui] sidebar_tooltips`: when a sidebar row offers its full name on hover.
+/// Governs both sidebars — a git panel row's path answers to it the same way a
+/// worktree or session name does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SidebarTooltips {
     /// Never — a name the panel cut off stays cut off.
@@ -1626,7 +1628,11 @@ impl RawConfig {
                 tabs_always: self.ui.session_display.tabs_always.unwrap_or(false),
             },
             pr_status: self.ui.pr_status.unwrap_or(false),
-            pr_status_concurrency: self.ui.pr_status_concurrency.unwrap_or(DEFAULT_CONCURRENCY).max(1),
+            pr_status_concurrency: self
+                .ui
+                .pr_status_concurrency
+                .unwrap_or(DEFAULT_CONCURRENCY)
+                .max(1),
             icons: build_icons(self.ui.icons),
             focus_outline: FocusOutline {
                 sidebar: self.ui.focus_outline.sidebar.unwrap_or(false),

@@ -330,7 +330,8 @@ search_scope       = "filtered"  # whether a sidebar search is confined by the
                                  # "all": a query reaches every row; the
                                  # toggles resume when it empties
 sidebar_tooltips   = "elided"    # when a sidebar row spells its full name out
-                                 # on hover
+                                 # on hover — both sidebars, so a git panel
+                                 # path answers to it like a worktree name
                                  # "elided" (default): only where the row had
                                  # to cut the name off
                                  # "always": on every row — a row without a
