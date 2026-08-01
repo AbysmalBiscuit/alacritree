@@ -16,8 +16,13 @@ use crate::clipboard_image;
 use crate::colors::rgb_to_color32;
 use crate::command_palette::{self, CommandPalette, PaletteAction, PaletteItem};
 use crate::config::{
-    Config, FontConfig, Icons, LastSessionClose, PathStyleConfig, ScrollbarStyle, SearchScope,
-    SidebarFocus, SidebarTooltips, TextEmphasis, UiFont,
+    Config, DEFAULT_HOME_ICON, DEFAULT_PR_CLOSED_ICON, DEFAULT_PR_DRAFT_ICON,
+    DEFAULT_PR_MERGED_ICON, DEFAULT_PR_OPEN_ICON, DEFAULT_PROJECT_COLLAPSED_ICON,
+    DEFAULT_PROJECT_EXPANDED_ICON, DEFAULT_SEARCH_ICON, DEFAULT_SESSION_ICON,
+    DEFAULT_UPSTREAM_DIVERGED_ICON, DEFAULT_UPSTREAM_GONE_ICON, DEFAULT_UPSTREAM_LEVEL_ICON,
+    DEFAULT_UPSTREAM_UNTRACKED_ICON, DEFAULT_WORKTREE_ICON, DEFAULT_WORKTREE_MAIN_ICON, FontConfig,
+    IconStyle, Icons, LastSessionClose, PathStyleConfig, ScrollbarStyle, SearchScope, SidebarFocus,
+    SidebarTooltips, TextEmphasis, UiFont,
 };
 use crate::doppler;
 use crate::file_drop;
@@ -3365,15 +3370,17 @@ impl AlacritreeApp {
                                     drag_handle(ui, &theme)
                                         .dnd_set_drag_payload(DraggedProject(project.root.clone()));
                                 }
-                                let (arrow, arrow_hint) = if project.expanded {
-                                    (icons.project_expanded.as_str(), "collapse project")
+                                let (arrow_style, arrow_default) = if project.expanded {
+                                    (&icons.project_expanded, DEFAULT_PROJECT_EXPANDED_ICON)
                                 } else {
-                                    (icons.project_collapsed.as_str(), "expand project")
+                                    (&icons.project_collapsed, DEFAULT_PROJECT_COLLAPSED_ICON)
                                 };
-                                if icon_tooltip(
-                                    icon_button(ui, arrow, theme.text_dim, &theme),
-                                    arrow_hint,
-                                    theme.icon_tooltips,
+                                if styled_icon_button(
+                                    ui,
+                                    arrow_style,
+                                    arrow_default,
+                                    theme.text_dim,
+                                    &theme,
                                 )
                                 .clicked()
                                 {
@@ -5148,12 +5155,13 @@ fn attention_dot(ui: &mut egui::Ui, theme: &Theme) {
 }
 
 /// Priority: attention dot > agent glyph (animated by the agent's own title
-/// updates) > the row's default marker.
+/// updates) > active highlight > the configured color > the built-in default.
 fn paint_row_status_icon(
     ui: &mut egui::Ui,
     theme: &Theme,
     attention: bool,
     agent_glyph: Option<char>,
+    style: &IconStyle,
     default_glyph: &str,
     is_active: bool,
 ) {
@@ -5162,22 +5170,23 @@ fn paint_row_status_icon(
         return;
     }
     let s = theme.ui_scale;
-    let (glyph, color) = match agent_glyph {
-        Some(g) => (g.to_string(), if is_active { theme.accent } else { theme.text }),
+    let (glyph, font, color) = match agent_glyph {
+        Some(g) => (
+            g.to_string(),
+            egui::FontId::proportional(10.0 * s),
+            if is_active { theme.accent } else { theme.text },
+        ),
         None => {
-            (default_glyph.to_string(), if is_active { theme.accent } else { theme.text_muted })
+            let (glyph, font, resolved) =
+                resolve_icon(style, default_glyph, theme.text_muted, 10.0, 10.0, theme);
+            let color = if is_active { theme.accent } else { resolved };
+            (glyph.to_string(), font, color)
         },
     };
     // Centered into the fixed slot, like `icon_button`: laying the glyph out as
     // text would size the slot to its advance width and shift the label with it.
     let (rect, _) = ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        glyph,
-        egui::FontId::proportional(10.0 * s),
-        color,
-    );
+    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, glyph, font, color);
 }
 
 /// Gap between adjacent `icon_button`s. They already pad their own glyph, so
@@ -5210,6 +5219,59 @@ fn icon_button(ui: &mut egui::Ui, glyph: &str, color: Color32, theme: &Theme) ->
         egui::FontId::proportional(12.0 * s),
         painted,
     );
+    resp
+}
+
+/// Resolve an icon's paint-time glyph, font, and color from its config and
+/// the site's built-in defaults.  `default_glyph` covers the case where a
+/// table styles a key without setting `glyph`.  `default_px` and `slot_px`
+/// are deliberately separate: `icon_button` paints its glyph at `12.0 *
+/// ui_scale` inside a `16.0 * ui_scale` slot, and conflating the two would
+/// resize every unconfigured icon while claiming pixel-identity.
+///
+/// One resolver, not one paint helper: `RichText` participates in layout
+/// while painter text draws into preallocated geometry, so each site keeps
+/// its own drawing call.
+fn resolve_icon<'a>(
+    style: &'a IconStyle,
+    default_glyph: &'a str,
+    default_color: Color32,
+    default_px: f32,
+    slot_px: f32,
+    theme: &Theme,
+) -> (&'a str, egui::FontId, Color32) {
+    let size = style.size.unwrap_or(default_px).min(slot_px) * theme.ui_scale;
+    let family = crate::fonts::ui_variant_family(style.bold, style.italic);
+    (
+        style.or_glyph(default_glyph),
+        egui::FontId::new(size, family),
+        style.color.unwrap_or(default_color),
+    )
+}
+
+/// `icon_button` for a configurable icon: same 16×16 slot and hover
+/// brightening, but the glyph, weight, slant, and size come from config.
+fn styled_icon_button(
+    ui: &mut egui::Ui,
+    style: &IconStyle,
+    default_glyph: &str,
+    color: Color32,
+    theme: &Theme,
+) -> egui::Response {
+    let s = theme.ui_scale;
+    let (glyph, font, color) = resolve_icon(style, default_glyph, color, 12.0, 16.0, theme);
+    let size = egui::vec2(16.0 * s, 16.0 * s);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let painted = if resp.hovered() {
+        Color32::from_rgb(
+            color.r().saturating_add(40),
+            color.g().saturating_add(40),
+            color.b().saturating_add(40),
+        )
+    } else {
+        color
+    };
+    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, glyph, font, painted);
     resp
 }
 
@@ -5341,7 +5403,7 @@ fn panel_header_filter_ui(
     ui: &mut egui::Ui,
     title: &str,
     filter: &PanelFilter,
-    search_icon: &str,
+    search_icon: &IconStyle,
     theme: &Theme,
     toggles_apply: bool,
 ) {
@@ -5358,7 +5420,21 @@ fn panel_header_filter_ui(
             .inner_margin(Margin::symmetric((4.0 * s).round() as i8, (1.0 * s).round() as i8))
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.x = 3.0 * s;
-                ui.label(RichText::new(search_icon).color(theme.text_dim).small());
+                // `TextStyle::Small`'s logical size is `font_normal`, unscaled —
+                // the same size `.small()` painted before this icon was
+                // configurable. The slot is generous (double that) since the
+                // icon sits in a frame that grows with its content rather
+                // than a fixed-pixel button.
+                let default_px = theme.font_normal / s;
+                let (glyph, font, color) = resolve_icon(
+                    search_icon,
+                    DEFAULT_SEARCH_ICON,
+                    theme.text_dim,
+                    default_px,
+                    default_px * 2.0,
+                    theme,
+                );
+                ui.label(RichText::new(glyph).color(color).font(font));
                 ui.label(
                     RichText::new(format!("{}▌", filter.query()))
                         .color(theme.text)
@@ -5497,6 +5573,7 @@ fn home_row(
                         attention,
                         agent_glyph,
                         &icons.home,
+                        DEFAULT_HOME_ICON,
                         is_active,
                     );
                     ui.label(
@@ -5996,7 +6073,15 @@ fn creating_row(ui: &mut egui::Ui, branch: &str, icons: &Icons, theme: &Theme) {
         row_with_trailing(
             ui,
             |ui| {
-                ui.label(RichText::new(&icons.worktree).color(theme.text_muted).size(10.0 * s));
+                let (glyph, font, color) = resolve_icon(
+                    &icons.worktree,
+                    DEFAULT_WORKTREE_ICON,
+                    theme.text_muted,
+                    10.0,
+                    10.0,
+                    theme,
+                );
+                ui.label(RichText::new(glyph).color(color).font(font));
                 let (resp, galley) = truncating_label(
                     ui,
                     RichText::new(branch).color(theme.text_muted).small(),
@@ -6017,36 +6102,44 @@ fn pr_badge<'a>(
     icons: &'a Icons,
     theme: &Theme,
     state: PrState,
-) -> (&'a str, Color32, &'static str) {
+) -> (&'a IconStyle, &'static str, Color32, &'static str) {
     match state {
-        PrState::Open => (&icons.pr_open, theme.pr_open, "open"),
-        PrState::Draft => (&icons.pr_draft, theme.pr_draft, "draft"),
-        PrState::Merged => (&icons.pr_merged, theme.pr_merged, "merged"),
-        PrState::Closed => (&icons.pr_closed, theme.pr_closed, "closed"),
+        PrState::Open => (&icons.pr_open, DEFAULT_PR_OPEN_ICON, theme.pr_open, "open"),
+        PrState::Draft => (&icons.pr_draft, DEFAULT_PR_DRAFT_ICON, theme.pr_draft, "draft"),
+        PrState::Merged => (&icons.pr_merged, DEFAULT_PR_MERGED_ICON, theme.pr_merged, "merged"),
+        PrState::Closed => (&icons.pr_closed, DEFAULT_PR_CLOSED_ICON, theme.pr_closed, "closed"),
     }
 }
 
-/// Badge glyph, color, and tooltip for an upstream state.  The tooltip names
+/// Badge style, color, and tooltip for an upstream state.  The tooltip names
 /// the upstream ref because the glyph cannot.
 fn upstream_badge<'a>(
     icons: &'a Icons,
     theme: &Theme,
     state: &UpstreamState,
-) -> (&'a str, Color32, String) {
+) -> (&'a IconStyle, &'static str, Color32, String) {
     match state {
-        UpstreamState::Level { upstream } => {
-            (&icons.upstream_level, theme.upstream_level, format!("tracks {upstream}"))
-        },
+        UpstreamState::Level { upstream } => (
+            &icons.upstream_level,
+            DEFAULT_UPSTREAM_LEVEL_ICON,
+            theme.upstream_level,
+            format!("tracks {upstream}"),
+        ),
         UpstreamState::Diverged { upstream, ahead, behind } => (
             &icons.upstream_diverged,
+            DEFAULT_UPSTREAM_DIVERGED_ICON,
             theme.upstream_diverged,
             format!("tracks {upstream} — {ahead} ahead, {behind} behind"),
         ),
-        UpstreamState::Gone { upstream } => {
-            (&icons.upstream_gone, theme.upstream_gone, format!("{upstream} is missing locally"))
-        },
+        UpstreamState::Gone { upstream } => (
+            &icons.upstream_gone,
+            DEFAULT_UPSTREAM_GONE_ICON,
+            theme.upstream_gone,
+            format!("{upstream} is missing locally"),
+        ),
         UpstreamState::Untracked => (
             &icons.upstream_untracked,
+            DEFAULT_UPSTREAM_UNTRACKED_ICON,
             theme.upstream_untracked,
             "no upstream configured".to_string(),
         ),
@@ -6081,7 +6174,11 @@ fn worktree_row(
     let frame = Frame::default().inner_margin(Margin { left: 16, right: 0, top: 3, bottom: 3 });
     let resp = frame
         .show(ui, |ui| {
-            let default_icon = if wt.is_main { &icons.worktree_main } else { &icons.worktree };
+            let (default_icon, default_glyph) = if wt.is_main {
+                (&icons.worktree_main, DEFAULT_WORKTREE_MAIN_ICON)
+            } else {
+                (&icons.worktree, DEFAULT_WORKTREE_ICON)
+            };
             let name_color = if wt.prunable || deleting {
                 theme.text_muted
             } else if is_active {
@@ -6098,6 +6195,7 @@ fn worktree_row(
                         attention,
                         agent_glyph,
                         default_icon,
+                        default_glyph,
                         is_active,
                     );
                     let (_, galley) = truncating_label(
@@ -6145,27 +6243,33 @@ fn worktree_row(
                         spawn_clicked = true;
                     }
                     if let Some(info) = pr {
-                        let (glyph, color, word) = pr_badge(icons, theme, info.state);
+                        let (style, default_glyph, color, word) =
+                            pr_badge(icons, theme, info.state);
+                        let (glyph, font, color) =
+                            resolve_icon(style, default_glyph, color, 10.0, 10.0, theme);
                         let (rect, resp) = ui
                             .allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
                         ui.painter().text(
                             rect.center(),
                             egui::Align2::CENTER_CENTER,
                             glyph,
-                            egui::FontId::proportional(10.0 * theme.ui_scale),
+                            font,
                             color,
                         );
                         resp.on_hover_text(format!("PR #{} — {word}", info.number));
                     }
                     if let Some(state) = wt.upstream.as_ref() {
-                        let (glyph, color, tip) = upstream_badge(icons, theme, state);
+                        let (style, default_glyph, color, tip) =
+                            upstream_badge(icons, theme, state);
+                        let (glyph, font, color) =
+                            resolve_icon(style, default_glyph, color, 10.0, 10.0, theme);
                         let (rect, resp) = ui
                             .allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
                         ui.painter().text(
                             rect.center(),
                             egui::Align2::CENTER_CENTER,
                             glyph,
-                            egui::FontId::proportional(10.0 * theme.ui_scale),
+                            font,
                             color,
                         );
                         resp.on_hover_text(tip);
@@ -6263,6 +6367,7 @@ fn session_row(
                         row.needs_attention,
                         row.agent_glyph,
                         &icons.session,
+                        DEFAULT_SESSION_ICON,
                         row.is_active,
                     );
                     let (_, galley) = truncating_label(
@@ -9655,6 +9760,180 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_configured_size_is_clamped_to_the_slot() {
+        let theme = Theme::from_config(&Config::default());
+        let style = IconStyle { size: Some(400.0), ..Default::default() };
+        let (_, font, _) = resolve_icon(&style, "○", Color32::WHITE, 10.0, 10.0, &theme);
+        assert!(
+            font.size <= 10.0 * theme.ui_scale,
+            "an oversized glyph must not overlap its neighbours"
+        );
+
+        let (_, font, _) = resolve_icon(&style, "×", Color32::WHITE, 12.0, 16.0, &theme);
+        assert!(font.size <= 16.0 * theme.ui_scale, "a button glyph clamps to its own 16px slot");
+    }
+
+    /// With no config, every icon must paint at exactly the size it does today —
+    /// buttons at 12 inside a 16 slot, status markers at 10.
+    #[test]
+    fn an_unconfigured_icon_keeps_its_current_size() {
+        let theme = Theme::from_config(&Config::default());
+        let style = IconStyle::default();
+        let (_, font, _) = resolve_icon(&style, "×", Color32::WHITE, 12.0, 16.0, &theme);
+        assert_eq!(font.size, 12.0 * theme.ui_scale);
+    }
+
+    #[test]
+    fn a_configured_color_wins_over_the_site_default() {
+        let theme = Theme::from_config(&Config::default());
+        let style = IconStyle { color: Some(Color32::RED), ..Default::default() };
+        let (_, _, color) = resolve_icon(&style, "○", Color32::WHITE, 10.0, 10.0, &theme);
+        assert_eq!(color, Color32::RED);
+    }
+
+    /// An unstyled icon must render `FontFamily::Proportional`, exactly what
+    /// every pre-existing call site painted before icons became configurable.
+    #[test]
+    fn an_unconfigured_icon_resolves_to_the_proportional_family() {
+        let theme = Theme::from_config(&Config::default());
+        let (_, font, _) =
+            resolve_icon(&IconStyle::default(), "○", Color32::WHITE, 10.0, 10.0, &theme);
+        assert_eq!(font.family, egui::FontFamily::Proportional);
+    }
+
+    /// `italic` alone (no `bold`) must resolve to the italic face, not the
+    /// bold-italic one — the two flags are independent inputs to
+    /// `ui_variant_family`.
+    #[test]
+    fn an_italic_icon_resolves_to_the_italic_family() {
+        let theme = Theme::from_config(&Config::default());
+        let style = IconStyle { italic: true, ..Default::default() };
+        let (_, font, _) = resolve_icon(&style, "○", Color32::WHITE, 10.0, 10.0, &theme);
+        assert_eq!(font.family, egui::FontFamily::Name(crate::fonts::UI_ITALIC_FAMILY.into()));
+    }
+
+    /// The search prompt derives its `resolve_icon` inputs from
+    /// `theme.font_normal` rather than a literal constant, since it used to
+    /// paint through `.small()`.  An unconfigured icon must still land on
+    /// exactly `font_normal`, matching what `TextStyle::Small` painted before
+    /// the icon became configurable.
+    #[test]
+    fn an_unconfigured_search_icon_matches_the_small_text_style_size() {
+        let theme = Theme::from_config(&Config::default());
+        let s = theme.ui_scale;
+        let default_px = theme.font_normal / s;
+        let (_, font, _) = resolve_icon(
+            &IconStyle::default(),
+            DEFAULT_SEARCH_ICON,
+            theme.text_dim,
+            default_px,
+            default_px * 2.0,
+            &theme,
+        );
+        assert_eq!(font.size, theme.font_normal);
+    }
+
+    /// A context with the three chrome variant families bound, as
+    /// `fonts::install_terminal_fonts` leaves it in the app.  egui panics on a
+    /// family it was never given, so any test that paints a bold/italic icon
+    /// needs them registered first.
+    fn ctx_with_ui_variant_faces() -> egui::Context {
+        let ctx = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        let mono = fonts.families[&egui::FontFamily::Monospace].clone();
+        for name in [
+            crate::fonts::UI_BOLD_FAMILY,
+            crate::fonts::UI_ITALIC_FAMILY,
+            crate::fonts::UI_BOLD_ITALIC_FAMILY,
+        ] {
+            fonts.families.insert(egui::FontFamily::Name(name.into()), mono.clone());
+        }
+        ctx.set_fonts(fonts);
+        ctx
+    }
+
+    /// The font family and paint color of the first shape whose text matches
+    /// `text`, or `None` if nothing painted it.
+    fn painted_glyph_style(
+        shapes: &[egui::epaint::ClippedShape],
+        text: &str,
+    ) -> Option<(egui::FontFamily, Color32)> {
+        fn walk(shape: &egui::Shape, text: &str, out: &mut Option<(egui::FontFamily, Color32)>) {
+            match shape {
+                egui::Shape::Text(t) => {
+                    if out.is_none() && t.galley.text() == text {
+                        let family = t.galley.job.sections[0].format.font_id.family.clone();
+                        let color = t.override_text_color.unwrap_or(t.fallback_color);
+                        *out = Some((family, color));
+                    }
+                },
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, text, out)),
+                _ => {},
+            }
+        }
+        let mut out = None;
+        for clipped in shapes {
+            walk(&clipped.shape, text, &mut out);
+        }
+        out
+    }
+
+    /// End-to-end: a worktree row painting an upstream badge styled with a
+    /// custom glyph, color, and weight through `upstream_badge` and
+    /// `resolve_icon` — proving the wiring, not just the resolver in isolation.
+    #[test]
+    fn a_styled_upstream_badge_paints_its_configured_glyph_color_and_weight() {
+        let theme = Theme::from_config(&Config::default());
+        let ctx = ctx_with_ui_variant_faces();
+        let mut icons = crate::config::Icons::default();
+        icons.upstream_gone = IconStyle {
+            glyph: Some("✕".to_string()),
+            color: Some(Color32::RED),
+            bold: true,
+            italic: false,
+            size: None,
+        };
+        let wt = crate::projects::Worktree {
+            name: "feature/x".to_owned(),
+            path: PathBuf::from("/repo/wt"),
+            branch: None,
+            is_main: false,
+            prunable: false,
+            upstream: Some(UpstreamState::Gone { upstream: "origin/x".into() }),
+            detached: false,
+        };
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(600.0, 200.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                worktree_row(
+                    ui, &wt, &wt.name, None, true, false, false, false, None, false, &icons, &theme,
+                );
+            });
+        });
+        let (family, color) =
+            painted_glyph_style(&output.shapes, "✕").expect("the configured glyph painted");
+        assert_eq!(family, egui::FontFamily::Name(crate::fonts::UI_BOLD_FAMILY.into()));
+        assert_eq!(color, Color32::RED);
+    }
+
+    /// Backward compatibility for the same badge, unconfigured: the built-in
+    /// glyph, the theme's built-in color, and the plain proportional family.
+    #[test]
+    fn an_unconfigured_upstream_badge_keeps_its_built_in_color_and_family() {
+        let theme = Theme::from_config(&Config::default());
+        let (family, color) = painted_glyph_style(&render_worktree_row_with_badges(), "✓")
+            .expect("the default glyph painted");
+        assert_eq!(family, egui::FontFamily::Proportional);
+        assert_eq!(color, theme.upstream_level);
+    }
+
     /// `[ui] sidebar_tooltips` bounds the row tooltip on both sides: `off`
     /// withholds a name the panel cut off, and `always` offers one even for a
     /// name that fits — which is what keeps a sweep down the list from losing
@@ -9704,14 +9983,14 @@ mod tests {
     fn the_upstream_tooltip_names_the_upstream_ref() {
         let icons = crate::config::Icons::default();
         let theme = Theme::from_config(&Config::default());
-        let (_, _, tip) = upstream_badge(
+        let (_, _, _, tip) = upstream_badge(
             &icons,
             &theme,
             &UpstreamState::Diverged { upstream: "origin/x".into(), ahead: 2, behind: 1 },
         );
         assert_eq!(tip, "tracks origin/x — 2 ahead, 1 behind");
 
-        let (_, _, tip) = upstream_badge(&icons, &theme, &UpstreamState::Untracked);
+        let (_, _, _, tip) = upstream_badge(&icons, &theme, &UpstreamState::Untracked);
         assert_eq!(tip, "no upstream configured");
     }
 

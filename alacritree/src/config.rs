@@ -475,7 +475,26 @@ fn text_emphasis(raw: &RawTextEmphasis) -> TextEmphasis {
 
 /// Text-presentation magnifier (U+2315).  Not in egui's bundled fonts; it
 /// resolves through the system fallback chain `fonts.rs` registers.
-const DEFAULT_SEARCH_ICON: &str = "⌕";
+pub(crate) const DEFAULT_SEARCH_ICON: &str = "⌕";
+
+/// Default glyphs for every other `[ui.icons]` key, shared between
+/// `Icons::default()` and the paint sites' `resolve_icon` fallback — a table
+/// override that styles a key without setting `glyph` still needs the real
+/// default to fall back to, not a blank string.
+pub(crate) const DEFAULT_WORKTREE_MAIN_ICON: &str = "●";
+pub(crate) const DEFAULT_WORKTREE_ICON: &str = "○";
+pub(crate) const DEFAULT_SESSION_ICON: &str = "▪";
+pub(crate) const DEFAULT_HOME_ICON: &str = "⌂";
+pub(crate) const DEFAULT_PROJECT_EXPANDED_ICON: &str = "▾";
+pub(crate) const DEFAULT_PROJECT_COLLAPSED_ICON: &str = "▸";
+pub(crate) const DEFAULT_PR_OPEN_ICON: &str = "⬤";
+pub(crate) const DEFAULT_PR_DRAFT_ICON: &str = "◯";
+pub(crate) const DEFAULT_PR_MERGED_ICON: &str = "⬤";
+pub(crate) const DEFAULT_PR_CLOSED_ICON: &str = "⬤";
+pub(crate) const DEFAULT_UPSTREAM_LEVEL_ICON: &str = "✓";
+pub(crate) const DEFAULT_UPSTREAM_DIVERGED_ICON: &str = "⇅";
+pub(crate) const DEFAULT_UPSTREAM_GONE_ICON: &str = "⌫";
+pub(crate) const DEFAULT_UPSTREAM_UNTRACKED_ICON: &str = "↑";
 
 /// What happens when the on-screen workspace's last session closes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -614,28 +633,29 @@ pub struct UiFont {
     pub bold_italic_family: Option<String>,
 }
 
-/// Sidebar status glyphs, each independently overridable from `[ui.icons]`.
-/// Overrides are trimmed and a blank value falls back to the default, so a
-/// row marker can never be rendered empty.  Action buttons (×, +, ↻, ⇅) are
-/// controls, not status, and stay fixed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Sidebar status glyphs, each independently overridable from `[ui.icons]`
+/// as a bare glyph or a table styling color/weight/slant/size.  An absent key
+/// falls back to the default below; a table with no `glyph` key keeps the
+/// default glyph but applies its own styling.  Action buttons (×, +, ↻, ⇅)
+/// are controls, not status, and stay fixed.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Icons {
     /// Glyph prefixing the sidebar search prompt.
-    pub search: String,
-    pub worktree_main: String,
-    pub worktree: String,
-    pub session: String,
-    pub home: String,
-    pub project_expanded: String,
-    pub project_collapsed: String,
-    pub pr_open: String,
-    pub pr_draft: String,
-    pub pr_merged: String,
-    pub pr_closed: String,
-    pub upstream_level: String,
-    pub upstream_diverged: String,
-    pub upstream_gone: String,
-    pub upstream_untracked: String,
+    pub search: IconStyle,
+    pub worktree_main: IconStyle,
+    pub worktree: IconStyle,
+    pub session: IconStyle,
+    pub home: IconStyle,
+    pub project_expanded: IconStyle,
+    pub project_collapsed: IconStyle,
+    pub pr_open: IconStyle,
+    pub pr_draft: IconStyle,
+    pub pr_merged: IconStyle,
+    pub pr_closed: IconStyle,
+    pub upstream_level: IconStyle,
+    pub upstream_diverged: IconStyle,
+    pub upstream_gone: IconStyle,
+    pub upstream_untracked: IconStyle,
 }
 
 /// `[ui.focus_outline]`: stroke a border around a panel while it owns
@@ -659,24 +679,29 @@ impl Default for FocusOutline {
     }
 }
 
+/// A default icon: just the glyph, no styling.
+fn glyph(g: &str) -> IconStyle {
+    IconStyle { glyph: Some(g.to_string()), ..Default::default() }
+}
+
 impl Default for Icons {
     fn default() -> Self {
         Self {
-            search: DEFAULT_SEARCH_ICON.into(),
-            worktree_main: "●".into(),
-            worktree: "○".into(),
-            session: "▪".into(),
-            home: "⌂".into(),
-            project_expanded: "▾".into(),
-            project_collapsed: "▸".into(),
-            pr_open: "⬤".into(),
-            pr_draft: "◯".into(),
-            pr_merged: "⬤".into(),
-            pr_closed: "⬤".into(),
-            upstream_level: "✓".into(),
-            upstream_diverged: "⇅".into(),
-            upstream_gone: "⌫".into(),
-            upstream_untracked: "↑".into(),
+            search: glyph(DEFAULT_SEARCH_ICON),
+            worktree_main: glyph(DEFAULT_WORKTREE_MAIN_ICON),
+            worktree: glyph(DEFAULT_WORKTREE_ICON),
+            session: glyph(DEFAULT_SESSION_ICON),
+            home: glyph(DEFAULT_HOME_ICON),
+            project_expanded: glyph(DEFAULT_PROJECT_EXPANDED_ICON),
+            project_collapsed: glyph(DEFAULT_PROJECT_COLLAPSED_ICON),
+            pr_open: glyph(DEFAULT_PR_OPEN_ICON),
+            pr_draft: glyph(DEFAULT_PR_DRAFT_ICON),
+            pr_merged: glyph(DEFAULT_PR_MERGED_ICON),
+            pr_closed: glyph(DEFAULT_PR_CLOSED_ICON),
+            upstream_level: glyph(DEFAULT_UPSTREAM_LEVEL_ICON),
+            upstream_diverged: glyph(DEFAULT_UPSTREAM_DIVERGED_ICON),
+            upstream_gone: glyph(DEFAULT_UPSTREAM_GONE_ICON),
+            upstream_untracked: glyph(DEFAULT_UPSTREAM_UNTRACKED_ICON),
         }
     }
 }
@@ -1373,53 +1398,53 @@ struct RawWsl {
     automount_root: Option<String>,
 }
 
-/// `[ui.icons]`: sidebar glyph overrides.  Any string works, so Nerd Font
-/// users can substitute their own icons.
+/// `[ui.icons]`: sidebar glyph overrides.  A bare string sets the glyph
+/// alone; a table also styles color/weight/slant/size.  Any glyph works, so
+/// Nerd Font users can substitute their own icons.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RawIcons {
-    search: Option<String>,
-    worktree_main: Option<String>,
-    worktree: Option<String>,
-    session: Option<String>,
-    home: Option<String>,
-    project_expanded: Option<String>,
-    project_collapsed: Option<String>,
-    pr_open: Option<String>,
-    pr_draft: Option<String>,
-    pr_merged: Option<String>,
-    pr_closed: Option<String>,
-    upstream_level: Option<String>,
-    upstream_diverged: Option<String>,
-    upstream_gone: Option<String>,
-    upstream_untracked: Option<String>,
+    search: Option<RawIconStyle>,
+    worktree_main: Option<RawIconStyle>,
+    worktree: Option<RawIconStyle>,
+    session: Option<RawIconStyle>,
+    home: Option<RawIconStyle>,
+    project_expanded: Option<RawIconStyle>,
+    project_collapsed: Option<RawIconStyle>,
+    pr_open: Option<RawIconStyle>,
+    pr_draft: Option<RawIconStyle>,
+    pr_merged: Option<RawIconStyle>,
+    pr_closed: Option<RawIconStyle>,
+    upstream_level: Option<RawIconStyle>,
+    upstream_diverged: Option<RawIconStyle>,
+    upstream_gone: Option<RawIconStyle>,
+    upstream_untracked: Option<RawIconStyle>,
 }
 
-/// A trimmed, non-blank override — or the default.
-fn icon_or(raw: Option<String>, default: &str) -> String {
-    raw.map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| default.to_string())
+/// An absent key falls back to the key's default style (glyph included); a
+/// present one always wins, even if it styles without setting `glyph`.
+fn style_or(raw: Option<RawIconStyle>, default: &IconStyle) -> IconStyle {
+    raw.map(IconStyle::from).unwrap_or_else(|| default.clone())
 }
 
 fn build_icons(raw: RawIcons) -> Icons {
     let d = Icons::default();
     Icons {
-        search: icon_or(raw.search, &d.search),
-        worktree_main: icon_or(raw.worktree_main, &d.worktree_main),
-        worktree: icon_or(raw.worktree, &d.worktree),
-        session: icon_or(raw.session, &d.session),
-        home: icon_or(raw.home, &d.home),
-        project_expanded: icon_or(raw.project_expanded, &d.project_expanded),
-        project_collapsed: icon_or(raw.project_collapsed, &d.project_collapsed),
-        pr_open: icon_or(raw.pr_open, &d.pr_open),
-        pr_draft: icon_or(raw.pr_draft, &d.pr_draft),
-        pr_merged: icon_or(raw.pr_merged, &d.pr_merged),
-        pr_closed: icon_or(raw.pr_closed, &d.pr_closed),
-        upstream_level: icon_or(raw.upstream_level, &d.upstream_level),
-        upstream_diverged: icon_or(raw.upstream_diverged, &d.upstream_diverged),
-        upstream_gone: icon_or(raw.upstream_gone, &d.upstream_gone),
-        upstream_untracked: icon_or(raw.upstream_untracked, &d.upstream_untracked),
+        search: style_or(raw.search, &d.search),
+        worktree_main: style_or(raw.worktree_main, &d.worktree_main),
+        worktree: style_or(raw.worktree, &d.worktree),
+        session: style_or(raw.session, &d.session),
+        home: style_or(raw.home, &d.home),
+        project_expanded: style_or(raw.project_expanded, &d.project_expanded),
+        project_collapsed: style_or(raw.project_collapsed, &d.project_collapsed),
+        pr_open: style_or(raw.pr_open, &d.pr_open),
+        pr_draft: style_or(raw.pr_draft, &d.pr_draft),
+        pr_merged: style_or(raw.pr_merged, &d.pr_merged),
+        pr_closed: style_or(raw.pr_closed, &d.pr_closed),
+        upstream_level: style_or(raw.upstream_level, &d.upstream_level),
+        upstream_diverged: style_or(raw.upstream_diverged, &d.upstream_diverged),
+        upstream_gone: style_or(raw.upstream_gone, &d.upstream_gone),
+        upstream_untracked: style_or(raw.upstream_untracked, &d.upstream_untracked),
     }
 }
 
@@ -2154,8 +2179,50 @@ mod tests {
 
     #[test]
     fn search_icon_defaults_and_overrides() {
-        assert_eq!(ui_from_toml("").icons.search, DEFAULT_SEARCH_ICON);
-        assert_eq!(ui_from_toml("[ui.icons]\nsearch = \"\u{f002}\"").icons.search, "\u{f002}");
+        assert_eq!(ui_from_toml("").icons.search.or_glyph(""), DEFAULT_SEARCH_ICON);
+        assert_eq!(
+            ui_from_toml("[ui.icons]\nsearch = \"\u{f002}\"").icons.search.or_glyph(""),
+            "\u{f002}"
+        );
+    }
+
+    #[test]
+    fn icons_defaults_are_unchanged_for_every_pre_existing_key() {
+        let ui = ui_from_toml("");
+        assert_eq!(ui.icons.worktree_main.or_glyph(""), "●");
+        assert_eq!(ui.icons.worktree.or_glyph(""), "○");
+        assert_eq!(ui.icons.session.or_glyph(""), "▪");
+        assert_eq!(ui.icons.home.or_glyph(""), "⌂");
+        assert_eq!(ui.icons.project_expanded.or_glyph(""), "▾");
+        assert_eq!(ui.icons.project_collapsed.or_glyph(""), "▸");
+        assert_eq!(ui.icons.pr_open.or_glyph(""), "⬤");
+        assert_eq!(ui.icons.pr_draft.or_glyph(""), "◯");
+    }
+
+    #[test]
+    fn a_bare_string_icon_override_parses_through_the_real_config_path() {
+        let ui = ui_from_toml("[ui.icons]\nworktree = \"◆\"");
+        assert_eq!(ui.icons.worktree.or_glyph("○"), "◆");
+        assert_eq!(ui.icons.worktree.color, None);
+        assert!(!ui.icons.worktree.bold);
+        // An untouched key keeps today's default glyph, unaffected by a
+        // sibling key's override.
+        assert_eq!(ui.icons.worktree_main.or_glyph(""), "●");
+    }
+
+    #[test]
+    fn a_table_icon_override_parses_glyph_color_weight_slant_and_size_through_the_real_config_path()
+    {
+        let ui = ui_from_toml(
+            "[ui.icons]\nupstream_gone = { glyph = \"⌫\", color = \"#ff5555\", bold = true, \
+             italic = true, size = 14 }",
+        );
+        let style = &ui.icons.upstream_gone;
+        assert_eq!(style.or_glyph(""), "⌫");
+        assert_eq!(style.color, Some(Color32::from_rgb(0xff, 0x55, 0x55)));
+        assert!(style.bold);
+        assert!(style.italic);
+        assert_eq!(style.size, Some(14.0));
     }
 
     #[derive(Deserialize)]
@@ -2611,40 +2678,40 @@ program = "second"
     fn icons_default_to_todays_glyphs() {
         let ui = ui_from_toml("");
         assert_eq!(ui.icons, Icons::default());
-        assert_eq!(ui.icons.worktree_main, "●");
-        assert_eq!(ui.icons.worktree, "○");
-        assert_eq!(ui.icons.session, "▪");
-        assert_eq!(ui.icons.home, "⌂");
-        assert_eq!(ui.icons.project_expanded, "▾");
-        assert_eq!(ui.icons.project_collapsed, "▸");
-        assert_eq!(ui.icons.pr_open, "⬤");
-        assert_eq!(ui.icons.pr_draft, "◯");
-        assert_eq!(ui.icons.pr_merged, "⬤");
-        assert_eq!(ui.icons.pr_closed, "⬤");
+        assert_eq!(ui.icons.worktree_main.or_glyph(""), "●");
+        assert_eq!(ui.icons.worktree.or_glyph(""), "○");
+        assert_eq!(ui.icons.session.or_glyph(""), "▪");
+        assert_eq!(ui.icons.home.or_glyph(""), "⌂");
+        assert_eq!(ui.icons.project_expanded.or_glyph(""), "▾");
+        assert_eq!(ui.icons.project_collapsed.or_glyph(""), "▸");
+        assert_eq!(ui.icons.pr_open.or_glyph(""), "⬤");
+        assert_eq!(ui.icons.pr_draft.or_glyph(""), "◯");
+        assert_eq!(ui.icons.pr_merged.or_glyph(""), "⬤");
+        assert_eq!(ui.icons.pr_closed.or_glyph(""), "⬤");
     }
 
     #[test]
     fn icon_overrides_apply_and_trim() {
         let ui = ui_from_toml("[ui.icons]\nworktree = \" W \"\nhome = \"H\"");
-        assert_eq!(ui.icons.worktree, "W");
-        assert_eq!(ui.icons.home, "H");
-        assert_eq!(ui.icons.worktree_main, "●", "untouched fields keep defaults");
+        assert_eq!(ui.icons.worktree.or_glyph(""), "W");
+        assert_eq!(ui.icons.home.or_glyph(""), "H");
+        assert_eq!(ui.icons.worktree_main.or_glyph(""), "●", "untouched fields keep defaults");
     }
 
     #[test]
     fn blank_icon_override_falls_back() {
         let ui = ui_from_toml("[ui.icons]\nworktree_main = \"   \"\nsession = \"\"");
-        assert_eq!(ui.icons.worktree_main, "●");
-        assert_eq!(ui.icons.session, "▪");
+        assert_eq!(ui.icons.worktree_main.or_glyph("●"), "●");
+        assert_eq!(ui.icons.session.or_glyph("▪"), "▪");
     }
 
     #[test]
     fn upstream_icons_have_defaults() {
         let ui = ui_from_toml("");
-        assert_eq!(ui.icons.upstream_level, "✓");
-        assert_eq!(ui.icons.upstream_diverged, "⇅");
-        assert_eq!(ui.icons.upstream_gone, "⌫");
-        assert_eq!(ui.icons.upstream_untracked, "↑");
+        assert_eq!(ui.icons.upstream_level.or_glyph(""), "✓");
+        assert_eq!(ui.icons.upstream_diverged.or_glyph(""), "⇅");
+        assert_eq!(ui.icons.upstream_gone.or_glyph(""), "⌫");
+        assert_eq!(ui.icons.upstream_untracked.or_glyph(""), "↑");
     }
 
     #[test]
