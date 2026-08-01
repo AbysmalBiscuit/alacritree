@@ -8697,7 +8697,6 @@ mod tests {
             is_main,
             prunable: false,
             upstream: None,
-            detached: false,
         };
         Project {
             root: PathBuf::from(root),
@@ -9737,7 +9736,6 @@ mod tests {
             is_main: false,
             prunable: false,
             upstream: None,
-            detached: false,
         };
 
         let texts = texts_while_hovering(140.0, |ui| {
@@ -9900,7 +9898,6 @@ mod tests {
             is_main: false,
             prunable: false,
             upstream: Some(UpstreamState::Gone { upstream: "origin/x".into() }),
-            detached: false,
         };
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -10031,7 +10028,6 @@ mod tests {
                 is_main: false,
                 prunable: false,
                 upstream: None,
-                detached: false,
             };
 
             let texts = texts_while_hovering(140.0, |ui| {
@@ -10077,7 +10073,6 @@ mod tests {
             is_main: false,
             prunable: false,
             upstream: Some(UpstreamState::Level { upstream: "origin/x".into() }),
-            detached: false,
         };
         let pr = PrInfo {
             number: 1,

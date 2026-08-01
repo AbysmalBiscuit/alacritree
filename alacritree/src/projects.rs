@@ -40,10 +40,6 @@ pub struct Worktree {
     /// Upstream state for `branch`, when the feature is enabled and the
     /// backend could answer.
     pub upstream: Option<crate::upstream::UpstreamState>,
-    /// HEAD points at a commit rather than a branch.  Required because
-    /// `branch` is *not* `None` here — both backends substitute a 7-character
-    /// short OID, which a branch-keyed lookup could collide with.
-    pub detached: bool,
 }
 
 /// A discovery result and whether it can be trusted to replace an existing
@@ -121,7 +117,6 @@ impl Project {
                 is_main: true,
                 prunable: false,
                 upstream: None,
-                detached: false,
             }],
             root,
             name,
@@ -173,17 +168,8 @@ impl Project {
                     .or_else(|| rec.head.as_ref().map(|h| h.chars().take(7).collect()));
                 let wt_name = if i == 0 { "main".to_string() } else { display_name(&path) };
                 let prunable = i != 0 && !path.is_dir();
-                let detached = rec.branch.is_none();
                 let upstream = rec.branch.as_deref().and_then(|b| upstreams.get(b).cloned());
-                Worktree {
-                    name: wt_name,
-                    path,
-                    branch,
-                    is_main: i == 0,
-                    prunable,
-                    upstream,
-                    detached,
-                }
+                Worktree { name: wt_name, path, branch, is_main: i == 0, prunable, upstream }
             })
             .collect();
 
@@ -222,7 +208,6 @@ impl Project {
             is_main: true,
             prunable: false,
             upstream,
-            detached,
         });
 
         if let Ok(names) = repo.worktrees() {
@@ -247,7 +232,6 @@ impl Project {
                         branch,
                         is_main: false,
                         upstream,
-                        detached,
                     });
                 }
             }
@@ -489,7 +473,6 @@ mod tests {
                 is_main: true,
                 prunable: false,
                 upstream: None,
-                detached: false,
             },
             Worktree {
                 name: "feature".to_string(),
@@ -498,7 +481,6 @@ mod tests {
                 is_main: false,
                 prunable: false,
                 upstream: None,
-                detached: false,
             },
         ];
 
@@ -660,10 +642,10 @@ worktree /home/lev/wt/tmp\0HEAD 0011223344556677\0detached\0\0";
         );
     }
 
-    /// The whole point of the `detached` flag: `branch` holds a short OID here,
-    /// and a real branch can be named the same thing.  Asserting only that the
-    /// *record* has no branch would pass against today's parser and prove
-    /// nothing — build the worktree and check the flag and the lookup.
+    /// A detached HEAD's `branch` holds a short OID, and a real branch can be
+    /// named the same thing.  Build a worktree where that collision actually
+    /// occurs and check the lookup, not just that the record has no branch —
+    /// the latter would pass against today's parser and prove nothing.
     #[test]
     fn a_detached_worktree_gets_no_badge_even_when_its_oid_looks_like_a_branch() {
         let dir = tempfile::tempdir().unwrap();
@@ -679,7 +661,6 @@ worktree /home/lev/wt/tmp\0HEAD 0011223344556677\0detached\0\0";
 
         let project = Project::discover(dir.path().to_path_buf(), true).project;
         let main = &project.worktrees[0];
-        assert!(main.detached, "a detached HEAD must be flagged");
         assert!(
             main.upstream.is_none(),
             "a detached row must not adopt the same-named branch's state"

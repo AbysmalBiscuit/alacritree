@@ -827,7 +827,6 @@ mod tests {
             is_main: false,
             prunable: false,
             upstream: None,
-            detached: false,
         }
     }
 
