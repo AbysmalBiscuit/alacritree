@@ -21,17 +21,6 @@ pub enum UpstreamState {
     Untracked,
 }
 
-impl UpstreamState {
-    pub fn upstream_name(&self) -> Option<&str> {
-        match self {
-            UpstreamState::Level { upstream }
-            | UpstreamState::Diverged { upstream, .. }
-            | UpstreamState::Gone { upstream } => Some(upstream),
-            UpstreamState::Untracked => None,
-        }
-    }
-}
-
 /// Parse the tab-delimited output of
 /// `git for-each-ref --format='%(refname:short)%09%(upstream:short)%09%(upstream:track,nobracket)'`.
 /// The track field is empty for a level branch, absent-upstream branches
@@ -151,24 +140,6 @@ fn shorten(refname: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn upstream_name_is_exposed_for_tracked_states_only() {
-        assert_eq!(
-            UpstreamState::Level { upstream: "origin/x".into() }.upstream_name(),
-            Some("origin/x")
-        );
-        assert_eq!(
-            UpstreamState::Diverged { upstream: "origin/x".into(), ahead: 1, behind: 2 }
-                .upstream_name(),
-            Some("origin/x")
-        );
-        assert_eq!(
-            UpstreamState::Gone { upstream: "origin/x".into() }.upstream_name(),
-            Some("origin/x")
-        );
-        assert_eq!(UpstreamState::Untracked.upstream_name(), None);
-    }
 
     #[test]
     fn parses_every_upstream_state() {
