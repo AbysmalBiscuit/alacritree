@@ -9460,9 +9460,9 @@ mod tests {
         assert!(theme.path_style.filename.bold);
     }
 
-    /// With no override, `attention` keeps painting from the palette, exactly
-    /// as it did before `sidebar_attention` existed; a configured color must
-    /// reach `Theme::attention`, not just the raw config field.
+    /// With no override, `attention` reads the palette's yellow slot; a
+    /// configured color must reach `Theme::attention`, not just the raw
+    /// config field.
     #[test]
     fn sidebar_attention_overrides_the_palette_default() {
         let default_theme = Theme::from_config(&Config::default());
