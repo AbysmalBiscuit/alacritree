@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use egui::{Context, FontData, FontDefinitions, FontFamily, FontTweak};
 
-use crate::config::FontConfig;
+use crate::config::{FontConfig, UiFont};
 
 /// Hard cap on fallback faces.  fontconfig's trimmed sort tops out at a few
 /// dozen on a typical system; this just bounds startup memory and parse cost
@@ -40,6 +40,14 @@ const UI_FONT_ID: &str = "alacritree_ui_normal";
 /// Temporary family the UI chain is assembled under before being spliced to
 /// the head of `Proportional`; removed again so it never leaks to egui.
 const UI_FAMILY: &str = "alacritree_ui";
+
+/// Registered variant families for chrome text.  Distinct from
+/// `BOLD_FAMILY`/`ITALIC_FAMILY`/`BOLD_ITALIC_FAMILY` (the terminal grid's
+/// variant faces) so a `[ui.font]` override never changes what bold/italic
+/// cells render in the terminal.
+pub const UI_BOLD_FAMILY: &str = "alacritree_ui_bold";
+pub const UI_ITALIC_FAMILY: &str = "alacritree_ui_italic";
+pub const UI_BOLD_ITALIC_FAMILY: &str = "alacritree_ui_bold_italic";
 
 #[derive(Clone, Copy)]
 enum Variant {
@@ -601,8 +609,12 @@ fn fallback_tweak(primary_ratio: Option<f32>, data: &[u8], index: u32) -> FontTw
 /// it.  `Monospace` (the grid) is untouched.  Returns `false` and leaves the
 /// definitions unchanged when the family cannot be resolved or read, in which
 /// case the chrome keeps using the terminal font.
-fn install_ui_font(defs: &mut FontDefinitions, family_or_path: &str, fonts: &SystemFonts) -> bool {
-    let Some(resolved) = resolve_ui_face(family_or_path, fonts) else {
+fn install_ui_normal_chain(
+    defs: &mut FontDefinitions,
+    family_or_path: &str,
+    fonts: &SystemFonts,
+) -> bool {
+    let Some(resolved) = resolve_ui_face(family_or_path, Variant::Normal, fonts) else {
         log::warn!("could not resolve ui font '{family_or_path}'; keeping the terminal font");
         return false;
     };
@@ -651,16 +663,115 @@ fn install_ui_font(defs: &mut FontDefinitions, family_or_path: &str, fonts: &Sys
     true
 }
 
+/// Splice `[ui.font] family` into `Proportional` when configured, then
+/// register the bold/italic/bold-italic chrome families unconditionally —
+/// they must exist even with no `[ui.font]` table so bold/italic chrome text
+/// has somewhere to resolve to.  Returns whether the normal chain installed.
+fn install_ui_font(defs: &mut FontDefinitions, ui: &UiFont, fonts: &SystemFonts) -> bool {
+    let installed = match ui.family.as_deref() {
+        Some(family_or_path) => install_ui_normal_chain(defs, family_or_path, fonts),
+        None => false,
+    };
+
+    install_ui_variant(defs, ui, Variant::Bold, UI_BOLD_FAMILY, BOLD_FAMILY, fonts);
+    install_ui_variant(defs, ui, Variant::Italic, UI_ITALIC_FAMILY, ITALIC_FAMILY, fonts);
+    install_ui_variant(
+        defs,
+        ui,
+        Variant::BoldItalic,
+        UI_BOLD_ITALIC_FAMILY,
+        BOLD_ITALIC_FAMILY,
+        fonts,
+    );
+
+    installed
+}
+
+/// Order is explicit because egui families cannot nest: the configured UI
+/// variant first, then the variant derived from the UI family, then the
+/// terminal's variant ids, then normal.  Deduplicated by id.
+fn install_ui_variant(
+    defs: &mut FontDefinitions,
+    ui: &UiFont,
+    variant: Variant,
+    ui_family_name: &str,
+    terminal_family: &str,
+    fonts: &SystemFonts,
+) {
+    let mut ids: Vec<String> = Vec::new();
+    let configured = match variant {
+        Variant::Bold => ui.bold_family.as_deref(),
+        Variant::Italic => ui.italic_family.as_deref(),
+        Variant::BoldItalic => ui.bold_italic_family.as_deref(),
+        Variant::Normal => None,
+    };
+    for candidate in configured.into_iter().chain(ui.family.as_deref()) {
+        let Some(resolved) = resolve_ui_face(candidate, variant, fonts) else {
+            continue;
+        };
+        let Ok(bytes) = map_font_file(&resolved.path) else {
+            continue;
+        };
+        // The normal UI face is validated before registration; a configured
+        // variant path pointing at non-font bytes would otherwise register
+        // and panic when egui parses it.
+        if !epaint_can_parse(bytes, resolved.face_index) {
+            log::warn!(
+                "ui {} font {} is not parseable; skipping",
+                variant.label(),
+                resolved.path.display()
+            );
+            continue;
+        }
+        let id = format!("{ui_family_name}_{}", ids.len());
+        insert_face(defs, &id, bytes, resolved.face_index);
+        ids.push(id);
+        // The configured family gets its own fallback chain registered
+        // against a scratch family before the inherited terminal ids below
+        // are appended, so the fallback machinery has somewhere to write to.
+        let mut book = FallbackBook::default();
+        book.loaded_faces.insert((resolved.path.clone(), resolved.face_index));
+        book.primary_height_ratio = face_height_ratio(bytes, resolved.face_index);
+        let target = FontFamily::Name(ui_family_name.into());
+        defs.families.insert(target.clone(), ids.clone());
+        register_fallback_faces(
+            defs,
+            candidate,
+            None,
+            variant,
+            &[target.clone()],
+            fonts,
+            &mut book,
+        );
+        ids = defs.families.remove(&target).unwrap_or(ids);
+    }
+    let inherited =
+        defs.families.get(&FontFamily::Name(terminal_family.into())).cloned().unwrap_or_default();
+    ids.extend(inherited);
+    ids.extend(defs.families.get(&FontFamily::Proportional).cloned().unwrap_or_default());
+
+    let mut seen = std::collections::HashSet::new();
+    ids.retain(|id| seen.insert(id.clone()));
+    defs.families.insert(FontFamily::Name(ui_family_name.into()), ids);
+}
+
+/// Maps ANSI-style bold/italic flags onto the chrome font family carrying
+/// that style; unstyled text keeps using `Proportional` directly.
+pub fn ui_variant_family(bold: bool, italic: bool) -> FontFamily {
+    match (bold, italic) {
+        (false, false) => FontFamily::Proportional,
+        (true, false) => FontFamily::Name(UI_BOLD_FAMILY.into()),
+        (false, true) => FontFamily::Name(UI_ITALIC_FAMILY.into()),
+        (true, true) => FontFamily::Name(UI_BOLD_ITALIC_FAMILY.into()),
+    }
+}
+
 /// Register the terminal faces with egui and return the normal-variant
 /// fallback chain, in the order egui consults it, for the colour glyph
 /// renderer to resolve against.
-pub fn install_terminal_fonts(
-    ctx: &Context,
-    font: &FontConfig,
-    ui_family: Option<&str>,
-) -> Vec<ChainFace> {
+pub fn install_terminal_fonts(ctx: &Context, font: &FontConfig, ui: &UiFont) -> Vec<ChainFace> {
     let fonts = SystemFonts::default();
-    match build_font_definitions(font, ui_family, &fonts) {
+    match build_font_definitions(font, ui, &fonts) {
         Some((defs, chain)) => {
             ctx.set_fonts(defs);
             chain
@@ -673,7 +784,7 @@ pub fn install_terminal_fonts(
 /// from the egui handoff so tests can inspect what registration produced.
 fn build_font_definitions(
     font: &FontConfig,
-    ui_family: Option<&str>,
+    ui: &UiFont,
     fonts: &SystemFonts,
 ) -> Option<(FontDefinitions, Vec<ChainFace>)> {
     let (normal, bold, italic, bold_italic) =
@@ -773,9 +884,10 @@ fn build_font_definitions(
         register_fallback_faces(&mut defs, family, style, variant, targets, fonts, &mut book);
     }
 
-    if let Some(ui_family) = ui_family {
-        install_ui_font(&mut defs, ui_family, fonts);
-    }
+    // The normal chain only splices when a UI font is configured, but the
+    // variant families must always exist — with no UI font they inherit the
+    // terminal's variant faces, which is what chrome text already renders with.
+    install_ui_font(&mut defs, ui, fonts);
 
     Some((defs, book.chain))
 }
@@ -1065,7 +1177,11 @@ fn resolve_face(
 /// out (fontdb can't see them), a fair trade for keeping typos on the
 /// terminal font.
 #[cfg(unix)]
-fn resolve_ui_face(family_or_path: &str, fonts: &SystemFonts) -> Option<ResolvedFace> {
+fn resolve_ui_face(
+    family_or_path: &str,
+    variant: Variant,
+    fonts: &SystemFonts,
+) -> Option<ResolvedFace> {
     if let Some(face) = resolve_via_path(family_or_path) {
         return Some(face);
     }
@@ -1073,18 +1189,22 @@ fn resolve_ui_face(family_or_path: &str, fonts: &SystemFonts) -> Option<Resolved
         family_or_path.to_ascii_lowercase().as_str(),
         "sans-serif" | "serif" | "monospace" | "cursive" | "fantasy" | "system-ui"
     );
-    let listed = resolve_via_fontdb(family_or_path, Variant::Normal, fonts);
+    let listed = resolve_via_fontdb(family_or_path, variant, fonts);
     if !generic && listed.is_none() {
         return None;
     }
-    fontconfig_resolve::resolve(family_or_path, None, Variant::Normal).or(listed)
+    fontconfig_resolve::resolve(family_or_path, None, variant).or(listed)
 }
 
 /// fontdb already matches family names literally, so the shared path is
 /// exactly as strict as the UI font needs.
 #[cfg(not(unix))]
-fn resolve_ui_face(family_or_path: &str, fonts: &SystemFonts) -> Option<ResolvedFace> {
-    resolve_face(family_or_path, None, Variant::Normal, fonts)
+fn resolve_ui_face(
+    family_or_path: &str,
+    variant: Variant,
+    fonts: &SystemFonts,
+) -> Option<ResolvedFace> {
+    resolve_face(family_or_path, None, variant, fonts)
 }
 
 #[cfg(not(unix))]
@@ -1312,7 +1432,8 @@ mod tests {
         let fonts = SystemFonts::with_cache_dir(None);
         let mono_before = defs.families[&FontFamily::Monospace].clone();
 
-        assert!(install_ui_font(&mut defs, path.to_string_lossy().as_ref(), &fonts));
+        let ui = UiFont { family: Some(path.to_string_lossy().into_owned()), ..UiFont::default() };
+        assert!(install_ui_font(&mut defs, &ui, &fonts));
 
         let prop = &defs.families[&FontFamily::Proportional];
         assert_eq!(prop.first().map(String::as_str), Some(UI_FONT_ID));
@@ -1330,9 +1451,42 @@ mod tests {
         let fonts = SystemFonts::with_cache_dir(None);
         let before = defs.families[&FontFamily::Proportional].clone();
 
-        assert!(!install_ui_font(&mut defs, "alacritree-no-such-ui-family-9f3a", &fonts));
+        let ui = UiFont {
+            family: Some("alacritree-no-such-ui-family-9f3a".to_string()),
+            ..UiFont::default()
+        };
+        assert!(!install_ui_font(&mut defs, &ui, &fonts));
 
         assert_eq!(defs.families[&FontFamily::Proportional], before);
+    }
+
+    /// An egui family is a flat vector of font ids — one family cannot reference
+    /// another — so each UI variant chain must physically contain the terminal
+    /// variant's ids, deduplicated, after its own faces.
+    #[test]
+    fn ui_variant_families_are_registered_and_deduplicated() {
+        let fonts = SystemFonts::with_cache_dir(None);
+        let mut defs = FontDefinitions::default();
+        let face = map_font_file(&write_parseable_font("ui_variant_test.ttf")).unwrap();
+        insert_face(&mut defs, NORMAL_FONT_ID, face, 0);
+        register_variant(&mut defs, BOLD_FONT_ID, BOLD_FAMILY, None, (face, 0));
+
+        install_ui_font(&mut defs, &UiFont::default(), &fonts);
+
+        for family in [UI_BOLD_FAMILY, UI_ITALIC_FAMILY, UI_BOLD_ITALIC_FAMILY] {
+            let ids = defs.families.get(&FontFamily::Name(family.into())).expect(family);
+            assert!(!ids.is_empty(), "{family} must resolve to at least one face");
+            let mut seen = std::collections::HashSet::new();
+            assert!(ids.iter().all(|id| seen.insert(id)), "{family} has duplicate ids");
+        }
+    }
+
+    #[test]
+    fn ui_variant_family_maps_the_style_flags() {
+        assert_eq!(ui_variant_family(false, false), FontFamily::Proportional);
+        assert_eq!(ui_variant_family(true, false), FontFamily::Name(UI_BOLD_FAMILY.into()));
+        assert_eq!(ui_variant_family(false, true), FontFamily::Name(UI_ITALIC_FAMILY.into()));
+        assert_eq!(ui_variant_family(true, true), FontFamily::Name(UI_BOLD_ITALIC_FAMILY.into()));
     }
 
     // epaint clones the whole buffer of every `Cow::Owned` face it parses, so
@@ -1400,7 +1554,7 @@ mod tests {
     #[test]
     fn every_registered_face_parses_like_epaint() {
         let ctx = Context::default();
-        install_terminal_fonts(&ctx, &FontConfig::default(), None);
+        install_terminal_fonts(&ctx, &FontConfig::default(), &UiFont::default());
         // The first pass is what forces epaint to parse every face.
         ctx.begin_pass(Default::default());
         let _ = ctx.end_pass();
@@ -1580,7 +1734,8 @@ mod tests {
             normal: crate::config::FontFace { family: Some(family), style: None },
             ..Default::default()
         };
-        let (defs, chain) = build_font_definitions(&config, None, &fonts).expect("family resolves");
+        let (defs, chain) =
+            build_font_definitions(&config, &UiFont::default(), &fonts).expect("family resolves");
 
         assert_eq!(defs.font_data[NORMAL_FONT_ID].index, resolved.face_index);
         assert_eq!(chain[0].face_index, resolved.face_index);

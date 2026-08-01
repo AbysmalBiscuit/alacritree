@@ -304,7 +304,7 @@ fn scale_rgba(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::FontConfig;
+    use crate::config::{FontConfig, UiFont};
 
     fn metrics() -> Metrics {
         Metrics { average_advance: 9.0, line_height: 20.0, descent: -4.0 }
@@ -339,7 +339,7 @@ mod tests {
             .collect(),
             ..FontConfig::default()
         };
-        let chain = crate::fonts::install_terminal_fonts(ctx, &font, None);
+        let chain = crate::fonts::install_terminal_fonts(ctx, &font, &UiFont::default());
 
         let renders_emoji = chain.iter().find_map(|face| {
             let data = std::fs::read(&face.path).ok()?;
@@ -432,7 +432,8 @@ mod tests {
     #[test]
     fn plain_text_is_left_to_egui() {
         let ctx = Context::default();
-        let chain = crate::fonts::install_terminal_fonts(&ctx, &FontConfig::default(), None);
+        let chain =
+            crate::fonts::install_terminal_fonts(&ctx, &FontConfig::default(), &UiFont::default());
         let mut cache = ColorGlyphCache::new(chain, 10);
         for c in ['A', 'z', '0', '─', '│'] {
             assert!(cache.get(&ctx, c, &metrics(), 1).is_none(), "{c} took the colour path");
