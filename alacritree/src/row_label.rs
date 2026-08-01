@@ -116,6 +116,8 @@ mod tests {
             branch: branch.map(str::to_string),
             is_main: false,
             prunable: false,
+            upstream: None,
+            detached: false,
         }
     }
 
@@ -250,6 +252,8 @@ mod tests {
             branch: Some("main".to_string()),
             is_main: true,
             prunable: false,
+            upstream: None,
+            detached: false,
         };
         let mut templates = LabelTemplates::new(Some("$path".to_string()), None);
         assert_eq!(templates.worktree_label(&wt, None), "/home/lev/Git/monorepo");

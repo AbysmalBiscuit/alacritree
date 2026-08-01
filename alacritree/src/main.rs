@@ -47,6 +47,7 @@ mod steady_state;
 mod terminal_view;
 #[cfg(test)]
 mod test_util;
+mod upstream;
 mod worktree;
 mod wsl;
 mod wsl_helper;

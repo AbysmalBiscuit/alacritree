@@ -206,6 +206,8 @@ pub(crate) mod tests {
                     branch: None,
                     is_main: false,
                     prunable: false,
+                    upstream: None,
+                    detached: false,
                 })
                 .collect(),
             expanded,

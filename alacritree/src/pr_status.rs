@@ -826,6 +826,8 @@ mod tests {
             branch: branch.map(String::from),
             is_main: false,
             prunable: false,
+            upstream: None,
+            detached: false,
         }
     }
 

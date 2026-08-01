@@ -8539,6 +8539,8 @@ mod tests {
             branch: None,
             is_main,
             prunable: false,
+            upstream: None,
+            detached: false,
         };
         Project {
             root: PathBuf::from(root),
@@ -9543,6 +9545,8 @@ mod tests {
             branch: None,
             is_main: false,
             prunable: false,
+            upstream: None,
+            detached: false,
         };
 
         let texts = texts_while_hovering(140.0, |ui| {
@@ -9607,6 +9611,8 @@ mod tests {
                 branch: None,
                 is_main: false,
                 prunable: false,
+                upstream: None,
+                detached: false,
             };
 
             let texts = texts_while_hovering(140.0, |ui| {

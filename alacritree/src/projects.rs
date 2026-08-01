@@ -36,6 +36,13 @@ pub struct Worktree {
     /// (`git worktree list` still shows it as prunable). Such a row cannot
     /// host a shell and only offers cleanup.
     pub prunable: bool,
+    /// Upstream state for `branch`, when the feature is enabled and the
+    /// backend could answer.
+    pub upstream: Option<crate::upstream::UpstreamState>,
+    /// HEAD points at a commit rather than a branch.  Required because
+    /// `branch` is *not* `None` here — both backends substitute a 7-character
+    /// short OID, which a branch-keyed lookup could collide with.
+    pub detached: bool,
 }
 
 /// A discovery result and whether it can be trusted to replace an existing
@@ -112,6 +119,8 @@ impl Project {
                 branch: None,
                 is_main: true,
                 prunable: false,
+                upstream: None,
+                detached: false,
             }],
             root,
             name,
@@ -153,7 +162,15 @@ impl Project {
                     .or_else(|| rec.head.as_ref().map(|h| h.chars().take(7).collect()));
                 let wt_name = if i == 0 { "main".to_string() } else { display_name(&path) };
                 let prunable = i != 0 && !path.is_dir();
-                Worktree { name: wt_name, path, branch, is_main: i == 0, prunable }
+                Worktree {
+                    name: wt_name,
+                    path,
+                    branch,
+                    is_main: i == 0,
+                    prunable,
+                    upstream: None,
+                    detached: false,
+                }
             })
             .collect();
 
@@ -183,6 +200,8 @@ impl Project {
             branch: current_branch(repo),
             is_main: true,
             prunable: false,
+            upstream: None,
+            detached: false,
         });
 
         if let Ok(names) = repo.worktrees() {
@@ -202,6 +221,8 @@ impl Project {
                         path,
                         branch,
                         is_main: false,
+                        upstream: None,
+                        detached: false,
                     });
                 }
             }
@@ -435,6 +456,8 @@ mod tests {
                 branch: None,
                 is_main: true,
                 prunable: false,
+                upstream: None,
+                detached: false,
             },
             Worktree {
                 name: "feature".to_string(),
@@ -442,6 +465,8 @@ mod tests {
                 branch: Some("feature".to_string()),
                 is_main: false,
                 prunable: false,
+                upstream: None,
+                detached: false,
             },
         ];
 
