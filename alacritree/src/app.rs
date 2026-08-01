@@ -10366,8 +10366,9 @@ mod tests {
         }
     }
 
-    /// An unconfigured action button must paint exactly what it painted as a
-    /// fixed glyph: same slot, same size, same proportional family.
+    /// An unconfigured action button paints its built-in glyph in the
+    /// proportional family, at 12px inside its 16px slot, in the site's
+    /// default colour.
     #[test]
     fn an_unconfigured_action_button_is_unchanged() {
         let theme = Theme::from_config(&Config::default());
@@ -10420,6 +10421,76 @@ mod tests {
         );
         assert_eq!(glyph, "×");
         assert_eq!(color, theme.text_muted);
+    }
+
+    /// A table that styles a key without setting `glyph` (color/weight only)
+    /// must still fall back to the site's `default_glyph` argument —
+    /// `Icons::default()` never exercises this path, since its glyph is
+    /// always set.
+    #[test]
+    fn a_glyphless_style_falls_back_to_the_site_default_glyph() {
+        let theme = Theme::from_config(&Config::default());
+        let style = IconStyle { color: Some(Color32::RED), bold: true, ..Default::default() };
+        let (glyph, font, color) =
+            resolve_icon(&style, DEFAULT_CLOSE_ICON, theme.text_muted, 12.0, 16.0, &theme);
+        assert_eq!(glyph, DEFAULT_CLOSE_ICON.as_str());
+        assert_eq!(color, Color32::RED);
+        assert_eq!(font.family, egui::FontFamily::Name(crate::fonts::UI_BOLD_FAMILY.into()));
+    }
+
+    /// End-to-end: the delete-worktree button in a real row paints its own
+    /// configured styling, and that styling does not leak onto the sibling
+    /// new-shell button — pinning the `icons.delete_worktree` binding at its
+    /// call site, not just `resolve_icon` in isolation. Wiring the wrong key
+    /// at that call site (e.g. `icons.close_session` where
+    /// `icons.delete_worktree` belongs) would still compile and still paint
+    /// a glyph, but this would fail.
+    #[test]
+    fn the_delete_worktree_button_paints_its_own_key_not_its_siblings() {
+        let theme = Theme::from_config(&Config::default());
+        let ctx = ctx_with_ui_variant_faces();
+        let mut icons = crate::config::Icons::default();
+        let distinctive = Color32::from_rgb(200, 30, 220);
+        icons.delete_worktree =
+            IconStyle { color: Some(distinctive), bold: true, ..Default::default() };
+        let wt = crate::projects::Worktree {
+            name: "feature/x".to_owned(),
+            path: PathBuf::from("/repo/wt"),
+            branch: None,
+            is_main: false,
+            prunable: false,
+            upstream: None,
+        };
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(600.0, 200.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                worktree_row(
+                    ui, &wt, &wt.name, None, true, false, false, false, None, false, &icons, &theme,
+                );
+            });
+        });
+
+        let (delete_family, _, delete_color) =
+            painted_glyph_style(&output.shapes, "×").expect("the delete button painted");
+        assert_eq!(
+            delete_color, distinctive,
+            "the delete button must paint icons.delete_worktree's configured colour"
+        );
+        assert_eq!(delete_family, egui::FontFamily::Name(crate::fonts::UI_BOLD_FAMILY.into()));
+
+        let (spawn_family, _, spawn_color) =
+            painted_glyph_style(&output.shapes, "+").expect("the new-shell button painted");
+        assert_eq!(
+            spawn_color, theme.text_muted,
+            "styling delete_worktree must not leak onto the sibling new-shell button"
+        );
+        assert_eq!(spawn_family, egui::FontFamily::Proportional);
     }
 
     /// `[ui] sidebar_tooltips` bounds the row tooltip on both sides: `off`

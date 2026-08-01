@@ -500,7 +500,7 @@ macro_rules! baked_glyphs {
     ($slice:ident: $($(#[$m:meta])* $name:ident = $glyph:literal;)*) => {
         $($(#[$m])* pub(crate) const $name: BakedGlyph = BakedGlyph($glyph);)*
         #[cfg(test)]
-        pub(crate) const $slice: &[BakedGlyph] = &[$(BakedGlyph($glyph)),*];
+        pub(crate) const $slice: &[BakedGlyph] = &[$($name),*];
     };
 }
 
