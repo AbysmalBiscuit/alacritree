@@ -522,13 +522,18 @@ table that styles it further:
 
 ```toml
 [ui.icons]
-upstream_gone = { glyph = "⌫", color = "#ff5555", bold = true, italic = false, size = 14 }
+upstream_gone = { glyph = "⌫", color = "#ff5555", bold = true, italic = false, size = 8 }
 ```
 
 `glyph` is optional in table form — a table with no `glyph` key keeps that
 icon's default glyph and only applies the styling. `size` is in logical
 pixels, measured before `ui_scale`, and is clamped to the space the sidebar
-row reserves for that icon, so it cannot grow past its slot.
+row reserves for that icon, so it cannot grow past its slot. Status markers
+and badges — `upstream_gone` above, and 11 other `[ui.icons]` keys covering
+worktree/session/home icons, PR badges, and the other upstream states — paint
+in a 10 px slot with a 10 px default, so `size` on those can only shrink.
+Only the project expand/collapse arrow (16 px slot, 12 px default) and the
+sidebar search icon can grow past their defaults.
 
 ### Shell launch profiles
 
