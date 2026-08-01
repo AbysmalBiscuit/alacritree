@@ -636,8 +636,11 @@ pub struct UiFont {
 /// Sidebar status glyphs, each independently overridable from `[ui.icons]`
 /// as a bare glyph or a table styling color/weight/slant/size.  An absent key
 /// falls back to the default below; a table with no `glyph` key keeps the
-/// default glyph but applies its own styling.  Action buttons (×, +, ↻, ⇅)
-/// are controls, not status, and stay fixed.
+/// default glyph but applies its own styling.  Action buttons (×, +, ↻) are
+/// controls, not status, and stay fixed. The projects panel's reorder toggle
+/// also paints a fixed glyph (⇅) that happens to match `upstream_diverged`'s
+/// default below — the two are unrelated, and reconfiguring one does not
+/// affect the other.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Icons {
     /// Glyph prefixing the sidebar search prompt.
@@ -706,9 +709,9 @@ impl Default for Icons {
     }
 }
 
-/// A sidebar icon's glyph and how to paint it.  Parses from a bare string
-/// (glyph only) or a table, so configs written before styling existed keep
-/// working unchanged.
+/// A sidebar icon's glyph and how to paint it.  Parses from a bare string,
+/// accepted as glyph-only, or a table that also styles color, weight, slant,
+/// and size.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct IconStyle {
     pub glyph: Option<String>,
