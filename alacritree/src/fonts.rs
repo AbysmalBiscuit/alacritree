@@ -35,6 +35,7 @@ pub const BOLD_ITALIC_FAMILY: &str = "alacritree_bold_italic";
 /// fonts lack them.  Appended last in each chrome family, so an installed
 /// font that already has a glyph keeps rendering it.
 const SYMBOLS_FONT: &[u8] = include_bytes!("../assets/alacritree-symbols.ttf");
+const SYMBOLS_ID: &str = "alacritree_symbols";
 
 const NORMAL_FONT_ID: &str = "alacritree_terminal_normal";
 const BOLD_FONT_ID: &str = "alacritree_terminal_bold";
@@ -429,6 +430,7 @@ impl FallbackBook {
 /// Whether `face` can hand egui an outline for `c`.  A face may claim a
 /// character in its cmap and still have nothing to draw for it, which is what
 /// makes a cell go blank.
+#[cfg(test)]
 pub(crate) fn face_outlines_char(face: &ChainFace, c: char) -> bool {
     let Ok(data) = std::fs::read(&face.path) else {
         return false;
@@ -758,6 +760,63 @@ fn install_ui_variant(
     defs.families.insert(FontFamily::Name(ui_family_name.into()), ids);
 }
 
+/// Append the bundled symbol face to each chrome family as the last resort.
+///
+/// Runs after every family is assembled, never during.  `install_ui_font`
+/// builds its chain under `UI_FAMILY` and then front-splices it into
+/// `Proportional`, so a face added there would land *ahead* of the
+/// terminal-derived fallbacks and override glyphs that already draw.
+///
+/// One font-data id per distinct height ratio among the targets: the ratio
+/// anchors `fallback_tweak` to whichever face heads that family, and bold or
+/// italic chrome can be a different face from normal.  Sharing bytes across
+/// ids is free — `FontData::from_static` borrows.
+fn install_symbol_fallback(defs: &mut FontDefinitions, ui: &UiFont) {
+    if !ui.builtin_symbols {
+        return;
+    }
+    if !epaint_can_parse(SYMBOLS_FONT, 0) {
+        log::warn!("bundled symbol font is not parseable; chrome falls back to system fonts");
+        return;
+    }
+
+    let targets = [
+        FontFamily::Proportional,
+        FontFamily::Name(UI_BOLD_FAMILY.into()),
+        FontFamily::Name(UI_ITALIC_FAMILY.into()),
+        FontFamily::Name(UI_BOLD_ITALIC_FAMILY.into()),
+    ];
+
+    let mut ids_by_ratio: Vec<(Option<u32>, String)> = Vec::new();
+    for family in targets {
+        let Some(existing) = defs.families.get(&family) else {
+            continue;
+        };
+        if existing.iter().any(|id| id.starts_with(SYMBOLS_ID)) {
+            continue;
+        }
+        // Quantized so ratios that differ only by float noise share one id.
+        let ratio = existing
+            .first()
+            .and_then(|id| defs.font_data.get(id))
+            .and_then(|d| face_height_ratio(&d.font, d.index))
+            .map(|r| (r * 1000.0).round() as u32);
+
+        let id = match ids_by_ratio.iter().find(|(r, _)| *r == ratio) {
+            Some((_, id)) => id.clone(),
+            None => {
+                let id = format!("{SYMBOLS_ID}_{}", ids_by_ratio.len());
+                let tweak = fallback_tweak(ratio.map(|r| r as f32 / 1000.0), SYMBOLS_FONT, 0);
+                let data = FontData { index: 0, tweak, ..FontData::from_static(SYMBOLS_FONT) };
+                defs.font_data.insert(id.clone(), Arc::new(data));
+                ids_by_ratio.push((ratio, id.clone()));
+                id
+            },
+        };
+        defs.families.entry(family).or_default().push(id);
+    }
+}
+
 /// Maps ANSI-style bold/italic flags onto the chrome font family carrying
 /// that style; unstyled text keeps using `Proportional` directly.
 pub fn ui_variant_family(bold: bool, italic: bool) -> FontFamily {
@@ -780,7 +839,7 @@ pub fn install_terminal_fonts(ctx: &Context, font: &FontConfig, ui: &UiFont) -> 
             chain
         },
         None => {
-            install_unresolvable_font_fallback(ctx);
+            ctx.set_fonts(unresolvable_font_definitions(ui));
             Vec::new()
         },
     }
@@ -792,7 +851,9 @@ pub fn install_terminal_fonts(ctx: &Context, font: &FontConfig, ui: &UiFont) -> 
 /// this, `ctx.set_fonts` is never called, so `alacritree_*`/`alacritree_ui_*`
 /// are unbound names — egui panics the moment anything paints a bold or
 /// italic cell or icon, rather than just falling back to the wrong face.
-fn install_unresolvable_font_fallback(ctx: &Context) {
+/// Separated from the egui handoff so tests can inspect what the aliasing
+/// produced, the same way `build_font_definitions` is.
+fn unresolvable_font_definitions(ui: &UiFont) -> FontDefinitions {
     let mut defs = FontDefinitions::default();
     let monospace = defs.families[&FontFamily::Monospace].clone();
     let proportional = defs.families[&FontFamily::Proportional].clone();
@@ -802,7 +863,8 @@ fn install_unresolvable_font_fallback(ctx: &Context) {
     for name in [UI_BOLD_FAMILY, UI_ITALIC_FAMILY, UI_BOLD_ITALIC_FAMILY] {
         defs.families.insert(FontFamily::Name(name.into()), proportional.clone());
     }
-    ctx.set_fonts(defs);
+    install_symbol_fallback(&mut defs, ui);
+    defs
 }
 
 /// Resolve and register every face for `install_terminal_fonts`, separated
@@ -910,6 +972,7 @@ fn build_font_definitions(
     }
 
     install_ui_font(&mut defs, ui, fonts);
+    install_symbol_fallback(&mut defs, ui);
 
     Some((defs, book.chain))
 }
@@ -2006,6 +2069,106 @@ mod tests {
         assert_eq!(baked_glyphs().len(), 29, "assets/README.md lists the codepoints");
     }
 
+    /// Last position is the whole guarantee: an earlier face that already draws
+    /// a glyph must keep drawing it.  Front-splicing the baked face would
+    /// override working chrome instead of filling gaps.
+    #[test]
+    fn the_symbol_face_lands_last_in_every_chrome_family() {
+        let path = write_parseable_font("alacritree_test_symbol_order.ttf");
+        let mut defs = FontDefinitions::default();
+        let fonts = SystemFonts::with_cache_dir(None);
+        let ui = UiFont { family: Some(path.to_string_lossy().into_owned()), ..UiFont::default() };
+        assert!(install_ui_font(&mut defs, &ui, &fonts));
+        install_symbol_fallback(&mut defs, &ui);
+
+        for family in [
+            FontFamily::Proportional,
+            FontFamily::Name(UI_BOLD_FAMILY.into()),
+            FontFamily::Name(UI_ITALIC_FAMILY.into()),
+            FontFamily::Name(UI_BOLD_ITALIC_FAMILY.into()),
+        ] {
+            let ids = defs.families.get(&family).unwrap_or_else(|| panic!("{family:?} exists"));
+            let at: Vec<usize> = ids
+                .iter()
+                .enumerate()
+                .filter(|(_, id)| id.starts_with(SYMBOLS_ID))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(at.len(), 1, "{family:?} must carry exactly one symbol id, got {ids:?}");
+            assert_eq!(at[0], ids.len() - 1, "{family:?} must carry it last, got {ids:?}");
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The grid keeps its own chain; a symbol face there would change how
+    /// existing terminal output renders.
+    #[test]
+    fn the_symbol_face_stays_out_of_the_terminal_families() {
+        let mut defs = FontDefinitions::default();
+        install_symbol_fallback(&mut defs, &UiFont::default());
+        for family in [
+            FontFamily::Monospace,
+            FontFamily::Name(BOLD_FAMILY.into()),
+            FontFamily::Name(ITALIC_FAMILY.into()),
+            FontFamily::Name(BOLD_ITALIC_FAMILY.into()),
+        ] {
+            let ids = defs.families.get(&family).cloned().unwrap_or_default();
+            assert!(!ids.iter().any(|id| id.starts_with(SYMBOLS_ID)), "{family:?} got {ids:?}");
+        }
+    }
+
+    /// Refusing the face must leave registration exactly as it was.
+    #[test]
+    fn refusing_builtin_symbols_registers_nothing() {
+        let mut defs = FontDefinitions::default();
+        let before = defs.families.clone();
+        install_symbol_fallback(&mut defs, &UiFont { builtin_symbols: false, ..UiFont::default() });
+        assert_eq!(defs.families, before);
+        assert!(!defs.font_data.keys().any(|id| id.starts_with(SYMBOLS_ID)));
+    }
+
+    /// Running twice must not stack a second copy.
+    #[test]
+    fn installing_the_symbol_face_twice_is_idempotent() {
+        let mut defs = FontDefinitions::default();
+        install_symbol_fallback(&mut defs, &UiFont::default());
+        let once = defs.families[&FontFamily::Proportional].clone();
+        install_symbol_fallback(&mut defs, &UiFont::default());
+        assert_eq!(defs.families[&FontFamily::Proportional], once);
+    }
+
+    /// Appending cannot move a family's metrics, which are read from its first
+    /// font.  A future change that front-loads the face would silently alter
+    /// line height for every chrome label.
+    #[test]
+    fn the_symbol_face_does_not_become_the_metrics_source() {
+        let mut defs = FontDefinitions::default();
+        let head_before = defs.families[&FontFamily::Proportional].first().cloned();
+        install_symbol_fallback(&mut defs, &UiFont::default());
+        assert_eq!(defs.families[&FontFamily::Proportional].first().cloned(), head_before);
+    }
+
+    /// When no configured font resolves, the chrome families are aliased to
+    /// egui's bundled defaults.  That is precisely when a system is least likely
+    /// to have the glyphs, so the face has to reach this path too.
+    #[test]
+    fn the_unresolvable_font_path_still_gets_the_symbol_face() {
+        let defs = unresolvable_font_definitions(&UiFont::default());
+        for family in [
+            FontFamily::Proportional,
+            FontFamily::Name(UI_BOLD_FAMILY.into()),
+            FontFamily::Name(UI_ITALIC_FAMILY.into()),
+            FontFamily::Name(UI_BOLD_ITALIC_FAMILY.into()),
+        ] {
+            let ids = defs.families.get(&family).unwrap_or_else(|| panic!("{family:?} exists"));
+            assert_eq!(
+                ids.iter().position(|id| id.starts_with(SYMBOLS_ID)),
+                Some(ids.len() - 1),
+                "{family:?} must carry the symbol id last, got {ids:?}"
+            );
+        }
+    }
+
     /// Counts every glyph the crate paints from its own constants, deduplicated.
     #[cfg(test)]
     fn baked_glyphs() -> Vec<char> {
@@ -2020,25 +2183,16 @@ mod tests {
         seen
     }
 
-    /// `ttf_parser::OutlineBuilder` that records only whether anything was drawn.
+    /// `outline_glyph` reports whether a glyph has an outline through its
+    /// return value, so the builder itself has nothing to record.
     #[derive(Default)]
-    struct OutlineExtents {
-        drawn: bool,
-    }
+    struct OutlineExtents;
 
     impl ttf_parser::OutlineBuilder for OutlineExtents {
-        fn move_to(&mut self, _: f32, _: f32) {
-            self.drawn = true;
-        }
-        fn line_to(&mut self, _: f32, _: f32) {
-            self.drawn = true;
-        }
-        fn quad_to(&mut self, _: f32, _: f32, _: f32, _: f32) {
-            self.drawn = true;
-        }
-        fn curve_to(&mut self, _: f32, _: f32, _: f32, _: f32, _: f32, _: f32) {
-            self.drawn = true;
-        }
+        fn move_to(&mut self, _: f32, _: f32) {}
+        fn line_to(&mut self, _: f32, _: f32) {}
+        fn quad_to(&mut self, _: f32, _: f32, _: f32, _: f32) {}
+        fn curve_to(&mut self, _: f32, _: f32, _: f32, _: f32, _: f32, _: f32) {}
         fn close(&mut self) {}
     }
 }
