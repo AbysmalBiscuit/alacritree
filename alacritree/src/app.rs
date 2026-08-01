@@ -9182,7 +9182,7 @@ mod tests {
     #[test]
     fn ui_text_px_overrides_from_ui_font_size() {
         let font = crate::config::FontConfig::default();
-        let ui = crate::config::UiFont { family: None, size: Some(12.0) };
+        let ui = crate::config::UiFont { size: Some(12.0), ..Default::default() };
         let (normal, heading) = ui_text_px(&font, &ui);
         assert_eq!(normal, 16.0); // 12 pt × 96/72
         assert_eq!(

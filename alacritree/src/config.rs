@@ -606,6 +606,12 @@ pub struct UiFont {
     pub family: Option<String>,
     /// Typographic points, same unit as `[font] size`; clamped to ≥ 1.0.
     pub size: Option<f32>,
+    /// Family used for bold chrome text; falls back to `family` when unset.
+    pub bold_family: Option<String>,
+    /// Family used for italic chrome text; falls back to `family` when unset.
+    pub italic_family: Option<String>,
+    /// Family used for bold-italic chrome text; falls back to `family` when unset.
+    pub bold_italic_family: Option<String>,
 }
 
 /// Sidebar status glyphs, each independently overridable from `[ui.icons]`.
@@ -1420,6 +1426,9 @@ struct RawSessionDisplay {
 struct RawUiFont {
     family: Option<String>,
     size: Option<f32>,
+    bold_family: Option<String>,
+    italic_family: Option<String>,
+    bold_italic_family: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1831,6 +1840,14 @@ impl RawConfig {
         let ui_font = UiFont {
             family: self.ui.font.family.clone().filter(|f| !f.trim().is_empty()),
             size: self.ui.font.size.map(|s| s.max(1.0)),
+            bold_family: self.ui.font.bold_family.clone().filter(|f| !f.trim().is_empty()),
+            italic_family: self.ui.font.italic_family.clone().filter(|f| !f.trim().is_empty()),
+            bold_italic_family: self
+                .ui
+                .font
+                .bold_italic_family
+                .clone()
+                .filter(|f| !f.trim().is_empty()),
         };
 
         // ---- Profiles ----
@@ -2484,6 +2501,20 @@ program = "second"
     fn blank_ui_font_family_is_ignored() {
         let config = parse("[ui.font]\nfamily = \"  \"");
         assert_eq!(config.ui_font.family, None);
+    }
+
+    #[test]
+    fn ui_font_variant_families_parse_and_default_to_none() {
+        let config = parse("[ui.font]\nfamily = \"Inter\"\nbold_family = \"Inter Display\"");
+        assert_eq!(config.ui_font.bold_family.as_deref(), Some("Inter Display"));
+        assert_eq!(config.ui_font.italic_family, None);
+        assert_eq!(config.ui_font.bold_italic_family, None);
+    }
+
+    #[test]
+    fn blank_ui_font_variant_families_are_ignored() {
+        let config = parse("[ui.font]\nbold_family = \"  \"");
+        assert_eq!(config.ui_font.bold_family, None);
     }
 
     #[test]
