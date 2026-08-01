@@ -150,7 +150,7 @@ impl Theme {
             text_muted,
             accent,
             attention,
-            pr_open: rgb_to_color32(config.palette.normal[2]),   // green
+            pr_open: rgb_to_color32(config.palette.normal[2]), // green
             pr_draft: text_muted,
             pr_merged: rgb_to_color32(config.palette.normal[5]), // magenta
             pr_closed: rgb_to_color32(config.palette.normal[1]), // red
@@ -9788,8 +9788,8 @@ mod tests {
         assert!(font.size <= 16.0 * theme.ui_scale, "a button glyph clamps to its own 16px slot");
     }
 
-    /// With no config, every icon must paint at exactly the size it does today —
-    /// buttons at 12 inside a 16 slot, status markers at 10.
+    /// With no config, every icon paints at its built-in size: buttons at 12
+    /// inside a 16 slot, status markers at 10.
     #[test]
     fn an_unconfigured_icon_keeps_its_current_size() {
         let theme = Theme::from_config(&Config::default());
@@ -9919,8 +9919,8 @@ mod tests {
         assert_eq!(color, Color32::RED);
     }
 
-    /// Backward compatibility for the same badge, unconfigured: the built-in
-    /// glyph, the theme's built-in color, and the plain proportional family.
+    /// The same badge unconfigured: the built-in glyph, the theme's built-in
+    /// color, and the plain proportional family.
     #[test]
     fn an_unconfigured_upstream_badge_keeps_its_built_in_color_and_family() {
         let theme = Theme::from_config(&Config::default());

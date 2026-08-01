@@ -1454,8 +1454,8 @@ fn build_icons(raw: RawIcons) -> Icons {
 }
 
 /// A styled icon override: either a bare glyph string (`worktree = "◆"`) or a
-/// table (`worktree = { glyph = "◆", color = "#ff5555", bold = true }`), so
-/// existing bare-string configs keep parsing unchanged.
+/// table (`worktree = { glyph = "◆", color = "#ff5555", bold = true }`).  The
+/// bare form is listed first so a plain string never attempts the table arm.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum RawIconStyle {
@@ -2212,8 +2212,8 @@ mod tests {
         assert_eq!(ui.icons.worktree.or_glyph("○"), "◆");
         assert_eq!(ui.icons.worktree.color, None);
         assert!(!ui.icons.worktree.bold);
-        // An untouched key keeps today's default glyph, unaffected by a
-        // sibling key's override.
+        // An untouched key keeps its default glyph, unaffected by a sibling
+        // key's override.
         assert_eq!(ui.icons.worktree_main.or_glyph(""), "●");
     }
 
