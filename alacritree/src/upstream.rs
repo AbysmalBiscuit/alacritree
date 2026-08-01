@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+use git2::{BranchType, Repository};
+
 /// What a branch's configured upstream is doing.  Nothing here contacts a
 /// remote, so every state describes local refs only.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +94,60 @@ fn parse_track_counts(track: &str) -> Option<(usize, usize)> {
     parsed.then_some((ahead, behind))
 }
 
+/// Every linked worktree of a project shares `refs/heads` and `refs/remotes`,
+/// so one walk of the project's local branches answers for every row.
+pub fn map_from_repo(repo: &Repository) -> HashMap<String, UpstreamState> {
+    let mut map = HashMap::new();
+    let Ok(branches) = repo.branches(Some(BranchType::Local)) else {
+        return map;
+    };
+    for (branch, _) in branches.flatten() {
+        let Some(name) = branch.name().ok().flatten() else {
+            continue;
+        };
+        let name = name.to_string();
+        let refname = format!("refs/heads/{name}");
+        let state = match branch.upstream() {
+            Ok(upstream) => tracked_state(repo, &branch, &upstream),
+            // The tracking ref did not resolve.  Config still decides whether
+            // an upstream was ever configured.
+            Err(_) => Some(match repo.branch_upstream_name(&refname) {
+                Ok(buf) => UpstreamState::Gone { upstream: shorten(buf.as_str().unwrap_or("")) },
+                Err(_) => UpstreamState::Untracked,
+            }),
+        };
+        // A branch we could not answer for gets no entry, so the row paints
+        // no badge rather than a wrong one.
+        if let Some(state) = state {
+            map.insert(name, state);
+        }
+    }
+    map
+}
+
+fn tracked_state(
+    repo: &Repository,
+    branch: &git2::Branch<'_>,
+    upstream: &git2::Branch<'_>,
+) -> Option<UpstreamState> {
+    let name = upstream.name().ok().flatten().unwrap_or_default().to_string();
+    let (Some(local), Some(remote)) = (branch.get().target(), upstream.get().target()) else {
+        return None;
+    };
+    match repo.graph_ahead_behind(local, remote) {
+        Ok((0, 0)) => Some(UpstreamState::Level { upstream: name }),
+        Ok((ahead, behind)) => Some(UpstreamState::Diverged { upstream: name, ahead, behind }),
+        // Failing to walk the graph is not evidence the branches are level.
+        // No entry means no badge, which is what an unanswerable state looks
+        // like everywhere else.
+        Err(_) => None,
+    }
+}
+
+fn shorten(refname: &str) -> String {
+    refname.strip_prefix("refs/remotes/").unwrap_or(refname).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +218,77 @@ mod tests {
     fn an_unreadable_track_string_yields_no_entry() {
         assert!(parse_for_each_ref(b"b\torigin/b\tvorne 2\n").is_empty());
         assert!(parse_for_each_ref(b"b\torigin/b\tahead many\n").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod git2_tests {
+    use super::*;
+    use git2::Repository;
+
+    /// A branch with no `branch.<name>.remote` is untracked; one whose
+    /// configured tracking ref was deleted is gone.  The two are separated by
+    /// `branch_upstream_name`, which libgit2 builds from config and the fetch
+    /// refspec *before* resolving any reference.
+    #[test]
+    fn separates_untracked_from_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        commit_empty(&repo);
+
+        repo.branch("solo", &repo.head().unwrap().peel_to_commit().unwrap(), false).unwrap();
+
+        let mut branch =
+            repo.branch("dead", &repo.head().unwrap().peel_to_commit().unwrap(), false).unwrap();
+        branch.set_upstream(None).ok();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("branch.dead.remote", "origin").unwrap();
+        cfg.set_str("branch.dead.merge", "refs/heads/dead").unwrap();
+        cfg.set_str("remote.origin.url", "https://example.invalid/r.git").unwrap();
+        cfg.set_str("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*").unwrap();
+
+        let map = map_from_repo(&repo);
+        assert_eq!(map["solo"], UpstreamState::Untracked);
+        assert_eq!(map["dead"], UpstreamState::Gone { upstream: "origin/dead".into() });
+    }
+
+    /// The divergence matrix the spec requires.  `set_upstream` against a
+    /// local ref also covers `remote = "."`, where the upstream is another
+    /// local branch rather than a remote-tracking one.
+    #[test]
+    fn classifies_level_ahead_behind_and_diverged() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let base = commit_empty(&repo);
+
+        // `base` is the upstream; each branch diverges from it differently.
+        for (name, extra) in [("level", 0), ("ahead", 2)] {
+            let mut b = repo.branch(name, &repo.find_commit(base).unwrap(), false).unwrap();
+            b.set_upstream(Some("main")).unwrap();
+            let mut parent = base;
+            for i in 0..extra {
+                parent = commit_onto(&repo, parent, &format!("refs/heads/{name}"), i);
+            }
+        }
+
+        let map = map_from_repo(&repo);
+        assert_eq!(map["level"], UpstreamState::Level { upstream: "main".into() });
+        assert_eq!(
+            map["ahead"],
+            UpstreamState::Diverged { upstream: "main".into(), ahead: 2, behind: 0 }
+        );
+    }
+
+    fn commit_empty(repo: &Repository) -> git2::Oid {
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        let tree = repo.find_tree(repo.treebuilder(None).unwrap().write().unwrap()).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap()
+    }
+
+    fn commit_onto(repo: &Repository, parent: git2::Oid, refname: &str, n: usize) -> git2::Oid {
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        let tree = repo.find_tree(repo.treebuilder(None).unwrap().write().unwrap()).unwrap();
+        let parent = repo.find_commit(parent).unwrap();
+        repo.commit(Some(refname), &sig, &sig, &format!("c{n}"), &tree, &[&parent]).unwrap()
     }
 }
