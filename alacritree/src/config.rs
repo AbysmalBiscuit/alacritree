@@ -682,7 +682,7 @@ pub struct SessionDisplay {
 /// alacritree-only `[ui.font]`: font family/size for the chrome (sidebars,
 /// modals — everything that isn't the terminal grid).  Both fields default
 /// to deriving from `[font]`, so an absent table changes nothing.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct UiFont {
     pub family: Option<String>,
     /// Typographic points, same unit as `[font] size`; clamped to ≥ 1.0.
@@ -693,6 +693,23 @@ pub struct UiFont {
     pub italic_family: Option<String>,
     /// Family used for bold-italic chrome text; falls back to `family` when unset.
     pub bold_italic_family: Option<String>,
+    /// Register the bundled symbol face as the last resort in each chrome
+    /// family.  On by default: it is only ever reached for a glyph no earlier
+    /// face could draw, so it cannot change a chrome that already renders.
+    pub builtin_symbols: bool,
+}
+
+impl Default for UiFont {
+    fn default() -> Self {
+        Self {
+            family: None,
+            size: None,
+            bold_family: None,
+            italic_family: None,
+            bold_italic_family: None,
+            builtin_symbols: true,
+        }
+    }
 }
 
 /// Sidebar status glyphs, each independently overridable from `[ui.icons]`
@@ -1573,6 +1590,7 @@ struct RawUiFont {
     bold_family: Option<String>,
     italic_family: Option<String>,
     bold_italic_family: Option<String>,
+    builtin_symbols: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1994,6 +2012,7 @@ impl RawConfig {
                 .bold_italic_family
                 .clone()
                 .filter(|f| !f.trim().is_empty()),
+            builtin_symbols: self.ui.font.builtin_symbols.unwrap_or(true),
         };
 
         // ---- Profiles ----
@@ -2741,6 +2760,22 @@ program = "second"
     fn blank_ui_font_variant_families_are_ignored() {
         let config = parse("[ui.font]\nbold_family = \"  \"");
         assert_eq!(config.ui_font.bold_family, None);
+    }
+
+    /// The face is appended last, so enabling it cannot disturb a font that
+    /// already renders a glyph — which is why it is on unless refused.
+    #[test]
+    fn builtin_symbols_defaults_on_and_can_be_refused() {
+        assert!(parse("").ui_font.builtin_symbols);
+        assert!(parse("[ui.font]\nsize = 12").ui_font.builtin_symbols);
+        assert!(!parse("[ui.font]\nbuiltin_symbols = false").ui_font.builtin_symbols);
+        assert!(parse("[ui.font]\nbuiltin_symbols = true").ui_font.builtin_symbols);
+    }
+
+    /// A derived `Default` would make the documented default silently invert.
+    #[test]
+    fn the_ui_font_default_is_not_the_derived_zero_value() {
+        assert!(UiFont::default().builtin_symbols);
     }
 
     #[test]
