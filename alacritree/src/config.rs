@@ -756,6 +756,7 @@ pub struct UiTheme {
     pub sidebar_foreground: Option<Color32>,
     pub sidebar_border: Option<Color32>,
     pub sidebar_accent: Option<Color32>,
+    pub sidebar_attention: Option<Color32>,
     /// Fire a desktop notification when a non-visible session needs attention.
     pub notifications: bool,
     /// How long an attention trigger must survive without the session going
@@ -832,6 +833,7 @@ impl Default for UiTheme {
             sidebar_foreground: None,
             sidebar_border: None,
             sidebar_accent: None,
+            sidebar_attention: None,
             notifications: true,
             attention_grace: Duration::ZERO,
             confirm_session_close: ConfirmSessionClose::Never,
@@ -1545,6 +1547,7 @@ struct RawUi {
     sidebar_foreground: Option<RgbStr>,
     sidebar_border: Option<RgbStr>,
     sidebar_accent: Option<RgbStr>,
+    sidebar_attention: Option<RgbStr>,
     notifications: Option<bool>,
     /// Grace window in milliseconds before an attention trigger pings; a
     /// session that resumes work inside it swallows the ping.  Default 0.
@@ -1731,6 +1734,7 @@ impl RawConfig {
             sidebar_foreground: self.ui.sidebar_foreground.map(|v| rgb_to_color32(v.0)),
             sidebar_border: self.ui.sidebar_border.map(|v| rgb_to_color32(v.0)),
             sidebar_accent: self.ui.sidebar_accent.map(|v| rgb_to_color32(v.0)),
+            sidebar_attention: self.ui.sidebar_attention.map(|v| rgb_to_color32(v.0)),
             notifications: self.ui.notifications.unwrap_or(true),
             attention_grace: Duration::from_millis(self.ui.attention_grace_ms.unwrap_or(0)),
             confirm_session_close: parse_confirm_session_close(
@@ -2899,6 +2903,15 @@ program = "second"
                 spelling: PathSpelling { quote: Quoting::Posix, wsl_translate: false },
                 highlight: false,
             }
+        );
+    }
+
+    #[test]
+    fn sidebar_attention_parses_and_defaults_to_none() {
+        assert_eq!(ui_from_toml("").sidebar_attention, None);
+        assert_eq!(
+            ui_from_toml("[ui]\nsidebar_attention = \"#ffb86c\"").sidebar_attention,
+            Some(Color32::from_rgb(0xff, 0xb8, 0x6c))
         );
     }
 

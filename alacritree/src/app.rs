@@ -134,6 +134,8 @@ impl Theme {
             config.ui.sidebar_foreground.unwrap_or_else(|| rgb_to_color32(config.palette.fg));
         let accent =
             config.ui.sidebar_accent.unwrap_or_else(|| rgb_to_color32(config.palette.normal[4])); // ANSI blue
+        let attention =
+            config.ui.sidebar_attention.unwrap_or_else(|| rgb_to_color32(config.palette.normal[3])); // ANSI yellow
         let border = config.ui.sidebar_border.unwrap_or_else(|| lighten(sidebar_bg, 0.10));
         let text_muted = blend_toward(text, sidebar_bg, 0.55);
         let (font_normal, font_heading) = ui_text_px(&config.font, &config.ui_font);
@@ -147,7 +149,7 @@ impl Theme {
             text_dim: blend_toward(text, sidebar_bg, 0.35),
             text_muted,
             accent,
-            attention: rgb_to_color32(config.palette.normal[3]), // ANSI yellow
+            attention,
             pr_open: rgb_to_color32(config.palette.normal[2]),   // green
             pr_draft: text_muted,
             pr_merged: rgb_to_color32(config.palette.normal[5]), // magenta
@@ -9456,6 +9458,20 @@ mod tests {
         assert_eq!(theme.path_style.git_rows, PathStyle::Fish);
         assert_eq!(theme.path_style.git_header, PathStyle::Full);
         assert!(theme.path_style.filename.bold);
+    }
+
+    /// With no override, `attention` keeps painting from the palette, exactly
+    /// as it did before `sidebar_attention` existed; a configured color must
+    /// reach `Theme::attention`, not just the raw config field.
+    #[test]
+    fn sidebar_attention_overrides_the_palette_default() {
+        let default_theme = Theme::from_config(&Config::default());
+        assert_eq!(default_theme.attention, rgb_to_color32(Config::default().palette.normal[3]));
+
+        let mut config = Config::default();
+        config.ui.sidebar_attention = Some(Color32::from_rgb(0xff, 0xb8, 0x6c));
+        let theme = Theme::from_config(&config);
+        assert_eq!(theme.attention, Color32::from_rgb(0xff, 0xb8, 0x6c));
     }
 
     /// The header is the one site whose path is absolute, so it is the one that
