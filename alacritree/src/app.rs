@@ -16,9 +16,10 @@ use crate::clipboard_image;
 use crate::colors::rgb_to_color32;
 use crate::command_palette::{self, CommandPalette, PaletteAction, PaletteItem};
 use crate::config::{
-    Config, DEFAULT_HOME_ICON, DEFAULT_PR_CLOSED_ICON, DEFAULT_PR_DRAFT_ICON,
-    DEFAULT_PR_MERGED_ICON, DEFAULT_PR_OPEN_ICON, DEFAULT_PROJECT_COLLAPSED_ICON,
-    DEFAULT_PROJECT_EXPANDED_ICON, DEFAULT_SEARCH_ICON, DEFAULT_SESSION_ICON,
+    BakedGlyph, Config, DEFAULT_ADD_ICON, DEFAULT_CLOSE_ICON, DEFAULT_HOME_ICON,
+    DEFAULT_PR_CLOSED_ICON, DEFAULT_PR_DRAFT_ICON, DEFAULT_PR_MERGED_ICON, DEFAULT_PR_OPEN_ICON,
+    DEFAULT_PROJECT_COLLAPSED_ICON, DEFAULT_PROJECT_EXPANDED_ICON, DEFAULT_REFRESH_ICON,
+    DEFAULT_REORDER_ICON, DEFAULT_SEARCH_ICON, DEFAULT_SESSION_ICON,
     DEFAULT_UPSTREAM_DIVERGED_ICON, DEFAULT_UPSTREAM_GONE_ICON, DEFAULT_UPSTREAM_LEVEL_ICON,
     DEFAULT_UPSTREAM_UNTRACKED_ICON, DEFAULT_WORKTREE_ICON, DEFAULT_WORKTREE_MAIN_ICON, FontConfig,
     IconStyle, Icons, LastSessionClose, PathStyleConfig, ScrollbarStyle, SearchScope, SidebarFocus,
@@ -3263,7 +3264,13 @@ impl AlacritreeApp {
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icon_tooltip(
-                            icon_button(ui, "+", theme.text_dim, &theme),
+                            styled_icon_button(
+                                ui,
+                                &icons.add_project,
+                                DEFAULT_ADD_ICON,
+                                theme.text_dim,
+                                &theme,
+                            ),
                             "add project",
                             theme.icon_tooltips,
                         )
@@ -3279,7 +3286,7 @@ impl AlacritreeApp {
                             (theme.text_dim, "reorder projects")
                         };
                         if icon_tooltip(
-                            icon_button(ui, "⇅", color, &theme),
+                            styled_icon_button(ui, &icons.reorder, DEFAULT_REORDER_ICON, color, &theme),
                             hint,
                             theme.icon_tooltips,
                         )
@@ -3375,13 +3382,13 @@ impl AlacritreeApp {
                                 let (arrow_style, arrow_default, arrow_hint) = if project.expanded {
                                     (
                                         &icons.project_expanded,
-                                        DEFAULT_PROJECT_EXPANDED_ICON.as_str(),
+                                        DEFAULT_PROJECT_EXPANDED_ICON,
                                         "collapse project",
                                     )
                                 } else {
                                     (
                                         &icons.project_collapsed,
-                                        DEFAULT_PROJECT_COLLAPSED_ICON.as_str(),
+                                        DEFAULT_PROJECT_COLLAPSED_ICON,
                                         "expand project",
                                     )
                                 };
@@ -3420,7 +3427,13 @@ impl AlacritreeApp {
                             },
                             |ui| {
                                 if icon_tooltip(
-                                    icon_button(ui, "×", theme.text_muted, &theme),
+                                    styled_icon_button(
+                                        ui,
+                                        &icons.remove_project,
+                                        DEFAULT_CLOSE_ICON,
+                                        theme.text_muted,
+                                        &theme,
+                                    ),
                                     "remove from sidebar",
                                     theme.icon_tooltips,
                                 )
@@ -3432,7 +3445,13 @@ impl AlacritreeApp {
                                     });
                                 }
                                 if icon_tooltip(
-                                    icon_button(ui, "↻", theme.text_muted, &theme),
+                                    styled_icon_button(
+                                        ui,
+                                        &icons.refresh,
+                                        DEFAULT_REFRESH_ICON,
+                                        theme.text_muted,
+                                        &theme,
+                                    ),
                                     "refresh worktrees",
                                     theme.icon_tooltips,
                                 )
@@ -3441,7 +3460,13 @@ impl AlacritreeApp {
                                     refresh_idx = Some(idx);
                                 }
                                 if icon_tooltip(
-                                    icon_button(ui, "+", theme.text_muted, &theme),
+                                    styled_icon_button(
+                                        ui,
+                                        &icons.new_worktree,
+                                        DEFAULT_ADD_ICON,
+                                        theme.text_muted,
+                                        &theme,
+                                    ),
                                     "create new worktree",
                                     theme.icon_tooltips,
                                 )
@@ -5225,7 +5250,7 @@ fn paint_row_status_icon(
     attention: bool,
     agent_glyph: Option<char>,
     style: &IconStyle,
-    default_glyph: &str,
+    default_glyph: BakedGlyph,
     is_active: bool,
 ) -> Option<(egui::Rect, String)> {
     if attention {
@@ -5245,51 +5270,23 @@ fn paint_row_status_icon(
             (glyph.to_string(), font, color)
         },
     };
-    // Centered into the fixed slot, like `icon_button`: laying the glyph out as
-    // text would size the slot to its advance width and shift the label with it.
+    // Centered into the fixed slot: laying the glyph out as text would size
+    // the slot to its advance width and shift the label with it.
     let (rect, _) = ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
     ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, glyph, font, color);
     let name = agent_glyph.and_then(crate::session::agent_name_for_glyph)?;
     Some((rect, format!("{name} is running")))
 }
 
-/// Gap between adjacent `icon_button`s. They already pad their own glyph, so
+/// Gap between adjacent action buttons. They already pad their own glyph, so
 /// the default item spacing on top of that reads as a hole in the cluster.
 /// Deliberately unscaled: the padding it supplements grows with `ui_scale`.
 const ICON_CLUSTER_SPACING: f32 = 2.0;
 
-/// Frameless, fixed-footprint icon button. Painter-drawn rather than a
-/// `Button` because `Button` lays text out from the top-left of its rect, so
-/// glyphs of different intrinsic heights (e.g. `+` vs `↻`) end up on different
-/// baselines. `painter.text` with `CENTER_CENTER` centers the galley in the
-/// rect, giving real grid alignment.
-fn icon_button(ui: &mut egui::Ui, glyph: &str, color: Color32, theme: &Theme) -> egui::Response {
-    let s = theme.ui_scale;
-    let size = egui::vec2(16.0 * s, 16.0 * s);
-    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
-    let painted = if resp.hovered() {
-        Color32::from_rgb(
-            color.r().saturating_add(40),
-            color.g().saturating_add(40),
-            color.b().saturating_add(40),
-        )
-    } else {
-        color
-    };
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        glyph,
-        egui::FontId::proportional(12.0 * s),
-        painted,
-    );
-    resp
-}
-
 /// Resolve an icon's paint-time glyph, font, and color from its config and
 /// the site's built-in defaults.  `default_glyph` covers the case where a
 /// table styles a key without setting `glyph`.  `default_px` and `slot_px`
-/// are deliberately separate: `icon_button` paints its glyph at `12.0 *
+/// are deliberately separate: an action button paints its glyph at `12.0 *
 /// ui_scale` inside a `16.0 * ui_scale` slot, and conflating the two would
 /// resize every unconfigured icon.
 ///
@@ -5298,7 +5295,7 @@ fn icon_button(ui: &mut egui::Ui, glyph: &str, color: Color32, theme: &Theme) ->
 /// its own drawing call.
 fn resolve_icon<'a>(
     style: &'a IconStyle,
-    default_glyph: &'a str,
+    default_glyph: BakedGlyph,
     default_color: Color32,
     default_px: f32,
     slot_px: f32,
@@ -5307,18 +5304,18 @@ fn resolve_icon<'a>(
     let size = style.size.unwrap_or(default_px).min(slot_px) * theme.ui_scale;
     let family = crate::fonts::ui_variant_family(style.bold, style.italic);
     (
-        style.or_glyph(default_glyph),
+        style.or_glyph(default_glyph.as_str()),
         egui::FontId::new(size, family),
         style.color.unwrap_or(default_color),
     )
 }
 
-/// `icon_button` for a configurable icon: same 16×16 slot and hover
-/// brightening, but the glyph, weight, slant, and size come from config.
+/// A configurable icon in a 16×16 slot: the glyph, weight, slant, size and
+/// colour come from config, with the built-in glyph as the fallback.
 fn styled_icon_button(
     ui: &mut egui::Ui,
     style: &IconStyle,
-    default_glyph: &str,
+    default_glyph: BakedGlyph,
     color: Color32,
     theme: &Theme,
 ) -> egui::Response {
@@ -5492,7 +5489,7 @@ fn panel_header_filter_ui(
                 let default_px = theme.font_normal / s;
                 let (glyph, font, color) = resolve_icon(
                     search_icon,
-                    DEFAULT_SEARCH_ICON.as_str(),
+                    DEFAULT_SEARCH_ICON,
                     theme.text_dim,
                     default_px,
                     default_px * 2.0,
@@ -5641,7 +5638,7 @@ fn home_row(
                         attention,
                         agent_glyph,
                         &icons.home,
-                        DEFAULT_HOME_ICON.as_str(),
+                        DEFAULT_HOME_ICON,
                         is_active,
                     );
                     ui.label(
@@ -5652,7 +5649,13 @@ fn home_row(
                     );
                 },
                 |ui| {
-                    let btn = icon_button(ui, "+", theme.text_muted, theme);
+                    let btn = styled_icon_button(
+                        ui,
+                        &icons.new_session,
+                        DEFAULT_ADD_ICON,
+                        theme.text_muted,
+                        theme,
+                    );
                     hints.add(btn.rect, "new shell");
                     spawn_rect = Some(btn.rect);
                     if btn.clicked() {
@@ -6146,7 +6149,7 @@ fn creating_row(ui: &mut egui::Ui, branch: &str, icons: &Icons, theme: &Theme) {
             |ui| {
                 let (glyph, font, color) = resolve_icon(
                     &icons.worktree,
-                    DEFAULT_WORKTREE_ICON.as_str(),
+                    DEFAULT_WORKTREE_ICON,
                     theme.text_muted,
                     10.0,
                     10.0,
@@ -6173,18 +6176,12 @@ fn pr_badge<'a>(
     icons: &'a Icons,
     theme: &Theme,
     state: PrState,
-) -> (&'a IconStyle, &'static str, Color32, &'static str) {
+) -> (&'a IconStyle, BakedGlyph, Color32, &'static str) {
     match state {
-        PrState::Open => (&icons.pr_open, DEFAULT_PR_OPEN_ICON.as_str(), theme.pr_open, "open"),
-        PrState::Draft => {
-            (&icons.pr_draft, DEFAULT_PR_DRAFT_ICON.as_str(), theme.pr_draft, "draft")
-        },
-        PrState::Merged => {
-            (&icons.pr_merged, DEFAULT_PR_MERGED_ICON.as_str(), theme.pr_merged, "merged")
-        },
-        PrState::Closed => {
-            (&icons.pr_closed, DEFAULT_PR_CLOSED_ICON.as_str(), theme.pr_closed, "closed")
-        },
+        PrState::Open => (&icons.pr_open, DEFAULT_PR_OPEN_ICON, theme.pr_open, "open"),
+        PrState::Draft => (&icons.pr_draft, DEFAULT_PR_DRAFT_ICON, theme.pr_draft, "draft"),
+        PrState::Merged => (&icons.pr_merged, DEFAULT_PR_MERGED_ICON, theme.pr_merged, "merged"),
+        PrState::Closed => (&icons.pr_closed, DEFAULT_PR_CLOSED_ICON, theme.pr_closed, "closed"),
     }
 }
 
@@ -6194,29 +6191,29 @@ fn upstream_badge<'a>(
     icons: &'a Icons,
     theme: &Theme,
     state: &UpstreamState,
-) -> (&'a IconStyle, &'static str, Color32, String) {
+) -> (&'a IconStyle, BakedGlyph, Color32, String) {
     match state {
         UpstreamState::Level { upstream } => (
             &icons.upstream_level,
-            DEFAULT_UPSTREAM_LEVEL_ICON.as_str(),
+            DEFAULT_UPSTREAM_LEVEL_ICON,
             theme.upstream_level,
             format!("tracks {upstream}"),
         ),
         UpstreamState::Diverged { upstream, ahead, behind } => (
             &icons.upstream_diverged,
-            DEFAULT_UPSTREAM_DIVERGED_ICON.as_str(),
+            DEFAULT_UPSTREAM_DIVERGED_ICON,
             theme.upstream_diverged,
             format!("tracks {upstream} — {ahead} ahead, {behind} behind"),
         ),
         UpstreamState::Gone { upstream } => (
             &icons.upstream_gone,
-            DEFAULT_UPSTREAM_GONE_ICON.as_str(),
+            DEFAULT_UPSTREAM_GONE_ICON,
             theme.upstream_gone,
             format!("{upstream} is missing locally"),
         ),
         UpstreamState::Untracked => (
             &icons.upstream_untracked,
-            DEFAULT_UPSTREAM_UNTRACKED_ICON.as_str(),
+            DEFAULT_UPSTREAM_UNTRACKED_ICON,
             theme.upstream_untracked,
             "no upstream configured".to_string(),
         ),
@@ -6256,9 +6253,9 @@ fn worktree_row(
     let resp = frame
         .show(ui, |ui| {
             let (default_icon, default_glyph) = if wt.is_main {
-                (&icons.worktree_main, DEFAULT_WORKTREE_MAIN_ICON.as_str())
+                (&icons.worktree_main, DEFAULT_WORKTREE_MAIN_ICON)
             } else {
-                (&icons.worktree, DEFAULT_WORKTREE_ICON.as_str())
+                (&icons.worktree, DEFAULT_WORKTREE_ICON)
             };
             let name_color = if wt.prunable || deleting {
                 theme.text_muted
@@ -6304,14 +6301,26 @@ fn worktree_row(
                         } else {
                             "delete worktree and branch"
                         };
-                        let btn = icon_button(ui, "×", theme.text_muted, theme);
+                        let btn = styled_icon_button(
+                            ui,
+                            &icons.delete_worktree,
+                            DEFAULT_CLOSE_ICON,
+                            theme.text_muted,
+                            theme,
+                        );
                         hints.add(btn.rect, hover);
                         delete_rect = Some(btn.rect);
                         if btn.clicked() {
                             delete_clicked = true;
                         }
                     }
-                    let btn = icon_button(ui, "+", theme.text_muted, theme);
+                    let btn = styled_icon_button(
+                        ui,
+                        &icons.new_session,
+                        DEFAULT_ADD_ICON,
+                        theme.text_muted,
+                        theme,
+                    );
                     hints.add(btn.rect, "new shell");
                     spawn_rect = Some(btn.rect);
                     if btn.clicked() {
@@ -6451,7 +6460,7 @@ fn session_row(
                         row.needs_attention,
                         row.agent_glyph,
                         &icons.session,
-                        DEFAULT_SESSION_ICON.as_str(),
+                        DEFAULT_SESSION_ICON,
                         row.is_active,
                     );
                     let (_, galley) = truncating_label(
@@ -6463,7 +6472,13 @@ fn session_row(
                     title_elided = galley.elided;
                 },
                 |ui| {
-                    let btn = icon_button(ui, "×", theme.text_muted, theme);
+                    let btn = styled_icon_button(
+                        ui,
+                        &icons.close_session,
+                        DEFAULT_CLOSE_ICON,
+                        theme.text_muted,
+                        theme,
+                    );
                     hints.add(btn.rect, "close session");
                     close_rect = Some(btn.rect);
                     if btn.clicked() {
@@ -9810,7 +9825,13 @@ mod tests {
         let slot = std::cell::Cell::new(None);
         let mut button = |ui: &mut egui::Ui| {
             let resp = icon_tooltip(
-                icon_button(ui, "×", theme.text_muted, theme),
+                styled_icon_button(
+                    ui,
+                    &IconStyle::default(),
+                    DEFAULT_CLOSE_ICON,
+                    theme.text_muted,
+                    theme,
+                ),
                 hint,
                 theme.icon_tooltips,
             );
@@ -9877,13 +9898,15 @@ mod tests {
     fn a_configured_size_is_clamped_to_the_slot() {
         let theme = Theme::from_config(&Config::default());
         let style = IconStyle { size: Some(400.0), ..Default::default() };
-        let (_, font, _) = resolve_icon(&style, "○", Color32::WHITE, 10.0, 10.0, &theme);
+        let (_, font, _) =
+            resolve_icon(&style, DEFAULT_WORKTREE_ICON, Color32::WHITE, 10.0, 10.0, &theme);
         assert!(
             font.size <= 10.0 * theme.ui_scale,
             "an oversized glyph must not overlap its neighbours"
         );
 
-        let (_, font, _) = resolve_icon(&style, "×", Color32::WHITE, 12.0, 16.0, &theme);
+        let (_, font, _) =
+            resolve_icon(&style, DEFAULT_CLOSE_ICON, Color32::WHITE, 12.0, 16.0, &theme);
         assert!(font.size <= 16.0 * theme.ui_scale, "a button glyph clamps to its own 16px slot");
     }
 
@@ -9893,7 +9916,8 @@ mod tests {
     fn an_unconfigured_icon_keeps_its_current_size() {
         let theme = Theme::from_config(&Config::default());
         let style = IconStyle::default();
-        let (_, font, _) = resolve_icon(&style, "×", Color32::WHITE, 12.0, 16.0, &theme);
+        let (_, font, _) =
+            resolve_icon(&style, DEFAULT_CLOSE_ICON, Color32::WHITE, 12.0, 16.0, &theme);
         assert_eq!(font.size, 12.0 * theme.ui_scale);
     }
 
@@ -9901,7 +9925,8 @@ mod tests {
     fn a_configured_color_wins_over_the_site_default() {
         let theme = Theme::from_config(&Config::default());
         let style = IconStyle { color: Some(Color32::RED), ..Default::default() };
-        let (_, _, color) = resolve_icon(&style, "○", Color32::WHITE, 10.0, 10.0, &theme);
+        let (_, _, color) =
+            resolve_icon(&style, DEFAULT_WORKTREE_ICON, Color32::WHITE, 10.0, 10.0, &theme);
         assert_eq!(color, Color32::RED);
     }
 
@@ -9910,8 +9935,14 @@ mod tests {
     #[test]
     fn an_unconfigured_icon_resolves_to_the_proportional_family() {
         let theme = Theme::from_config(&Config::default());
-        let (_, font, _) =
-            resolve_icon(&IconStyle::default(), "○", Color32::WHITE, 10.0, 10.0, &theme);
+        let (_, font, _) = resolve_icon(
+            &IconStyle::default(),
+            DEFAULT_WORKTREE_ICON,
+            Color32::WHITE,
+            10.0,
+            10.0,
+            &theme,
+        );
         assert_eq!(font.family, egui::FontFamily::Proportional);
     }
 
@@ -9922,7 +9953,8 @@ mod tests {
     fn an_italic_icon_resolves_to_the_italic_family() {
         let theme = Theme::from_config(&Config::default());
         let style = IconStyle { italic: true, ..Default::default() };
-        let (_, font, _) = resolve_icon(&style, "○", Color32::WHITE, 10.0, 10.0, &theme);
+        let (_, font, _) =
+            resolve_icon(&style, DEFAULT_WORKTREE_ICON, Color32::WHITE, 10.0, 10.0, &theme);
         assert_eq!(font.family, egui::FontFamily::Name(crate::fonts::UI_ITALIC_FAMILY.into()));
     }
 
@@ -10057,9 +10089,9 @@ mod tests {
         assert_eq!(size, theme.font_normal);
     }
 
-    /// The expand/collapse arrow is the sidebar's only `styled_icon_button`
-    /// call site. It must keep `icon_button`'s 16x16 slot while painting a
-    /// glyph, color, and weight from config.
+    /// Every action button shares the same 16x16 slot while painting a
+    /// glyph, color, and weight from config; the expand/collapse arrow
+    /// exercises that path here.
     #[test]
     fn styled_icon_button_paints_a_configured_glyph_in_its_16px_slot() {
         let theme = Theme::from_config(&Config::default());
@@ -10082,7 +10114,16 @@ mod tests {
         let mut rect = None;
         let output = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                rect = Some(styled_icon_button(ui, &style, "▸", theme.text_dim, &theme).rect);
+                rect = Some(
+                    styled_icon_button(
+                        ui,
+                        &style,
+                        DEFAULT_PROJECT_COLLAPSED_ICON,
+                        theme.text_dim,
+                        &theme,
+                    )
+                    .rect,
+                );
             });
         });
 
@@ -10090,7 +10131,7 @@ mod tests {
         let expected_size = egui::vec2(16.0 * s, 16.0 * s);
         assert!(
             (painted_size - expected_size).length() < 0.01,
-            "styled_icon_button must keep icon_button's 16x16 slot: got {painted_size:?}, \
+            "styled_icon_button must paint into a 16x16 slot: got {painted_size:?}, \
              expected {expected_size:?}"
         );
         let (family, size, color) =
@@ -10175,9 +10216,10 @@ mod tests {
             for (glyph, hint) in [
                 (DEFAULT_UPSTREAM_LEVEL_ICON, "tracks origin/x"),
                 (DEFAULT_PR_OPEN_ICON, "PR #7 — open"),
-                ("×", "delete worktree and branch"),
-                ("+", "new shell"),
+                (DEFAULT_CLOSE_ICON, "delete worktree and branch"),
+                (DEFAULT_ADD_ICON, "new shell"),
             ] {
+                let glyph = glyph.as_str();
                 let texts = texts_while_hovering_badge(&theme, glyph);
                 let shown = texts.iter().flatten().any(|(text, _)| text == hint);
                 assert_eq!(shown, want, "icon_tooltips = {icon_tooltips}, icon {glyph}");
@@ -10322,6 +10364,62 @@ mod tests {
                 "attention dot, icon_tooltips = {icon_tooltips}"
             );
         }
+    }
+
+    /// An unconfigured action button must paint exactly what it painted as a
+    /// fixed glyph: same slot, same size, same proportional family.
+    #[test]
+    fn an_unconfigured_action_button_is_unchanged() {
+        let theme = Theme::from_config(&Config::default());
+        let icons = Icons::default();
+        let (glyph, font, color) = resolve_icon(
+            &icons.delete_worktree,
+            DEFAULT_CLOSE_ICON,
+            theme.text_muted,
+            12.0,
+            16.0,
+            &theme,
+        );
+        assert_eq!(glyph, "×");
+        assert_eq!(font.family, egui::FontFamily::Proportional);
+        assert_eq!(font.size, 12.0 * theme.ui_scale);
+        assert_eq!(color, theme.text_muted);
+    }
+
+    /// Styling one action button must not reach a sibling that shares its glyph.
+    #[test]
+    fn styling_the_destructive_button_leaves_its_siblings_alone() {
+        let theme = Theme::from_config(&Config::default());
+        let mut icons = Icons::default();
+        icons.delete_worktree = IconStyle {
+            glyph: Some("✖".into()),
+            color: Some(Color32::RED),
+            bold: true,
+            ..Default::default()
+        };
+
+        let (glyph, font, color) = resolve_icon(
+            &icons.delete_worktree,
+            DEFAULT_CLOSE_ICON,
+            theme.text_muted,
+            12.0,
+            16.0,
+            &theme,
+        );
+        assert_eq!(glyph, "✖");
+        assert_eq!(color, Color32::RED);
+        assert_eq!(font.family, egui::FontFamily::Name(crate::fonts::UI_BOLD_FAMILY.into()));
+
+        let (glyph, _, color) = resolve_icon(
+            &icons.close_session,
+            DEFAULT_CLOSE_ICON,
+            theme.text_muted,
+            12.0,
+            16.0,
+            &theme,
+        );
+        assert_eq!(glyph, "×");
+        assert_eq!(color, theme.text_muted);
     }
 
     /// `[ui] sidebar_tooltips` bounds the row tooltip on both sides: `off`
