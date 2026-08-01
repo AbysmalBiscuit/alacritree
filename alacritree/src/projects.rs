@@ -368,7 +368,21 @@ fn display_name(root: &std::path::Path) -> String {
 /// this last command only runs when `$2` is `"1"`, since `for-each-ref` with
 /// `%(upstream:track)` computes divergence for every branch even when the
 /// caller only wants the parse skipped.
-const DISCOVER_SCRIPT: &str = r#"
+/// The `for-each-ref` format the upstream section emits.  A macro rather than
+/// a const so the script can `concat!` it and tests can hand the identical
+/// string to git, instead of asserting against a second copy that can drift.
+///
+/// `lstrip=2` rather than `:short`: shortening consults other ref namespaces
+/// and yields `heads/<name>` for a branch whose name a tag also uses, which
+/// no longer joins against the plain branch name in a worktree record.
+macro_rules! upstream_format {
+    () => {
+        "%(refname:lstrip=2)%09%(upstream:short)%09%(upstream:track,nobracket)"
+    };
+}
+
+const DISCOVER_SCRIPT: &str = concat!(
+    r#"
 p="$1"
 sep() { printf '\n@@ALACRITREE@@\n'; }
 git -C "$p" rev-parse --is-inside-work-tree >/dev/null 2>&1 && printf yes || printf no
@@ -385,9 +399,12 @@ sep
 printf '%s' "$HOME"
 sep
 if [ "$2" = "1" ]; then
-  LC_ALL=C git -C "$p" for-each-ref --format='%(refname:short)%09%(upstream:short)%09%(upstream:track,nobracket)' refs/heads/ 2>/dev/null
+  LC_ALL=C git -C "$p" for-each-ref --format='"#,
+    upstream_format!(),
+    r#"' refs/heads/ 2>/dev/null
 fi
-"#;
+"#
+);
 
 /// One record from `git worktree list --porcelain -z`.  The main worktree is
 /// always the first record.
@@ -459,7 +476,45 @@ fn default_branch_from_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command_ext::CommandExt as _;
     use crate::test_util::{add_worktree, init_repo};
+
+    /// `%(refname:short)` shortens to the *unambiguous* name, so a branch that
+    /// shares its name with a tag comes back as `heads/<name>`.  Worktree
+    /// records carry the plain branch name, so any shortening that consults
+    /// other ref namespaces breaks the join and the row loses its badge.
+    #[test]
+    fn the_upstream_format_keys_branches_by_plain_name_even_when_a_tag_shares_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .hide_console()
+                .current_dir(dir.path())
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out.stdout
+        };
+        git(&["init", "-b", "main"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-m", "x"]);
+        git(&["branch", "release"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "tag", "-m", "collide", "release"]);
+
+        let out =
+            git(&["for-each-ref", &format!("--format={}", upstream_format!()), "refs/heads/"]);
+        let map = crate::upstream::parse_for_each_ref(&out);
+
+        assert!(
+            map.contains_key("release"),
+            "expected a `release` key, got {:?}",
+            map.keys().collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn refresh_keeps_worktrees_when_discovery_is_not_authoritative() {
@@ -626,8 +681,8 @@ worktree /home/lev/wt/tmp\0HEAD 0011223344556677\0detached\0\0";
         assert_eq!(records[0].path, "/home/lev/my proj");
     }
 
-    /// Section indices are positional, so a new section must go *after* `$HOME`
-    /// to leave every existing index alone.
+    /// The parser reads sections by position, so their order is a contract:
+    /// each index below names the command whose output belongs there.
     #[test]
     fn the_discover_script_sections_keep_their_indices() {
         let sections: Vec<&str> = DISCOVER_SCRIPT.split("\nsep\n").collect();
@@ -645,7 +700,7 @@ worktree /home/lev/wt/tmp\0HEAD 0011223344556677\0detached\0\0";
     /// A detached HEAD's `branch` holds a short OID, and a real branch can be
     /// named the same thing.  Build a worktree where that collision actually
     /// occurs and check the lookup, not just that the record has no branch —
-    /// the latter would pass against today's parser and prove nothing.
+    /// the latter holds whether or not the lookup guards against the collision.
     #[test]
     fn a_detached_worktree_gets_no_badge_even_when_its_oid_looks_like_a_branch() {
         let dir = tempfile::tempdir().unwrap();
