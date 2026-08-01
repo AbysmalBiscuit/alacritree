@@ -31,6 +31,11 @@ pub const BOLD_FAMILY: &str = "alacritree_bold";
 pub const ITALIC_FAMILY: &str = "alacritree_italic";
 pub const BOLD_ITALIC_FAMILY: &str = "alacritree_bold_italic";
 
+/// Glyphs alacritree paints itself, so the chrome renders on systems whose
+/// fonts lack them.  Appended last in each chrome family, so an installed
+/// font that already has a glyph keeps rendering it.
+const SYMBOLS_FONT: &[u8] = include_bytes!("../assets/alacritree-symbols.ttf");
+
 const NORMAL_FONT_ID: &str = "alacritree_terminal_normal";
 const BOLD_FONT_ID: &str = "alacritree_terminal_bold";
 const ITALIC_FONT_ID: &str = "alacritree_terminal_italic";
@@ -424,9 +429,7 @@ impl FallbackBook {
 /// Whether `face` can hand egui an outline for `c`.  A face may claim a
 /// character in its cmap and still have nothing to draw for it, which is what
 /// makes a cell go blank.
-#[cfg(test)]
-#[cfg(test)]
-pub fn face_outlines_char(face: &ChainFace, c: char) -> bool {
+pub(crate) fn face_outlines_char(face: &ChainFace, c: char) -> bool {
     let Ok(data) = std::fs::read(&face.path) else {
         return false;
     };
@@ -1968,6 +1971,75 @@ mod tests {
         assert!(disk_cache::load(&cache_path).is_none());
 
         std::fs::remove_file(&cache_path).ok();
+    }
+
+    /// Every glyph alacritree ships must be drawable from the baked face.  A
+    /// cmap entry is not enough: a font can map a codepoint to a glyph with no
+    /// outline, which paints as a blank box.
+    #[test]
+    fn the_baked_face_draws_every_glyph_alacritree_ships() {
+        let face = ttf_parser::Face::parse(SYMBOLS_FONT, 0).expect("the baked face parses");
+        let mut blank = Vec::new();
+        for c in baked_glyphs() {
+            match face.glyph_index(c) {
+                None => blank.push((c, "absent from the cmap")),
+                Some(id) => {
+                    let mut builder = OutlineExtents::default();
+                    if face.outline_glyph(id, &mut builder).is_none() {
+                        blank.push((c, "mapped but has no outline"));
+                    }
+                },
+            }
+        }
+        assert!(
+            blank.is_empty(),
+            "regenerate alacritree/assets/alacritree-symbols.ttf; see assets/README.md: {:?}",
+            blank
+                .iter()
+                .map(|(c, why)| format!("U+{:04X} {c} {why}", *c as u32))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_baked_glyph_set_is_the_documented_size() {
+        assert_eq!(baked_glyphs().len(), 29, "assets/README.md lists the codepoints");
+    }
+
+    /// Counts every glyph the crate paints from its own constants, deduplicated.
+    #[cfg(test)]
+    fn baked_glyphs() -> Vec<char> {
+        let mut seen: Vec<char> = crate::config::DEFAULT_ICON_GLYPHS
+            .iter()
+            .chain(crate::config::CHROME_GLYPHS.iter())
+            .flat_map(|g| g.as_str().chars())
+            .chain(crate::session::AGENT_GLYPHS.iter().copied())
+            .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        seen
+    }
+
+    /// `ttf_parser::OutlineBuilder` that records only whether anything was drawn.
+    #[derive(Default)]
+    struct OutlineExtents {
+        drawn: bool,
+    }
+
+    impl ttf_parser::OutlineBuilder for OutlineExtents {
+        fn move_to(&mut self, _: f32, _: f32) {
+            self.drawn = true;
+        }
+        fn line_to(&mut self, _: f32, _: f32) {
+            self.drawn = true;
+        }
+        fn quad_to(&mut self, _: f32, _: f32, _: f32, _: f32) {
+            self.drawn = true;
+        }
+        fn curve_to(&mut self, _: f32, _: f32, _: f32, _: f32, _: f32, _: f32) {
+            self.drawn = true;
+        }
+        fn close(&mut self) {}
     }
 }
 
