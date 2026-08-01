@@ -626,6 +626,10 @@ pub struct Icons {
     pub pr_draft: String,
     pub pr_merged: String,
     pub pr_closed: String,
+    pub upstream_level: String,
+    pub upstream_diverged: String,
+    pub upstream_gone: String,
+    pub upstream_untracked: String,
 }
 
 /// `[ui.focus_outline]`: stroke a border around a panel while it owns
@@ -663,6 +667,10 @@ impl Default for Icons {
             pr_draft: "◯".into(),
             pr_merged: "⬤".into(),
             pr_closed: "⬤".into(),
+            upstream_level: "✓".into(),
+            upstream_diverged: "⇅".into(),
+            upstream_gone: "⌫".into(),
+            upstream_untracked: "↑".into(),
         }
     }
 }
@@ -1356,6 +1364,10 @@ struct RawIcons {
     pr_draft: Option<String>,
     pr_merged: Option<String>,
     pr_closed: Option<String>,
+    upstream_level: Option<String>,
+    upstream_diverged: Option<String>,
+    upstream_gone: Option<String>,
+    upstream_untracked: Option<String>,
 }
 
 /// A trimmed, non-blank override — or the default.
@@ -1379,6 +1391,10 @@ fn build_icons(raw: RawIcons) -> Icons {
         pr_draft: icon_or(raw.pr_draft, &d.pr_draft),
         pr_merged: icon_or(raw.pr_merged, &d.pr_merged),
         pr_closed: icon_or(raw.pr_closed, &d.pr_closed),
+        upstream_level: icon_or(raw.upstream_level, &d.upstream_level),
+        upstream_diverged: icon_or(raw.upstream_diverged, &d.upstream_diverged),
+        upstream_gone: icon_or(raw.upstream_gone, &d.upstream_gone),
+        upstream_untracked: icon_or(raw.upstream_untracked, &d.upstream_untracked),
     }
 }
 
@@ -2499,6 +2515,15 @@ program = "second"
         let ui = ui_from_toml("[ui.icons]\nworktree_main = \"   \"\nsession = \"\"");
         assert_eq!(ui.icons.worktree_main, "●");
         assert_eq!(ui.icons.session, "▪");
+    }
+
+    #[test]
+    fn upstream_icons_have_defaults() {
+        let ui = ui_from_toml("");
+        assert_eq!(ui.icons.upstream_level, "✓");
+        assert_eq!(ui.icons.upstream_diverged, "⇅");
+        assert_eq!(ui.icons.upstream_gone, "⌫");
+        assert_eq!(ui.icons.upstream_untracked, "↑");
     }
 
     #[test]

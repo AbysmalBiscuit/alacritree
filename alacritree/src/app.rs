@@ -38,6 +38,7 @@ use crate::sidebar_focus;
 use crate::sidebar_nav::{self, SidebarRow};
 use crate::state::{self, PersistedProject};
 use crate::terminal_view;
+use crate::upstream::UpstreamState;
 use crate::worktree::{self as wt, CreateRequest, Progress};
 use crate::wsl::{self, ShellChoice};
 use crate::wsl_helper::{self, WslProbe};
@@ -78,6 +79,11 @@ struct Theme {
     pr_draft: Color32,
     pr_merged: Color32,
     pr_closed: Color32,
+    /// Branch upstream badge colors, mapped from the ANSI palette.
+    upstream_level: Color32,
+    upstream_diverged: Color32,
+    upstream_gone: Color32,
+    upstream_untracked: Color32,
     /// Logical-pixel size for headings (titles like "Projects", "Git").
     /// `FontConfig::UI_HEADING_RATIO` of the terminal font size.
     font_heading: f32,
@@ -141,6 +147,10 @@ impl Theme {
             pr_draft: text_muted,
             pr_merged: rgb_to_color32(config.palette.normal[5]), // magenta
             pr_closed: rgb_to_color32(config.palette.normal[1]), // red
+            upstream_level: rgb_to_color32(config.palette.normal[2]), // green
+            upstream_diverged: rgb_to_color32(config.palette.normal[3]), // yellow
+            upstream_gone: rgb_to_color32(config.palette.normal[1]), // red
+            upstream_untracked: rgb_to_color32(config.palette.normal[4]), // blue
             font_heading,
             font_normal,
             ui_scale: font_normal / 11.25,
@@ -6019,6 +6029,33 @@ fn pr_badge<'a>(
     }
 }
 
+/// Badge glyph, color, and tooltip for an upstream state.  The tooltip names
+/// the upstream ref because the glyph cannot.
+fn upstream_badge<'a>(
+    icons: &'a Icons,
+    theme: &Theme,
+    state: &UpstreamState,
+) -> (&'a str, Color32, String) {
+    match state {
+        UpstreamState::Level { upstream } => {
+            (&icons.upstream_level, theme.upstream_level, format!("tracks {upstream}"))
+        },
+        UpstreamState::Diverged { upstream, ahead, behind } => (
+            &icons.upstream_diverged,
+            theme.upstream_diverged,
+            format!("tracks {upstream} — {ahead} ahead, {behind} behind"),
+        ),
+        UpstreamState::Gone { upstream } => {
+            (&icons.upstream_gone, theme.upstream_gone, format!("{upstream} is missing locally"))
+        },
+        UpstreamState::Untracked => (
+            &icons.upstream_untracked,
+            theme.upstream_untracked,
+            "no upstream configured".to_string(),
+        ),
+    }
+}
+
 fn worktree_row(
     ui: &mut egui::Ui,
     wt: &Worktree,
@@ -6122,6 +6159,19 @@ fn worktree_row(
                             color,
                         );
                         resp.on_hover_text(format!("PR #{} — {word}", info.number));
+                    }
+                    if let Some(state) = wt.upstream.as_ref() {
+                        let (glyph, color, tip) = upstream_badge(icons, theme, state);
+                        let (rect, resp) = ui
+                            .allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            glyph,
+                            egui::FontId::proportional(10.0 * theme.ui_scale),
+                            color,
+                        );
+                        resp.on_hover_text(tip);
                     }
                 },
             );
@@ -9440,6 +9490,26 @@ mod tests {
         out
     }
 
+    /// The x-coordinate of every painted glyph, keyed by its text — for
+    /// asserting left-to-right screen order rather than the (reversed)
+    /// right-to-left call order `row_with_trailing` lays widgets out in.
+    fn painted_glyph_centers(shapes: &[egui::epaint::ClippedShape]) -> HashMap<String, f32> {
+        fn walk(shape: &egui::Shape, out: &mut HashMap<String, f32>) {
+            match shape {
+                egui::Shape::Text(t) => {
+                    out.insert(t.galley.text().to_owned(), t.pos.x);
+                },
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {},
+            }
+        }
+        let mut out = HashMap::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
     /// Rest the pointer over a row and collect every text painted while it
     /// lingers there, tooltip included. The frames advance the clock past
     /// `tooltip_delay` and keep the pointer still, which is what egui waits
@@ -9631,6 +9701,84 @@ mod tests {
             );
             assert_eq!(tooltip_shown(&texts, name), want, "{mode:?} on {name:?}: {texts:?}");
         }
+    }
+
+    #[test]
+    fn the_upstream_tooltip_names_the_upstream_ref() {
+        let icons = crate::config::Icons::default();
+        let theme = Theme::from_config(&Config::default());
+        let (_, _, tip) = upstream_badge(
+            &icons,
+            &theme,
+            &UpstreamState::Diverged { upstream: "origin/x".into(), ahead: 2, behind: 1 },
+        );
+        assert_eq!(tip, "tracks origin/x — 2 ahead, 1 behind");
+
+        let (_, _, tip) = upstream_badge(&icons, &theme, &UpstreamState::Untracked);
+        assert_eq!(tip, "no upstream configured");
+    }
+
+    /// A single headless frame of a worktree row carrying both a PR and an
+    /// upstream state, so both trailing badges paint alongside the × and +
+    /// buttons.
+    fn render_worktree_row_with_badges() -> Vec<egui::epaint::ClippedShape> {
+        let theme = Theme::from_config(&Config::default());
+        let icons = crate::config::Icons::default();
+        let wt = crate::projects::Worktree {
+            name: "feature/x".to_owned(),
+            path: PathBuf::from("/repo/wt"),
+            branch: None,
+            is_main: false,
+            prunable: false,
+            upstream: Some(UpstreamState::Level { upstream: "origin/x".into() }),
+            detached: false,
+        };
+        let pr = PrInfo {
+            number: 1,
+            base_branch: "main".into(),
+            url: String::new(),
+            state: PrState::Open,
+        };
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(600.0, 200.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                worktree_row(
+                    ui,
+                    &wt,
+                    &wt.name,
+                    Some(&pr),
+                    true,
+                    false,
+                    false,
+                    false,
+                    None,
+                    false,
+                    &icons,
+                    &theme,
+                );
+            });
+        });
+        output.shapes
+    }
+
+    /// `row_with_trailing` lays the trailing group out right-to-left, so call
+    /// order is the reverse of what the user sees.  Assert the rendering, not
+    /// the call order — the two read as opposites.
+    #[test]
+    fn the_upstream_badge_paints_left_of_the_pr_badge_and_the_buttons() {
+        let centers = painted_glyph_centers(&render_worktree_row_with_badges());
+        let x = |g: &str| centers.get(g).copied().expect(g);
+        assert!(x("✓") < x("⬤"), "upstream badge sits left of the PR badge");
+        assert!(x("⬤") < x("+"), "badges sit left of the action buttons");
+        assert!(x("+") < x("×"), "the existing button order is unchanged");
     }
 
     /// Session rows sense their click the same retroactive way, so a long
