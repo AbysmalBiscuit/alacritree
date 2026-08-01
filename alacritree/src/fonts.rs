@@ -884,9 +884,6 @@ fn build_font_definitions(
         register_fallback_faces(&mut defs, family, style, variant, targets, fonts, &mut book);
     }
 
-    // The normal chain only splices when a UI font is configured, but the
-    // variant families must always exist — with no UI font they inherit the
-    // terminal's variant faces, which is what chrome text already renders with.
     install_ui_font(&mut defs, ui, fonts);
 
     Some((defs, book.chain))
@@ -1462,23 +1459,75 @@ mod tests {
 
     /// An egui family is a flat vector of font ids — one family cannot reference
     /// another — so each UI variant chain must physically contain the terminal
-    /// variant's ids, deduplicated, after its own faces.
+    /// variant's ids, deduplicated, after its own faces.  `register_variant`
+    /// with no real face falls back to normal bytes under a fresh id, so
+    /// `BOLD_FONT_ID`/`ITALIC_FONT_ID`/`BOLD_ITALIC_FONT_ID` here are fallback
+    /// ids, not real variant faces — this only proves the splice carries
+    /// whatever ids the terminal chain published, real or not.
     #[test]
-    fn ui_variant_families_are_registered_and_deduplicated() {
+    fn ui_variant_families_inherit_the_terminal_chain() {
         let fonts = SystemFonts::with_cache_dir(None);
         let mut defs = FontDefinitions::default();
-        let face = map_font_file(&write_parseable_font("ui_variant_test.ttf")).unwrap();
+        let path = write_parseable_font("alacritree_test_ui_variant_chain.ttf");
+        let face = map_font_file(&path).unwrap();
         insert_face(&mut defs, NORMAL_FONT_ID, face, 0);
         register_variant(&mut defs, BOLD_FONT_ID, BOLD_FAMILY, None, (face, 0));
+        register_variant(&mut defs, ITALIC_FONT_ID, ITALIC_FAMILY, None, (face, 0));
+        register_variant(&mut defs, BOLD_ITALIC_FONT_ID, BOLD_ITALIC_FAMILY, None, (face, 0));
 
         install_ui_font(&mut defs, &UiFont::default(), &fonts);
 
-        for family in [UI_BOLD_FAMILY, UI_ITALIC_FAMILY, UI_BOLD_ITALIC_FAMILY] {
-            let ids = defs.families.get(&FontFamily::Name(family.into())).expect(family);
-            assert!(!ids.is_empty(), "{family} must resolve to at least one face");
+        let proportional_head = defs.families[&FontFamily::Proportional][0].clone();
+        for (ui_family, terminal_id) in [
+            (UI_BOLD_FAMILY, BOLD_FONT_ID),
+            (UI_ITALIC_FAMILY, ITALIC_FONT_ID),
+            (UI_BOLD_ITALIC_FAMILY, BOLD_ITALIC_FONT_ID),
+        ] {
+            let ids = defs.families.get(&FontFamily::Name(ui_family.into())).expect(ui_family);
+            assert!(
+                ids.contains(&terminal_id.to_string()),
+                "{ui_family} must inherit the terminal chain's {terminal_id}"
+            );
+            assert!(
+                ids.contains(&proportional_head),
+                "{ui_family} must inherit Proportional's head face"
+            );
             let mut seen = std::collections::HashSet::new();
-            assert!(ids.iter().all(|id| seen.insert(id)), "{family} has duplicate ids");
+            assert!(ids.iter().all(|id| seen.insert(id)), "{ui_family} has duplicate ids");
         }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The variant parse gate at the heart of `install_ui_variant` exists so a
+    /// configured `[ui.font]` variant family pointing at non-font bytes is
+    /// skipped instead of registered — registering it would make egui panic
+    /// when it parses the face at render time.
+    #[test]
+    fn unparseable_configured_variant_is_skipped_not_registered() {
+        let fonts = SystemFonts::with_cache_dir(None);
+        let mut defs = FontDefinitions::default();
+        let junk_path = std::env::temp_dir().join("alacritree_test_ui_variant_junk.ttf");
+        std::fs::write(&junk_path, b"not a font").unwrap();
+        let before = defs.font_data.len();
+
+        let ui = UiFont {
+            bold_family: Some(junk_path.to_string_lossy().into_owned()),
+            ..UiFont::default()
+        };
+        install_ui_font(&mut defs, &ui, &fonts);
+
+        assert_eq!(
+            defs.font_data.len(),
+            before,
+            "unparseable bytes must not register a new font id"
+        );
+        assert!(
+            !defs.font_data.contains_key(&format!("{UI_BOLD_FAMILY}_0")),
+            "the skipped candidate must never mint an id"
+        );
+
+        std::fs::remove_file(&junk_path).ok();
     }
 
     #[test]
