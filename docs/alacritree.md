@@ -297,6 +297,10 @@ sidebar_background = "#1c1c1c"
 sidebar_foreground = "#d8d8d8"
 sidebar_border     = "#2a2a2a"
 sidebar_accent     = "#6a9fb5"
+sidebar_attention  = "#f1c40f"   # optional; unset derives the attention badge
+                                 # from the palette's normal[3] (ANSI yellow),
+                                 # the same fallback pattern sidebar_accent
+                                 # uses for its own default (normal[4], blue)
 notifications      = true   # desktop notification when a hidden session bells;
                             # clicking it focuses the session that pinged
 attention_grace_ms = 0      # hold pings this long and drop them if the session
@@ -356,6 +360,18 @@ pr_status          = false  # poll `gh` for each branch's open PR, which drives
                             # below (default false)
 pr_status_concurrency = 8   # cap concurrent `gh` PR lookups; default 8,
                             # clamped to a minimum of 1
+upstream_status    = false  # paint a badge on each worktree row for its
+                            # branch's upstream state — level, diverged, gone,
+                            # or untracked (default false; also gates whether
+                            # the state is computed at all, so it costs
+                            # nothing when off)
+                            # Local refs only: nothing fetches, so a branch
+                            # deleted on the remote still reads as tracked
+                            # until something prunes locally.
+                            # extensions.worktreeConfig is unsupported: a
+                            # linked worktree that overrides branch.* in its
+                            # own config.worktree is read from the project
+                            # root instead, so that override is not seen.
 delta_path         = "delta"     # explicit delta binary for the diff pane;
                                  # unset discovers it on PATH
 worktree_name      = "$name ${pr: }"  # template for worktree row labels:
@@ -368,6 +384,9 @@ project_name       = "$name"     # same for project rows ($name, $path). A
 [ui.font]                   # chrome only — sidebars and modals, not the grid
 family = "Inter"            # unset derives from [font]
 size   = 12.0               # points, same unit as [font] size
+bold_family        = "Inter Display"  # unset falls back to family
+italic_family      = "Inter"          # unset falls back to family
+bold_italic_family = "Inter Display"  # unset falls back to family
 
 [ui.session_display]        # startup defaults; key bindings toggle both at runtime
 sidebar_always = false      # keep a sidebar session row even with one session
@@ -392,7 +411,12 @@ italic = false
 [ui.path_style.parent]      # emphasis for the leading directories
 color  = "#8a8a8a"
 
-[ui.icons]                  # sidebar glyph overrides (e.g. Nerd Font icons)
+[ui.icons]                  # sidebar glyph overrides (e.g. Nerd Font icons).
+                             # Each key takes a bare string (glyph only, as
+                             # below) or a table that also styles color,
+                             # weight, slant, and size — see "Icon styling"
+                             # below. The bare-string form keeps working
+                             # unchanged.
 search = "⌕"                # glyph prefixing the sidebar search prompt
 worktree_main = "●"         # the project's main checkout
 worktree = "○"
@@ -404,6 +428,10 @@ pr_open = "⬤"               # the four PR glyphs need pr_status = true; they
 pr_draft = "◯"              # differ by colour, so overriding one shape is
 pr_merged = "⬤"             # usually not what you want
 pr_closed = "⬤"
+upstream_level = "✓"        # the four upstream glyphs need upstream_status =
+upstream_diverged = "⇅"     # true; each carries its own default color from
+upstream_gone = "⌫"         # the theme, which a table override replaces
+upstream_untracked = "↑"
 
 [ui.drop]                   # what dragging files onto the window does
 enabled       = true        # master switch; false ignores every drop
@@ -486,6 +514,21 @@ tables are read by the same `Raw*` structs, so those parts of an existing
 `alacritty.toml` carry over. The structs cover the fields alacritree acts on
 rather than Alacritty's full schema — see `config.rs` for what a given table
 actually accepts.
+
+### Icon styling
+
+Every `[ui.icons]` key takes either a bare glyph string, as shown above, or a
+table that styles it further:
+
+```toml
+[ui.icons]
+upstream_gone = { glyph = "⌫", color = "#ff5555", bold = true, italic = false, size = 14 }
+```
+
+`glyph` is optional in table form — a table with no `glyph` key keeps that
+icon's default glyph and only applies the styling. `size` is in logical
+pixels, measured before `ui_scale`, and is clamped to the space the sidebar
+row reserves for that icon, so it cannot grow past its slot.
 
 ### Shell launch profiles
 
