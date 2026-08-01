@@ -681,6 +681,25 @@ impl Default for Icons {
     }
 }
 
+/// A sidebar icon's glyph and how to paint it.  Parses from a bare string
+/// (glyph only) or a table, so configs written before styling existed keep
+/// working unchanged.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IconStyle {
+    pub glyph: Option<String>,
+    pub color: Option<Color32>,
+    pub bold: bool,
+    pub italic: bool,
+    /// Logical pixels before `ui_scale`; clamped to the icon's slot at paint.
+    pub size: Option<f32>,
+}
+
+impl IconStyle {
+    pub fn or_glyph<'a>(&'a self, default: &'a str) -> &'a str {
+        self.glyph.as_deref().map(str::trim).filter(|g| !g.is_empty()).unwrap_or(default)
+    }
+}
+
 /// How one text span is emphasized.  `color: None` inherits whatever color the
 /// site normally paints, so an emphasis that sets only `bold` still tracks the
 /// theme.
@@ -1404,6 +1423,39 @@ fn build_icons(raw: RawIcons) -> Icons {
     }
 }
 
+/// A styled icon override: either a bare glyph string (`worktree = "◆"`) or a
+/// table (`worktree = { glyph = "◆", color = "#ff5555", bold = true }`), so
+/// existing bare-string configs keep parsing unchanged.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawIconStyle {
+    Glyph(String),
+    Table {
+        glyph: Option<String>,
+        color: Option<RgbStr>,
+        #[serde(default)]
+        bold: bool,
+        #[serde(default)]
+        italic: bool,
+        size: Option<f32>,
+    },
+}
+
+impl From<RawIconStyle> for IconStyle {
+    fn from(raw: RawIconStyle) -> Self {
+        match raw {
+            RawIconStyle::Glyph(glyph) => IconStyle { glyph: Some(glyph), ..Default::default() },
+            RawIconStyle::Table { glyph, color, bold, italic, size } => IconStyle {
+                glyph,
+                color: color.map(|c| rgb_to_color32(c.0)),
+                bold,
+                italic,
+                size: size.map(|s| s.max(1.0)),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RawUiWsl {
@@ -2104,6 +2156,44 @@ mod tests {
     fn search_icon_defaults_and_overrides() {
         assert_eq!(ui_from_toml("").icons.search, DEFAULT_SEARCH_ICON);
         assert_eq!(ui_from_toml("[ui.icons]\nsearch = \"\u{f002}\"").icons.search, "\u{f002}");
+    }
+
+    #[derive(Deserialize)]
+    struct IconStyleWrapper {
+        icon: RawIconStyle,
+    }
+
+    fn icon_style_from_toml(input: &str) -> IconStyle {
+        let wrapper: IconStyleWrapper = toml::from_str(input).expect("valid toml");
+        wrapper.icon.into()
+    }
+
+    #[test]
+    fn icon_style_parses_a_bare_string() {
+        let icon = icon_style_from_toml("icon = \"◆\"");
+        assert_eq!(icon.or_glyph("○"), "◆");
+        assert_eq!(icon.color, None);
+        assert!(!icon.bold);
+    }
+
+    #[test]
+    fn icon_style_parses_a_table() {
+        let icon = icon_style_from_toml(
+            "icon = { glyph = \"⌫\", color = \"#ff5555\", bold = true, size = 12 }",
+        );
+        assert_eq!(icon.or_glyph("x"), "⌫");
+        assert_eq!(icon.color, Some(Color32::from_rgb(0xff, 0x55, 0x55)));
+        assert!(icon.bold);
+        assert_eq!(icon.size, Some(12.0));
+    }
+
+    #[test]
+    fn a_blank_glyph_falls_back_to_the_default() {
+        let icon = icon_style_from_toml("icon = \"   \"");
+        assert_eq!(icon.or_glyph("○"), "○");
+
+        let icon = icon_style_from_toml("icon = { color = \"#ff0000\" }");
+        assert_eq!(icon.or_glyph("○"), "○", "a table with no glyph keeps the default");
     }
 
     #[test]
