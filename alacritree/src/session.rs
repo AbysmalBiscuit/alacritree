@@ -216,7 +216,10 @@ pub fn agent_name_for_glyph(glyph: char) -> Option<&'static str> {
 }
 
 /// The agent glyphs alone, for the coverage check that proves the baked font
-/// can draw every glyph alacritree ships.
+/// can draw every glyph alacritree ships.  Every one of these is also
+/// reachable through `AGENT_PROCESS_GLYPHS` above, so nothing outside tests
+/// needs this list — hence the gate.
+#[cfg(test)]
 pub(crate) const AGENT_GLYPHS: &[char] = &['✳', '◇', '✦', '▲', '❖', '⊕'];
 
 /// Plain-text dump of a session's grid for IPC clients.

@@ -499,6 +499,7 @@ impl std::ops::Deref for BakedGlyph {
 macro_rules! baked_glyphs {
     ($slice:ident: $($(#[$m:meta])* $name:ident = $glyph:literal;)*) => {
         $($(#[$m])* pub(crate) const $name: BakedGlyph = BakedGlyph($glyph);)*
+        #[cfg(test)]
         pub(crate) const $slice: &[BakedGlyph] = &[$(BakedGlyph($glyph)),*];
     };
 }
@@ -530,20 +531,30 @@ baked_glyphs! {
 
 baked_glyphs! {
     CHROME_GLYPHS:
-    /// Action buttons.  Task 5 gives each of these a config key; the glyphs
-    /// are declared here because coverage is owed regardless of who names them.
+    /// Action buttons.  Each takes a config key of its own; the glyphs are
+    /// declared here because coverage is owed regardless of who names them.
     DEFAULT_ADD_ICON = "+";
     DEFAULT_CLOSE_ICON = "×";
     DEFAULT_REFRESH_ICON = "↻";
     DEFAULT_REORDER_ICON = "⇅";
-    /// Painted inline in labels and hover text rather than through any icon
-    /// key.  They earn coverage the same way, so they are declared the same way.
+    /// Painted directly as literals at their call sites — labels, hover text —
+    /// rather than through these constants, so nothing in ordinary builds
+    /// reads them.  They are declared here only to give the coverage check
+    /// something to assert against, hence gated to test builds; the glyphs
+    /// themselves ship in the app regardless of that gate.
+    #[cfg(test)]
     DEFAULT_MIDDOT_GLYPH = "·";
+    #[cfg(test)]
     DEFAULT_EMDASH_GLYPH = "—";
+    #[cfg(test)]
     DEFAULT_BULLET_GLYPH = "•";
+    #[cfg(test)]
     DEFAULT_ELLIPSIS_GLYPH = "…";
+    #[cfg(test)]
     DEFAULT_DOWN_ARROW_GLYPH = "↓";
+    #[cfg(test)]
     DEFAULT_DRAG_HANDLE_GLYPH = "⠿";
+    #[cfg(test)]
     DEFAULT_CURSOR_BLOCK_GLYPH = "▌";
 }
 
