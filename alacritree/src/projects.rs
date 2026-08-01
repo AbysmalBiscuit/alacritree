@@ -149,6 +149,8 @@ impl Project {
         };
 
         let records = parse_worktree_list_z(sections.get(1).copied().unwrap_or_default());
+        let upstreams =
+            crate::upstream::parse_for_each_ref(sections.get(6).copied().unwrap_or_default());
         let worktrees: Vec<Worktree> = records
             .iter()
             .enumerate()
@@ -162,14 +164,16 @@ impl Project {
                     .or_else(|| rec.head.as_ref().map(|h| h.chars().take(7).collect()));
                 let wt_name = if i == 0 { "main".to_string() } else { display_name(&path) };
                 let prunable = i != 0 && !path.is_dir();
+                let detached = rec.branch.is_none();
+                let upstream = rec.branch.as_deref().and_then(|b| upstreams.get(b).cloned());
                 Worktree {
                     name: wt_name,
                     path,
                     branch,
                     is_main: i == 0,
                     prunable,
-                    upstream: None,
-                    detached: false,
+                    upstream,
+                    detached,
                 }
             })
             .collect();
@@ -193,25 +197,36 @@ impl Project {
     fn from_repo(root: PathBuf, name: String, repo: &Repository) -> Self {
         let main_path = repo.workdir().map(|p| p.to_path_buf()).unwrap_or_else(|| root.clone());
 
+        let upstreams = crate::upstream::map_from_repo(repo);
+        let lookup = |branch: &Option<String>, detached: bool| {
+            if detached { None } else { branch.as_deref().and_then(|b| upstreams.get(b).cloned()) }
+        };
+
         let mut worktrees = Vec::new();
+        let (branch, detached) = current_branch(repo);
+        let upstream = lookup(&branch, detached);
         worktrees.push(Worktree {
             name: "main".to_string(),
             path: main_path.clone(),
-            branch: current_branch(repo),
+            branch,
             is_main: true,
             prunable: false,
-            upstream: None,
-            detached: false,
+            upstream,
+            detached,
         });
 
         if let Ok(names) = repo.worktrees() {
             for name in names.iter().flatten() {
                 if let Ok(wt) = repo.find_worktree(name) {
                     let path = wt.path().to_path_buf();
-                    let branch = Repository::open(&path)
+                    let (branch, detached) = match Repository::open(&path)
                         .ok()
-                        .and_then(|wt_repo| current_branch(&wt_repo))
-                        .or_else(|| branch_from_admin_head(repo, name));
+                        .map(|wt_repo| current_branch(&wt_repo))
+                    {
+                        Some((Some(branch), detached)) => (Some(branch), detached),
+                        _ => (branch_from_admin_head(repo, name), false),
+                    };
+                    let upstream = lookup(&branch, detached);
                     worktrees.push(Worktree {
                         name: name.to_string(),
                         // Directory existence, not git2's `is_prunable`, is
@@ -221,8 +236,8 @@ impl Project {
                         path,
                         branch,
                         is_main: false,
-                        upstream: None,
-                        detached: false,
+                        upstream,
+                        detached,
                     });
                 }
             }
@@ -282,16 +297,16 @@ pub fn project_json(project: &Project) -> Value {
     })
 }
 
-fn current_branch(repo: &Repository) -> Option<String> {
-    let head = repo.head().ok()?;
+/// Branch name, or the short OID when detached.  The flag is what callers
+/// key on: the OID string is indistinguishable from a branch name.
+fn current_branch(repo: &Repository) -> (Option<String>, bool) {
+    let Ok(head) = repo.head() else {
+        return (None, false);
+    };
     if head.is_branch() {
-        head.shorthand().map(|s| s.to_string())
+        (head.shorthand().map(|s| s.to_string()), false)
     } else {
-        // Detached HEAD: show the short OID.
-        head.target().map(|oid| {
-            let s = oid.to_string();
-            s.chars().take(7).collect()
-        })
+        (head.target().map(|oid| oid.to_string().chars().take(7).collect()), true)
     }
 }
 
@@ -355,7 +370,7 @@ fn display_name(root: &std::path::Path) -> String {
 /// Sections: 0 repo-or-not, 1 `worktree list --porcelain -z`,
 /// 2 origin/HEAD symref, 3 which common default-branch names exist,
 /// 4 `init.defaultBranch` only if it names an existing branch,
-/// 5 the distro's `$HOME`.
+/// 5 the distro's `$HOME`, 6 upstream tracking state per local branch.
 const DISCOVER_SCRIPT: &str = r#"
 p="$1"
 sep() { printf '\n@@ALACRITREE@@\n'; }
@@ -371,6 +386,8 @@ cfg=$(git -C "$p" config init.defaultBranch 2>/dev/null)
 if [ -n "$cfg" ] && git -C "$p" rev-parse --verify --quiet "refs/heads/$cfg" >/dev/null 2>&1; then printf '%s' "$cfg"; fi
 sep
 printf '%s' "$HOME"
+sep
+LC_ALL=C git -C "$p" for-each-ref --format='%(refname:short)%09%(upstream:short)%09%(upstream:track,nobracket)' refs/heads/ 2>/dev/null
 "#;
 
 /// One record from `git worktree list --porcelain -z`.  The main worktree is
@@ -612,16 +629,41 @@ worktree /home/lev/wt/tmp\0HEAD 0011223344556677\0detached\0\0";
         assert_eq!(records[0].path, "/home/lev/my proj");
     }
 
-    /// `$HOME` rides the existing discovery batch, so its section index must not
-    /// drift from the script.  A blank section means the distro reported nothing
-    /// and there is no home to collapse to.
+    /// Section indices are positional, so a new section must go *after* `$HOME`
+    /// to leave every existing index alone.
     #[test]
-    fn the_discover_script_ends_with_the_home_section() {
+    fn the_discover_script_sections_keep_their_indices() {
+        let sections: Vec<&str> = DISCOVER_SCRIPT.split("\nsep\n").collect();
+        assert_eq!(sections.len(), 7, "six sep boundaries, seven sections");
+        assert!(sections[5].contains(r#"printf '%s' "$HOME""#), "$HOME must stay at index 5");
+        assert!(sections[6].contains("for-each-ref"), "upstream tracking is the new last section");
+        assert!(sections[6].contains("LC_ALL=C"), "the track vocabulary is localized");
+    }
+
+    /// The whole point of the `detached` flag: `branch` holds a short OID here,
+    /// and a real branch can be named the same thing.  Asserting only that the
+    /// *record* has no branch would pass against today's parser and prove
+    /// nothing — build the worktree and check the flag and the lookup.
+    #[test]
+    fn a_detached_worktree_gets_no_badge_even_when_its_oid_looks_like_a_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        let tree = repo.find_tree(repo.treebuilder(None).unwrap().write().unwrap()).unwrap();
+        let oid = repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
+
+        // A branch named exactly like the short OID the detached row will show.
+        let short: String = oid.to_string().chars().take(7).collect();
+        repo.branch(&short, &repo.find_commit(oid).unwrap(), false).unwrap();
+        repo.set_head_detached(oid).unwrap();
+
+        let project = Project::discover(dir.path().to_path_buf()).project;
+        let main = &project.worktrees[0];
+        assert!(main.detached, "a detached HEAD must be flagged");
         assert!(
-            DISCOVER_SCRIPT.trim_end().ends_with(r#"printf '%s' "$HOME""#),
-            "the $HOME section must be last so its index stays 5"
+            main.upstream.is_none(),
+            "a detached row must not adopt the same-named branch's state"
         );
-        assert_eq!(DISCOVER_SCRIPT.matches("\nsep\n").count(), 5, "one sep per section boundary");
     }
 
     /// Discovery is adopted through one method by both refresh paths.  Two paths
