@@ -712,14 +712,15 @@ impl Default for UiFont {
     }
 }
 
-/// Sidebar status glyphs, each independently overridable from `[ui.icons]`
-/// as a bare glyph or a table styling color/weight/slant/size.  An absent key
-/// falls back to the default below; a table with no `glyph` key keeps the
-/// default glyph but applies its own styling.  Action buttons (×, +, ↻) are
-/// controls, not status, and stay fixed. The projects panel's reorder toggle
-/// also paints a fixed glyph (⇅) that happens to match `upstream_diverged`'s
-/// default below — the two are unrelated, and reconfiguring one does not
-/// affect the other.
+/// Sidebar glyphs, each independently overridable from `[ui.icons]` as a bare
+/// glyph or a table styling color/weight/slant/size.  An absent key falls back
+/// to the default below; a table with no `glyph` key keeps the default glyph
+/// but applies its own styling.
+///
+/// One key per action, not per glyph: the three `×` buttons remove a project,
+/// delete a worktree and its branch, and close a session, so only separate
+/// keys let the destructive one be marked. `reorder` and `upstream_diverged`
+/// share a default glyph and are otherwise unrelated.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Icons {
     /// Glyph prefixing the sidebar search prompt.
@@ -738,6 +739,14 @@ pub struct Icons {
     pub upstream_diverged: IconStyle,
     pub upstream_gone: IconStyle,
     pub upstream_untracked: IconStyle,
+    pub add_project: IconStyle,
+    pub new_worktree: IconStyle,
+    pub new_session: IconStyle,
+    pub remove_project: IconStyle,
+    pub delete_worktree: IconStyle,
+    pub close_session: IconStyle,
+    pub refresh: IconStyle,
+    pub reorder: IconStyle,
 }
 
 /// `[ui.focus_outline]`: stroke a border around a panel while it owns
@@ -784,6 +793,14 @@ impl Default for Icons {
             upstream_diverged: glyph(DEFAULT_UPSTREAM_DIVERGED_ICON),
             upstream_gone: glyph(DEFAULT_UPSTREAM_GONE_ICON),
             upstream_untracked: glyph(DEFAULT_UPSTREAM_UNTRACKED_ICON),
+            add_project: glyph(DEFAULT_ADD_ICON),
+            new_worktree: glyph(DEFAULT_ADD_ICON),
+            new_session: glyph(DEFAULT_ADD_ICON),
+            remove_project: glyph(DEFAULT_CLOSE_ICON),
+            delete_worktree: glyph(DEFAULT_CLOSE_ICON),
+            close_session: glyph(DEFAULT_CLOSE_ICON),
+            refresh: glyph(DEFAULT_REFRESH_ICON),
+            reorder: glyph(DEFAULT_REORDER_ICON),
         }
     }
 }
@@ -1503,6 +1520,14 @@ struct RawIcons {
     upstream_diverged: Option<RawIconStyle>,
     upstream_gone: Option<RawIconStyle>,
     upstream_untracked: Option<RawIconStyle>,
+    add_project: Option<RawIconStyle>,
+    new_worktree: Option<RawIconStyle>,
+    new_session: Option<RawIconStyle>,
+    remove_project: Option<RawIconStyle>,
+    delete_worktree: Option<RawIconStyle>,
+    close_session: Option<RawIconStyle>,
+    refresh: Option<RawIconStyle>,
+    reorder: Option<RawIconStyle>,
 }
 
 /// An absent key falls back to the key's default style (glyph included); a
@@ -1529,6 +1554,14 @@ fn build_icons(raw: RawIcons) -> Icons {
         upstream_diverged: style_or(raw.upstream_diverged, &d.upstream_diverged),
         upstream_gone: style_or(raw.upstream_gone, &d.upstream_gone),
         upstream_untracked: style_or(raw.upstream_untracked, &d.upstream_untracked),
+        add_project: style_or(raw.add_project, &d.add_project),
+        new_worktree: style_or(raw.new_worktree, &d.new_worktree),
+        new_session: style_or(raw.new_session, &d.new_session),
+        remove_project: style_or(raw.remove_project, &d.remove_project),
+        delete_worktree: style_or(raw.delete_worktree, &d.delete_worktree),
+        close_session: style_or(raw.close_session, &d.close_session),
+        refresh: style_or(raw.refresh, &d.refresh),
+        reorder: style_or(raw.reorder, &d.reorder),
     }
 }
 
@@ -2821,6 +2854,39 @@ program = "second"
         assert_eq!(ui.icons.upstream_diverged.or_glyph(""), "⇅");
         assert_eq!(ui.icons.upstream_gone.or_glyph(""), "⌫");
         assert_eq!(ui.icons.upstream_untracked.or_glyph(""), "↑");
+    }
+
+    /// Three buttons paint the same glyph for three different actions, one of
+    /// which deletes a branch.  Separate keys are what let the destructive one
+    /// be marked without touching the others.
+    #[test]
+    fn each_chrome_action_takes_its_own_icon_key() {
+        let ui = ui_from_toml("");
+        assert_eq!(ui.icons.add_project.or_glyph(""), "+");
+        assert_eq!(ui.icons.new_worktree.or_glyph(""), "+");
+        assert_eq!(ui.icons.new_session.or_glyph(""), "+");
+        assert_eq!(ui.icons.remove_project.or_glyph(""), "×");
+        assert_eq!(ui.icons.delete_worktree.or_glyph(""), "×");
+        assert_eq!(ui.icons.close_session.or_glyph(""), "×");
+        assert_eq!(ui.icons.refresh.or_glyph(""), "↻");
+        assert_eq!(ui.icons.reorder.or_glyph(""), "⇅");
+
+        let ui =
+            ui_from_toml("[ui.icons]\ndelete_worktree = { glyph = \"✖\", color = \"#ff5555\" }");
+        assert_eq!(ui.icons.delete_worktree.or_glyph(""), "✖");
+        assert_eq!(ui.icons.delete_worktree.color, Some(Color32::from_rgb(0xff, 0x55, 0x55)));
+        // A sibling sharing the same default glyph is unaffected.
+        assert_eq!(ui.icons.close_session.or_glyph(""), "×");
+        assert_eq!(ui.icons.close_session.color, None);
+    }
+
+    /// `reorder` and `upstream_diverged` default to the same glyph but are
+    /// independent keys.
+    #[test]
+    fn reorder_and_upstream_diverged_are_configured_separately() {
+        let ui = ui_from_toml("[ui.icons]\nreorder = \"⇕\"");
+        assert_eq!(ui.icons.reorder.or_glyph(""), "⇕");
+        assert_eq!(ui.icons.upstream_diverged.or_glyph(""), "⇅");
     }
 
     #[test]
