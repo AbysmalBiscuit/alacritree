@@ -766,7 +766,9 @@ impl AlacritreeApp {
                 // background discovery later swaps in via `poll_project_refreshes`.
                 let root = wsl::normalize_root(p.root.clone());
                 let mut project = match wsl::classify(&root) {
-                    wsl::Location::Windows(_) => Project::discover(root).project,
+                    wsl::Location::Windows(_) => {
+                        Project::discover(root, config.ui.upstream_status).project
+                    },
                     wsl::Location::Wsl { .. } => Project::placeholder(root),
                 };
                 project.expanded = p.expanded;
@@ -951,8 +953,9 @@ impl AlacritreeApp {
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         let worker_root = root.clone();
+        let upstream = self.config.ui.upstream_status;
         std::thread::spawn(move || {
-            let _ = tx.send(Project::discover(worker_root));
+            let _ = tx.send(Project::discover(worker_root, upstream));
             ctx.request_repaint();
         });
         self.project_refreshes.start(root, rx);
@@ -1465,9 +1468,9 @@ impl AlacritreeApp {
             return;
         }
         match wsl::classify(&path) {
-            wsl::Location::Windows(_) => {
-                self.projects.push(Project::discover(path.clone()).project)
-            },
+            wsl::Location::Windows(_) => self
+                .projects
+                .push(Project::discover(path.clone(), self.config.ui.upstream_status).project),
             wsl::Location::Wsl { .. } => {
                 self.projects.push(Project::placeholder(path.clone()));
                 let idx = self.projects.len() - 1;
@@ -1486,7 +1489,7 @@ impl AlacritreeApp {
         if let Some(idx) = self.projects.iter().position(|p| p.root == path) {
             return &self.projects[idx];
         }
-        self.projects.push(Project::discover(path.clone()).project);
+        self.projects.push(Project::discover(path.clone(), self.config.ui.upstream_status).project);
         self.persist_project(&path);
         self.projects.last().expect("just pushed")
     }

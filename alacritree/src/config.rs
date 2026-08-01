@@ -725,6 +725,11 @@ pub struct UiTheme {
     /// no `gh` processes; when enabled it is best-effort like the diff-base
     /// lookup: no `gh`, no auth, or no PR silently paints nothing.
     pub pr_status: bool,
+    /// Paint a badge showing each worktree branch's upstream state.  Off by
+    /// default so an unmodified config does no extra ref work.  The state comes
+    /// from local refs only — nothing fetches, so a branch deleted on the remote
+    /// still reads as tracked until something prunes.
+    pub upstream_status: bool,
     /// `[ui] pr_status_concurrency`: max `gh` lookups in flight at once.
     /// Defaults to 8; clamped to ≥ 1, since a cold cache spawns one lookup
     /// per eligible worktree in a single frame and an unbounded cap would
@@ -779,6 +784,7 @@ impl Default for UiTheme {
             icon_tooltips: true,
             session_display: SessionDisplay::default(),
             pr_status: false,
+            upstream_status: false,
             pr_status_concurrency: DEFAULT_CONCURRENCY,
             icons: Icons::default(),
             focus_outline: FocusOutline::default(),
@@ -1464,6 +1470,7 @@ struct RawUi {
     /// Sidebar scrollbar style: "floating" (default) | "solid".
     scrollbar: Option<String>,
     pr_status: Option<bool>,
+    upstream_status: Option<bool>,
     /// Max `gh` lookups in flight at once.  Defaults to 8; clamped to ≥ 1.
     pr_status_concurrency: Option<usize>,
     font: RawUiFont,
@@ -1637,6 +1644,7 @@ impl RawConfig {
                 tabs_always: self.ui.session_display.tabs_always.unwrap_or(false),
             },
             pr_status: self.ui.pr_status.unwrap_or(false),
+            upstream_status: self.ui.upstream_status.unwrap_or(false),
             pr_status_concurrency: self
                 .ui
                 .pr_status_concurrency
@@ -2497,6 +2505,12 @@ program = "second"
     fn pr_status_defaults_off_and_parses_on() {
         assert!(!ui_from_toml("").pr_status);
         assert!(ui_from_toml("[ui]\npr_status = true").pr_status);
+    }
+
+    #[test]
+    fn upstream_status_defaults_off_and_parses_on() {
+        assert!(!ui_from_toml("").upstream_status);
+        assert!(ui_from_toml("[ui]\nupstream_status = true").upstream_status);
     }
 
     #[test]

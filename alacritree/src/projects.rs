@@ -1,5 +1,6 @@
 //! Enumerate sidebar-added directories and their git worktrees.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use git2::Repository;
@@ -94,15 +95,15 @@ impl Project {
     /// Classify the root and discover through the owning backend: in-distro
     /// git for WSL paths, git2 for Windows paths, and a pseudo-worktree
     /// placeholder when the root is not a repository.
-    pub fn discover(root: PathBuf) -> Discovered {
+    pub fn discover(root: PathBuf, upstream: bool) -> Discovered {
         let name = display_name(&root);
         match wsl::classify(&root) {
             wsl::Location::Wsl { distro, linux_path } => {
-                Self::discover_wsl(root, name, &distro, &linux_path)
+                Self::discover_wsl(root, name, &distro, &linux_path, upstream)
             },
             // A directory that is not a repository is a fact, not a failure.
             wsl::Location::Windows(_) => match Repository::open(&root) {
-                Ok(repo) => Discovered::found(Self::from_repo(root, name, &repo)),
+                Ok(repo) => Discovered::found(Self::from_repo(root, name, &repo, upstream)),
                 Err(_) => Discovered::found(Self::placeholder(root)),
             },
         }
@@ -136,10 +137,18 @@ impl Project {
     /// are split on `wsl::SECTION_SEP`.  A round trip that never landed yields
     /// the same pseudo-worktree a non-git folder gets, but marked
     /// non-authoritative so it cannot overwrite a known worktree list.
-    fn discover_wsl(root: PathBuf, name: String, distro: &str, linux_path: &str) -> Discovered {
-        let batch = wsl::run_batch(distro, DISCOVER_SCRIPT, &[linux_path]).map_err(|e| {
-            log::warn!("WSL discovery failed for {}: {e}", root.display());
-        });
+    fn discover_wsl(
+        root: PathBuf,
+        name: String,
+        distro: &str,
+        linux_path: &str,
+        upstream: bool,
+    ) -> Discovered {
+        let upstream_arg = if upstream { "1" } else { "0" };
+        let batch =
+            wsl::run_batch(distro, DISCOVER_SCRIPT, &[linux_path, upstream_arg]).map_err(|e| {
+                log::warn!("WSL discovery failed for {}: {e}", root.display());
+            });
         let sections = batch.as_ref().map(|s| wsl::split_sections(s)).unwrap_or_default();
         let text = |i: usize| {
             sections
@@ -194,10 +203,11 @@ impl Project {
         }
     }
 
-    fn from_repo(root: PathBuf, name: String, repo: &Repository) -> Self {
+    fn from_repo(root: PathBuf, name: String, repo: &Repository, upstream: bool) -> Self {
         let main_path = repo.workdir().map(|p| p.to_path_buf()).unwrap_or_else(|| root.clone());
 
-        let upstreams = crate::upstream::map_from_repo(repo);
+        let upstreams =
+            if upstream { crate::upstream::map_from_repo(repo) } else { HashMap::new() };
         let lookup = |branch: &Option<String>, detached: bool| {
             if detached { None } else { branch.as_deref().and_then(|b| upstreams.get(b).cloned()) }
         };
@@ -370,7 +380,10 @@ fn display_name(root: &std::path::Path) -> String {
 /// Sections: 0 repo-or-not, 1 `worktree list --porcelain -z`,
 /// 2 origin/HEAD symref, 3 which common default-branch names exist,
 /// 4 `init.defaultBranch` only if it names an existing branch,
-/// 5 the distro's `$HOME`, 6 upstream tracking state per local branch.
+/// 5 the distro's `$HOME`, 6 upstream tracking state per local branch —
+/// this last command only runs when `$2` is `"1"`, since `for-each-ref` with
+/// `%(upstream:track)` computes divergence for every branch even when the
+/// caller only wants the parse skipped.
 const DISCOVER_SCRIPT: &str = r#"
 p="$1"
 sep() { printf '\n@@ALACRITREE@@\n'; }
@@ -387,7 +400,9 @@ if [ -n "$cfg" ] && git -C "$p" rev-parse --verify --quiet "refs/heads/$cfg" >/d
 sep
 printf '%s' "$HOME"
 sep
-LC_ALL=C git -C "$p" for-each-ref --format='%(refname:short)%09%(upstream:short)%09%(upstream:track,nobracket)' refs/heads/ 2>/dev/null
+if [ "$2" = "1" ]; then
+  LC_ALL=C git -C "$p" for-each-ref --format='%(refname:short)%09%(upstream:short)%09%(upstream:track,nobracket)' refs/heads/ 2>/dev/null
+fi
 "#;
 
 /// One record from `git worktree list --porcelain -z`.  The main worktree is
@@ -533,7 +548,7 @@ mod tests {
     #[test]
     fn a_non_git_windows_root_is_authoritative() {
         let dir = tempfile::tempdir().unwrap();
-        let found = Project::discover(dir.path().to_path_buf());
+        let found = Project::discover(dir.path().to_path_buf(), false);
         assert!(found.authoritative, "a directory that is genuinely not a repo is the truth");
         assert_eq!(found.project.worktrees.len(), 1);
     }
@@ -545,7 +560,7 @@ mod tests {
         let repo = init_repo(&repo_dir);
         add_worktree(&repo, "feature");
 
-        let project = Project::discover(repo_dir).project;
+        let project = Project::discover(repo_dir, false).project;
         let wt = project.worktrees.iter().find(|w| w.name == "feature").unwrap();
         assert!(!wt.prunable);
         assert_eq!(wt.branch.as_deref(), Some("feature"));
@@ -567,7 +582,7 @@ mod tests {
         let wt_path = add_worktree(&repo, "feature");
         std::fs::remove_dir_all(&wt_path).unwrap();
 
-        let project = Project::discover(repo_dir).project;
+        let project = Project::discover(repo_dir, false).project;
         let wt = project.worktrees.iter().find(|w| w.name == "feature").unwrap();
         assert!(wt.prunable);
         assert_eq!(wt.branch.as_deref(), Some("feature"));
@@ -579,7 +594,7 @@ mod tests {
         let repo_dir = tmp.path().join("repo");
         init_repo(&repo_dir);
 
-        let project = Project::discover(repo_dir).project;
+        let project = Project::discover(repo_dir, false).project;
         assert!(project.worktrees[0].is_main);
         assert!(!project.worktrees[0].prunable);
     }
@@ -590,7 +605,7 @@ mod tests {
         let repo_dir = tmp.path().join("repo");
         init_repo(&repo_dir);
 
-        let mut project = Project::discover(repo_dir).project;
+        let mut project = Project::discover(repo_dir, false).project;
         assert_eq!(project.display_name(), "repo");
 
         project.label = Some("Work".to_string());
@@ -638,6 +653,11 @@ worktree /home/lev/wt/tmp\0HEAD 0011223344556677\0detached\0\0";
         assert!(sections[5].contains(r#"printf '%s' "$HOME""#), "$HOME must stay at index 5");
         assert!(sections[6].contains("for-each-ref"), "upstream tracking is the new last section");
         assert!(sections[6].contains("LC_ALL=C"), "the track vocabulary is localized");
+        assert!(
+            sections[6].contains(r#"if [ "$2" = "1" ]; then"#),
+            "the for-each-ref call must stay gated by the upstream flag, or the feature runs \
+             even when disabled"
+        );
     }
 
     /// The whole point of the `detached` flag: `branch` holds a short OID here,
@@ -657,7 +677,7 @@ worktree /home/lev/wt/tmp\0HEAD 0011223344556677\0detached\0\0";
         repo.branch(&short, &repo.find_commit(oid).unwrap(), false).unwrap();
         repo.set_head_detached(oid).unwrap();
 
-        let project = Project::discover(dir.path().to_path_buf()).project;
+        let project = Project::discover(dir.path().to_path_buf(), true).project;
         let main = &project.worktrees[0];
         assert!(main.detached, "a detached HEAD must be flagged");
         assert!(
