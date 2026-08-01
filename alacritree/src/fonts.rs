@@ -2047,8 +2047,7 @@ mod tests {
             match face.glyph_index(c) {
                 None => blank.push((c, "absent from the cmap")),
                 Some(id) => {
-                    let mut builder = OutlineExtents::default();
-                    if face.outline_glyph(id, &mut builder).is_none() {
+                    if face.outline_glyph(id, &mut DiscardOutline).is_none() {
                         blank.push((c, "mapped but has no outline"));
                     }
                 },
@@ -2105,6 +2104,13 @@ mod tests {
     #[test]
     fn the_symbol_face_stays_out_of_the_terminal_families() {
         let mut defs = FontDefinitions::default();
+        // The named variant families only exist once registration has run, and
+        // an absent family is skipped rather than appended to, so seed them or
+        // three of the four assertions below would iterate over nothing.
+        let mono = defs.families[&FontFamily::Monospace].clone();
+        for name in [BOLD_FAMILY, ITALIC_FAMILY, BOLD_ITALIC_FAMILY] {
+            defs.families.insert(FontFamily::Name(name.into()), mono.clone());
+        }
         install_symbol_fallback(&mut defs, &UiFont::default());
         for family in [
             FontFamily::Monospace,
@@ -2181,19 +2187,6 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         seen
-    }
-
-    /// `outline_glyph` reports whether a glyph has an outline through its
-    /// return value, so the builder itself has nothing to record.
-    #[derive(Default)]
-    struct OutlineExtents;
-
-    impl ttf_parser::OutlineBuilder for OutlineExtents {
-        fn move_to(&mut self, _: f32, _: f32) {}
-        fn line_to(&mut self, _: f32, _: f32) {}
-        fn quad_to(&mut self, _: f32, _: f32, _: f32, _: f32) {}
-        fn curve_to(&mut self, _: f32, _: f32, _: f32, _: f32, _: f32, _: f32) {}
-        fn close(&mut self) {}
     }
 }
 
