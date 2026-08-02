@@ -42,6 +42,7 @@ pub struct Config {
     /// Offer the IPC socket that `alacritree mcp` connects to.  Mirrors
     /// alacritty's `[general] ipc_socket` (default on).
     pub ipc_socket: bool,
+    pub debug: DebugConfig,
     /// Start dir for sessions with no explicit workspace (the home tab);
     /// worktree tabs always use their checkout path.  Mirrors alacritty's
     /// `[general] working_directory`, except a leading `~` expands to the
@@ -58,6 +59,22 @@ pub struct Config {
     pub profiles: Vec<Profile>,
     /// Validated at load: always names an entry in `profiles` when `Some`.
     pub default_profile: Option<String>,
+}
+
+/// alacritty's `[debug]` section, plus one alacritree-only key.
+#[derive(Debug, Clone)]
+pub struct DebugConfig {
+    /// alacritree-only, set in `alacritree.toml`.  Default on: a crash that
+    /// leaves no record is the failure this exists to prevent.
+    pub crash_log: bool,
+    /// Upstream's name and upstream's default.
+    pub persistent_logging: bool,
+}
+
+impl Default for DebugConfig {
+    fn default() -> Self {
+        Self { crash_log: true, persistent_logging: false }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1004,6 +1021,7 @@ impl Default for Config {
             selection: SelectionConfig::default(),
             bindings: Vec::new(),
             ipc_socket: true,
+            debug: DebugConfig::default(),
             working_directory: None,
             wsl_automount_root: "/mnt".to_string(),
             wsl_resident_helper: true,
@@ -1293,6 +1311,7 @@ struct RawConfig {
     selection: RawSelection,
     keyboard: RawKeyboard,
     general: RawGeneral,
+    debug: RawDebug,
     wsl: RawWsl,
 }
 
@@ -1305,6 +1324,14 @@ struct RawConfig {
 struct RawGeneral {
     ipc_socket: Option<bool>,
     working_directory: Option<String>,
+}
+
+/// alacritty's `[debug]` section, plus one alacritree-only key.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawDebug {
+    crash_log: Option<bool>,
+    persistent_logging: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2064,6 +2091,10 @@ impl RawConfig {
             selection,
             bindings,
             ipc_socket: self.general.ipc_socket.unwrap_or(true),
+            debug: DebugConfig {
+                crash_log: self.debug.crash_log.unwrap_or(true),
+                persistent_logging: self.debug.persistent_logging.unwrap_or(false),
+            },
             working_directory: self
                 .general
                 .working_directory
@@ -3192,5 +3223,47 @@ program = "second"
         for g in ["+", "×", "↻", "⇅", "·", "—", "•", "…", "↓", "⠿", "▌"] {
             assert!(chrome.contains(&g), "{g} is missing from CHROME_GLYPHS");
         }
+    }
+
+    /// A derived `Default` on a bare `bool` would make this false and silently
+    /// invert the intended default, so the raw field is an `Option` resolved with
+    /// `unwrap_or` — the same shape `wsl.resident_helper` uses.
+    #[test]
+    fn crash_logging_is_on_unless_asked_otherwise() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+
+        let config = raw.into_config();
+
+        assert!(config.debug.crash_log);
+        assert!(!config.debug.persistent_logging);
+    }
+
+    #[test]
+    fn crash_logging_can_be_turned_off() {
+        let raw: RawConfig = toml::from_str("[debug]\ncrash_log = false").unwrap();
+
+        assert!(!raw.into_config().debug.crash_log);
+    }
+
+    #[test]
+    fn persistent_logging_can_be_turned_on() {
+        let raw: RawConfig = toml::from_str("[debug]\npersistent_logging = true").unwrap();
+
+        assert!(raw.into_config().debug.persistent_logging);
+    }
+
+    /// `[debug]` in both files merges key by key rather than the later table
+    /// replacing the earlier one wholesale.
+    #[test]
+    fn a_debug_table_in_both_files_merges_key_by_key() {
+        let alacritty: toml::Value = toml::from_str("[debug]\npersistent_logging = true").unwrap();
+        let alacritree: toml::Value = toml::from_str("[debug]\ncrash_log = false").unwrap();
+
+        let merged = merge(alacritty, alacritree);
+        let config: RawConfig = merged.try_into().unwrap();
+        let config = config.into_config();
+
+        assert!(config.debug.persistent_logging, "the alacritty.toml key was dropped");
+        assert!(!config.debug.crash_log, "the alacritree.toml key was dropped");
     }
 }
