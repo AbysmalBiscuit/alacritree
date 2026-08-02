@@ -82,11 +82,13 @@ fontconfig = "0.8"
 polling = "3.11"
 # Restricts the DLL search path at startup (`harden_dll_search_path`), borrows
 # the launching shell's console so the CLI can print (`attach_parent_console`),
-# and reads the cursor during a file drag, which winit discards.
+# reads the cursor during a file drag, which winit discards, and asks whether a
+# pid is still running before pruning its log.
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Console",
     "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }
 # Foreground-agent detection: walks the shell's descendant process tree.

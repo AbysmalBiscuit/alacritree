@@ -23,6 +23,7 @@ mod ime;
 mod input;
 mod ipc;
 mod links;
+mod logdir;
 mod mcp;
 mod mouse;
 #[cfg(target_os = "macos")]
