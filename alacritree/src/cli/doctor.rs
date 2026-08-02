@@ -402,14 +402,10 @@ fn classify(path: &Path, pid: u32) -> Verdict {
     }
 
     let mut exited = false;
-    let mut after_exit = false;
     let mut panicked = false;
     for entry in lines {
         if entry.contains("PANIC thread=") || entry.contains("panic records skipped:") {
             panicked = true;
-            if exited {
-                after_exit = true;
-            }
         }
         if entry.contains("exit error:") {
             return Verdict::Crashed;
@@ -419,7 +415,7 @@ fn classify(path: &Path, pid: u32) -> Verdict {
         }
     }
 
-    if panicked || after_exit {
+    if panicked {
         return Verdict::Crashed;
     }
     if exited {
@@ -1111,6 +1107,11 @@ mod tests {
         let checks = crash_checks_in(dir.path());
 
         let text: String = checks.iter().map(|c| c.detail.clone()).collect();
-        assert!(text.contains("indeterminate"), "not reported as indeterminate: {text}");
+        // The column label "indeterminate" appears in every non-empty directory's
+        // detail, so asserting on it alone would not catch a misclassification
+        // into another bucket. Pin the counts instead.
+        assert!(text.contains("1 indeterminate"), "not counted as indeterminate: {text}");
+        assert!(text.contains("0 crashed"), "wrongly counted as crashed: {text}");
+        assert!(text.contains("0 clean"), "wrongly counted as clean: {text}");
     }
 }
