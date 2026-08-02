@@ -31,6 +31,10 @@ static SKIPPED: AtomicUsize = AtomicUsize::new(0);
 
 static STATE: Mutex<State> = Mutex::new(State::new());
 
+/// How many panic records one process may write before it starts costing more
+/// than it explains.
+const MAX_PANIC_RECORDS: usize = 20;
+
 struct State {
     version: &'static str,
     /// Where artifacts live.  Guarded rather than a `OnceLock` because every
@@ -43,11 +47,17 @@ struct State {
     /// unrelated writer — is never mistaken for ours; only a path we ourselves
     /// settled on through `create_new` is ever reopened for append.
     artifact: Option<PathBuf>,
+    /// How many panic records this process has written, against the cap.
+    panics: usize,
+    /// Location of the previous panic, for collapsing a repeat that fires from
+    /// the same place every frame.
+    last: Option<String>,
+    repeats: usize,
 }
 
 impl State {
     const fn new() -> Self {
-        Self { version: "", dir: None, artifact: None }
+        Self { version: "", dir: None, artifact: None, panics: 0, last: None, repeats: 0 }
     }
 }
 
@@ -64,6 +74,7 @@ pub fn install(dir: &Path, version: &'static str) {
         let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
         state.version = version;
         state.dir = Some(dir.to_path_buf());
+        state.artifact = None;
     }
     ARMED.store(true, Ordering::Relaxed);
 
@@ -108,6 +119,7 @@ pub fn record_exit(result: &Result<(), eframe::Error>) {
     }
 
     let mut guard = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+    flush_repeats(&mut guard);
     write_event(&mut guard, &event);
 }
 
@@ -220,13 +232,59 @@ fn record_panic(info: &PanicHookInfo<'_>) {
     // mutex would wait on itself forever, and the mutex is not poisoned yet, so
     // recovering from poisoning cannot help.  A lost record beats a hang.
     match STATE.try_lock() {
-        Ok(mut state) => write_event(&mut state, &event),
-        Err(TryLockError::Poisoned(p)) => write_event(&mut p.into_inner(), &event),
+        Ok(mut state) => record_bounded(&mut state, &location, &event),
+        Err(TryLockError::Poisoned(p)) => record_bounded(&mut p.into_inner(), &location, &event),
         Err(TryLockError::WouldBlock) => {
             SKIPPED.fetch_add(1, Ordering::Relaxed);
             let _ = writeln!(std::io::stderr(), "alacritree: panic record skipped (recorder busy)");
         },
     }
+}
+
+/// Write a panic record unless this process has already said enough.
+fn record_bounded(state: &mut State, location: &str, event: &str) {
+    if state.last.as_deref() == Some(location) {
+        state.repeats += 1;
+        return;
+    }
+    state.last = Some(location.to_string());
+
+    // Past the cap, a new location must not route through `flush_repeats`: that
+    // would still perform one write per differing location forever, which is
+    // the exact unbounded growth the cap exists to stop. Drop the pending run
+    // instead of flushing it.
+    if state.panics > MAX_PANIC_RECORDS {
+        state.repeats = 0;
+        return;
+    }
+
+    flush_repeats(state);
+
+    if state.panics == MAX_PANIC_RECORDS {
+        state.panics += 1;
+        let notice = line(&format!("panic records suppressed after {MAX_PANIC_RECORDS}"));
+        write_event(state, &notice);
+        return;
+    }
+
+    state.panics += 1;
+    write_event(state, event);
+}
+
+/// Close a collapsed run: written when a differing-location panic follows it or
+/// the process exits.  A run still in progress when the process aborts loses its
+/// count, not its record — the one full write already has the backtrace, which
+/// is the diagnosis; the tally is a nice-to-have on top of it.  Once the cap has
+/// fired, `record_bounded` drops a pending run itself rather than routing it
+/// here, so no tally is ever written for a location seen past the cap.
+fn flush_repeats(state: &mut State) {
+    if state.repeats == 0 {
+        return;
+    }
+    let repeats = state.repeats + 1;
+    state.repeats = 0;
+    let notice = line(&format!("  x{repeats} from the same location"));
+    write_event(state, &notice);
 }
 
 fn payload_of(info: &PanicHookInfo<'_>) -> String {
@@ -248,6 +306,11 @@ pub fn reset_for_tests(dir: &Path) {
         *state = State::new();
         state.dir = Some(dir.to_path_buf());
     }
+    // A test that deliberately poisons STATE (to exercise poison recovery)
+    // would otherwise leave every later test's direct `.lock()` failing too:
+    // poisoning is a property of the Mutex itself, not the value inside it,
+    // and replacing the value above does not clear it.
+    STATE.clear_poison();
     ARMED.store(true, Ordering::Relaxed);
     ENABLED.store(true, Ordering::Relaxed);
     BROKEN.store(false, Ordering::Relaxed);
@@ -451,6 +514,117 @@ mod tests {
             let text = artifact_text();
             assert!(text.contains("exit ok"), "exit marker lost:\n{text}");
             assert!(text.contains("late-worker"), "late panic lost:\n{text}");
+        });
+    }
+
+    /// A panicking PTY thread leaves the app running and the IPC listener spawns a
+    /// thread per connection, so one repeatable defect could otherwise append a
+    /// backtrace per request forever.
+    /// Alternating two call sites keeps every panic at a location distinct from the
+    /// one before it, so the collapse never engages and each panic takes the write
+    /// path — the only way to actually drive `panics` up to the cap.
+    #[test]
+    fn panic_records_stop_after_the_cap() {
+        with_recorder(|_| {
+            for i in 0..25 {
+                if i % 2 == 0 {
+                    let _ = std::panic::catch_unwind(|| panic!("cap-a"));
+                } else {
+                    let _ = std::panic::catch_unwind(|| panic!("cap-b"));
+                }
+            }
+
+            let text = artifact_text();
+            assert_eq!(text.matches("PANIC thread=").count(), 20, "cap not applied:\n{text}");
+            assert!(text.contains("panic records suppressed after 20"), "no notice:\n{text}");
+
+            // The cap's actual promise is that the file stops growing, not just
+            // that it stops growing with PANIC records specifically — a leaked
+            // "xN" tally line per differing location past the cap would still
+            // fail this even though it contains no "PANIC thread=".
+            let path = artifact_path_for_tests().expect("an artifact was created");
+            let size_at_cap = std::fs::metadata(&path).expect("artifact metadata").len();
+
+            for i in 0..10 {
+                if i % 2 == 0 {
+                    let _ = std::panic::catch_unwind(|| panic!("cap-a"));
+                } else {
+                    let _ = std::panic::catch_unwind(|| panic!("cap-b"));
+                }
+            }
+
+            let size_after = std::fs::metadata(&path).expect("artifact metadata").len();
+            assert_eq!(size_after, size_at_cap, "the artifact grew after the cap notice");
+
+            let text = artifact_text();
+            let after_notice = text.split("panic records suppressed after 20").nth(1).unwrap_or("");
+            assert!(
+                !after_notice.contains("from the same location"),
+                "a repeat tally leaked past the cap:\n{text}"
+            );
+        });
+    }
+
+    #[test]
+    fn identical_consecutive_panics_collapse_into_a_count() {
+        with_recorder(|_| {
+            for _ in 0..3 {
+                let _ = std::panic::catch_unwind(|| panic!("same-place"));
+            }
+            // A collapsed run's count lives only in memory until something closes
+            // it — a differing-location panic or, as here, process exit.
+            record_exit(&Ok(()));
+
+            let text = artifact_text();
+            assert_eq!(text.matches("PANIC thread=").count(), 1, "not collapsed:\n{text}");
+            assert!(text.contains("x3"), "no repeat count:\n{text}");
+        });
+    }
+
+    /// The exit marker reports what the recorder could not write.  It is
+    /// best-effort by construction: a skip that races `record_exit`'s read may be
+    /// absent, and that is not a failure.
+    #[test]
+    fn skipped_records_are_counted_for_the_exit_marker() {
+        with_recorder(|_| {
+            let held = STATE.lock().expect("the recorder lock");
+            let _ = std::panic::catch_unwind(|| panic!("while-held"));
+            drop(held);
+
+            record_exit(&Ok(()));
+
+            let text = artifact_text();
+            assert!(text.contains("panic records skipped: 1"), "no skip marker:\n{text}");
+        });
+    }
+
+    /// A blocking `lock()` here waits on a mutex this very thread holds and never
+    /// becomes poisoned.  This test hangs against that implementation.
+    #[test]
+    fn a_panic_while_holding_the_lock_does_not_hang() {
+        with_recorder(|_| {
+            let held = STATE.lock().expect("the recorder lock");
+
+            let result = std::panic::catch_unwind(|| panic!("self-deadlock"));
+
+            drop(held);
+            assert!(result.is_err(), "the panic did not unwind");
+        });
+    }
+
+    /// An earlier panic must not silence the next one.
+    #[test]
+    fn a_poisoned_lock_still_records() {
+        with_recorder(|_| {
+            let _ = std::panic::catch_unwind(|| {
+                let _guard = STATE.lock().expect("the recorder lock");
+                panic!("poisoning");
+            });
+
+            let _ = std::panic::catch_unwind(|| panic!("after-poison"));
+
+            let text = artifact_text();
+            assert!(text.contains("after-poison"), "record lost after poisoning:\n{text}");
         });
     }
 }
