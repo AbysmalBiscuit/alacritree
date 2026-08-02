@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError, TryLockError};
 use std::time::SystemTime;
 
-use crate::logdir::{self, ProcessId};
+use crate::logdir;
 
 /// Whether a log directory has been chosen.  Read without the lock so the hook
 /// can decline before contending for anything, and false until `install`, which
@@ -37,11 +37,17 @@ struct State {
     /// writer already holds this lock, and a directory that can only ever be
     /// set once is unreachable for a second test case.
     dir: Option<PathBuf>,
+    /// The artifact this process has confirmed as its own, once `ensure_artifact`
+    /// has created or reopened it.  Reused directly on every later call so a file
+    /// that merely happens to already sit at our identity's path — debris from an
+    /// unrelated writer — is never mistaken for ours; only a path we ourselves
+    /// settled on through `create_new` is ever reopened for append.
+    artifact: Option<PathBuf>,
 }
 
 impl State {
     const fn new() -> Self {
-        Self { version: "", dir: None }
+        Self { version: "", dir: None, artifact: None }
     }
 }
 
@@ -78,11 +84,11 @@ pub fn session_begin() {
         return;
     }
     match STATE.lock() {
-        Ok(state) => {
-            let _ = ensure_artifact(&state);
+        Ok(mut state) => {
+            let _ = ensure_artifact(&mut state);
         },
         Err(poisoned) => {
-            let _ = ensure_artifact(&poisoned.into_inner());
+            let _ = ensure_artifact(&mut poisoned.into_inner());
         },
     }
 }
@@ -101,8 +107,8 @@ pub fn record_exit(result: &Result<(), eframe::Error>) {
         Err(e) => event.push_str(&line(&format!("exit error: {e}"))),
     }
 
-    let guard = STATE.lock().unwrap_or_else(PoisonError::into_inner);
-    write_event(&guard, &event);
+    let mut guard = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+    write_event(&mut guard, &event);
 }
 
 fn writable() -> bool {
@@ -130,15 +136,24 @@ fn line(body: &str) -> String {
 /// during config load, `session_begin`, and any write after the file has been
 /// removed — and a record written into a headerless file has to be read back as
 /// indeterminate, discarding information we actually had.
-fn ensure_artifact(state: &State) -> Option<File> {
+///
+/// A file already sitting at our identity's path is reopened for append only if
+/// it is the exact path this process itself settled on earlier; otherwise it is
+/// left untouched and `create_new`'s collision retry claims the next ordinal
+/// instead, so debris from an unrelated writer can never be corrupted by an
+/// append and never gets mistaken for a readable header.
+fn ensure_artifact(state: &mut State) -> Option<File> {
     let dir = state.dir.as_ref()?;
-    let mut id: ProcessId = logdir::process_id();
-    let path = dir.join(logdir::artifact_name(&id));
 
-    if path.exists() {
-        return OpenOptions::new().append(true).open(&path).ok();
+    if let Some(path) = &state.artifact
+        && let Ok(file) = OpenOptions::new().append(true).open(path)
+    {
+        return Some(file);
     }
+    // No confirmed artifact yet, or it was removed underneath us: either way,
+    // fall through to the allocator below rather than losing the record.
 
+    let mut id = logdir::process_id();
     // `create_new` is the allocator: a collision means debris under an
     // identity we believed unique, and truncating it would destroy a record.
     for _ in 0..32 {
@@ -151,6 +166,7 @@ fn ensure_artifact(state: &State) -> Option<File> {
                     break;
                 }
                 let _ = file.flush();
+                state.artifact = Some(path);
                 return Some(file);
             },
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => id.ordinal += 1,
@@ -170,7 +186,7 @@ fn fail_once(what: &str) {
 /// One `write_all` of a fully built string, to a handle opened and closed per
 /// event: if a panic ever does reach an abort, abort skips destructors, so
 /// nothing may be left sitting in a buffer.
-fn write_event(state: &State, event: &str) {
+fn write_event(state: &mut State, event: &str) {
     let Some(mut file) = ensure_artifact(state) else { return };
     if file.write_all(event.as_bytes()).is_err() || file.flush().is_err() {
         fail_once("cannot write the crash artifact");
@@ -204,8 +220,8 @@ fn record_panic(info: &PanicHookInfo<'_>) {
     // mutex would wait on itself forever, and the mutex is not poisoned yet, so
     // recovering from poisoning cannot help.  A lost record beats a hang.
     match STATE.try_lock() {
-        Ok(state) => write_event(&state, &event),
-        Err(TryLockError::Poisoned(p)) => write_event(&p.into_inner(), &event),
+        Ok(mut state) => write_event(&mut state, &event),
+        Err(TryLockError::Poisoned(p)) => write_event(&mut p.into_inner(), &event),
         Err(TryLockError::WouldBlock) => {
             SKIPPED.fetch_add(1, Ordering::Relaxed);
             let _ = writeln!(std::io::stderr(), "alacritree: panic record skipped (recorder busy)");
@@ -252,21 +268,42 @@ mod tests {
 
     /// Every hook-installing test runs through this so the harness's hook is
     /// restored: `take_hook` puts the default in place of what it removes
-    /// rather than leaving a slot, so restoration has to be explicit.
+    /// rather than leaving a slot, so restoration has to be explicit — and it
+    /// has to happen even when the body unwinds (a failing `assert!`), not just
+    /// on the success path. Restoring from a `Drop` guard would not work here:
+    /// `set_hook` itself panics when called from a thread that is already
+    /// panicking, and a `Drop` runs while its unwind is still in flight, so a
+    /// guard's `drop` would be a second panic during the first one's unwind —
+    /// which Rust escalates straight to an abort. Catching the unwind first,
+    /// restoring once it is no longer in flight, then resuming it is the only
+    /// ordering that keeps `set_hook` outside of a panicking thread.
     fn with_recorder<T>(body: impl FnOnce(&Path) -> T) -> T {
         let dir = tempfile::tempdir().expect("a temp dir");
         let previous = std::panic::take_hook();
         reset_for_tests(dir.path());
         install(dir.path(), "test");
         set_enabled(true);
-        let out = body(dir.path());
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(dir.path())));
         std::panic::set_hook(previous);
-        out
+        match outcome {
+            Ok(out) => out,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     fn artifact_text() -> String {
         let path = artifact_path_for_tests().expect("an artifact was created");
         String::from_utf8_lossy(&std::fs::read(path).expect("the artifact is readable")).into()
+    }
+
+    /// Counts header lines (`<timestamp> start ...`) rather than scanning for
+    /// the substring " start " anywhere in the text: a backtrace frame symbol
+    /// could otherwise render that substring and produce a spurious match.
+    fn header_count(text: &str) -> usize {
+        text.lines()
+            .filter(|line| line.split_once(' ').is_some_and(|(_, rest)| rest.starts_with("start ")))
+            .count()
     }
 
     /// The whole point: a panic that would otherwise vanish leaves a record
@@ -311,7 +348,7 @@ mod tests {
             session_begin();
             let text = artifact_text();
 
-            assert_eq!(text.matches(" start ").count(), 1, "not exactly one header:\n{text}");
+            assert_eq!(header_count(&text), 1, "not exactly one header:\n{text}");
         });
     }
 
@@ -324,8 +361,36 @@ mod tests {
             let _ = std::panic::catch_unwind(|| panic!("after-delete"));
 
             let text = artifact_text();
-            assert_eq!(text.matches(" start ").count(), 1, "not exactly one header:\n{text}");
+            assert_eq!(header_count(&text), 1, "not exactly one header:\n{text}");
             assert!(text.contains("after-delete"), "payload missing:\n{text}");
+        });
+    }
+
+    /// `create_new` is the allocator, never `create`: a file already occupying
+    /// our identity's path is debris from an unrelated writer, not a header we
+    /// can trust, so it must be left alone and the artifact has to land at the
+    /// next ordinal — which also proves `set_ordinal` recorded what the retry
+    /// actually settled on.
+    #[test]
+    fn a_colliding_path_is_left_untouched_and_the_next_ordinal_is_used() {
+        with_recorder(|dir| {
+            let id = logdir::process_id();
+            let collision_path = dir.join(logdir::artifact_name(&id));
+            std::fs::write(&collision_path, "not ours").expect("seed a collision");
+
+            let _ = std::panic::catch_unwind(|| panic!("collision-marker"));
+
+            let collision_content =
+                std::fs::read_to_string(&collision_path).expect("still readable");
+            assert_eq!(collision_content, "not ours", "the colliding file was overwritten");
+
+            let text = artifact_text();
+            assert!(text.contains("collision-marker"), "payload missing:\n{text}");
+            assert_eq!(
+                logdir::process_id().ordinal,
+                id.ordinal + 1,
+                "set_ordinal did not record the ordinal create_new settled on"
+            );
         });
     }
 
