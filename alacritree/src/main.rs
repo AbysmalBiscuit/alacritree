@@ -55,6 +55,8 @@ mod worktree;
 mod wsl;
 mod wsl_helper;
 
+use std::io::IsTerminal;
+
 use app::AlacritreeApp;
 use clap::Parser;
 
@@ -95,12 +97,21 @@ fn main() -> eframe::Result<()> {
     // egui_winit warns on every cold X11 clipboard probe even when it recovers.
     let default_filter = "info,egui_winit::clipboard=error";
     let (tee, log_sink) = logging::tee();
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_filter))
-        .target(env_logger::Target::Pipe(Box::new(tee)))
-        .init();
+    let mut log_builder =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_filter));
+    // `Target::Pipe` makes env_logger resolve `Auto` to `Never`, so the terminal
+    // check `Auto` stands for has to happen here.  An explicit `RUST_LOG_STYLE`
+    // still decides for itself.
+    let style_is_explicit =
+        std::env::var("RUST_LOG_STYLE").is_ok_and(|s| s == "always" || s == "never");
+    if !style_is_explicit && std::io::stderr().is_terminal() {
+        log_builder.write_style(env_logger::WriteStyle::Always);
+    }
+    log_builder.target(env_logger::Target::Pipe(Box::new(tee))).init();
 
     // A subcommand talks to an alacritree instead of being one.  Log output
-    // goes to stderr (env_logger's default), leaving stdout to the reply.
+    // always goes to stderr, whether or not `persistent_logging` also tees it
+    // to a file, leaving stdout to the reply.
     attach_parent_console();
     if let Some(code) = cli::run(cli::Cli::parse()) {
         std::process::exit(code);
