@@ -3450,7 +3450,11 @@ impl AlacritreeApp {
                                     create_request.set(Some(idx));
                                 }
                                 if show_proj_dot {
-                                    attention_dot(ui, &theme);
+                                    icon_tooltip(
+                                        attention_dot(ui, &theme),
+                                        ATTENTION_HINT,
+                                        theme.icon_tooltips,
+                                    );
                                 }
                             },
                         );
@@ -4842,6 +4846,7 @@ fn file_row(
     };
     let path_color = if is_active { theme.text } else { theme.text_dim };
     let mut path_galley = None;
+    let mut hints = IconHints::default();
     // `ui.horizontal` sizes its response rect to the (often short) path text,
     // leaving most of the row's width as a dead zone — and short labels make
     // the row barely taller than the text, so vertical misses are easy too.
@@ -4858,12 +4863,13 @@ fn file_row(
                 // label inside our row would eat clicks before the row sees
                 // them.  Opt out of selection on every label that lives inside
                 // a clickable row so the click falls through.
-                ui.add(
+                let badge = ui.add(
                     egui::Label::new(
                         RichText::new(change.kind.glyph()).color(color).monospace().small(),
                     )
                     .selectable(false),
                 );
+                hints.add(badge.rect, change.kind.label());
                 let (_, galley) = git_path_label(ui, &change.path, path_color, theme);
                 path_galley = Some(galley);
                 fill_row(ui);
@@ -4871,7 +4877,9 @@ fn file_row(
         )
         .response
         .interact(egui::Sense::click());
-    let resp = git_path_tooltip(resp, path_galley.as_deref(), theme);
+    let resp = hints.apply(resp, theme.icon_tooltips, |resp| {
+        git_path_tooltip(resp, path_galley.as_deref(), theme)
+    });
     paint_row_bg(ui, &resp, bg_idx, panel_x, theme, is_active);
     resp
 }
@@ -5194,16 +5202,23 @@ fn row_status_icon_size(theme: &Theme) -> egui::Vec2 {
     egui::vec2(10.0, 14.0) * theme.ui_scale
 }
 
+const ATTENTION_HINT: &str = "needs attention";
+
 /// Painted (rather than `RichText("●")`) so its size is independent of font
 /// metrics — `RichText("●")` renders inconsistently across fallback fonts.
-fn attention_dot(ui: &mut egui::Ui, theme: &Theme) {
-    let (rect, _) = ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
+fn attention_dot(ui: &mut egui::Ui, theme: &Theme) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
     let radius = 3.0 * theme.ui_scale;
     ui.painter().circle_filled(rect.center(), radius, theme.attention);
+    resp
 }
 
 /// Priority: attention dot > agent glyph (animated by the agent's own title
 /// updates) > active highlight > the configured color > the built-in default.
+///
+/// Returns what the slot has to say on hover, for the row to register with the
+/// rest of its icons. The row icon proper reports nothing the row does not
+/// already spell out, so it stays silent.
 fn paint_row_status_icon(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -5212,10 +5227,9 @@ fn paint_row_status_icon(
     style: &IconStyle,
     default_glyph: &str,
     is_active: bool,
-) {
+) -> Option<(egui::Rect, String)> {
     if attention {
-        attention_dot(ui, theme);
-        return;
+        return Some((attention_dot(ui, theme).rect, ATTENTION_HINT.to_owned()));
     }
     let s = theme.ui_scale;
     let (glyph, font, color) = match agent_glyph {
@@ -5235,6 +5249,8 @@ fn paint_row_status_icon(
     // text would size the slot to its advance width and shift the label with it.
     let (rect, _) = ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
     ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, glyph, font, color);
+    let name = agent_glyph.and_then(crate::session::agent_name_for_glyph)?;
+    Some((rect, format!("{name} is running")))
 }
 
 /// Gap between adjacent `icon_button`s. They already pad their own glyph, so
@@ -5610,13 +5626,16 @@ fn home_row(
     let mut spawn_clicked = false;
     let mut spawn_rect: Option<egui::Rect> = None;
     let mut hints = IconHints::default();
+    // The leading and trailing groups run as sibling closures, so the status
+    // slot's hint travels out separately and joins the rest afterwards.
+    let mut status_hint = None;
     let frame = Frame::default().inner_margin(Margin { left: 6, right: 0, top: 3, bottom: 3 });
     let resp = frame
         .show(ui, |ui| {
             row_with_trailing(
                 ui,
                 |ui| {
-                    paint_row_status_icon(
+                    status_hint = paint_row_status_icon(
                         ui,
                         theme,
                         attention,
@@ -5644,7 +5663,10 @@ fn home_row(
         })
         .response
         .interact(egui::Sense::click());
-    // The row carries no name tooltip of its own, so the button's hint is the
+    if let Some((rect, hint)) = status_hint {
+        hints.add(rect, hint);
+    }
+    // The row carries no name tooltip of its own, so the icons' hints are the
     // only thing a hover here has to say.
     let resp = hints.apply(resp, theme.icon_tooltips, |resp| resp);
 
@@ -6219,6 +6241,9 @@ fn worktree_row(
     let mut spawn_clicked = false;
     let mut spawn_rect: Option<egui::Rect> = None;
     let mut name_elided = false;
+    // The leading and trailing groups run as sibling closures, so the status
+    // slot's hint travels out separately and joins the rest afterwards.
+    let mut status_hint = None;
     // right: 0 keeps the worktree `×` at the same x as the project row's `×`,
     // which has no frame margin and sits flush against the panel's outer padding.
     let frame = Frame::default().inner_margin(Margin { left: 16, right: 0, top: 3, bottom: 3 });
@@ -6239,7 +6264,7 @@ fn worktree_row(
             row_with_trailing(
                 ui,
                 |ui| {
-                    paint_row_status_icon(
+                    status_hint = paint_row_status_icon(
                         ui,
                         theme,
                         attention,
@@ -6323,6 +6348,9 @@ fn worktree_row(
         })
         .response
         .interact(egui::Sense::click());
+    if let Some((rect, hint)) = status_hint {
+        hints.add(rect, hint);
+    }
     let resp = hints.apply(resp, theme.icon_tooltips, |resp| {
         if wt.prunable {
             resp.on_hover_text("worktree directory is missing — × prunes it")
@@ -6399,6 +6427,9 @@ fn session_row(
     let mut hints = IconHints::default();
     let mut close_rect: Option<egui::Rect> = None;
     let mut title_elided = false;
+    // The leading and trailing groups run as sibling closures, so the status
+    // slot's hint travels out separately and joins the rest afterwards.
+    let mut status_hint = None;
     // One indent level deeper than worktree rows (16); right: 0 keeps the ×
     // at the same x as the other rows' trailing icons.
     let frame = Frame::default().inner_margin(Margin { left: 28, right: 0, top: 3, bottom: 3 });
@@ -6408,7 +6439,7 @@ fn session_row(
             row_with_trailing(
                 ui,
                 |ui| {
-                    paint_row_status_icon(
+                    status_hint = paint_row_status_icon(
                         ui,
                         theme,
                         row.needs_attention,
@@ -6437,6 +6468,9 @@ fn session_row(
         })
         .response
         .interact(egui::Sense::click());
+    if let Some((rect, hint)) = status_hint {
+        hints.add(rect, hint);
+    }
     let resp = hints.apply(resp, theme.icon_tooltips, |resp| {
         name_tooltip(resp, &row.title, title_elided, theme.sidebar_tooltips)
     });
@@ -10200,6 +10234,86 @@ mod tests {
                 button_hint_painted(&theme, "close session"),
                 want,
                 "icon_tooltips = {icon_tooltips}"
+            );
+        }
+    }
+
+    /// The letter a git row leads with is the whole report — `M`, `?`, `!` say
+    /// nothing to a reader who does not already know porcelain. The row senses
+    /// its own frame, so the badge needs the same recovery the sidebar icons do.
+    #[test]
+    fn icon_tooltips_gate_the_git_status_badge_hint() {
+        for (icon_tooltips, want) in [(true, true), (false, false)] {
+            let mut config = Config::default();
+            config.ui.icon_tooltips = icon_tooltips;
+            config.ui.sidebar_tooltips = SidebarTooltips::Off;
+            let theme = Theme::from_config(&config);
+            let palette = config.palette.clone();
+
+            for (kind, glyph, hint) in [
+                (ChangeKind::Modified, "M", "modified"),
+                (ChangeKind::Untracked, "?", "untracked"),
+                (ChangeKind::Conflicted, "!", "conflicted"),
+            ] {
+                let change = FileChange { path: "README.md".to_owned(), kind };
+                let mut row = |ui: &mut egui::Ui| {
+                    let _ = file_row(ui, &change, &theme, &palette, false);
+                };
+                assert_eq!(
+                    hint_painted_over(&mut row, glyph, hint),
+                    want,
+                    "icon_tooltips = {icon_tooltips}, badge {glyph}"
+                );
+            }
+        }
+    }
+
+    /// The slot a row leads with is a report rather than a button: it stands
+    /// for the agent running in the session, or for the session asking to be
+    /// looked at. Both say so on hover. The dot paints no text to aim at, so
+    /// it is found through the slot the glyph occupies — one replaces the
+    /// other in place.
+    #[test]
+    fn icon_tooltips_gate_the_status_slot_hint() {
+        const WIDTH: f32 = 220.0;
+        let icons = crate::config::Icons::default();
+        let session = |attention, agent_glyph| SessionRowData {
+            id: 1,
+            title: "zsh".to_owned(),
+            needs_attention: attention,
+            agent_glyph,
+            is_active: true,
+            is_displayed: true,
+        };
+
+        for (icon_tooltips, want) in [(true, true), (false, false)] {
+            let mut config = Config::default();
+            config.ui.icon_tooltips = icon_tooltips;
+            config.ui.sidebar_tooltips = SidebarTooltips::Off;
+            let theme = Theme::from_config(&config);
+
+            let agent = session(false, Some('✳'));
+            let mut agent_row = |ui: &mut egui::Ui| {
+                session_row(ui, &agent, false, false, &icons, &theme);
+            };
+            assert_eq!(
+                hint_painted_over(&mut agent_row, "✳", "claude is running"),
+                want,
+                "agent glyph, icon_tooltips = {icon_tooltips}"
+            );
+
+            let probe =
+                frames_while_hovering_at(egui::Pos2::new(-100.0, -100.0), WIDTH, &mut agent_row);
+            let slot = painted_glyph_positions(probe.last().expect("the row painted"))["✳"];
+
+            let waiting = session(true, None);
+            let texts = texts_while_hovering_at(slot, WIDTH, |ui| {
+                session_row(ui, &waiting, false, false, &icons, &theme);
+            });
+            assert_eq!(
+                texts.iter().flatten().any(|(text, _)| text == "needs attention"),
+                want,
+                "attention dot, icon_tooltips = {icon_tooltips}"
             );
         }
     }

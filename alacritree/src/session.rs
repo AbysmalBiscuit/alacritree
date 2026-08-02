@@ -208,6 +208,13 @@ const AGENT_PROCESS_GLYPHS: &[(&str, char)] = &[
     ("continue", '⊕'),
 ];
 
+/// The agent a status glyph stands for. A title's own decorative glyph is not
+/// in the table, so it names nothing rather than claiming an agent alacritree
+/// never recognized.
+pub fn agent_name_for_glyph(glyph: char) -> Option<&'static str> {
+    AGENT_PROCESS_GLYPHS.iter().find(|(_, g)| *g == glyph).map(|(name, _)| *name)
+}
+
 /// Plain-text dump of a session's grid for IPC clients.
 pub struct ScreenSnapshot {
     /// Requested scrollback (top) followed by the full visible screen, one

@@ -346,7 +346,10 @@ sidebar_tooltips   = "elided"    # when a sidebar row spells its full name out
 icon_tooltips      = true        # whether a sidebar icon explains itself on
                                  # hover (default true) — what a button does
                                  # ("add project", "close session", …) and what
-                                 # a status badge reports, on both sidebars
+                                 # a status badge reports: the agent running in
+                                 # a row, a row asking to be looked at, a
+                                 # branch's PR and upstream state, and the
+                                 # letter a git panel row leads with
                                  # independent of sidebar_tooltips, which is
                                  # about a name the row had to cut off: an
                                  # icon's hint never depends on panel width

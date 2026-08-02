@@ -39,6 +39,18 @@ impl ChangeKind {
             ChangeKind::Conflicted => "!",
         }
     }
+
+    /// What the glyph stands for, for readers who do not know porcelain.
+    pub fn label(&self) -> &'static str {
+        match self {
+            ChangeKind::Added => "added",
+            ChangeKind::Modified => "modified",
+            ChangeKind::Deleted => "deleted",
+            ChangeKind::Renamed => "renamed",
+            ChangeKind::Untracked => "untracked",
+            ChangeKind::Conflicted => "conflicted",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
