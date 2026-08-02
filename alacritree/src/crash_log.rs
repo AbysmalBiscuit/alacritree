@@ -298,6 +298,44 @@ fn payload_of(info: &PanicHookInfo<'_>) -> String {
     "non-string panic payload".to_string()
 }
 
+/// How long an artifact outlives the process that wrote it.
+const RETAIN_DAYS: u64 = 30;
+
+pub fn prune() {
+    let dir = STATE.lock().unwrap_or_else(PoisonError::into_inner).dir.clone();
+    if let Some(dir) = dir {
+        prune_in(&dir);
+    }
+}
+
+/// Delete by filename and `stat` only — nothing is opened.
+///
+/// This is safe against a concurrent pruner without any claim protocol because
+/// identities are never reused: a path is only deleted when its producer is
+/// dead and the file is over `RETAIN_DAYS` old, and recreating that exact path
+/// would need the same start nanosecond, pid, and ordinal.  If that invariant
+/// is ever broken, deletion has to verify identity first.
+fn prune_in(dir: &Path) {
+    let cutoff = SystemTime::now() - std::time::Duration::from_secs(RETAIN_DAYS * 86_400);
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(id) = logdir::parse_name("crash-", name) else { continue };
+        if logdir::pid_is_live(id.pid) {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else { continue };
+        if modified > cutoff {
+            continue;
+        }
+        // A concurrent pruner reaching it first is the expected outcome, not a
+        // problem worth reporting.
+        let _ = std::fs::remove_file(entry.path());
+    }
+}
+
 #[cfg(test)]
 pub fn reset_for_tests(dir: &Path) {
     // Wholesale, so a field added later cannot leak between test cases.
@@ -328,6 +366,7 @@ pub fn artifact_path_for_tests() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logdir::ProcessId;
 
     /// Every hook-installing test runs through this so the harness's hook is
     /// restored: `take_hook` puts the default in place of what it removes
@@ -626,5 +665,80 @@ mod tests {
             let text = artifact_text();
             assert!(text.contains("after-poison"), "record lost after poisoning:\n{text}");
         });
+    }
+
+    /// Retention is by age and liveness alone.  Reading a file to decide whether to
+    /// keep it is what let two earlier designs delete the only record of a crash.
+    #[test]
+    fn pruning_ignores_contents_entirely() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let dead = ProcessId { start: 1, pid: 0, ordinal: 0 };
+        let old_clean = dir.path().join(logdir::artifact_name(&dead));
+        std::fs::write(&old_clean, "t1 start v pid=0\nt2 exit ok\n").unwrap();
+        let old_crash = dir.path().join("crash-2-0.log");
+        std::fs::write(&old_crash, "t1 start v pid=0\nt2 PANIC thread=main\n").unwrap();
+        set_mtime_days_ago(&old_clean, 40);
+        set_mtime_days_ago(&old_crash, 40);
+
+        prune_in(dir.path());
+
+        assert!(!old_clean.exists(), "an old dead-pid artifact survived");
+        assert!(!old_crash.exists(), "contents changed the decision");
+    }
+
+    #[test]
+    fn a_live_producers_artifact_is_never_pruned() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mine = ProcessId { start: 1, pid: std::process::id(), ordinal: 0 };
+        let path = dir.path().join(logdir::artifact_name(&mine));
+        std::fs::write(&path, "t1 start v\n").unwrap();
+        set_mtime_days_ago(&path, 400);
+
+        prune_in(dir.path());
+
+        assert!(path.exists(), "a live process's artifact was deleted");
+    }
+
+    #[test]
+    fn a_fresh_artifact_survives_even_from_a_dead_pid() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("crash-1-0.log");
+        std::fs::write(&path, "t1 start v\n").unwrap();
+
+        prune_in(dir.path());
+
+        assert!(path.exists(), "a fresh artifact was deleted");
+    }
+
+    /// A concurrently starting instance can delete the same path first.
+    #[test]
+    fn a_vanished_path_is_not_an_error() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("crash-1-0.log");
+        std::fs::write(&path, "t1 start v\n").unwrap();
+        set_mtime_days_ago(&path, 40);
+
+        prune_in(dir.path());
+        prune_in(dir.path());
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn files_that_are_not_artifacts_are_left_alone() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let state = dir.path().join("state.toml");
+        std::fs::write(&state, "x").unwrap();
+        set_mtime_days_ago(&state, 400);
+
+        prune_in(dir.path());
+
+        assert!(state.exists(), "an unrelated file was deleted");
+    }
+
+    fn set_mtime_days_ago(path: &Path, days: u64) {
+        let when = SystemTime::now() - std::time::Duration::from_secs(days * 86_400);
+        let file = OpenOptions::new().write(true).open(path).expect("open for mtime");
+        file.set_modified(when).expect("set mtime");
     }
 }
