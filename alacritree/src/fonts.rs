@@ -2182,7 +2182,7 @@ mod tests {
             .iter()
             .chain(crate::config::CHROME_GLYPHS.iter())
             .flat_map(|g| g.as_str().chars())
-            .chain(crate::session::AGENT_GLYPHS.iter().copied())
+            .chain(crate::session::AGENT_PROCESS_GLYPHS.iter().map(|(_, g)| *g))
             .collect();
         seen.sort_unstable();
         seen.dedup();

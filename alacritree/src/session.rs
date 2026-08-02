@@ -199,7 +199,7 @@ const AGENT_CACHE_TTL: Duration = Duration::from_millis(1000);
 /// `starts_with`: `comm` is kernel-truncated — 15 bytes on Linux, 16 on
 /// macOS (`cursor-agent` would otherwise miss) — and Windows names carry an
 /// `.exe` suffix.
-const AGENT_PROCESS_GLYPHS: &[(&str, char)] = &[
+pub(crate) const AGENT_PROCESS_GLYPHS: &[(&str, char)] = &[
     ("claude", '✳'),
     ("codex", '◇'),
     ("gemini", '✦'),
@@ -215,12 +215,6 @@ pub fn agent_name_for_glyph(glyph: char) -> Option<&'static str> {
     AGENT_PROCESS_GLYPHS.iter().find(|(_, g)| *g == glyph).map(|(name, _)| *name)
 }
 
-/// The agent glyphs alone, for the coverage check that proves the baked font
-/// can draw every glyph alacritree ships.  Every one of these is also
-/// reachable through `AGENT_PROCESS_GLYPHS` above, so nothing outside tests
-/// needs this list — hence the gate.
-#[cfg(test)]
-pub(crate) const AGENT_GLYPHS: &[char] = &['✳', '◇', '✦', '▲', '❖', '⊕'];
 
 /// Plain-text dump of a session's grid for IPC clients.
 pub struct ScreenSnapshot {
