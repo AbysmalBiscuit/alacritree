@@ -459,12 +459,21 @@ mod tests {
     /// ordering that keeps `set_hook` outside of a panicking thread.
     fn with_recorder<T>(body: impl FnOnce(&Path) -> T) -> T {
         let dir = tempfile::tempdir().expect("a temp dir");
+        with_recorder_in(dir.path(), body)
+    }
+
+    /// Takes the directory rather than making one, for the case that has to
+    /// name a path before it exists.
+    fn with_recorder_in<T>(dir: &Path, body: impl FnOnce(&Path) -> T) -> T {
+        // Declared first so it outlives the restore below: the next test must
+        // not install its hook until this one's is back in place.
+        let _identity = logdir::lock_identity();
         let previous = std::panic::take_hook();
-        reset_for_tests(dir.path());
-        install(dir.path(), "test");
+        reset_for_tests(dir);
+        install(dir, "test");
         set_enabled(true);
 
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(dir.path())));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(dir)));
         std::panic::set_hook(previous);
         match outcome {
             Ok(out) => out,
@@ -596,16 +605,13 @@ mod tests {
     fn a_missing_log_directory_is_created() {
         let root = tempfile::tempdir().expect("a temp dir");
         let nested = root.path().join("does").join("not").join("exist");
-        let previous = std::panic::take_hook();
-        reset_for_tests(&nested);
-        install(&nested, "test");
-        set_enabled(true);
 
-        let _ = std::panic::catch_unwind(|| panic!("first-launch"));
+        with_recorder_in(&nested, |dir| {
+            let _ = std::panic::catch_unwind(|| panic!("first-launch"));
 
-        std::panic::set_hook(previous);
-        assert!(nested.is_dir(), "the log directory was not created");
-        assert!(artifact_text().contains("first-launch"));
+            assert!(dir.is_dir(), "the log directory was not created");
+            assert!(artifact_text().contains("first-launch"));
+        });
     }
 
     #[test]

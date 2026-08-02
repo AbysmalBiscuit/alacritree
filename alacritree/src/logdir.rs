@@ -135,6 +135,19 @@ pub fn reset_identity_for_tests() {
 }
 
 #[cfg(test)]
+static IDENTITY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serializes the tests that drive the process identity and the crash recorder.
+/// Both are process-global — the ordinal, the recorder state, and the panic hook
+/// are one apiece for the whole binary — so the default multi-threaded harness
+/// runs them on top of each other. Tests that panic on purpose poison this
+/// mutex, which says nothing about the `()` it guards.
+#[cfg(test)]
+pub fn lock_identity() -> std::sync::MutexGuard<'static, ()> {
+    IDENTITY_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -205,6 +218,7 @@ mod tests {
     /// Start and pid are fixed for the process; only the ordinal moves.
     #[test]
     fn the_identity_is_stable_except_for_the_ordinal() {
+        let _identity = lock_identity();
         reset_identity_for_tests();
         let first = process_id();
 
