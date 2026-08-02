@@ -3169,34 +3169,19 @@ program = "second"
         assert_eq!(ui.drop.spelling.quote, Quoting::Auto);
     }
 
-    /// A glyph reachable from config must be reachable from the aggregate, or
-    /// the baked subset can silently omit it.
+    /// Asserts against bare literals independent of the constants, like
+    /// `the_chrome_slice_carries_the_action_and_decorative_glyphs` below, so a
+    /// typo'd `DEFAULT_*_ICON` fails here.  Three PR-status icons share `⬤`,
+    /// so a per-glyph `contains` would miss a typo hiding behind a duplicate;
+    /// comparing the full sorted multiset catches it instead.
     #[test]
-    fn every_default_icon_appears_in_the_aggregate_slice() {
-        let aggregate: Vec<&str> = DEFAULT_ICON_GLYPHS.iter().map(|g| g.as_str()).collect();
-        for g in [
-            DEFAULT_SEARCH_ICON,
-            DEFAULT_WORKTREE_MAIN_ICON,
-            DEFAULT_WORKTREE_ICON,
-            DEFAULT_SESSION_ICON,
-            DEFAULT_HOME_ICON,
-            DEFAULT_PROJECT_EXPANDED_ICON,
-            DEFAULT_PROJECT_COLLAPSED_ICON,
-            DEFAULT_PR_OPEN_ICON,
-            DEFAULT_PR_DRAFT_ICON,
-            DEFAULT_PR_MERGED_ICON,
-            DEFAULT_PR_CLOSED_ICON,
-            DEFAULT_UPSTREAM_LEVEL_ICON,
-            DEFAULT_UPSTREAM_DIVERGED_ICON,
-            DEFAULT_UPSTREAM_GONE_ICON,
-            DEFAULT_UPSTREAM_UNTRACKED_ICON,
-        ] {
-            assert!(
-                aggregate.contains(&g.as_str()),
-                "{} is missing from the aggregate",
-                g.as_str()
-            );
-        }
+    fn the_icon_slice_carries_exactly_the_default_icon_glyphs() {
+        let mut icons: Vec<&str> = DEFAULT_ICON_GLYPHS.iter().map(|g| g.as_str()).collect();
+        icons.sort_unstable();
+        let mut expected =
+            ["⌕", "●", "○", "▪", "⌂", "▾", "▸", "⬤", "◯", "⬤", "⬤", "✓", "⇅", "⌫", "↑"];
+        expected.sort_unstable();
+        assert_eq!(icons, expected);
     }
 
     /// The action-button and decorative glyphs are painted from literals that no
