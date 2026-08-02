@@ -713,6 +713,11 @@ pub struct UiTheme {
     pub search_scope: SearchScope,
     /// When a sidebar row spells its full name out on hover.
     pub sidebar_tooltips: SidebarTooltips,
+    /// Whether a sidebar icon explains itself on hover — what a button does,
+    /// what a status badge reports.  A separate axis from
+    /// [`Self::sidebar_tooltips`], which reveals a name the row had to cut off:
+    /// an icon's hint never depends on the panel's width.
+    pub icon_tooltips: bool,
     /// Show single-session sidebar rows / tab segments ([`SessionDisplay`]).
     pub session_display: SessionDisplay,
     /// Paint PR-status badges on worktree rows (and poll `gh` for expanded
@@ -771,6 +776,7 @@ impl Default for UiTheme {
             sidebar_focus: SidebarFocus::default(),
             search_scope: SearchScope::default(),
             sidebar_tooltips: SidebarTooltips::default(),
+            icon_tooltips: true,
             session_display: SessionDisplay::default(),
             pr_status: false,
             pr_status_concurrency: DEFAULT_CONCURRENCY,
@@ -1450,6 +1456,8 @@ struct RawUi {
     /// When a sidebar row spells its full name out on hover:
     /// "elided" (default) | "always" | "off".
     sidebar_tooltips: Option<String>,
+    /// Whether a sidebar icon explains itself on hover: `true` (default).
+    icon_tooltips: Option<bool>,
     session_display: RawSessionDisplay,
     delta_path: Option<String>,
     icons: RawIcons,
@@ -1623,6 +1631,7 @@ impl RawConfig {
             sidebar_focus: parse_sidebar_focus(self.ui.sidebar_focus.as_deref()),
             search_scope: parse_search_scope(self.ui.search_scope.as_deref()),
             sidebar_tooltips: parse_sidebar_tooltips(self.ui.sidebar_tooltips.as_deref()),
+            icon_tooltips: self.ui.icon_tooltips.unwrap_or(true),
             session_display: SessionDisplay {
                 sidebar_always: self.ui.session_display.sidebar_always.unwrap_or(false),
                 tabs_always: self.ui.session_display.tabs_always.unwrap_or(false),
@@ -2112,6 +2121,27 @@ mod tests {
     fn only_follow_moves_the_terminal() {
         assert!(!SidebarFocus::Preserve.follows());
         assert!(SidebarFocus::Follow.follows());
+    }
+
+    /// The hints are what an unmodified config already shows, so the key has
+    /// to default on: a `false` default would take them away from everyone who
+    /// never asked for the setting.
+    #[test]
+    fn icon_tooltips_default_on_and_can_be_refused() {
+        assert!(ui_from_toml("").icon_tooltips);
+        assert!(ui_from_toml("[ui]\nicon_tooltips = true").icon_tooltips);
+        assert!(!ui_from_toml("[ui]\nicon_tooltips = false").icon_tooltips);
+    }
+
+    /// Row names and button hints answer to different keys, so silencing one
+    /// must leave the other untouched.
+    #[test]
+    fn icon_tooltips_and_sidebar_tooltips_are_independent() {
+        let ui = ui_from_toml("[ui]\nsidebar_tooltips = \"off\"");
+        assert!(ui.icon_tooltips);
+
+        let ui = ui_from_toml("[ui]\nicon_tooltips = false");
+        assert_eq!(ui.sidebar_tooltips, SidebarTooltips::Elided);
     }
 
     #[test]

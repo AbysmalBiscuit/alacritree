@@ -339,6 +339,13 @@ sidebar_tooltips   = "elided"    # when a sidebar row spells its full name out
                                  # the next one instantly, so a sweep down the
                                  # list stalls on each name that fits
                                  # "off": never
+icon_tooltips      = true        # whether a sidebar icon explains itself on
+                                 # hover (default true) — what a button does
+                                 # ("add project", "close session", …) and what
+                                 # a status badge reports, on both sidebars
+                                 # independent of sidebar_tooltips, which is
+                                 # about a name the row had to cut off: an
+                                 # icon's hint never depends on panel width
 confirm_session_close = "never"  # when the sidebar × asks before killing a PTY:
                                  # "never" (default) | "busy" | "always"
 last_session_close = "respawn"   # closing the on-screen workspace's last

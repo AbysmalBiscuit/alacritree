@@ -96,6 +96,8 @@ struct Theme {
     path_style: PathStyleConfig,
     /// When a row spells its full name out on hover.
     sidebar_tooltips: SidebarTooltips,
+    /// Whether a sidebar button says what it does on hover.
+    icon_tooltips: bool,
 }
 
 /// Logical-pixel (normal, heading) sizes for UI text.  `[ui.font] size`
@@ -150,6 +152,7 @@ impl Theme {
             },
             path_style: config.ui.path_style,
             sidebar_tooltips: config.ui.sidebar_tooltips,
+            icon_tooltips: config.ui.icon_tooltips,
         }
     }
 }
@@ -3242,9 +3245,12 @@ impl AlacritreeApp {
                         self.project_filter.toggles_apply(self.search_scope),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if icon_button(ui, "+", theme.text_dim, &theme)
-                            .on_hover_text("add project")
-                            .clicked()
+                        if icon_tooltip(
+                            icon_button(ui, "+", theme.text_dim, &theme),
+                            "add project",
+                            theme.icon_tooltips,
+                        )
+                        .clicked()
                         {
                             add_project_clicked = true;
                         }
@@ -3255,7 +3261,13 @@ impl AlacritreeApp {
                         } else {
                             (theme.text_dim, "reorder projects")
                         };
-                        if icon_button(ui, "⇅", color, &theme).on_hover_text(hint).clicked() {
+                        if icon_tooltip(
+                            icon_button(ui, "⇅", color, &theme),
+                            hint,
+                            theme.icon_tooltips,
+                        )
+                        .clicked()
+                        {
                             reorder_toggled = true;
                         }
                     });
@@ -3343,12 +3355,18 @@ impl AlacritreeApp {
                                     drag_handle(ui, &theme)
                                         .dnd_set_drag_payload(DraggedProject(project.root.clone()));
                                 }
-                                let arrow = if project.expanded {
-                                    icons.project_expanded.as_str()
+                                let (arrow, arrow_hint) = if project.expanded {
+                                    (icons.project_expanded.as_str(), "collapse project")
                                 } else {
-                                    icons.project_collapsed.as_str()
+                                    (icons.project_collapsed.as_str(), "expand project")
                                 };
-                                if icon_button(ui, arrow, theme.text_dim, &theme).clicked() {
+                                if icon_tooltip(
+                                    icon_button(ui, arrow, theme.text_dim, &theme),
+                                    arrow_hint,
+                                    theme.icon_tooltips,
+                                )
+                                .clicked()
+                                {
                                     project.expanded = !project.expanded;
                                     expand_toggled = Some((project.root.clone(), project.expanded));
                                 }
@@ -3370,24 +3388,33 @@ impl AlacritreeApp {
                                 ));
                             },
                             |ui| {
-                                if icon_button(ui, "×", theme.text_muted, &theme)
-                                    .on_hover_text("remove from sidebar")
-                                    .clicked()
+                                if icon_tooltip(
+                                    icon_button(ui, "×", theme.text_muted, &theme),
+                                    "remove from sidebar",
+                                    theme.icon_tooltips,
+                                )
+                                .clicked()
                                 {
                                     remove_request = Some(ProjectRemoveState {
                                         root: project_root.clone(),
                                         name: project_name.clone(),
                                     });
                                 }
-                                if icon_button(ui, "↻", theme.text_muted, &theme)
-                                    .on_hover_text("refresh worktrees")
-                                    .clicked()
+                                if icon_tooltip(
+                                    icon_button(ui, "↻", theme.text_muted, &theme),
+                                    "refresh worktrees",
+                                    theme.icon_tooltips,
+                                )
+                                .clicked()
                                 {
                                     refresh_idx = Some(idx);
                                 }
-                                if icon_button(ui, "+", theme.text_muted, &theme)
-                                    .on_hover_text("create new worktree")
-                                    .clicked()
+                                if icon_tooltip(
+                                    icon_button(ui, "+", theme.text_muted, &theme),
+                                    "create new worktree",
+                                    theme.icon_tooltips,
+                                )
+                                .clicked()
                                 {
                                     create_request.set(Some(idx));
                                 }
@@ -3917,8 +3944,8 @@ impl AlacritreeApp {
                             |ui| {
                                 if let Some(default) = default {
                                     // right_to_left: default sits rightmost, `vs` to its left.
-                                    let resp = ui
-                                        .add(
+                                    let resp = icon_tooltip(
+                                        ui.add(
                                             egui::Label::new(
                                                 RichText::new(default)
                                                     .color(theme.text_dim)
@@ -3927,8 +3954,10 @@ impl AlacritreeApp {
                                             .truncate()
                                             .sense(egui::Sense::click()),
                                         )
-                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                        .on_hover_text("Set the branch this panel diffs against");
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand),
+                                        "Set the branch this panel diffs against",
+                                        theme.icon_tooltips,
+                                    );
                                     if resp.clicked() {
                                         open_picker.set(Some(path.clone()));
                                     }
@@ -4925,6 +4954,12 @@ fn truncating_label(
     (response, galley)
 }
 
+/// Offer `hint` — what the icon under `resp` does or reports — as its tooltip,
+/// unless `[ui] icon_tooltips` turns the hints off.
+fn icon_tooltip(resp: egui::Response, hint: &str, enabled: bool) -> egui::Response {
+    if enabled { resp.on_hover_text(hint) } else { resp }
+}
+
 /// Offer `name` as `resp`'s tooltip, as far as the configured mode allows.
 fn name_tooltip(
     resp: egui::Response,
@@ -5462,8 +5497,11 @@ fn home_row(
                     );
                 },
                 |ui| {
-                    let btn =
-                        icon_button(ui, "+", theme.text_muted, theme).on_hover_text("new shell");
+                    let btn = icon_tooltip(
+                        icon_button(ui, "+", theme.text_muted, theme),
+                        "new shell",
+                        theme.icon_tooltips,
+                    );
                     spawn_rect = Some(btn.rect);
                     if btn.clicked() {
                         spawn_clicked = true;
@@ -6050,15 +6088,21 @@ fn worktree_row(
                         } else {
                             "delete worktree and branch"
                         };
-                        let btn =
-                            icon_button(ui, "×", theme.text_muted, theme).on_hover_text(hover);
+                        let btn = icon_tooltip(
+                            icon_button(ui, "×", theme.text_muted, theme),
+                            hover,
+                            theme.icon_tooltips,
+                        );
                         delete_rect = Some(btn.rect);
                         if btn.clicked() {
                             delete_clicked = true;
                         }
                     }
-                    let btn =
-                        icon_button(ui, "+", theme.text_muted, theme).on_hover_text("new shell");
+                    let btn = icon_tooltip(
+                        icon_button(ui, "+", theme.text_muted, theme),
+                        "new shell",
+                        theme.icon_tooltips,
+                    );
                     spawn_rect = Some(btn.rect);
                     if btn.clicked() {
                         spawn_clicked = true;
@@ -6180,8 +6224,11 @@ fn session_row(
                     title_elided = galley.elided;
                 },
                 |ui| {
-                    let btn = icon_button(ui, "×", theme.text_muted, theme)
-                        .on_hover_text("close session");
+                    let btn = icon_tooltip(
+                        icon_button(ui, "×", theme.text_muted, theme),
+                        "close session",
+                        theme.icon_tooltips,
+                    );
                     close_rect = Some(btn.rect);
                     if btn.clicked() {
                         close_clicked = true;
@@ -9398,10 +9445,20 @@ mod tests {
     /// while the tooltip still has space to spell the name out.
     fn texts_while_hovering(
         row_width: f32,
+        row: impl FnMut(&mut egui::Ui),
+    ) -> Vec<Vec<(String, bool)>> {
+        texts_while_hovering_at(egui::Pos2::new(row_width / 2.0, 20.0), row_width, row)
+    }
+
+    /// `texts_while_hovering` over a chosen point rather than the row's middle.
+    /// A button occupies a slot too small to hit by guessing at the layout, so
+    /// its tests render once to learn where it landed and hover that.
+    fn texts_while_hovering_at(
+        hover: egui::Pos2,
+        row_width: f32,
         mut row: impl FnMut(&mut egui::Ui),
     ) -> Vec<Vec<(String, bool)>> {
         let ctx = egui::Context::default();
-        let hover = egui::Pos2::new(row_width / 2.0, 20.0);
         let mut seen = Vec::new();
         for frame in 0..8 {
             let input = egui::RawInput {
@@ -9433,6 +9490,28 @@ mod tests {
             seen.push(painted_texts(&output.shapes));
         }
         seen
+    }
+
+    /// Rest the pointer on a lone sidebar button and report whether its hint
+    /// was painted. The button is rendered twice: once off-pointer to learn
+    /// its slot, then again with the pointer resting in the middle of it.
+    fn button_hint_painted(theme: &Theme, hint: &str) -> bool {
+        let slot = std::cell::Cell::new(None);
+        let mut button = |ui: &mut egui::Ui| {
+            let resp = icon_tooltip(
+                icon_button(ui, "×", theme.text_muted, theme),
+                hint,
+                theme.icon_tooltips,
+            );
+            slot.set(Some(resp.rect));
+        };
+
+        let off_pointer = egui::Pos2::new(-100.0, -100.0);
+        let _ = texts_while_hovering_at(off_pointer, 140.0, &mut button);
+        let centre = slot.get().expect("the button painted a slot").center();
+
+        let frames = texts_while_hovering_at(centre, 140.0, &mut button);
+        frames.iter().flatten().any(|(text, _)| text == hint)
     }
 
     /// Whether a tooltip spelled `name` out over the row that already paints
@@ -9480,6 +9559,26 @@ mod tests {
             tooltip_shown(&texts, &wt.name),
             "hovering the elided row painted no tooltip with the full name: {texts:?}"
         );
+    }
+
+    /// A sidebar button says what it does on hover, and `[ui] icon_tooltips`
+    /// is what decides whether it may. The two settings are independent axes:
+    /// silencing the row names must leave the button hints alone, or turning
+    /// off one kind of tooltip would quietly cost the other.
+    #[test]
+    fn icon_tooltips_gate_the_button_hint() {
+        for (icon_tooltips, want) in [(true, true), (false, false)] {
+            let mut config = Config::default();
+            config.ui.icon_tooltips = icon_tooltips;
+            config.ui.sidebar_tooltips = SidebarTooltips::Off;
+            let theme = Theme::from_config(&config);
+
+            assert_eq!(
+                button_hint_painted(&theme, "close session"),
+                want,
+                "icon_tooltips = {icon_tooltips}"
+            );
+        }
     }
 
     /// `[ui] sidebar_tooltips` bounds the row tooltip on both sides: `off`
