@@ -107,6 +107,12 @@ enum Command {
 
     /// Write a shell completion script to stdout.
     Completions { shell: Shell },
+
+    /// Take the crash recorder lock and panic, to prove the hook does not
+    /// deadlock against itself.  Debug builds only.
+    #[cfg(debug_assertions)]
+    #[command(hide = true)]
+    ProvokeLockPanic,
 }
 
 #[derive(Debug, Subcommand)]
@@ -214,6 +220,11 @@ pub fn run(cli: Cli) -> Option<i32> {
         // nothing is running — which is exactly when a crash is being chased.
         Command::Crashes => return Some(crashes::run(cli.json)),
         Command::Install { dest } => return Some(install::run(dest, cli.json)),
+        #[cfg(debug_assertions)]
+        Command::ProvokeLockPanic => {
+            crate::crash_log::provoke_lock_panic();
+            return Some(0);
+        },
         other => to_request(other),
     };
 
@@ -309,6 +320,8 @@ fn to_request(command: Command) -> IpcRequest {
         | Command::Install { .. } => {
             unreachable!("handled before dispatch")
         },
+        #[cfg(debug_assertions)]
+        Command::ProvokeLockPanic => unreachable!("handled before dispatch"),
     }
 }
 

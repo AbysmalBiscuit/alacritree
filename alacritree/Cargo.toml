@@ -63,6 +63,8 @@ nucleo-matcher = "0.3"
 [dev-dependencies]
 # Throwaway repos and state files for worktree, prune, and persistence tests.
 tempfile = "3"
+# Integration tests parse the `--json` output of the real binary.
+serde_json = "1"
 
 [target.'cfg(unix)'.dependencies]
 # Linux socket discovery uses the effective uid when a GUI launcher omits

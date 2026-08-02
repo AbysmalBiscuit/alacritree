@@ -336,6 +336,17 @@ fn prune_in(dir: &Path) {
     }
 }
 
+/// Panic while holding the recorder lock, so a test can prove the hook takes
+/// the skip path instead of waiting on a mutex this thread already owns.
+#[cfg(debug_assertions)]
+pub fn provoke_lock_panic() {
+    let dir = std::env::temp_dir().join("alacritree-provoke");
+    install(&dir, "provoke");
+    set_enabled(true);
+    let _guard = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+    panic!("provoked while holding the recorder lock");
+}
+
 #[cfg(test)]
 pub fn reset_for_tests(dir: &Path) {
     // Wholesale, so a field added later cannot leak between test cases.
