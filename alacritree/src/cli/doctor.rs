@@ -100,6 +100,7 @@ fn report(socket: Option<&Path>) -> Vec<Check> {
     checks.extend(config_checks(&config::diagnose()));
     checks.extend(persisted_state_checks(&config));
     checks.extend(ipc_checks(socket, config.ipc_socket));
+    checks.extend(crash_checks());
     #[cfg(windows)]
     checks.extend(process_checks(&running_alacritree_processes()));
     checks
@@ -313,6 +314,118 @@ fn ipc_checks(socket: Option<&Path>, enabled: bool) -> Vec<Check> {
         },
     });
     checks
+}
+
+/// Reading more of an artifact than this buys nothing: the markers that
+/// classify it are lines, and one oversized malformed file must not be read in
+/// full on every invocation.
+const ARTIFACT_READ_CAP: u64 = 256 * 1024;
+
+/// What an artifact says happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Clean,
+    Running,
+    Crashed,
+    Indeterminate,
+}
+
+fn crash_checks() -> Vec<Check> {
+    match crate::logdir::log_dir() {
+        Some(dir) => crash_checks_in(&dir),
+        None => vec![check(
+            "crashes",
+            "log directory",
+            Status::Fail,
+            "no log directory on this platform".to_string(),
+        )],
+    }
+}
+
+fn crash_checks_in(dir: &Path) -> Vec<Check> {
+    if !dir.exists() {
+        return vec![check("crashes", "artifacts", Status::Ok, "none recorded".to_string())];
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        let detail = format!("cannot read {}", dir.display());
+        return vec![check("crashes", "log directory", Status::Fail, detail)];
+    };
+
+    let mut crashed = 0usize;
+    let mut indeterminate = 0usize;
+    let mut running = 0usize;
+    let mut clean = 0usize;
+    let mut newest: Option<(u128, String)> = None;
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(id) = crate::logdir::parse_name("crash-", name) else { continue };
+
+        let verdict = classify(&entry.path(), id.pid);
+        match verdict {
+            Verdict::Crashed => crashed += 1,
+            Verdict::Indeterminate => indeterminate += 1,
+            Verdict::Running => running += 1,
+            Verdict::Clean => clean += 1,
+        }
+        if newest.as_ref().is_none_or(|(start, _)| id.start > *start) {
+            newest = Some((id.start, name.to_string()));
+        }
+    }
+
+    let total = crashed + indeterminate + running + clean;
+    if total == 0 {
+        return vec![check("crashes", "artifacts", Status::Ok, "none recorded".to_string())];
+    }
+
+    let status = if crashed > 0 || indeterminate > 0 { Status::Warn } else { Status::Ok };
+    let newest = newest.map(|(_, n)| n).unwrap_or_default();
+    let detail = format!(
+        "{total} artifacts: {crashed} crashed, {indeterminate} indeterminate, {running} running, \
+         {clean} clean; newest {newest}"
+    );
+    vec![check("crashes", "artifacts", status, detail)]
+}
+
+fn classify(path: &Path, pid: u32) -> Verdict {
+    let Ok(meta) = std::fs::metadata(path) else { return Verdict::Indeterminate };
+    if meta.len() > ARTIFACT_READ_CAP {
+        return Verdict::Indeterminate;
+    }
+    let Ok(bytes) = std::fs::read(path) else { return Verdict::Indeterminate };
+    let text = String::from_utf8_lossy(&bytes);
+
+    let mut lines = text.lines();
+    if !lines.next().is_some_and(|first| first.contains(" start ")) {
+        return Verdict::Indeterminate;
+    }
+
+    let mut exited = false;
+    let mut after_exit = false;
+    let mut panicked = false;
+    for entry in lines {
+        if entry.contains("PANIC thread=") || entry.contains("panic records skipped:") {
+            panicked = true;
+            if exited {
+                after_exit = true;
+            }
+        }
+        if entry.contains("exit error:") {
+            return Verdict::Crashed;
+        }
+        if entry.contains("exit ok") {
+            exited = true;
+        }
+    }
+
+    if panicked || after_exit {
+        return Verdict::Crashed;
+    }
+    if exited {
+        return Verdict::Clean;
+    }
+    if crate::logdir::pid_is_live(pid) { Verdict::Running } else { Verdict::Crashed }
 }
 
 /// A live process running one of our binaries, and therefore pinning it.
@@ -939,5 +1052,65 @@ mod tests {
 
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].status, Status::Ok);
+    }
+
+    /// A crash last week must not make `doctor` exit nonzero in someone's script.
+    /// `Fail` is reserved for crash logging being broken right now.
+    #[test]
+    fn a_past_crash_warns_but_does_not_fail() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(dir.path().join("crash-1-0.log"), "t1 start v\nt2 PANIC thread=main\n")
+            .unwrap();
+
+        let checks = crash_checks_in(dir.path());
+
+        assert!(checks.iter().any(|c| c.status == Status::Warn), "a recorded crash did not warn");
+        assert_eq!(exit_code(&checks), 0, "a past crash made doctor exit nonzero");
+    }
+
+    #[test]
+    fn no_artifacts_is_ok() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+
+        let checks = crash_checks_in(dir.path());
+
+        assert!(checks.iter().all(|c| c.status == Status::Ok), "an empty directory was not ok");
+    }
+
+    /// A clean shutdown is the common case and must not accumulate warnings.
+    #[test]
+    fn a_clean_artifact_is_ok() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(dir.path().join("crash-1-0.log"), "t1 start v pid=0\nt2 exit ok\n").unwrap();
+
+        let checks = crash_checks_in(dir.path());
+
+        assert!(checks.iter().all(|c| c.status == Status::Ok), "a clean artifact warned");
+    }
+
+    /// A record written after the exit marker means a detached worker outlived the
+    /// shutdown — a real defect, even though the process exited cleanly.
+    #[test]
+    fn a_record_after_the_exit_marker_warns() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let body = "t1 start v pid=0\nt2 exit ok\nt3 PANIC thread=pty-1\n";
+        std::fs::write(dir.path().join("crash-1-0.log"), body).unwrap();
+
+        let checks = crash_checks_in(dir.path());
+
+        assert!(checks.iter().any(|c| c.status == Status::Warn), "a late worker panic was missed");
+    }
+
+    /// A truncated artifact is neither clean nor a live process; saying either
+    /// would be a lie about the only evidence there is.
+    #[test]
+    fn a_headerless_artifact_is_indeterminate() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(dir.path().join("crash-1-0.log"), "PANIC without a header\n").unwrap();
+
+        let checks = crash_checks_in(dir.path());
+
+        let text: String = checks.iter().map(|c| c.detail.clone()).collect();
+        assert!(text.contains("indeterminate"), "not reported as indeterminate: {text}");
     }
 }
