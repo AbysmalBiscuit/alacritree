@@ -285,7 +285,12 @@ mod git2_tests {
     #[test]
     fn classifies_level_ahead_behind_and_diverged() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = Repository::init(dir.path()).unwrap();
+        // The upstreams below are named, so the branch the first commit lands
+        // on has to be too: a plain `init` takes it from `init.defaultBranch`,
+        // which is `master` wherever the developer has not set it.
+        let mut opts = git2::RepositoryInitOptions::new();
+        opts.initial_head("main");
+        let repo = Repository::init_opts(dir.path(), &opts).unwrap();
         let base = commit_empty(&repo);
 
         // `main` never moves, so `level` stays level and `ahead` only grows
