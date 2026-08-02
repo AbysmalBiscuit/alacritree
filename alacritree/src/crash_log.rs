@@ -111,11 +111,11 @@ pub fn record_exit(result: &Result<(), eframe::Error>) {
     let mut event = String::new();
     let skipped = SKIPPED.load(Ordering::Relaxed);
     if skipped > 0 {
-        event.push_str(&line(&format!("panic records skipped: {skipped}")));
+        event.push_str(&line(&format!("{SKIPPED_MARKER} {skipped}")));
     }
     match result {
-        Ok(()) => event.push_str(&line("exit ok")),
-        Err(e) => event.push_str(&line(&format!("exit error: {e}"))),
+        Ok(()) => event.push_str(&line(EXIT_OK_MARKER)),
+        Err(e) => event.push_str(&line(&format!("{EXIT_ERROR_MARKER} {e}"))),
     }
 
     let mut guard = STATE.lock().unwrap_or_else(PoisonError::into_inner);
@@ -143,6 +143,16 @@ fn timestamp() -> String {
 fn line(body: &str) -> String {
     format!("{} {body}\n", timestamp())
 }
+
+/// The vocabulary the writer emits and [`classify`] reads back.  Building both
+/// sides from these constants, instead of each duplicating the literals, is
+/// what keeps a renamed marker from silently breaking classification while
+/// every hand-written test still passes.
+pub const HEADER_MARKER: &str = "start ";
+pub const PANIC_MARKER: &str = "PANIC thread=";
+pub const SKIPPED_MARKER: &str = "panic records skipped:";
+pub const EXIT_OK_MARKER: &str = "exit ok";
+pub const EXIT_ERROR_MARKER: &str = "exit error:";
 
 /// The single initializer.  The header has three possible authors — a panic
 /// during config load, `session_begin`, and any write after the file has been
@@ -173,7 +183,7 @@ fn ensure_artifact(state: &mut State) -> Option<File> {
         match OpenOptions::new().create_new(true).write(true).open(&path) {
             Ok(mut file) => {
                 logdir::set_ordinal(id.ordinal);
-                let header = line(&format!("start {} pid={}", state.version, id.pid));
+                let header = line(&format!("{HEADER_MARKER}{} pid={}", state.version, id.pid));
                 if file.write_all(header.as_bytes()).is_err() {
                     break;
                 }
@@ -221,7 +231,7 @@ fn record_panic(info: &PanicHookInfo<'_>) {
     // unsafe in edition 2024 and PTY threads are already running by now.
     let backtrace = Backtrace::force_capture();
 
-    let mut event = line(&format!("PANIC thread={thread}"));
+    let mut event = line(&format!("{PANIC_MARKER}{thread}"));
     event.push_str(&format!("  at {location}\n"));
     event.push_str(&format!("  {payload}\n"));
     for bt_line in backtrace.to_string().lines() {
@@ -336,6 +346,63 @@ fn prune_in(dir: &Path) {
     }
 }
 
+/// Reading more of an artifact than this buys nothing: the markers that
+/// classify it are lines, and one oversized malformed file must not be read in
+/// full on every invocation.
+const ARTIFACT_READ_CAP: u64 = 256 * 1024;
+
+/// What an artifact says happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Clean,
+    Running,
+    Crashed,
+    Indeterminate,
+}
+
+/// Read an artifact back and say what it recorded: a clean exit, a still-live
+/// process, a crash, or too little to tell.  The one module that writes the
+/// vocabulary is also the one that reads it, so the two cannot drift apart.
+pub fn classify(path: &Path, pid: u32) -> Verdict {
+    let Ok(meta) = std::fs::metadata(path) else { return Verdict::Indeterminate };
+    if meta.len() > ARTIFACT_READ_CAP {
+        return Verdict::Indeterminate;
+    }
+    let Ok(bytes) = std::fs::read(path) else { return Verdict::Indeterminate };
+    let text = String::from_utf8_lossy(&bytes);
+
+    let mut lines = text.lines();
+    let has_header = lines
+        .next()
+        .and_then(|first| first.split_once(' '))
+        .is_some_and(|(_, rest)| rest.starts_with(HEADER_MARKER));
+    if !has_header {
+        return Verdict::Indeterminate;
+    }
+
+    let mut exited = false;
+    let mut panicked = false;
+    for entry in lines {
+        if entry.contains(PANIC_MARKER) || entry.contains(SKIPPED_MARKER) {
+            panicked = true;
+        }
+        if entry.contains(EXIT_ERROR_MARKER) {
+            return Verdict::Crashed;
+        }
+        if entry.contains(EXIT_OK_MARKER) {
+            exited = true;
+        }
+    }
+
+    if panicked {
+        return Verdict::Crashed;
+    }
+    if exited {
+        return Verdict::Clean;
+    }
+    if logdir::pid_is_live(pid) { Verdict::Running } else { Verdict::Crashed }
+}
+
 /// Panic while holding the recorder lock, so a test can prove the hook takes
 /// the skip path instead of waiting on a mutex this thread already owns.
 #[cfg(debug_assertions)]
@@ -415,7 +482,9 @@ mod tests {
     /// could otherwise render that substring and produce a spurious match.
     fn header_count(text: &str) -> usize {
         text.lines()
-            .filter(|line| line.split_once(' ').is_some_and(|(_, rest)| rest.starts_with("start ")))
+            .filter(|line| {
+                line.split_once(' ').is_some_and(|(_, rest)| rest.starts_with(HEADER_MARKER))
+            })
             .count()
     }
 
@@ -745,6 +814,30 @@ mod tests {
         prune_in(dir.path());
 
         assert!(state.exists(), "an unrelated file was deleted");
+    }
+
+    /// No hand-written body can catch the writer and `classify` drifting apart —
+    /// only driving both the real writer and the real reader end to end can.
+    #[test]
+    fn a_real_panic_classifies_as_crashed() {
+        with_recorder(|_| {
+            session_begin();
+            let _ = std::panic::catch_unwind(|| panic!("classify-marker"));
+
+            let path = artifact_path_for_tests().expect("an artifact was created");
+            assert_eq!(classify(&path, std::process::id()), Verdict::Crashed);
+        });
+    }
+
+    #[test]
+    fn a_real_clean_exit_classifies_as_clean() {
+        with_recorder(|_| {
+            session_begin();
+            record_exit(&Ok(()));
+
+            let path = artifact_path_for_tests().expect("an artifact was created");
+            assert_eq!(classify(&path, std::process::id()), Verdict::Clean);
+        });
     }
 
     fn set_mtime_days_ago(path: &Path, days: u64) {

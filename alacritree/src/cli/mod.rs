@@ -91,8 +91,13 @@ enum Command {
     /// Check the external tools, config and state alacritree depends on.
     Doctor,
 
-    /// Every recorded crash, newest first.
-    Crashes,
+    /// Crashed and indeterminate sessions, newest first.  Clean exits and
+    /// still-running sessions are hidden unless `--all` is given.
+    Crashes {
+        /// Also show clean exits and still-running sessions.
+        #[arg(long)]
+        all: bool,
+    },
 
     /// Copy this binary into a bin directory (default: ~/.local/bin).
     ///
@@ -218,7 +223,7 @@ pub fn run(cli: Cli) -> Option<i32> {
         Command::Doctor => return Some(doctor::run(cli.json, cli.socket.as_deref())),
         // Reads files rather than asking an instance, so it answers when
         // nothing is running — which is exactly when a crash is being chased.
-        Command::Crashes => return Some(crashes::run(cli.json)),
+        Command::Crashes { all } => return Some(crashes::run(cli.json, all)),
         Command::Install { dest } => return Some(install::run(dest, cli.json)),
         #[cfg(debug_assertions)]
         Command::ProvokeLockPanic => {
@@ -316,7 +321,7 @@ fn to_request(command: Command) -> IpcRequest {
         Command::Completions { .. }
         | Command::Mcp
         | Command::Doctor
-        | Command::Crashes
+        | Command::Crashes { .. }
         | Command::Install { .. } => {
             unreachable!("handled before dispatch")
         },

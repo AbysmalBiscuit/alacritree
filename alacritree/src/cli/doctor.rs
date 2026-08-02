@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use crate::app::{ShellDecision, shell_decision};
 use crate::command_ext::CommandExt;
 use crate::config::{self, Config, ConfigDiagnosis, ConfigFile, Profile, ShellConfig};
+use crate::crash_log::{Verdict, classify};
 use crate::ipc::{self, IpcRequest, SendError};
 use crate::state;
 use crate::wsl::{self, ShellChoice};
@@ -316,20 +317,6 @@ fn ipc_checks(socket: Option<&Path>, enabled: bool) -> Vec<Check> {
     checks
 }
 
-/// Reading more of an artifact than this buys nothing: the markers that
-/// classify it are lines, and one oversized malformed file must not be read in
-/// full on every invocation.
-const ARTIFACT_READ_CAP: u64 = 256 * 1024;
-
-/// What an artifact says happened.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Verdict {
-    Clean,
-    Running,
-    Crashed,
-    Indeterminate,
-}
-
 fn crash_checks() -> Vec<Check> {
     match crate::logdir::log_dir() {
         Some(dir) => crash_checks_in(&dir),
@@ -386,42 +373,6 @@ fn crash_checks_in(dir: &Path) -> Vec<Check> {
          {clean} clean; newest {newest}"
     );
     vec![check("crashes", "artifacts", status, detail)]
-}
-
-fn classify(path: &Path, pid: u32) -> Verdict {
-    let Ok(meta) = std::fs::metadata(path) else { return Verdict::Indeterminate };
-    if meta.len() > ARTIFACT_READ_CAP {
-        return Verdict::Indeterminate;
-    }
-    let Ok(bytes) = std::fs::read(path) else { return Verdict::Indeterminate };
-    let text = String::from_utf8_lossy(&bytes);
-
-    let mut lines = text.lines();
-    if !lines.next().is_some_and(|first| first.contains(" start ")) {
-        return Verdict::Indeterminate;
-    }
-
-    let mut exited = false;
-    let mut panicked = false;
-    for entry in lines {
-        if entry.contains("PANIC thread=") || entry.contains("panic records skipped:") {
-            panicked = true;
-        }
-        if entry.contains("exit error:") {
-            return Verdict::Crashed;
-        }
-        if entry.contains("exit ok") {
-            exited = true;
-        }
-    }
-
-    if panicked {
-        return Verdict::Crashed;
-    }
-    if exited {
-        return Verdict::Clean;
-    }
-    if crate::logdir::pid_is_live(pid) { Verdict::Running } else { Verdict::Crashed }
 }
 
 /// A live process running one of our binaries, and therefore pinning it.
