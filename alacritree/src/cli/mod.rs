@@ -9,6 +9,7 @@
 //! `state.toml` and git directly.  Commands that are meaningless without a
 //! window (anything about sessions) fail there rather than pretending.
 
+mod crashes;
 mod doctor;
 mod install;
 mod offline;
@@ -89,6 +90,9 @@ enum Command {
 
     /// Check the external tools, config and state alacritree depends on.
     Doctor,
+
+    /// Every recorded crash, newest first.
+    Crashes,
 
     /// Copy this binary into a bin directory (default: ~/.local/bin).
     ///
@@ -206,6 +210,9 @@ pub fn run(cli: Cli) -> Option<i32> {
         // Diagnosing the machine is not something a running instance can answer:
         // the report has to be truthful when there is nothing to ask.
         Command::Doctor => return Some(doctor::run(cli.json, cli.socket.as_deref())),
+        // Reads files rather than asking an instance, so it answers when
+        // nothing is running — which is exactly when a crash is being chased.
+        Command::Crashes => return Some(crashes::run(cli.json)),
         Command::Install { dest } => return Some(install::run(dest, cli.json)),
         other => to_request(other),
     };
@@ -295,7 +302,11 @@ fn to_request(command: Command) -> IpcRequest {
             },
         },
         // None of these reach an alacritree, so none has a request to build.
-        Command::Completions { .. } | Command::Mcp | Command::Doctor | Command::Install { .. } => {
+        Command::Completions { .. }
+        | Command::Mcp
+        | Command::Doctor
+        | Command::Crashes
+        | Command::Install { .. } => {
             unreachable!("handled before dispatch")
         },
     }
