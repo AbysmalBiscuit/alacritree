@@ -94,7 +94,9 @@ fn main() -> eframe::Result<()> {
 
     // egui_winit warns on every cold X11 clipboard probe even when it recovers.
     let default_filter = "info,egui_winit::clipboard=error";
+    let (tee, log_sink) = logging::tee();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_filter))
+        .target(env_logger::Target::Pipe(Box::new(tee)))
         .init();
 
     // A subcommand talks to an alacritree instead of being one.  Log output
@@ -104,7 +106,29 @@ fn main() -> eframe::Result<()> {
         std::process::exit(code);
     }
 
+    // Only the GUI path records crashes.  Every subcommand exits before config
+    // is read, so no gate could govern them, and `alacritree mcp` is a
+    // long-lived loop that would write records nothing could disable.
+    let log_dir = logdir::log_dir();
+    if let Some(dir) = &log_dir {
+        crash_log::install(dir, env!("CARGO_PKG_VERSION"));
+    }
+
     let config = config::load();
+
+    // The gate defaults on so a panic in `config::load` above is still
+    // recorded; that is the one case where `crash_log = false` leaves a file.
+    crash_log::set_enabled(config.debug.crash_log);
+    crash_log::session_begin();
+    crash_log::prune();
+
+    if config.debug.persistent_logging
+        && let Some(dir) = &log_dir
+    {
+        logging::prune_session_logs(dir);
+        *log_sink.lock().unwrap_or_else(|e| e.into_inner()) = logging::open_session_log(dir);
+    }
+
     wsl::set_automount_root(config.wsl_automount_root.clone());
     wsl_helper::set_enabled(config.wsl_resident_helper);
     let translucent = config.window.opacity < 1.0;
@@ -121,11 +145,17 @@ fn main() -> eframe::Result<()> {
     let native_options =
         eframe::NativeOptions { viewport, vsync: config.ui.vsync, ..Default::default() };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "Alacritree",
         native_options,
         Box::new(move |cc| Ok(Box::new(AlacritreeApp::new(cc, config)))),
-    )
+    );
+
+    // Only reached when `run_native` returns.  A panic unwinds past this — winit
+    // resumes it outside the window procedure — so the hook is what records
+    // that case.
+    crash_log::record_exit(&result);
+    result
 }
 
 /// Borrow the console of whatever shell launched us, but only when we have no
