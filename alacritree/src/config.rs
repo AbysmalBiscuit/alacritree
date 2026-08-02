@@ -486,14 +486,6 @@ impl BakedGlyph {
     }
 }
 
-impl std::ops::Deref for BakedGlyph {
-    type Target = str;
-
-    fn deref(&self) -> &str {
-        self.0
-    }
-}
-
 /// Declares a glyph constant and enrols it in `$slice` in one step, so the
 /// aggregate cannot drift from the constants it describes.
 macro_rules! baked_glyphs {
