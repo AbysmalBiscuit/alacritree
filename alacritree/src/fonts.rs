@@ -2176,7 +2176,6 @@ mod tests {
     }
 
     /// Counts every glyph the crate paints from its own constants, deduplicated.
-    #[cfg(test)]
     fn baked_glyphs() -> Vec<char> {
         let mut seen: Vec<char> = crate::config::DEFAULT_ICON_GLYPHS
             .iter()
