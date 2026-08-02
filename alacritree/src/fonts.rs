@@ -2133,7 +2133,9 @@ mod tests {
         assert!(!defs.font_data.keys().any(|id| id.starts_with(SYMBOLS_ID)));
     }
 
-    /// Running twice must not stack a second copy.
+    /// Running twice must not stack a second copy. Covers only the case where
+    /// the face is already installed in every target family; a partially
+    /// installed state is unreachable in production and untested here.
     #[test]
     fn installing_the_symbol_face_twice_is_idempotent() {
         let mut defs = FontDefinitions::default();
