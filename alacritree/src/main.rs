@@ -122,10 +122,12 @@ fn main() -> eframe::Result<()> {
     crash_log::session_begin();
     crash_log::prune();
 
+    if let Some(dir) = &log_dir {
+        logging::prune_session_logs(dir);
+    }
     if config.debug.persistent_logging
         && let Some(dir) = &log_dir
     {
-        logging::prune_session_logs(dir);
         *log_sink.lock().unwrap_or_else(|e| e.into_inner()) = logging::open_session_log(dir);
     }
 
