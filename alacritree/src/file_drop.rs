@@ -559,6 +559,7 @@ mod tests {
         assert_eq!(text, "/a/one.png");
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_pasted_path_is_translated_for_a_wsl_shell() {
         let paths = [PathBuf::from(r"C:\pics\a.png")];
