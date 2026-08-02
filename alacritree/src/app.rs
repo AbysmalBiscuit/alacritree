@@ -3372,17 +3372,29 @@ impl AlacritreeApp {
                                     drag_handle(ui, &theme)
                                         .dnd_set_drag_payload(DraggedProject(project.root.clone()));
                                 }
-                                let (arrow_style, arrow_default) = if project.expanded {
-                                    (&icons.project_expanded, DEFAULT_PROJECT_EXPANDED_ICON)
+                                let (arrow_style, arrow_default, arrow_hint) = if project.expanded {
+                                    (
+                                        &icons.project_expanded,
+                                        DEFAULT_PROJECT_EXPANDED_ICON,
+                                        "collapse project",
+                                    )
                                 } else {
-                                    (&icons.project_collapsed, DEFAULT_PROJECT_COLLAPSED_ICON)
+                                    (
+                                        &icons.project_collapsed,
+                                        DEFAULT_PROJECT_COLLAPSED_ICON,
+                                        "expand project",
+                                    )
                                 };
-                                if styled_icon_button(
-                                    ui,
-                                    arrow_style,
-                                    arrow_default,
-                                    theme.text_dim,
-                                    &theme,
+                                if icon_tooltip(
+                                    styled_icon_button(
+                                        ui,
+                                        arrow_style,
+                                        arrow_default,
+                                        theme.text_dim,
+                                        &theme,
+                                    ),
+                                    arrow_hint,
+                                    theme.icon_tooltips,
                                 )
                                 .clicked()
                                 {
