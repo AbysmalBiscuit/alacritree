@@ -283,8 +283,10 @@ alternative was an empty box.
 
 Set `false` to skip it entirely.
 
-    [ui.font]
-    builtin_symbols = false
+```toml
+[ui.font]
+builtin_symbols = false
+```
 
 One limit is worth knowing: a font can claim a codepoint in its character map
 and still have nothing to draw for it. egui takes the first font that claims
