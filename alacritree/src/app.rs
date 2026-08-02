@@ -4985,6 +4985,40 @@ fn truncating_label(
     (response, galley)
 }
 
+/// The hints for icons a row paints inside itself, with the rect each covers.
+///
+/// A row allocates its frame at end-of-show, so its retroactive `interact`
+/// registers after the icons in egui's z-order and takes the hover mark away
+/// from them — an icon's own `on_hover_text` never opens. The row answers for
+/// whichever icon the pointer is over instead, the same way it already routes
+/// a click that landed on a button.
+#[derive(Default)]
+struct IconHints(Vec<(egui::Rect, String)>);
+
+impl IconHints {
+    fn add(&mut self, rect: egui::Rect, hint: impl Into<String>) {
+        self.0.push((rect, hint.into()));
+    }
+
+    fn at(&self, pos: egui::Pos2) -> Option<&str> {
+        self.0.iter().find(|(rect, _)| rect.contains(pos)).map(|(_, hint)| hint.as_str())
+    }
+
+    /// The tooltip `resp` should carry: an icon's hint where the pointer is on
+    /// one, otherwise `fallback` for the rest of the row.
+    fn apply(
+        &self,
+        resp: egui::Response,
+        enabled: bool,
+        fallback: impl FnOnce(egui::Response) -> egui::Response,
+    ) -> egui::Response {
+        match resp.hover_pos().and_then(|pos| self.at(pos)) {
+            Some(hint) if enabled => resp.on_hover_text(hint.to_owned()),
+            _ => fallback(resp),
+        }
+    }
+}
+
 /// Offer `hint` — what the icon under `resp` does or reports — as its tooltip,
 /// unless `[ui] icon_tooltips` turns the hints off.
 fn icon_tooltip(resp: egui::Response, hint: &str, enabled: bool) -> egui::Response {
@@ -5575,6 +5609,7 @@ fn home_row(
 
     let mut spawn_clicked = false;
     let mut spawn_rect: Option<egui::Rect> = None;
+    let mut hints = IconHints::default();
     let frame = Frame::default().inner_margin(Margin { left: 6, right: 0, top: 3, bottom: 3 });
     let resp = frame
         .show(ui, |ui| {
@@ -5598,11 +5633,8 @@ fn home_row(
                     );
                 },
                 |ui| {
-                    let btn = icon_tooltip(
-                        icon_button(ui, "+", theme.text_muted, theme),
-                        "new shell",
-                        theme.icon_tooltips,
-                    );
+                    let btn = icon_button(ui, "+", theme.text_muted, theme);
+                    hints.add(btn.rect, "new shell");
                     spawn_rect = Some(btn.rect);
                     if btn.clicked() {
                         spawn_clicked = true;
@@ -5612,6 +5644,9 @@ fn home_row(
         })
         .response
         .interact(egui::Sense::click());
+    // The row carries no name tooltip of its own, so the button's hint is the
+    // only thing a hover here has to say.
+    let resp = hints.apply(resp, theme.icon_tooltips, |resp| resp);
 
     // Same z-order recovery as worktree_row: the retroactive frame interact
     // shadows the inner button, so route clicks inside its rect to spawn.
@@ -6179,6 +6214,7 @@ fn worktree_row(
     let panel_x = ui.max_rect().x_range();
 
     let mut delete_clicked = false;
+    let mut hints = IconHints::default();
     let mut delete_rect: Option<egui::Rect> = None;
     let mut spawn_clicked = false;
     let mut spawn_rect: Option<egui::Rect> = None;
@@ -6237,21 +6273,15 @@ fn worktree_row(
                         } else {
                             "delete worktree and branch"
                         };
-                        let btn = icon_tooltip(
-                            icon_button(ui, "×", theme.text_muted, theme),
-                            hover,
-                            theme.icon_tooltips,
-                        );
+                        let btn = icon_button(ui, "×", theme.text_muted, theme);
+                        hints.add(btn.rect, hover);
                         delete_rect = Some(btn.rect);
                         if btn.clicked() {
                             delete_clicked = true;
                         }
                     }
-                    let btn = icon_tooltip(
-                        icon_button(ui, "+", theme.text_muted, theme),
-                        "new shell",
-                        theme.icon_tooltips,
-                    );
+                    let btn = icon_button(ui, "+", theme.text_muted, theme);
+                    hints.add(btn.rect, "new shell");
                     spawn_rect = Some(btn.rect);
                     if btn.clicked() {
                         spawn_clicked = true;
@@ -6261,7 +6291,7 @@ fn worktree_row(
                             pr_badge(icons, theme, info.state);
                         let (glyph, font, color) =
                             resolve_icon(style, default_glyph, color, 10.0, 10.0, theme);
-                        let (rect, resp) = ui
+                        let (rect, _) = ui
                             .allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
                         ui.painter().text(
                             rect.center(),
@@ -6270,14 +6300,14 @@ fn worktree_row(
                             font,
                             color,
                         );
-                        resp.on_hover_text(format!("PR #{} — {word}", info.number));
+                        hints.add(rect, format!("PR #{} — {word}", info.number));
                     }
                     if let Some(state) = wt.upstream.as_ref() {
                         let (style, default_glyph, color, tip) =
                             upstream_badge(icons, theme, state);
                         let (glyph, font, color) =
                             resolve_icon(style, default_glyph, color, 10.0, 10.0, theme);
-                        let (rect, resp) = ui
+                        let (rect, _) = ui
                             .allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
                         ui.painter().text(
                             rect.center(),
@@ -6286,18 +6316,20 @@ fn worktree_row(
                             font,
                             color,
                         );
-                        resp.on_hover_text(tip);
+                        hints.add(rect, tip);
                     }
                 },
             );
         })
         .response
         .interact(egui::Sense::click());
-    let resp = if wt.prunable {
-        resp.on_hover_text("worktree directory is missing — × prunes it")
-    } else {
-        name_tooltip(resp, display_name, name_elided, theme.sidebar_tooltips)
-    };
+    let resp = hints.apply(resp, theme.icon_tooltips, |resp| {
+        if wt.prunable {
+            resp.on_hover_text("worktree directory is missing — × prunes it")
+        } else {
+            name_tooltip(resp, display_name, name_elided, theme.sidebar_tooltips)
+        }
+    });
 
     // Frame allocates its space at end-of-show, so its retroactive `interact`
     // registers *after* the inner button in egui's z-order — meaning clicks on
@@ -6364,6 +6396,7 @@ fn session_row(
     let panel_x = ui.max_rect().x_range();
 
     let mut close_clicked = false;
+    let mut hints = IconHints::default();
     let mut close_rect: Option<egui::Rect> = None;
     let mut title_elided = false;
     // One indent level deeper than worktree rows (16); right: 0 keeps the ×
@@ -6393,11 +6426,8 @@ fn session_row(
                     title_elided = galley.elided;
                 },
                 |ui| {
-                    let btn = icon_tooltip(
-                        icon_button(ui, "×", theme.text_muted, theme),
-                        "close session",
-                        theme.icon_tooltips,
-                    );
+                    let btn = icon_button(ui, "×", theme.text_muted, theme);
+                    hints.add(btn.rect, "close session");
                     close_rect = Some(btn.rect);
                     if btn.clicked() {
                         close_clicked = true;
@@ -6407,7 +6437,9 @@ fn session_row(
         })
         .response
         .interact(egui::Sense::click());
-    let resp = name_tooltip(resp, &row.title, title_elided, theme.sidebar_tooltips);
+    let resp = hints.apply(resp, theme.icon_tooltips, |resp| {
+        name_tooltip(resp, &row.title, title_elided, theme.sidebar_tooltips)
+    });
 
     // Frame allocates its space at end-of-show, so its retroactive `interact`
     // registers *after* the inner button in egui's z-order — meaning clicks on
@@ -9660,8 +9692,23 @@ mod tests {
     fn texts_while_hovering_at(
         hover: egui::Pos2,
         row_width: f32,
-        mut row: impl FnMut(&mut egui::Ui),
+        row: impl FnMut(&mut egui::Ui),
     ) -> Vec<Vec<(String, bool)>> {
+        frames_while_hovering_at(hover, row_width, row)
+            .iter()
+            .map(|shapes| painted_texts(shapes))
+            .collect()
+    }
+
+    /// The shapes behind `texts_while_hovering_at`. A status badge exposes no
+    /// rect to aim at, so its tests paint one pass with the pointer away to
+    /// find where the glyph landed, then hover exactly that — which only holds
+    /// because both passes lay out through this same function.
+    fn frames_while_hovering_at(
+        hover: egui::Pos2,
+        row_width: f32,
+        mut row: impl FnMut(&mut egui::Ui),
+    ) -> Vec<Vec<egui::epaint::ClippedShape>> {
         let ctx = egui::Context::default();
         let mut seen = Vec::new();
         for frame in 0..8 {
@@ -9691,9 +9738,29 @@ mod tests {
                     );
                 });
             });
-            seen.push(painted_texts(&output.shapes));
+            seen.push(output.shapes);
         }
         seen
+    }
+
+    /// Where each glyph painted, keyed by its text.
+    fn painted_glyph_positions(
+        shapes: &[egui::epaint::ClippedShape],
+    ) -> HashMap<String, egui::Pos2> {
+        fn walk(shape: &egui::Shape, out: &mut HashMap<String, egui::Pos2>) {
+            match shape {
+                egui::Shape::Text(t) => {
+                    out.insert(t.galley.text().to_owned(), t.pos + t.galley.size() / 2.0);
+                },
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {},
+            }
+        }
+        let mut out = HashMap::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
     }
 
     /// Rest the pointer on a lone sidebar button and report whether its hint
@@ -9764,26 +9831,6 @@ mod tests {
             tooltip_shown(&texts, &wt.name),
             "hovering the elided row painted no tooltip with the full name: {texts:?}"
         );
-    }
-
-    /// A sidebar button says what it does on hover, and `[ui] icon_tooltips`
-    /// is what decides whether it may. The two settings are independent axes:
-    /// silencing the row names must leave the button hints alone, or turning
-    /// off one kind of tooltip would quietly cost the other.
-    #[test]
-    fn icon_tooltips_gate_the_button_hint() {
-        for (icon_tooltips, want) in [(true, true), (false, false)] {
-            let mut config = Config::default();
-            config.ui.icon_tooltips = icon_tooltips;
-            config.ui.sidebar_tooltips = SidebarTooltips::Off;
-            let theme = Theme::from_config(&config);
-
-            assert_eq!(
-                button_hint_painted(&theme, "close session"),
-                want,
-                "icon_tooltips = {icon_tooltips}"
-            );
-        }
     }
 
     #[test]
@@ -10011,6 +10058,150 @@ mod tests {
         assert_eq!(family, egui::FontFamily::Name(crate::fonts::UI_BOLD_FAMILY.into()));
         assert_eq!(size, 12.0 * s, "a button glyph paints at 12px inside its 16px slot");
         assert_eq!(color, Color32::RED);
+    }
+
+    /// Rest the pointer on the worktree-row badge that painted `glyph` and
+    /// report every text drawn while it lingers there.
+    fn texts_while_hovering_badge(theme: &Theme, glyph: &str) -> Vec<Vec<(String, bool)>> {
+        let icons = crate::config::Icons::default();
+        let wt = crate::projects::Worktree {
+            name: "wt".to_owned(),
+            path: PathBuf::from("/repo/wt"),
+            branch: None,
+            is_main: false,
+            prunable: false,
+            upstream: Some(UpstreamState::Level { upstream: "origin/x".into() }),
+        };
+        let pr = PrInfo {
+            number: 7,
+            base_branch: "main".into(),
+            url: String::new(),
+            state: PrState::Open,
+        };
+        let mut render = |ui: &mut egui::Ui| {
+            worktree_row(
+                ui,
+                &wt,
+                &wt.name,
+                Some(&pr),
+                true,
+                false,
+                false,
+                false,
+                None,
+                false,
+                &icons,
+                theme,
+            );
+        };
+
+        texts_while_hovering_icon(&mut render, glyph)
+    }
+
+    /// Whether resting the pointer on the icon that painted `glyph` surfaces
+    /// `hint`.
+    fn hint_painted_over(row: impl FnMut(&mut egui::Ui), glyph: &str, hint: &str) -> bool {
+        texts_while_hovering_icon(row, glyph).iter().flatten().any(|(text, _)| text == hint)
+    }
+
+    /// Find the icon that painted `glyph`, then hover it. Two passes: an icon
+    /// exposes no rect to aim at, so the first pass reads the position back out
+    /// of the shapes it drew.
+    fn texts_while_hovering_icon(
+        mut row: impl FnMut(&mut egui::Ui),
+        glyph: &str,
+    ) -> Vec<Vec<(String, bool)>> {
+        const WIDTH: f32 = 220.0;
+        let off_pointer = egui::Pos2::new(-100.0, -100.0);
+        let probe = frames_while_hovering_at(off_pointer, WIDTH, &mut row);
+        let at = painted_glyph_positions(probe.last().expect("the row painted"));
+        let centre = *at.get(glyph).unwrap_or_else(|| panic!("no {glyph} icon painted: {at:?}"));
+
+        texts_while_hovering_at(centre, WIDTH, &mut row)
+    }
+
+    /// Every icon a worktree row paints — buttons and status badges alike —
+    /// explains itself on hover, and answers to one key. A row that senses its
+    /// own frame outranks the icons inside it, so each of these would go quiet
+    /// on its own `on_hover_text`.
+    #[test]
+    fn icon_tooltips_gate_every_worktree_row_icon() {
+        for (icon_tooltips, want) in [(true, true), (false, false)] {
+            let mut config = Config::default();
+            config.ui.icon_tooltips = icon_tooltips;
+            config.ui.sidebar_tooltips = SidebarTooltips::Off;
+            let theme = Theme::from_config(&config);
+
+            for (glyph, hint) in [
+                (DEFAULT_UPSTREAM_LEVEL_ICON, "tracks origin/x"),
+                (DEFAULT_PR_OPEN_ICON, "PR #7 — open"),
+                ("×", "delete worktree and branch"),
+                ("+", "new shell"),
+            ] {
+                let texts = texts_while_hovering_badge(&theme, glyph);
+                let shown = texts.iter().flatten().any(|(text, _)| text == hint);
+                assert_eq!(shown, want, "icon_tooltips = {icon_tooltips}, icon {glyph}");
+            }
+        }
+    }
+
+    /// The session and home rows sense their own frames the same way, so their
+    /// buttons need the same recovery as the worktree row's.
+    #[test]
+    fn icon_tooltips_reach_the_session_and_home_row_buttons() {
+        let icons = crate::config::Icons::default();
+        for (icon_tooltips, want) in [(true, true), (false, false)] {
+            let mut config = Config::default();
+            config.ui.icon_tooltips = icon_tooltips;
+            config.ui.sidebar_tooltips = SidebarTooltips::Off;
+            let theme = Theme::from_config(&config);
+
+            let row = SessionRowData {
+                id: 1,
+                title: "zsh".to_owned(),
+                needs_attention: false,
+                agent_glyph: None,
+                is_active: true,
+                is_displayed: true,
+            };
+            let mut session = |ui: &mut egui::Ui| {
+                session_row(ui, &row, false, false, &icons, &theme);
+            };
+            assert_eq!(
+                hint_painted_over(&mut session, "×", "close session"),
+                want,
+                "session row, icon_tooltips = {icon_tooltips}"
+            );
+
+            let mut home = |ui: &mut egui::Ui| {
+                home_row(ui, true, false, false, false, None, &icons, &theme);
+            };
+            assert_eq!(
+                hint_painted_over(&mut home, "+", "new shell"),
+                want,
+                "home row, icon_tooltips = {icon_tooltips}"
+            );
+        }
+    }
+
+    /// A sidebar button says what it does on hover, and `[ui] icon_tooltips`
+    /// is what decides whether it may. The two settings are independent axes:
+    /// silencing the row names must leave the button hints alone, or turning
+    /// off one kind of tooltip would quietly cost the other.
+    #[test]
+    fn icon_tooltips_gate_the_button_hint() {
+        for (icon_tooltips, want) in [(true, true), (false, false)] {
+            let mut config = Config::default();
+            config.ui.icon_tooltips = icon_tooltips;
+            config.ui.sidebar_tooltips = SidebarTooltips::Off;
+            let theme = Theme::from_config(&config);
+
+            assert_eq!(
+                button_hint_painted(&theme, "close session"),
+                want,
+                "icon_tooltips = {icon_tooltips}"
+            );
+        }
     }
 
     /// `[ui] sidebar_tooltips` bounds the row tooltip on both sides: `off`
