@@ -17,8 +17,8 @@ artifact is a derivative and should not be mistaken for the real face.
 ### Regenerating
 
 Needed whenever a glyph is added to `DEFAULT_ICON_GLYPHS`, `CHROME_GLYPHS`,
-or `AGENT_PROCESS_GLYPHS`. `fonts.rs`'s coverage test fails until this is
-done, and names the missing codepoint.
+or `AGENT_GLYPHS`. `fonts.rs`'s coverage test fails until this is done, and
+names the missing codepoint.
 
 Requires `fonttools` and DejaVu 2.37.
 

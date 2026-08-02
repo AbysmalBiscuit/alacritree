@@ -271,6 +271,28 @@ Bold, italic, and bold-italic faces can be picked independently in
 `offset` and per-glyph `glyph_offset` tuning is supported, again to match
 Alacritty's config surface.
 
+### `builtin_symbols`
+
+`true` by default. Alacritree bundles a small font carrying only the glyphs
+it paints itself (`⌂`, `⌫`, `⇅`, `✓` and about 25 others), registered as the
+**last** entry in each chrome font family.
+
+Because it is last, a font that already has a glyph keeps rendering it — your
+font choice is unaffected, and the bundled face is reached only where the
+alternative was an empty box.
+
+Set `false` to skip it entirely.
+
+    [ui.font]
+    builtin_symbols = false
+
+One limit is worth knowing: a font can claim a codepoint in its character map
+and still have nothing to draw for it. egui takes the first font that claims
+a glyph, so such a font wins over the bundled one and the box stays empty.
+This is uncommon, and no ordering fixes it.
+
+Run `alacritree --licenses` for the bundled font's licence.
+
 ## Configuration
 
 Two TOML files are loaded and **deep-merged using Alacritty's own merge
@@ -435,6 +457,14 @@ upstream_level = "✓"        # the four upstream glyphs need upstream_status =
 upstream_diverged = "⇅"     # true; each carries its own default color from
 upstream_gone = "⌫"         # the theme, which a table override replaces
 upstream_untracked = "↑"
+add_project = "+"           # the eight action-button icons in the sidebar's
+new_worktree = "+"          # chrome — each is independent even where the
+new_session = "+"           # default glyph is shared, e.g. styling
+remove_project = "×"        # delete_worktree red leaves close_session and
+delete_worktree = "×"       # remove_project alone, and reorder is separate
+close_session = "×"         # from upstream_diverged despite matching "⇅"
+refresh = "↻"
+reorder = "⇅"
 
 [ui.drop]                   # what dragging files onto the window does
 enabled       = true        # master switch; false ignores every drop
@@ -535,8 +565,11 @@ row reserves for that icon, so it cannot grow past its slot. Status markers
 and badges — `upstream_gone` above, and 11 other `[ui.icons]` keys covering
 worktree/session/home icons, PR badges, and the other upstream states — paint
 in a 10 px slot with a 10 px default, so `size` on those can only shrink.
-Only the project expand/collapse arrow (16 px slot, 12 px default) and the
-sidebar search icon can grow past their defaults.
+The project expand/collapse arrow and the eight action-button icons
+(`add_project`, `new_worktree`, `new_session`, `remove_project`,
+`delete_worktree`, `close_session`, `refresh`, `reorder`) paint in a 16 px
+slot with a 12 px default, and the sidebar search icon has a slot of its own
+tied to the UI font size — all three groups can grow past their defaults.
 
 ### Shell launch profiles
 

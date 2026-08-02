@@ -22,6 +22,10 @@ use clap_complete::Shell;
 
 use crate::ipc::{self, IpcRequest, SendError};
 
+/// Redistributing the embedded subset obliges us to carry its notice, and
+/// installation copies only the executable — so the text ships inside it.
+const FONT_LICENSE: &str = include_str!("../../assets/FONT-LICENSE.txt");
+
 #[derive(Debug, Parser)]
 #[command(name = "alacritree", version, about = "Alacritty fork with worktree-aware sidebars")]
 pub struct Cli {
@@ -35,6 +39,10 @@ pub struct Cli {
     /// Talk to the instance listening on this socket rather than finding one.
     #[arg(long, global = true, value_name = "PATH")]
     socket: Option<PathBuf>,
+
+    /// Print the licence for the bundled symbol font and exit.
+    #[arg(long)]
+    licenses: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -179,6 +187,11 @@ enum WorktreeCommand {
 /// `Some(code)` is a process exit code; `None` means no subcommand was given
 /// and this invocation is a plain `alacritree`.
 pub fn run(cli: Cli) -> Option<i32> {
+    if cli.licenses {
+        println!("{FONT_LICENSE}");
+        return Some(0);
+    }
+
     let request = match cli.command? {
         Command::Completions { shell } => {
             let mut command = Cli::command();
@@ -423,6 +436,23 @@ mod tests {
         let cli = Cli::try_parse_from(["alacritree"]).expect("parses");
         assert!(cli.command.is_none());
         assert_eq!(run(cli), None);
+    }
+
+    /// The bundled font's notice has to travel with the binary: installation
+    /// copies the executable and nothing beside it.
+    #[test]
+    fn the_bundled_font_notice_is_embedded() {
+        assert!(FONT_LICENSE.contains("Bitstream"), "the notice must be the upstream text");
+        assert!(FONT_LICENSE.len() > 1000, "a truncated notice does not satisfy the licence");
+    }
+
+    /// `--licenses` needs no subcommand and exits before anything asks a
+    /// running instance for a reply.
+    #[test]
+    fn licenses_flag_prints_and_exits_without_a_subcommand() {
+        let cli = Cli::try_parse_from(["alacritree", "--licenses"]).expect("parses");
+        assert!(cli.command.is_none());
+        assert_eq!(run(cli), Some(0));
     }
 
     /// With an app listening, the request must reach it — and the offline path
