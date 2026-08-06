@@ -192,7 +192,11 @@ forward-delete in TUIs.
   whichever section holds the best match. Type to filter, `Up`/`Down` move the
   selection, `Enter` runs the highlighted row (dispatching an action, jumping to
   a session, or switching workspace), `Escape` clears the query and then closes,
-  and a click outside dismisses it. The default is `Ctrl+K` (which shadows
+  and a click outside dismisses it. On a window too narrow for the palette's
+  usual width it takes four fifths of the window instead, and the three columns
+  shrink together and wrap their text rather than running off the edge. Anything
+  a column still has to cut short shows in full on hover. The default is
+  `Ctrl+K` (which shadows
   `Ctrl+K` for terminal apps; rebind or free it with `ReceiveChar` if you need it
   there).
 - `PaletteTop` / `PaletteBottom` — move the palette cursor to the first / last

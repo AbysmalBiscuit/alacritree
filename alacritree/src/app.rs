@@ -4516,9 +4516,15 @@ fn dirty_warning(counts: &DirtyCounts) -> Option<String> {
     ))
 }
 
+/// The modal frame's horizontal inner margin.  Any width budgeted against the
+/// window has to leave room for it, so it lives apart from the frame itself.
+fn modal_pad_x(scale: f32) -> f32 {
+    (16.0 * scale).round()
+}
+
 fn modal_frame(theme: &Theme) -> Frame {
     let s = theme.ui_scale;
-    let pad_x = (16.0 * s).round() as i8;
+    let pad_x = modal_pad_x(s) as i8;
     let pad_y = (12.0 * s).round() as i8;
     Frame::default()
         .fill(theme.sidebar_bg)
@@ -4591,31 +4597,59 @@ fn focus_default(ctx: &Context, id: egui::Id) {
     }
 }
 
-/// A single line of text, ellipsized to `max_w` rather than wrapped — the
-/// building block for the palette's fixed columns.
-fn single_line_galley(
+/// What a palette column does with text too wide for it.  epaint overruns the
+/// column rather than splitting a word unless told it may break anywhere, so
+/// the choice follows the content: prose can rely on its spaces, a lone
+/// identifier or key chord cannot.
+#[derive(Clone, Copy)]
+enum ColumnWrap {
+    /// One line, ellipsized at the column edge — the scannable default.
+    Clip,
+    /// Wrap at word boundaries, over as many lines as it takes.
+    Words,
+    /// Wrap mid-token if that is the only way to stay inside the column.
+    Anywhere,
+}
+
+impl ColumnWrap {
+    fn limits(self) -> (usize, bool) {
+        match self {
+            Self::Clip => (1, true),
+            Self::Words => (usize::MAX, false),
+            Self::Anywhere => (usize::MAX, true),
+        }
+    }
+}
+
+/// A palette column's text, laid out to `max_w`.  Whatever still does not fit
+/// is ellipsized, which the caller reads back off the galley's `elided` flag to
+/// offer the full text on hover.
+fn column_galley(
     ctx: &Context,
     text: &str,
     family: egui::FontFamily,
     size: f32,
     color: Color32,
     max_w: f32,
+    wrap: ColumnWrap,
 ) -> std::sync::Arc<egui::Galley> {
     use egui::text::{LayoutJob, TextFormat};
+    let (max_rows, break_anywhere) = wrap.limits();
     let mut job = LayoutJob::single_section(
         text.to_owned(),
         TextFormat { font_id: egui::FontId::new(size, family), color, ..Default::default() },
     );
     job.wrap.max_width = max_w.max(0.0);
-    job.wrap.max_rows = 1;
-    job.wrap.break_anywhere = true;
+    job.wrap.max_rows = max_rows;
+    job.wrap.break_anywhere = break_anywhere;
     job.wrap.overflow_character = Some('…');
     ctx.fonts(|f| f.layout_job(job))
 }
 
-/// Text wrapped to `max_w` over as many lines as it needs — the description
-/// column, which reads as a sentence and so must not be cut short.
-fn wrapped_galley(
+/// Prose laid out to `max_w`.  Wrapping at spaces reads best, but a word wider
+/// than the column overruns it instead of breaking, so a galley that came back
+/// too wide is laid out again mid-word.
+fn prose_galley(
     ctx: &Context,
     text: &str,
     family: egui::FontFamily,
@@ -4623,18 +4657,45 @@ fn wrapped_galley(
     color: Color32,
     max_w: f32,
 ) -> std::sync::Arc<egui::Galley> {
-    use egui::text::{LayoutJob, TextFormat};
-    let mut job = LayoutJob::single_section(
-        text.to_owned(),
-        TextFormat { font_id: egui::FontId::new(size, family), color, ..Default::default() },
-    );
-    job.wrap.max_width = max_w.max(0.0);
-    ctx.fonts(|f| f.layout_job(job))
+    let wrapped = column_galley(ctx, text, family.clone(), size, color, max_w, ColumnWrap::Words);
+    if wrapped.size().x <= max_w {
+        return wrapped;
+    }
+    column_galley(ctx, text, family, size, color, max_w, ColumnWrap::Anywhere)
 }
 
-/// Fixed geometry for the palette's `description | action | keys` grid.  Every
-/// row and the header lay out against the same widths, so the columns line up
-/// down the list instead of each row packing its own way.
+/// The hover text for a row: the full text of whatever its columns had to cut,
+/// and nothing at all when everything already reads in place.
+fn elided_hover(columns: &[(bool, &str)]) -> Option<String> {
+    let full: Vec<&str> =
+        columns.iter().filter(|(elided, _)| *elided).map(|(_, text)| *text).collect();
+    (!full.is_empty()).then(|| full.join("\n"))
+}
+
+/// The palette's comfortable content width, and the share of a window it may
+/// take instead when the window cannot hold that.
+const PALETTE_WIDTH: f32 = 760.0;
+const PALETTE_SCREEN_FRACTION: f32 = 0.8;
+
+/// How wide the palette's content may be.  A window too narrow for the
+/// comfortable width sizes the palette against the window instead, so the modal
+/// keeps a margin either side rather than running past both edges.
+fn palette_content_width(scale: f32, screen_w: f32) -> f32 {
+    let budget = screen_w * PALETTE_SCREEN_FRACTION - 2.0 * modal_pad_x(scale);
+    budget.min(PALETTE_WIDTH * scale).max(0.0)
+}
+
+/// The action and keys columns' fixed widths, and the narrowest the description
+/// still reads at beside them.
+const PALETTE_ACTION_W: f32 = 200.0;
+const PALETTE_KEYS_W: f32 = 180.0;
+const PALETTE_DESC_MIN: f32 = 160.0;
+
+/// Geometry for the palette's `description | action | keys` grid.  Every row and
+/// the header lay out against the same widths, so the columns line up down the
+/// list instead of each row packing its own way.  A grid with room for the fixed
+/// widths gets them; a tighter one shrinks all three by the same factor and
+/// wraps their text, rather than letting the last column run off the edge.
 struct PaletteColumns {
     width: f32,
     pad: f32,
@@ -4642,17 +4703,40 @@ struct PaletteColumns {
     action: f32,
     keys: f32,
     gap: f32,
+    /// Set once the grid is tighter than its fixed widths, at which point every
+    /// column wraps instead of ellipsizing.
+    narrow: bool,
 }
 
 impl PaletteColumns {
-    fn new(theme: &Theme, width: f32) -> Self {
-        let s = theme.ui_scale;
-        let pad = 10.0 * s;
-        let gap = 14.0 * s;
-        let action = 200.0 * s;
-        let keys = 180.0 * s;
-        let desc = (width - 2.0 * pad - 2.0 * gap - action - keys).max(120.0 * s);
-        Self { width, pad, desc, action, keys, gap }
+    fn new(scale: f32, width: f32) -> Self {
+        let pad = 10.0 * scale;
+        let gap = 14.0 * scale;
+        let content = (width - 2.0 * pad - 2.0 * gap).max(0.0);
+        let action = PALETTE_ACTION_W * scale;
+        let keys = PALETTE_KEYS_W * scale;
+        let comfortable = PALETTE_DESC_MIN * scale + action + keys;
+        if content >= comfortable {
+            let desc = content - action - keys;
+            return Self { width, pad, desc, action, keys, gap, narrow: false };
+        }
+        let shrink = content / comfortable;
+        Self {
+            width,
+            pad,
+            desc: PALETTE_DESC_MIN * scale * shrink,
+            action: action * shrink,
+            keys: keys * shrink,
+            gap,
+            narrow: true,
+        }
+    }
+
+    /// How the action and keys columns lay out.  Their text is one unbroken
+    /// token, so a narrow grid has to split it mid-word; a comfortable one
+    /// keeps every row one line tall and ellipsizes the overflow.
+    fn token_wrap(&self) -> ColumnWrap {
+        if self.narrow { ColumnWrap::Anywhere } else { ColumnWrap::Clip }
     }
 
     fn desc_x(&self, left: f32) -> f32 {
@@ -4682,13 +4766,14 @@ fn paint_palette_header(ui: &mut egui::Ui, theme: &Theme, cols: &PaletteColumns)
         ("ACTION", cols.action_x(left), cols.action),
         ("KEYS", cols.keys_x(left), cols.keys),
     ] {
-        let g = single_line_galley(
+        let g = column_galley(
             ui.ctx(),
             text,
             egui::FontFamily::Proportional,
             size,
             theme.text_muted,
             w,
+            ColumnWrap::Clip,
         );
         painter.galley(egui::pos2(x, rect.top() + 2.0 * s), g, theme.text_muted);
     }
@@ -4702,13 +4787,16 @@ fn paint_palette_section(ui: &mut egui::Ui, theme: &Theme, cols: &PaletteColumns
     let size = (theme.font_normal - 2.0).max(8.0);
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(cols.width, size + 14.0 * s), egui::Sense::hover());
-    let g = single_line_galley(
+    // A heading spans the row rather than the description column, so a narrow
+    // grid does not cut it down to the width of the text beside it.
+    let g = column_galley(
         ui.ctx(),
         &title.to_uppercase(),
         egui::FontFamily::Proportional,
         size,
         theme.accent,
-        cols.desc,
+        cols.width - 2.0 * cols.pad,
+        ColumnWrap::Clip,
     );
     ui.painter().galley(
         egui::pos2(cols.desc_x(rect.left()), rect.bottom() - size - 3.0 * s),
@@ -4719,8 +4807,10 @@ fn paint_palette_section(ui: &mut egui::Ui, theme: &Theme, cols: &PaletteColumns
 
 /// Paint one command-palette row across the three columns: the description
 /// (bright, wrapped over as many lines as it needs), the action's config name
-/// (dim), and every key bound to it (accent).  A selected row gets a soft
-/// accent wash and a crisp accent bar; a hovered one a faint fill.
+/// (dim), and every key bound to it (accent).  On a narrow grid the other two
+/// columns wrap as well; whatever is still cut short offers its full text on
+/// hover.  A selected row gets a soft accent wash and a crisp accent bar; a
+/// hovered one a faint fill.
 fn paint_palette_row(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -4732,7 +4822,8 @@ fn paint_palette_row(
     let v_pad = 6.0 * s;
     let ctx = ui.ctx();
 
-    let desc = wrapped_galley(
+    let token = cols.token_wrap();
+    let desc = prose_galley(
         ctx,
         &item.primary,
         egui::FontFamily::Proportional,
@@ -4740,24 +4831,31 @@ fn paint_palette_row(
         theme.text,
         cols.desc,
     );
-    let action = single_line_galley(
+    let action = column_galley(
         ctx,
         &item.secondary,
         egui::FontFamily::Proportional,
         theme.font_normal,
         theme.text_dim,
         cols.action,
+        token,
     );
-    let keys = single_line_galley(
+    let keys = column_galley(
         ctx,
         &item.keys,
         egui::FontFamily::Monospace,
         theme.font_normal,
         theme.accent,
         cols.keys,
+        token,
     );
+    let hover = elided_hover(&[
+        (desc.elided, item.primary.as_str()),
+        (action.elided, item.secondary.as_str()),
+        (keys.elided, item.keys.as_str()),
+    ]);
 
-    let row_h = (desc.size().y.max(action.size().y) + 2.0 * v_pad).round();
+    let row_h = (desc.size().y.max(action.size().y).max(keys.size().y) + 2.0 * v_pad).round();
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(cols.width, row_h), egui::Sense::click());
     let painter = ui.painter().clone();
 
@@ -4782,7 +4880,10 @@ fn paint_palette_row(
     painter.galley(egui::pos2(cols.action_x(left), top), action, theme.text_dim);
     painter.galley(egui::pos2(cols.keys_x(left), top), keys, theme.accent);
 
-    resp
+    match hover {
+        Some(text) => resp.on_hover_text(text),
+        None => resp,
+    }
 }
 
 /// A modal action button.  Framed and filled so it reads as clickable —
@@ -6951,6 +7052,7 @@ impl AlacritreeApp {
 
         let items = self.palette_items();
         let hint = palette_hint(&self.config.bindings);
+        let content_w = palette_content_width(s, ctx.screen_rect().width());
         let mut chosen: Option<PaletteAction> = None;
 
         let modal = {
@@ -6958,9 +7060,9 @@ impl AlacritreeApp {
             egui::Modal::new(egui::Id::new("alacritree_command_palette"))
                 .frame(modal_frame(&theme))
                 .show(ctx, |ui| {
-                    ui.set_width(760.0 * s);
+                    ui.set_width(content_w);
                     ui.spacing_mut().item_spacing.y = 6.0 * s;
-                    let cols = PaletteColumns::new(&theme, ui.available_width());
+                    let cols = PaletteColumns::new(s, ui.available_width());
 
                     let input_id = egui::Id::new("alacritree_command_palette_query");
                     let query_changed = ui
@@ -10983,5 +11085,82 @@ mod tests {
         let ineligible = resolve_pr_info(&mut memo, &PathBuf::from("/repo/other"), false, &poll);
         assert_eq!(lookups.get(), 1, "an ineligible path never runs the lookup");
         assert!(ineligible.is_none());
+    }
+
+    /// The palette asks for a comfortable fixed width, but a window too narrow
+    /// to hold it must still show the whole modal, margins included.
+    #[test]
+    fn the_palette_shrinks_to_fit_a_narrow_window() {
+        assert_eq!(
+            palette_content_width(1.0, 1920.0),
+            PALETTE_WIDTH,
+            "a wide window gets the comfortable width unchanged"
+        );
+
+        for screen in [1000.0_f32, 820.0, 700.0, 520.0, 400.0] {
+            let outer = palette_content_width(1.0, screen) + 2.0 * modal_pad_x(1.0);
+            assert!(
+                outer <= screen * PALETTE_SCREEN_FRACTION + 0.5,
+                "at {screen}px the modal is {outer}px, past its share of the window"
+            );
+        }
+    }
+
+    #[test]
+    fn the_palette_never_asks_for_a_negative_width() {
+        assert!(palette_content_width(1.0, 10.0) >= 0.0);
+    }
+
+    /// A window wide enough keeps the fixed grid, so the columns line up exactly
+    /// where they always have.
+    #[test]
+    fn wide_columns_keep_the_fixed_grid() {
+        let cols = PaletteColumns::new(1.0, 760.0);
+        assert_eq!(cols.action, 200.0);
+        assert_eq!(cols.keys, 180.0);
+        assert_eq!(cols.desc, 760.0 - 2.0 * 10.0 - 2.0 * 14.0 - 380.0);
+        assert!(!cols.narrow, "a wide palette ellipsizes its columns rather than wrapping them");
+    }
+
+    /// Too narrow for the fixed grid, every column shrinks by the same factor
+    /// rather than the last one running off the edge.
+    #[test]
+    fn narrow_columns_shrink_together_and_stay_inside_the_row() {
+        for width in [520.0_f32, 440.0, 360.0, 240.0, 120.0] {
+            let cols = PaletteColumns::new(1.0, width);
+            assert!(cols.narrow, "at {width}px the fixed grid cannot fit");
+            let right = cols.keys_x(0.0) + cols.keys;
+            assert!(
+                right <= width - cols.pad + 0.5,
+                "at {width}px the keys column ends at {right}, past the row"
+            );
+            assert!(cols.desc > 0.0 && cols.action > 0.0 && cols.keys > 0.0);
+            assert!((cols.action / cols.desc - 200.0 / 160.0).abs() < 1e-3);
+            assert!((cols.keys / cols.desc - 180.0 / 160.0).abs() < 1e-3);
+        }
+    }
+
+    /// The grid does not jump as it crosses from fixed to proportional.
+    #[test]
+    fn the_columns_are_continuous_across_the_narrow_threshold() {
+        let fixed = PaletteColumns::new(1.0, 588.0);
+        let narrow = PaletteColumns::new(1.0, 587.0);
+        assert!(!fixed.narrow && narrow.narrow);
+        assert!((fixed.desc - narrow.desc).abs() < 1.0);
+        assert!((fixed.action - narrow.action).abs() < 1.0);
+        assert!((fixed.keys - narrow.keys).abs() < 1.0);
+    }
+
+    #[test]
+    fn only_a_cut_column_offers_its_full_text_on_hover() {
+        assert_eq!(elided_hover(&[(false, "Copy"), (false, "Copy"), (false, "Ctrl+C")]), None);
+        assert_eq!(
+            elided_hover(&[
+                (false, "Increase the font size"),
+                (true, "IncreaseFontSize"),
+                (true, "Ctrl+Plus, Ctrl+="),
+            ]),
+            Some("IncreaseFontSize\nCtrl+Plus, Ctrl+=".to_string())
+        );
     }
 }
