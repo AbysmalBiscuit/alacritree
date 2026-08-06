@@ -237,3 +237,7 @@ upstream's terminal crate and would not exist without it.
 
 Released under the [Apache License, Version 2.0](LICENSE-APACHE), matching
 upstream Alacritty.
+
+The bundled Alacritree Symbols font is a subset of DejaVu and remains under
+the [Bitstream Vera license](alacritree/assets/FONT-LICENSE.txt). Run
+`alacritree --licenses` to print its complete notice from an installed binary.
