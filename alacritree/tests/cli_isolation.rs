@@ -125,6 +125,16 @@ fn crashes_preserves_invalid_utf8_bytes_verbatim() {
 /// that down.
 #[test]
 fn a_panic_holding_the_recorder_lock_does_not_hang() {
+    // The stimulus is gated on `debug_assertions`, which a dev profile does not
+    // guarantee: `-C debug-assertions=off` in RUSTFLAGS is a legitimate way to
+    // build one, and the binary then carries no provoke path to drive. That
+    // flag reaches this crate too, so the gate read here is the one the binary
+    // was compiled under.
+    if !cfg!(debug_assertions) {
+        eprintln!("skipped: the binary under test was built without debug assertions");
+        return;
+    }
+
     let home = tempfile::tempdir().expect("a temp dir");
     let mut child = Command::new(binary())
         .arg("provoke-lock-panic")
