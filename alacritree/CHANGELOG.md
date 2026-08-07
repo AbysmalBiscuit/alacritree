@@ -48,7 +48,7 @@
 * **logging:** recover the crash artifact from real failure modes ([d6d142d](https://github.com/mathix420/alacritree/commit/d6d142da7d4e83b3c99f91bab512e101b663c9fb))
 * **logging:** restore terminal colour under Target::Pipe ([7192673](https://github.com/mathix420/alacritree/commit/7192673d7ec25fb576763f2276ec0046db395cf3))
 * **palette:** fit and wrap on a narrow window ([552d912](https://github.com/mathix420/alacritree/commit/552d912630c899dabe3f49b691cf21243daa7d75))
-* **sidebar:** surface the hints icons inside a row owe ([bd0dcbd](https://github.com/mathix420/alacritree/commit/bd0dcbd306522dd2588421327c10b668ea48228d))
+* **sidebar:** surface icon hints inside a row ([bd0dcbd](https://github.com/mathix420/alacritree/commit/bd0dcbd306522dd2588421327c10b668ea48228d))
 * **upstream:** drop badges for unreadable git state ([862c3d3](https://github.com/mathix420/alacritree/commit/862c3d356725a6b1cdd2ebde5838cdca657cd131))
 * **upstream:** key wsl branches by plain ref name ([304c7fa](https://github.com/mathix420/alacritree/commit/304c7fa5ebdae8f8fe78683cf03903468b7117d9))
 
