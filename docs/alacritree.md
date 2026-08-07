@@ -397,7 +397,8 @@ files       = true          # paste the paths of files and folders copied in a
                             # file manager, as Windows Terminal does
 image       = true          # write a clipboard bitmap (a Win+Shift+S capture)
                             # to a PNG and paste its path
-image_dir   = "~/shots"     # where those PNGs go (default: a temp subdirectory).
+image_dir   = "~/shots"     # where those PNGs go (default: the per-user cache
+                            # on Unix; %TEMP%/alacritree/clipboard on Windows).
                             # A directory you name here is never swept — set it
                             # and you keep every image and clean up yourself
 image_keep  = 20            # how many PNGs the default directory keeps.
@@ -431,6 +432,9 @@ Text always wins: a clipboard carrying both text and an image pastes the text.
 Only the regular clipboard is checked for files and images — the X11 PRIMARY
 selection is text, so middle-click paste is unchanged. Both options `false`
 restores the original behavior exactly, where a paste with no text does nothing.
+A default Unix image directory is private to its owner (`0700`), and generated
+files are `0600`. A directory named with `image_dir` keeps its existing sharing
+permissions and is never swept, while the generated image files remain `0600`.
 A pasted path is quoted and, inside a WSL session, translated exactly as a
 dropped one — both follow `[ui.drop]`'s `quote` and `wsl_translate`, so those
 keys still apply even with `[ui.drop] enabled = false`. `quote = "posix"` is

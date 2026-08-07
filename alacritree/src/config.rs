@@ -407,8 +407,23 @@ impl PasteConfig {
     }
 }
 
-/// Disposable by nature, and reachable from a WSL session through the usual
-/// automount once `shell_payload` translates it.
+/// Disposable by nature.  Unix keeps captures in the user's cache rather than
+/// a shared fixed-name tmp directory; Windows' `%TEMP%` is already per-user and
+/// remains reachable from WSL through the usual automount.
+#[cfg(unix)]
+pub fn default_image_dir() -> PathBuf {
+    let cache_home = xdg::BaseDirectories::with_prefix("alacritree").get_cache_home();
+    // SAFETY: `geteuid` takes no arguments and has no safety preconditions.
+    let uid = unsafe { libc::geteuid() };
+    unix_default_image_dir(cache_home, &std::env::temp_dir(), uid)
+}
+
+#[cfg(unix)]
+fn unix_default_image_dir(cache_home: Option<PathBuf>, temp_dir: &Path, uid: u32) -> PathBuf {
+    cache_home.unwrap_or_else(|| temp_dir.join(format!("alacritree-{uid}")))
+}
+
+#[cfg(not(unix))]
 pub fn default_image_dir() -> PathBuf {
     std::env::temp_dir().join("alacritree").join("clipboard")
 }
@@ -2499,6 +2514,22 @@ program = "second"
         let (dir, owned) = ui.paste.image_target();
         assert_eq!(dir, default_image_dir());
         assert!(owned, "the default directory is alacritree's own");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_unix_image_default_prefers_the_user_cache() {
+        let cache = PathBuf::from("/home/example/.cache/alacritree");
+        assert_eq!(unix_default_image_dir(Some(cache.clone()), Path::new("/tmp"), 1234), cache);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_unix_image_fallback_is_namespaced_by_user() {
+        assert_eq!(
+            unix_default_image_dir(None, Path::new("/tmp"), 1234),
+            PathBuf::from("/tmp/alacritree-1234")
+        );
     }
 
     #[test]

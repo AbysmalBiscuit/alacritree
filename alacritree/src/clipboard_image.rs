@@ -4,8 +4,8 @@
 //! and it returns a path.  That is what keeps it testable without a window.
 
 use std::fmt;
-use std::fs::{self, File};
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
@@ -74,7 +74,11 @@ pub fn file_name(png: &[u8]) -> String {
 /// for a directory alacritree owns — a directory the user named may hold files
 /// alacritree never wrote, and a filename pattern is no proof of ownership.
 pub fn store(dir: &Path, png: &[u8], cap: Option<usize>) -> io::Result<PathBuf> {
-    fs::create_dir_all(dir)?;
+    if cap.is_some() {
+        prepare_managed_dir(dir)?;
+    } else {
+        fs::create_dir_all(dir)?;
+    }
     let path = dir.join(file_name(png));
     if !reusable(&path, png.len() as u64) {
         write_atomically(dir, &path, png)?;
@@ -85,50 +89,131 @@ pub fn store(dir: &Path, png: &[u8], cap: Option<usize>) -> io::Result<PathBuf> 
     Ok(path)
 }
 
+/// Create and revalidate the directory that alacritree owns.  The open uses
+/// `O_NOFOLLOW` on Unix so a fixed-name symlink in a shared cache parent cannot
+/// redirect screenshots into an attacker-controlled location.
+#[cfg(unix)]
+fn prepare_managed_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    let handle = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)?;
+    let metadata = handle.metadata()?;
+    // SAFETY: `geteuid` takes no arguments and has no safety preconditions.
+    let uid = unsafe { libc::geteuid() };
+    if !metadata.is_dir() || metadata.uid() != uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not a directory owned by the current user", dir.display()),
+        ));
+    }
+    handle.set_permissions(fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn prepare_managed_dir(dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(dir)
+}
+
+/// Create a new image or staging file without ever exposing its contents to
+/// other local users.  `create_new` also refuses pre-planted symlinks.
+fn create_private_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        let file = options.open(path)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    options.open(path)
+}
+
+/// Open an existing generated image without following a replacement symlink,
+/// and repair files produced by an older permissive version.
+fn open_existing_private(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.custom_flags(libc::O_NOFOLLOW);
+        let file = options.open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+        }
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        let file = options.open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+        }
+        Ok(file)
+    }
+}
+
 /// Whether the destination already holds these bytes *and* its timestamp was
 /// refreshed.  Content addressing makes equal names strong evidence of equal
 /// bytes, not proof, so the length is checked too; a link, a directory or a
 /// timestamp that would not move all mean "write it again".
 fn reusable(path: &Path, len: u64) -> bool {
-    let Ok(meta) = fs::symlink_metadata(path) else {
+    let Ok(file) = open_existing_private(path) else {
         return false;
     };
-    if !meta.is_file() || meta.len() != len {
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    if metadata.len() != len {
         return false;
     }
-    File::options().write(true).open(path).and_then(|f| f.set_modified(SystemTime::now())).is_ok()
+    file.set_modified(SystemTime::now()).is_ok()
 }
 
 /// Write through a uniquely named temporary in the same directory so a reader
 /// never opens a half-written PNG.
 fn write_atomically(dir: &Path, path: &Path, png: &[u8]) -> io::Result<()> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let tmp = dir.join(format!(
-        "{}.{}.{}.tmp",
-        path.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    match place(&tmp, path, png) {
-        Ok(()) => Ok(()),
-        Err(e) => {
+    loop {
+        let tmp = dir.join(format!(
+            "{}.{}.{}.tmp",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = match create_private_file(&tmp) {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            result => result?,
+        };
+        if let Err(e) = file.write_all(png) {
+            drop(file);
             let _ = fs::remove_file(&tmp);
-            // Another instance writing the same content first is a success, not
-            // a collision — but only once the destination is checked the same
-            // way the reuse path checks it, since a racing writer can equally
-            // have left something of the wrong length behind.
-            if reusable(path, png.len() as u64) { Ok(()) } else { Err(e) }
-        },
-    }
-}
+            return Err(e);
+        }
+        drop(file);
 
-/// Every fallible step between creating `tmp` and it landing at `path`, kept
-/// in one function so `write_atomically` has a single place to clean up on
-/// any of their failures.
-fn place(tmp: &Path, path: &Path, png: &[u8]) -> io::Result<()> {
-    fs::write(tmp, png)?;
-    clear_directory_at(path);
-    fs::rename(tmp, path)
+        clear_directory_at(path);
+        match fs::rename(&tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                // Another instance writing the same content first is a success,
+                // but only once the destination is checked like the reuse path.
+                if reusable(path, png.len() as u64) {
+                    return Ok(());
+                }
+                return Err(e);
+            },
+        }
+    }
 }
 
 /// `rename` replaces a file but cannot replace a directory, so a directory
@@ -177,7 +262,7 @@ fn apply_cap(dir: &Path, keep: usize, in_use: &Path) {
         if path == in_use {
             continue;
         }
-        match fs::metadata(&path).and_then(|meta| meta.modified()) {
+        match open_existing_private(&path).and_then(|file| file.metadata()?.modified()) {
             Ok(when) => generated.push((when, path)),
             // Unranked means unswept: a file whose age cannot be read is never
             // the one chosen for deletion.
@@ -281,6 +366,114 @@ mod tests {
 
         assert_eq!(path.file_name().unwrap(), file_name(b"png bytes").as_str());
         assert_eq!(fs::read(&path).unwrap(), b"png bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_storage_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("clipboard");
+        let path = store(&dir, b"private", Some(20)).unwrap();
+
+        assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_managed_directory_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("clipboard");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+
+        store(&dir, b"private", Some(20)).unwrap();
+
+        assert_eq!(fs::metadata(dir).unwrap().permissions().mode() & 0o777, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_managed_directory_symlink_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        let link = tmp.path().join("clipboard");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(store(&link, b"private", Some(20)).is_err());
+        assert_eq!(fs::read_dir(target).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_configured_directory_symlink_is_preserved() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        let link = tmp.path().join("configured");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let path = store(&link, b"private", None).unwrap();
+
+        assert_eq!(fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o755);
+        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reused_image_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(file_name(b"private"));
+        fs::write(&path, b"private").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+
+        store(tmp.path(), b"private", None).unwrap();
+
+        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_cap_tightens_retained_images() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let retained = store(tmp.path(), b"retained", None).unwrap();
+        fs::set_permissions(&retained, fs::Permissions::from_mode(0o666)).unwrap();
+
+        store(tmp.path(), b"new", Some(2)).unwrap();
+
+        assert_eq!(fs::metadata(retained).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_destination_symlink_is_replaced_not_followed() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("outside");
+        let path = tmp.path().join(file_name(b"private"));
+        fs::write(&target, b"untouched").unwrap();
+        symlink(&target, &path).unwrap();
+
+        let stored = store(tmp.path(), b"private", None).unwrap();
+
+        assert_eq!(stored, path);
+        assert_eq!(fs::read(target).unwrap(), b"untouched");
+        assert_eq!(fs::read(stored).unwrap(), b"private");
     }
 
     #[test]
