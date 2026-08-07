@@ -27,7 +27,8 @@ These only fire while a modal is open and never reach the terminal grid.
 These are parsed from `[[keyboard.bindings]]` and matched against egui key
 events before the terminal sees them. The default set is preloaded, and your
 TOML entries are checked first — so any default can be rebound, or freed for
-the shell with `action = "None"`.
+the shell with `action = "ReceiveChar"`. Use `action = "None"` when the key
+should be consumed without running an action or reaching the shell.
 
 The alacritree-specific defaults are ordinary bindings like the rest. Nothing
 below is hard-coded.
@@ -311,7 +312,7 @@ deep-merged, so alacritree-specific overrides can live in `alacritree.toml`
 without touching the alacritty config.
 
 ```toml
-# Example: bind Ctrl+Shift+T to open a new session, and unbind Cmd+M on macOS.
+# Example: bind Ctrl+Shift+T to open a new session, and disable Cmd+M on macOS.
 [[keyboard.bindings]]
 key = "T"
 mods = "Control|Shift"

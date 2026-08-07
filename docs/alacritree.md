@@ -244,8 +244,9 @@ Input handling is layered:
 1. **Key bindings** — parsed from `[[keyboard.bindings]]` in the TOML config.
    Alacritty's default set is preloaded, and so are alacritree's own (sidebar
    toggles, workspace switches, session spawn / cycle, palette); your entries
-   are checked first so any default can be overridden or unbound (`action =
-   "None"`).
+   are checked first so any default can be overridden, forwarded to the
+   terminal (`action = "ReceiveChar"`), or consumed without an action (`action
+   = "None"`).
 2. **Modal Enter/Escape** — consumed by whichever dialog is open. These are
    not bindings and cannot be rebound.
 3. **Egui text events** — preferred for printable input because they handle
@@ -506,12 +507,15 @@ Tools:
 the editor tab is closed. Because the built-in editor writes every change
 immediately, MCP clients see the same auto-saved contents as the editor.
 
-Under the hood this mirrors Alacritty's IPC design, on every platform: the app
-listens on a unix socket at `$XDG_RUNTIME_DIR/alacritree/alacritree-<pid>.sock`,
-or on Windows a named pipe at `\\.\pipe\alacritree-<pid>.sock`, and advertises
-the path to child PTYs via `ALACRITREE_SOCKET` — so an agent running *inside*
-an Alacritree session automatically targets the instance hosting it. Other
-clients fall back to scanning the socket directory, or can pass
+Under the hood this mirrors Alacritty's IPC design, on every platform. On Unix,
+the app listens under `$XDG_RUNTIME_DIR/alacritree`, or under
+`/run/user/$UID/alacritree` on Linux when that environment variable is absent;
+if the runtime path cannot be created, it falls back to the system temporary
+directory. On Windows it uses a named pipe at
+`\\.\pipe\alacritree-<pid>.sock`. The path is advertised to child PTYs via
+`ALACRITREE_SOCKET`, so an agent running *inside* an Alacritree session
+automatically targets the instance hosting it. Other clients fall back to
+scanning the socket directory, or can pass
 `alacritree mcp --socket <path>` explicitly. Set `ipc_socket = false` under
 `[general]` (shared with Alacritty's option of the same name) to disable the
 socket entirely.
