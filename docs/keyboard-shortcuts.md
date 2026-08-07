@@ -2,43 +2,36 @@
 
 Alacritree has two layers of shortcuts:
 
-1. **Built-in app shortcuts** — hard-coded, not configurable. They drive
-   alacritree-specific UI (sidebars, workspaces, session list, quit dialog).
-2. **Configurable terminal bindings** — parsed from your
-   `[[keyboard.bindings]]` tables in `alacritty.toml` / `alacritree.toml`, with
-   a set of defaults that mirror alacritty.
-
-When both layers would match the same key, the built-in shortcut wins.
+1. **Key bindings** — parsed from your `[[keyboard.bindings]]` tables in
+   `alacritty.toml` / `alacritree.toml`. Alacritty's defaults are preloaded,
+   and so are alacritree's own (sidebars, workspaces, sessions, palette).
+   Everything in this layer is rebindable.
+2. **Modal keys** — `Enter` and `Escape` while a dialog is open. The modal
+   consumes them directly; they are not bindings and cannot be rebound.
 
 ---
 
-## Built-in app shortcuts
-
-These cannot be rebound today.
+## Modal keys
 
 | Shortcut             | Action                                                |
 | -------------------- | ----------------------------------------------------- |
-| `Ctrl+B`             | Toggle the left (projects/worktrees) sidebar          |
-| `Ctrl+G`             | Toggle the right (git status) sidebar                 |
-| `Ctrl+T`             | Open a new shell session in the current workspace     |
-| `Ctrl+Tab`           | Cycle to the next session in the current workspace    |
-| `Ctrl+Shift+Tab`     | Cycle to the previous session                         |
-| `Alt+Right`          | Switch to the next workspace (home / worktrees)       |
-| `Alt+Left`           | Switch to the previous workspace                      |
-| `Ctrl+Q`             | Open the quit confirmation dialog                     |
 | `Enter`              | Confirm a modal (quit, delete worktree, create branch)|
 | `Escape`             | Cancel a modal                                        |
 
-Modal-specific keys (`Enter`/`Escape`) only fire while a modal is open and never
-reach the terminal grid.
+These only fire while a modal is open and never reach the terminal grid.
 
 ---
 
-## Configurable terminal bindings
+## Key bindings
 
 These are parsed from `[[keyboard.bindings]]` and matched against egui key
-events before the terminal sees them. Alacritty's own default set is preloaded,
-and your TOML entries are checked first — so your config overrides any default.
+events before the terminal sees them. The default set is preloaded, and your
+TOML entries are checked first — so any default can be rebound, or freed for
+the shell with `action = "ReceiveChar"`. Use `action = "None"` when the key
+should be consumed without running an action or reaching the shell.
+
+The alacritree-specific defaults are ordinary bindings like the rest. Nothing
+below is hard-coded.
 
 ### Defaults on every platform
 
@@ -46,6 +39,15 @@ and your TOML entries are checked first — so your config overrides any default
 | -------------------- | ----------------------------------------------------- |
 | `Ctrl+Shift+V`       | Paste from the clipboard                              |
 | `Ctrl+Shift+C`       | Copy the current selection                            |
+| `Ctrl+B`             | Toggle the left (projects/worktrees) sidebar          |
+| `Ctrl+G`             | Toggle the right (git status) sidebar                 |
+| `Ctrl+T`             | Open a new shell session in the current workspace     |
+| `Ctrl+Tab`           | Cycle to the next session in the current workspace    |
+| `Ctrl+Shift+Tab`     | Cycle to the previous session                         |
+| `Alt+Right`          | Switch to the next workspace (home / worktrees)       |
+| `Alt+Left`           | Switch to the previous workspace                      |
+| `Ctrl+Shift+O`       | Add a project to the sidebar                          |
+| `Ctrl+Q`             | Open the quit confirmation dialog                     |
 | `Ctrl+Backtick`      | Toggle the workspace's persistent scratchpad tab      |
 | `Shift+Insert`       | Paste from the primary (X11) selection                |
 | `Ctrl+0`             | Reset font size                                       |
@@ -58,6 +60,7 @@ and your TOML entries are checked first — so your config overrides any default
 | `Shift+Tab`          | Send `CSI Z` (reverse tab — readline/vim)             |
 | `Alt+Shift+Tab`      | Send `ESC` + `CSI Z`                                  |
 | `Ctrl+Shift+B`       | Toggle keyboard focus between terminal and sidebar    |
+| `Ctrl+Shift+G`       | Move focus to the git status sidebar                  |
 | `Ctrl+Shift+W`       | Close the cursored session (sidebar) or the current shell |
 | `Home` / `End`       | Sidebar focused: cursor to the first / last row       |
 | `PageUp` / `PageDown`| Sidebar focused: jump to the previous / next project  |
@@ -213,14 +216,32 @@ caret there; bind them elsewhere if you want the caret back.
 - `Minimize`
 - `Quit` — open the quit confirmation dialog.
 
+### Sidebars and workspaces
+
+- `ToggleLeftSidebar` — show or hide the projects/worktrees sidebar.
+  Default: `Ctrl+B`.
+- `ToggleRightSidebar` — show or hide the git status sidebar. Default: `Ctrl+G`.
+- `SelectNextWorkspace` / `SelectPreviousWorkspace` — move between the home tab
+  and the worktrees. Defaults: `Alt+Right` / `Alt+Left`.
+- `AddProject` — open the picker that adds a project to the sidebar.
+  Default: `Ctrl+Shift+O`.
+- `SetBaseBranch` — open the base-branch picker for the sidebar-cursored
+  worktree, or the current one when the terminal has focus. No default key.
+- `ToggleSessionRows` / `ToggleSessionTabs` — flip the runtime
+  `session_display.sidebar_always` / `session_display.tabs_always` values, which
+  control whether a lone session still gets its own sidebar row or tab segment.
+  No default keys.
+
 ### Focus navigation
 
 - `ToggleSidebarFocus` — flip keyboard focus between the terminal and the
   projects sidebar. Focusing a hidden sidebar shows it; returning focus
   hides it again unless you toggled it open yourself.
-- `FocusProjectsSidebar` / `FocusTerminal` — the same moves as explicit
-  directional actions (no default keys) for users who prefer distinct
-  bindings.
+- `FocusProjectsSidebar` / `FocusGitSidebar` / `FocusTerminal` — move focus to
+  one specific panel. `FocusGitSidebar` defaults to `Ctrl+Shift+G`; the other
+  two have no default key.
+- `FocusLeft` / `FocusRight` — directional focus moves between panels. A TUI
+  that wants the keys itself still receives them. No default keys.
 
 While the sidebar has focus: `Up`/`Down` move between rows, `Right`/`Left`
 expand/collapse a project (`Left` on a worktree jumps to its project),
@@ -291,7 +312,7 @@ deep-merged, so alacritree-specific overrides can live in `alacritree.toml`
 without touching the alacritty config.
 
 ```toml
-# Example: bind Ctrl+Shift+T to open a new session, and unbind Cmd+M on macOS.
+# Example: bind Ctrl+Shift+T to open a new session, and disable Cmd+M on macOS.
 [[keyboard.bindings]]
 key = "T"
 mods = "Control|Shift"
