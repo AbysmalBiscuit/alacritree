@@ -58,3 +58,21 @@ jobs:
 
       - name: Check
         run: cargo check -p alacritree --locked
+
+  # Clipboard file/image fallbacks and WSL path handling are primarily
+  # Windows-facing. Compile and run their pure tests before those cfg branches
+  # reach a release tag.
+  alacritree-windows:
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Rust toolchain
+        run: rustup show
+
+      - name: Check
+        run: cargo check -p alacritree --all-targets --locked
+
+      - name: Test
+        run: cargo test -p alacritree --locked

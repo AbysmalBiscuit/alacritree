@@ -326,6 +326,23 @@ fn parse_quoting(raw: Option<&str>) -> Quoting {
     }
 }
 
+/// How a path is written for the shell that receives it.  Separate from
+/// `DropConfig` because a paste spells paths too, and must not be handed flags
+/// about whether drops are accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathSpelling {
+    pub quote: Quoting,
+    /// Rewrite a Windows path to its distro-side spelling before it reaches a
+    /// WSL shell, where a `C:\` path resolves to nothing.
+    pub wsl_translate: bool,
+}
+
+impl Default for PathSpelling {
+    fn default() -> Self {
+        Self { quote: Quoting::Auto, wsl_translate: true }
+    }
+}
+
 /// `[ui.drop]`: what dragging files onto the window does.  Every target
 /// accepts drops by default; each one can be switched off on its own, and
 /// `enabled` turns the lot off.
@@ -336,10 +353,7 @@ pub struct DropConfig {
     pub terminal: bool,
     pub sidebar: bool,
     pub scratchpad: bool,
-    pub quote: Quoting,
-    /// Rewrite a Windows path to its distro-side spelling before it reaches a
-    /// WSL shell, where a `C:\` path resolves to nothing.
-    pub wsl_translate: bool,
+    pub spelling: PathSpelling,
     /// Tint the region a drop would land on while files hover.
     pub highlight: bool,
 }
@@ -351,11 +365,67 @@ impl Default for DropConfig {
             terminal: true,
             sidebar: true,
             scratchpad: true,
-            quote: Quoting::Auto,
-            wsl_translate: true,
+            spelling: PathSpelling::default(),
             highlight: true,
         }
     }
+}
+
+/// `[ui.paste]`: what Paste does when the clipboard holds no text.  Both
+/// fallbacks are independent — one can be off without affecting the other, and
+/// both off leaves Paste exactly as it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PasteConfig {
+    /// Paste the paths of files and folders copied in a file manager.
+    pub files: bool,
+    /// Write a clipboard bitmap to a PNG and paste its path.
+    pub image: bool,
+    /// Where those PNGs go.  `None` is the app-owned default, the only
+    /// directory the count cap is ever applied to.
+    pub image_dir: Option<PathBuf>,
+    /// How many generated PNGs the owned directory keeps.  At least one: the
+    /// file a paste just handed to the shell has to still be there when the
+    /// shell opens it, so zero is not a reachable state.
+    pub image_keep: usize,
+}
+
+impl Default for PasteConfig {
+    fn default() -> Self {
+        Self { files: true, image: true, image_dir: None, image_keep: 20 }
+    }
+}
+
+impl PasteConfig {
+    /// The directory to write into, and whether alacritree owns it.  Ownership
+    /// is what licenses deleting anything: a directory the user named may hold
+    /// files alacritree never wrote.
+    pub fn image_target(&self) -> (PathBuf, bool) {
+        match &self.image_dir {
+            Some(dir) => (dir.clone(), false),
+            None => (default_image_dir(), true),
+        }
+    }
+}
+
+/// Disposable by nature.  Unix keeps captures in the user's cache rather than
+/// a shared fixed-name tmp directory; Windows' `%TEMP%` is already per-user and
+/// remains reachable from WSL through the usual automount.
+#[cfg(unix)]
+pub fn default_image_dir() -> PathBuf {
+    let cache_home = xdg::BaseDirectories::with_prefix("alacritree").get_cache_home();
+    // SAFETY: `geteuid` takes no arguments and has no safety preconditions.
+    let uid = unsafe { libc::geteuid() };
+    unix_default_image_dir(cache_home, &std::env::temp_dir(), uid)
+}
+
+#[cfg(unix)]
+fn unix_default_image_dir(cache_home: Option<PathBuf>, temp_dir: &Path, uid: u32) -> PathBuf {
+    cache_home.unwrap_or_else(|| temp_dir.join(format!("alacritree-{uid}")))
+}
+
+#[cfg(not(unix))]
+pub fn default_image_dir() -> PathBuf {
+    std::env::temp_dir().join("alacritree").join("clipboard")
 }
 
 /// How the sidebar scroll areas draw their scrollbar.
@@ -619,6 +689,8 @@ pub struct UiTheme {
     pub path_style: PathStyleConfig,
     /// `[ui.drop]`: what a file dragged onto the window does.
     pub drop: DropConfig,
+    /// `[ui.paste]`: what Paste does with a clipboard that holds no text.
+    pub paste: PasteConfig,
 }
 
 impl Default for UiTheme {
@@ -644,6 +716,7 @@ impl Default for UiTheme {
             project_name: None,
             path_style: PathStyleConfig::default(),
             drop: DropConfig::default(),
+            paste: PasteConfig::default(),
         }
     }
 }
@@ -1277,6 +1350,15 @@ struct RawUiDrop {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
+struct RawUiPaste {
+    files: Option<bool>,
+    image: Option<bool>,
+    image_dir: Option<String>,
+    image_keep: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 struct RawUi {
     sidebar_background: Option<RgbStr>,
     sidebar_foreground: Option<RgbStr>,
@@ -1316,6 +1398,7 @@ struct RawUi {
     path_style: RawPathStyle,
     /// What a file dragged onto the window does.  Default: every target on.
     drop: RawUiDrop,
+    paste: RawUiPaste,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1492,9 +1575,22 @@ impl RawConfig {
                 terminal: self.ui.drop.terminal.unwrap_or(true),
                 sidebar: self.ui.drop.sidebar.unwrap_or(true),
                 scratchpad: self.ui.drop.scratchpad.unwrap_or(true),
-                quote: parse_quoting(self.ui.drop.quote.as_deref()),
-                wsl_translate: self.ui.drop.wsl_translate.unwrap_or(true),
+                spelling: PathSpelling {
+                    quote: parse_quoting(self.ui.drop.quote.as_deref()),
+                    wsl_translate: self.ui.drop.wsl_translate.unwrap_or(true),
+                },
                 highlight: self.ui.drop.highlight.unwrap_or(true),
+            },
+            paste: PasteConfig {
+                files: self.ui.paste.files.unwrap_or(true),
+                image: self.ui.paste.image.unwrap_or(true),
+                image_dir: self
+                    .ui
+                    .paste
+                    .image_dir
+                    .as_deref()
+                    .and_then(|raw| parse_config_path(raw, "ui.paste.image_dir")),
+                image_keep: self.ui.paste.image_keep.unwrap_or(20).max(1),
             },
         };
 
@@ -2377,8 +2473,7 @@ program = "second"
                 terminal: true,
                 sidebar: true,
                 scratchpad: true,
-                quote: Quoting::Auto,
-                wsl_translate: true,
+                spelling: PathSpelling { quote: Quoting::Auto, wsl_translate: true },
                 highlight: true,
             }
         );
@@ -2403,11 +2498,85 @@ program = "second"
                 terminal: false,
                 sidebar: false,
                 scratchpad: false,
-                quote: Quoting::Posix,
-                wsl_translate: false,
+                spelling: PathSpelling { quote: Quoting::Posix, wsl_translate: false },
                 highlight: false,
             }
         );
+    }
+
+    #[test]
+    fn paste_options_default_to_on_with_the_owned_image_dir() {
+        let ui = ui_from_toml("");
+        assert_eq!(
+            ui.paste,
+            PasteConfig { files: true, image: true, image_dir: None, image_keep: 20 }
+        );
+        let (dir, owned) = ui.paste.image_target();
+        assert_eq!(dir, default_image_dir());
+        assert!(owned, "the default directory is alacritree's own");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_unix_image_default_prefers_the_user_cache() {
+        let cache = PathBuf::from("/home/example/.cache/alacritree");
+        assert_eq!(unix_default_image_dir(Some(cache.clone()), Path::new("/tmp"), 1234), cache);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_unix_image_fallback_is_namespaced_by_user() {
+        assert_eq!(
+            unix_default_image_dir(None, Path::new("/tmp"), 1234),
+            PathBuf::from("/tmp/alacritree-1234")
+        );
+    }
+
+    #[test]
+    fn paste_options_parse_from_the_ui_paste_table() {
+        let home = home::home_dir().expect("a home directory");
+        let ui = ui_from_toml(
+            "[ui.paste]\n\
+             files = false\n\
+             image = false\n\
+             image_dir = \"~/shots\"\n\
+             image_keep = 5\n",
+        );
+        assert_eq!(
+            ui.paste,
+            PasteConfig {
+                files: false,
+                image: false,
+                image_dir: Some(home.join("shots")),
+                image_keep: 5,
+            }
+        );
+    }
+
+    /// A directory the user chose may hold files alacritree never wrote, so it is
+    /// never swept — that is what makes pointing this at a pictures folder safe.
+    #[test]
+    fn a_configured_image_dir_is_not_owned() {
+        let ui = ui_from_toml("[ui.paste]\nimage_dir = \"~/shots\"");
+        let (dir, owned) = ui.paste.image_target();
+        assert_eq!(dir, home::home_dir().expect("a home directory").join("shots"));
+        assert!(!owned);
+    }
+
+    /// A relative path is rejected by `parse_config_path`, which must leave the
+    /// owned default in place rather than writing somewhere arbitrary.
+    #[test]
+    fn an_unusable_image_dir_falls_back_to_the_owned_default() {
+        let ui = ui_from_toml("[ui.paste]\nimage_dir = \"relative/path\"");
+        assert_eq!(ui.paste.image_dir, None);
+        assert!(ui.paste.image_target().1);
+    }
+
+    /// The cap can never reach zero: a paste hands the shell a path, and the shell
+    /// opens it after the sweep has already run.
+    #[test]
+    fn an_image_keep_of_zero_is_raised_to_one() {
+        assert_eq!(ui_from_toml("[ui.paste]\nimage_keep = 0").paste.image_keep, 1);
     }
 
     #[test]
@@ -2421,13 +2590,13 @@ program = "second"
             ("windows_always_quoted", Quoting::WindowsAlwaysQuoted),
         ] {
             let ui = ui_from_toml(&format!("[ui.drop]\nquote = \"{raw}\""));
-            assert_eq!(ui.drop.quote, expected, "{raw}");
+            assert_eq!(ui.drop.spelling.quote, expected, "{raw}");
         }
     }
 
     #[test]
     fn an_unknown_quoting_name_falls_back_to_auto() {
         let ui = ui_from_toml("[ui.drop]\nquote = \"shell\"");
-        assert_eq!(ui.drop.quote, Quoting::Auto);
+        assert_eq!(ui.drop.spelling.quote, Quoting::Auto);
     }
 }

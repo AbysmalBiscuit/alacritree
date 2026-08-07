@@ -392,6 +392,19 @@ quote         = "auto"      # "auto" (POSIX inside a distro, otherwise the host
 wsl_translate = true        # rewrite C:\x as /mnt/c/x for a WSL session
 highlight     = true        # tint the region a drop would land on
 
+[ui.paste]                  # what Paste does when the clipboard holds no text
+files       = true          # paste the paths of files and folders copied in a
+                            # file manager, as Windows Terminal does
+image       = true          # write a clipboard bitmap (a Win+Shift+S capture)
+                            # to a PNG and paste its path
+image_dir   = "~/shots"     # where those PNGs go (default: the per-user cache
+                            # on Unix; %TEMP%/alacritree/clipboard on Windows).
+                            # A directory you name here is never swept — set it
+                            # and you keep every image and clean up yourself
+image_keep  = 20            # how many PNGs the default directory keeps.
+                            # Minimum 1 — the image a paste just handed to the
+                            # shell always survives the sweep
+
 [workspace]
 worktree_dir = "~/dev/worktrees"   # base dir for new worktrees (default ~/.alacritree/worktrees)
 
@@ -414,6 +427,19 @@ automount_root = "/mnt"     # distro-side mount point for Windows drives,
 [window]
 opacity = 0.92   # restart required — transparency is a ViewportBuilder flag
 ```
+
+Text always wins: a clipboard carrying both text and an image pastes the text.
+Only the regular clipboard is checked for files and images — the X11 PRIMARY
+selection is text, so middle-click paste is unchanged. Both options `false`
+restores the original behavior exactly, where a paste with no text does nothing.
+A default Unix image directory is private to its owner (`0700`), and generated
+files are `0600`. A directory named with `image_dir` keeps its existing sharing
+permissions and is never swept, while the generated image files remain `0600`.
+A pasted path is quoted and, inside a WSL session, translated exactly as a
+dropped one — both follow `[ui.drop]`'s `quote` and `wsl_translate`, so those
+keys still apply even with `[ui.drop] enabled = false`. `quote = "posix"` is
+the only mode that makes an arbitrary filename inert; see the comment on
+`[ui.drop] quote` above for why.
 
 The sidebar cursor used to drop to the first row whenever its own row stopped
 being rendered — by a filter, or by deleting a session or worktree. It now
