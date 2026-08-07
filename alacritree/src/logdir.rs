@@ -5,7 +5,9 @@
 //! synced one copies crash data off the machine.
 
 use std::cmp::Reverse;
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -83,6 +85,45 @@ pub fn log_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(home::home_dir)
         .map(|dir| dir.join("alacritree"))
+}
+
+/// Make the application-owned diagnostics directory private, including files
+/// left by a version that relied on the process umask. Tightening the directory
+/// first prevents another local user from racing the migration.
+pub fn prepare_log_dir(dir: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o600))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Allocate a diagnostic file without ever publishing its contents through a
+/// permissive umask. The explicit chmod also repairs an unusually restrictive
+/// umask so the recorder can reopen the file later.
+pub fn create_private_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        options.mode(0o600);
+        let file = options.open(path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    options.open(path)
 }
 
 #[cfg(not(windows))]
@@ -229,5 +270,49 @@ mod tests {
         assert_eq!(first.pid, second.pid);
         assert_eq!(second.ordinal, 3);
         reset_identity_for_tests();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preparing_an_existing_directory_tightens_legacy_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("alacritree");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        for name in ["crash.log", "session.log"] {
+            let path = dir.join(name);
+            std::fs::write(&path, "private").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        }
+
+        prepare_log_dir(&dir).unwrap();
+
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        for name in ["crash.log", "session.log"] {
+            assert_eq!(
+                std::fs::metadata(dir.join(name)).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preparation_does_not_follow_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("alacritree");
+        let outside = root.path().join("outside.log");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(&outside, "public by choice").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&outside, dir.join("linked.log")).unwrap();
+
+        prepare_log_dir(&dir).unwrap();
+
+        assert_eq!(std::fs::metadata(outside).unwrap().permissions().mode() & 0o777, 0o644);
     }
 }

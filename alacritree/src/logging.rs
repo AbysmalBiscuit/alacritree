@@ -5,7 +5,7 @@
 //! preference that enables it is not known until config has loaded, and
 //! env_logger cannot be retargeted once built.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -60,14 +60,14 @@ impl Write for Tee {
 /// This process's continuous log, sharing the artifact's identity so the two
 /// files correlate.
 pub fn open_session_log(dir: &Path) -> Option<File> {
-    if std::fs::create_dir_all(dir).is_err() {
+    if logdir::prepare_log_dir(dir).is_err() {
         return None;
     }
     let id = logdir::process_id();
     let mut candidate = id;
     for _ in 0..32 {
         let path = dir.join(logdir::session_log_name(&candidate));
-        match OpenOptions::new().create_new(true).write(true).open(&path) {
+        match logdir::create_private_file(&path) {
             Ok(file) => {
                 // Only write back when this succeeded at the ordinal
                 // `process_id()` already reported. The crash recorder may
@@ -115,6 +115,7 @@ pub fn prune_session_logs(dir: &Path) {
 mod tests {
     use super::*;
     use crate::logdir::ProcessId;
+    use std::fs::OpenOptions;
 
     /// A sink filled after `Target::Pipe` has already moved the writer is the
     /// whole reason the handle is shared.
@@ -131,6 +132,19 @@ mod tests {
         let text = std::fs::read_to_string(&path).expect("read");
         assert!(!text.contains("before"), "wrote to a sink that was not set yet");
         assert!(text.contains("after"), "the late sink got nothing");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_session_log_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let file = open_session_log(dir.path()).expect("a session log");
+        drop(file);
+        let path = std::fs::read_dir(dir.path()).unwrap().next().unwrap().unwrap().path();
+
+        assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     /// If stderr accepts only a prefix, env_logger retries the suffix.  Writing

@@ -7,7 +7,7 @@
 
 use std::backtrace::Backtrace;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{self, Read, Write};
 use std::panic::PanicHookInfo;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -65,8 +65,8 @@ impl State {
 /// created once something is worth writing, so a launch with crash logging off
 /// leaves nothing behind.
 pub fn install(dir: &Path, version: &'static str) {
-    if let Err(e) = std::fs::create_dir_all(dir) {
-        let _ = writeln!(std::io::stderr(), "alacritree: cannot create {}: {e}", dir.display());
+    if let Err(e) = logdir::prepare_log_dir(dir) {
+        let _ = writeln!(std::io::stderr(), "alacritree: cannot secure {}: {e}", dir.display());
         BROKEN.store(true, Ordering::Relaxed);
         return;
     }
@@ -180,7 +180,7 @@ fn ensure_artifact(state: &mut State) -> Option<File> {
     // identity we believed unique, and truncating it would destroy a record.
     for _ in 0..32 {
         let path = dir.join(logdir::artifact_name(&id));
-        match OpenOptions::new().create_new(true).write(true).open(&path) {
+        match logdir::create_private_file(&path) {
             Ok(mut file) => {
                 logdir::set_ordinal(id.ordinal);
                 let header = line(&format!("{HEADER_MARKER}{} pid={}", state.version, id.pid));
@@ -349,7 +349,7 @@ fn prune_in(dir: &Path) {
 /// Reading more of an artifact than this buys nothing: the markers that
 /// classify it are lines, and one oversized malformed file must not be read in
 /// full on every invocation.
-const ARTIFACT_READ_CAP: u64 = 256 * 1024;
+pub(crate) const ARTIFACT_READ_CAP: usize = 256 * 1024;
 
 /// What an artifact says happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -360,16 +360,35 @@ pub enum Verdict {
     Indeterminate,
 }
 
+pub(crate) struct ArtifactSnapshot {
+    pub bytes: Vec<u8>,
+    pub truncated: bool,
+}
+
+/// Read at most one byte beyond the reporting limit, so truncation is explicit
+/// even if a file grows after it was opened.
+pub(crate) fn read_artifact(path: &Path) -> io::Result<ArtifactSnapshot> {
+    let file = File::open(path)?;
+    let mut bytes = Vec::with_capacity(ARTIFACT_READ_CAP + 1);
+    file.take((ARTIFACT_READ_CAP + 1) as u64).read_to_end(&mut bytes)?;
+    let truncated = bytes.len() > ARTIFACT_READ_CAP;
+    bytes.truncate(ARTIFACT_READ_CAP);
+    Ok(ArtifactSnapshot { bytes, truncated })
+}
+
 /// Read an artifact back and say what it recorded: a clean exit, a still-live
 /// process, a crash, or too little to tell.  The one module that writes the
 /// vocabulary is also the one that reads it, so the two cannot drift apart.
 pub fn classify(path: &Path, pid: u32) -> Verdict {
-    let Ok(meta) = std::fs::metadata(path) else { return Verdict::Indeterminate };
-    if meta.len() > ARTIFACT_READ_CAP {
+    let Ok(snapshot) = read_artifact(path) else { return Verdict::Indeterminate };
+    classify_snapshot(&snapshot, pid)
+}
+
+pub(crate) fn classify_snapshot(snapshot: &ArtifactSnapshot, pid: u32) -> Verdict {
+    if snapshot.truncated {
         return Verdict::Indeterminate;
     }
-    let Ok(bytes) = std::fs::read(path) else { return Verdict::Indeterminate };
-    let text = String::from_utf8_lossy(&bytes);
+    let text = String::from_utf8_lossy(&snapshot.bytes);
 
     let mut lines = text.lines();
     let has_header = lines
@@ -614,6 +633,19 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_crash_artifact_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        with_recorder(|_| {
+            session_begin();
+            let path = artifact_path_for_tests().expect("an artifact was created");
+
+            assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+        });
+    }
+
     #[test]
     fn a_clean_exit_is_recorded_and_nothing_is_deleted() {
         with_recorder(|_| {
@@ -844,6 +876,39 @@ mod tests {
             let path = artifact_path_for_tests().expect("an artifact was created");
             assert_eq!(classify(&path, std::process::id()), Verdict::Clean);
         });
+    }
+
+    #[test]
+    fn artifact_reads_are_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.log");
+        std::fs::write(&path, vec![b'x'; ARTIFACT_READ_CAP + 100]).unwrap();
+
+        let snapshot = read_artifact(&path).unwrap();
+
+        assert_eq!(snapshot.bytes.len(), ARTIFACT_READ_CAP);
+        assert!(snapshot.truncated);
+    }
+
+    #[test]
+    fn an_exactly_capped_artifact_is_not_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("at-cap.log");
+        std::fs::write(&path, vec![b'x'; ARTIFACT_READ_CAP]).unwrap();
+
+        let snapshot = read_artifact(&path).unwrap();
+
+        assert_eq!(snapshot.bytes.len(), ARTIFACT_READ_CAP);
+        assert!(!snapshot.truncated);
+    }
+
+    #[test]
+    fn a_truncated_artifact_is_indeterminate() {
+        let mut bytes = b"t1 start v pid=0\nt2 PANIC thread=main\n".to_vec();
+        bytes.resize(ARTIFACT_READ_CAP, b'x');
+        let snapshot = ArtifactSnapshot { bytes, truncated: true };
+
+        assert_eq!(classify_snapshot(&snapshot, 0), Verdict::Indeterminate);
     }
 
     fn set_mtime_days_ago(path: &Path, days: u64) {
