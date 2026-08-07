@@ -23,6 +23,7 @@ use serde::Deserialize;
 
 use crate::bindings::{self, KeyBinding};
 use crate::path_style::PathStyle;
+use crate::pr_status::DEFAULT_CONCURRENCY;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -533,6 +534,30 @@ fn parse_sidebar_focus(raw: Option<&str>) -> SidebarFocus {
     }
 }
 
+/// `[ui] search_scope`: whether a fuzzy query is confined by the panel's active
+/// toggle filters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchScope {
+    /// A query narrows the rows the toggles already allow.
+    #[default]
+    Filtered,
+    /// A query is evaluated against every row; the toggles stand aside until it
+    /// empties.
+    All,
+}
+
+fn parse_search_scope(raw: Option<&str>) -> SearchScope {
+    match raw {
+        None => SearchScope::default(),
+        Some("filtered") => SearchScope::Filtered,
+        Some("all") => SearchScope::All,
+        Some(other) => {
+            log::warn!("unknown ui.search_scope value {other:?}, using \"filtered\"");
+            SearchScope::default()
+        },
+    }
+}
+
 /// Whether per-session UI (sidebar session rows, tab-strip segments) renders
 /// for a single-session workspace instead of waiting for the two-session
 /// threshold.  These are startup defaults only: the app copies them into
@@ -654,6 +679,8 @@ pub struct UiTheme {
     pub last_session_close: LastSessionClose,
     /// How the projects sidebar repairs a cursor whose row stopped rendering.
     pub sidebar_focus: SidebarFocus,
+    /// Whether a fuzzy query is confined by the panel's active toggle filters.
+    pub search_scope: SearchScope,
     /// Show single-session sidebar rows / tab segments ([`SessionDisplay`]).
     pub session_display: SessionDisplay,
     /// Paint PR-status badges on worktree rows (and poll `gh` for expanded
@@ -661,6 +688,11 @@ pub struct UiTheme {
     /// no `gh` processes; when enabled it is best-effort like the diff-base
     /// lookup: no `gh`, no auth, or no PR silently paints nothing.
     pub pr_status: bool,
+    /// `[ui] pr_status_concurrency`: max `gh` lookups in flight at once.
+    /// Defaults to 8; clamped to ≥ 1, since a cold cache spawns one lookup
+    /// per eligible worktree in a single frame and an unbounded cap would
+    /// fork a thread and a `gh` process for every one of them at once.
+    pub pr_status_concurrency: usize,
     pub icons: Icons,
     pub focus_outline: FocusOutline,
     /// `[ui] scrollbar`: sidebar scrollbar style, "floating" (default) or
@@ -705,8 +737,10 @@ impl Default for UiTheme {
             confirm_session_close: ConfirmSessionClose::Never,
             last_session_close: LastSessionClose::Respawn,
             sidebar_focus: SidebarFocus::default(),
+            search_scope: SearchScope::default(),
             session_display: SessionDisplay::default(),
             pr_status: false,
+            pr_status_concurrency: DEFAULT_CONCURRENCY,
             icons: Icons::default(),
             focus_outline: FocusOutline::default(),
             scrollbar: ScrollbarStyle::Floating,
@@ -1377,12 +1411,17 @@ struct RawUi {
     /// How far the projects sidebar goes when the cursor's row stops being
     /// rendered: "preserve" (default) | "follow".
     sidebar_focus: Option<String>,
+    /// Whether a fuzzy query is confined by the panel's active toggle filters:
+    /// "filtered" (default) | "all".
+    search_scope: Option<String>,
     session_display: RawSessionDisplay,
     delta_path: Option<String>,
     icons: RawIcons,
     /// Sidebar scrollbar style: "floating" (default) | "solid".
     scrollbar: Option<String>,
     pr_status: Option<bool>,
+    /// Max `gh` lookups in flight at once.  Defaults to 8; clamped to ≥ 1.
+    pr_status_concurrency: Option<usize>,
     font: RawUiFont,
     worktree_name: Option<String>,
     project_name: Option<String>,
@@ -1546,11 +1585,13 @@ impl RawConfig {
             ),
             last_session_close: parse_last_session_close(self.ui.last_session_close.as_deref()),
             sidebar_focus: parse_sidebar_focus(self.ui.sidebar_focus.as_deref()),
+            search_scope: parse_search_scope(self.ui.search_scope.as_deref()),
             session_display: SessionDisplay {
                 sidebar_always: self.ui.session_display.sidebar_always.unwrap_or(false),
                 tabs_always: self.ui.session_display.tabs_always.unwrap_or(false),
             },
             pr_status: self.ui.pr_status.unwrap_or(false),
+            pr_status_concurrency: self.ui.pr_status_concurrency.unwrap_or(DEFAULT_CONCURRENCY).max(1),
             icons: build_icons(self.ui.icons),
             focus_outline: FocusOutline {
                 sidebar: self.ui.focus_outline.sidebar.unwrap_or(false),
@@ -2033,6 +2074,26 @@ mod tests {
     }
 
     #[test]
+    fn search_scope_defaults_to_filtered() {
+        let ui = ui_from_toml("");
+        assert_eq!(ui.search_scope, SearchScope::Filtered);
+    }
+
+    #[test]
+    fn search_scope_parses_both_values() {
+        for (raw, expected) in [("filtered", SearchScope::Filtered), ("all", SearchScope::All)] {
+            let ui = ui_from_toml(&format!("[ui]\nsearch_scope = \"{raw}\""));
+            assert_eq!(ui.search_scope, expected, "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn search_scope_invalid_falls_back_to_filtered() {
+        let ui = ui_from_toml("[ui]\nsearch_scope = \"everywhere\"");
+        assert_eq!(ui.search_scope, SearchScope::Filtered);
+    }
+
+    #[test]
     fn requires_prompt_covers_policy_matrix() {
         use ConfirmSessionClose::*;
         for (policy, busy, expected) in [
@@ -2342,6 +2403,17 @@ program = "second"
     fn pr_status_defaults_off_and_parses_on() {
         assert!(!ui_from_toml("").pr_status);
         assert!(ui_from_toml("[ui]\npr_status = true").pr_status);
+    }
+
+    #[test]
+    fn pr_status_concurrency_defaults_to_eight() {
+        assert_eq!(ui_from_toml("").pr_status_concurrency, 8);
+        assert_eq!(ui_from_toml("[ui]\npr_status_concurrency = 4").pr_status_concurrency, 4);
+    }
+
+    #[test]
+    fn pr_status_concurrency_clamps_to_one() {
+        assert_eq!(ui_from_toml("[ui]\npr_status_concurrency = 0").pr_status_concurrency, 1);
     }
 
     #[test]

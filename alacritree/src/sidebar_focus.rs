@@ -8,10 +8,10 @@
 //! return from, while a row gone from the model was deleted and the cursor
 //! slides to a sibling.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::app::WorkspaceKey;
-use crate::projects::Project;
+use crate::projects::{Project, Worktree};
 use crate::session::SessionId;
 use crate::sidebar_nav::SidebarRow;
 
@@ -301,6 +301,18 @@ pub struct UiInputs<'a> {
     pub session_rows_always: bool,
     pub query: &'a str,
     pub toggles: u32,
+    /// Whether the toggles narrow rows this frame.  A search scope that stands
+    /// them down changes the projection while `toggles` itself holds still.
+    pub toggles_apply: bool,
+    /// Advances when a PR lookup is banked or invalidated.  Fed as `0` unless a
+    /// PR filter is active, so a completion cannot invalidate a projection it
+    /// could not have changed.
+    pub pr_generation: u64,
+    /// The workspace whose live branch `active_branch` describes.  Without it a
+    /// switch between two worktrees whose caches hold the same branch string
+    /// moves every PR lookup key while nothing observed changes.
+    pub active_workspace: Option<&'a Path>,
+    pub active_branch: Option<&'a str>,
 }
 
 #[cfg(test)]
@@ -332,7 +344,50 @@ struct ProjectInput {
     root: PathBuf,
     name: String,
     expanded: bool,
-    worktrees: Vec<(PathBuf, String, bool)>,
+    worktrees: Vec<WorktreeInput>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct WorktreeInput {
+    path: PathBuf,
+    name: String,
+    prunable: bool,
+    branch: Option<String>,
+}
+
+/// A [`WorktreeInput`] and a live [`Worktree`] reduced to the same borrowed
+/// shape.  The compare path runs every frame and must not allocate, so the two
+/// are matched through this rather than by cloning one into the other's type —
+/// and a field added to `WorktreeInput` without a view of it stops compiling
+/// instead of silently dropping out of the comparison.
+#[derive(PartialEq, Eq)]
+struct WorktreeView<'a> {
+    path: &'a Path,
+    name: &'a str,
+    prunable: bool,
+    branch: Option<&'a str>,
+}
+
+impl WorktreeInput {
+    fn view(&self) -> WorktreeView<'_> {
+        WorktreeView {
+            path: &self.path,
+            name: &self.name,
+            prunable: self.prunable,
+            branch: self.branch.as_deref(),
+        }
+    }
+}
+
+impl<'a> From<&'a Worktree> for WorktreeView<'a> {
+    fn from(wt: &'a Worktree) -> Self {
+        Self {
+            path: &wt.path,
+            name: &wt.name,
+            prunable: wt.prunable,
+            branch: wt.branch.as_deref(),
+        }
+    }
 }
 
 /// Everything the snapshot is a function of.  Captured on rebuild, compared
@@ -344,6 +399,10 @@ pub struct ObservedInputs {
     session_rows_always: bool,
     query: String,
     toggles: u32,
+    toggles_apply: bool,
+    pr_generation: u64,
+    active_workspace: Option<PathBuf>,
+    active_branch: Option<String>,
 }
 
 impl ObservedInputs {
@@ -362,7 +421,12 @@ impl ObservedInputs {
                     worktrees: p
                         .worktrees
                         .iter()
-                        .map(|wt| (wt.path.clone(), wt.name.clone(), wt.prunable))
+                        .map(|wt| WorktreeInput {
+                            path: wt.path.clone(),
+                            name: wt.name.clone(),
+                            prunable: wt.prunable,
+                            branch: wt.branch.clone(),
+                        })
                         .collect(),
                 })
                 .collect(),
@@ -370,6 +434,10 @@ impl ObservedInputs {
             session_rows_always: ui.session_rows_always,
             query: ui.query.to_string(),
             toggles: ui.toggles,
+            toggles_apply: ui.toggles_apply,
+            pr_generation: ui.pr_generation,
+            active_workspace: ui.active_workspace.map(Path::to_path_buf),
+            active_branch: ui.active_branch.map(str::to_string),
         }
     }
 
@@ -390,6 +458,10 @@ impl ObservedInputs {
         if self.session_rows_always != ui.session_rows_always
             || self.query != ui.query
             || self.toggles != ui.toggles
+            || self.toggles_apply != ui.toggles_apply
+            || self.pr_generation != ui.pr_generation
+            || self.active_workspace.as_deref() != ui.active_workspace
+            || self.active_branch.as_deref() != ui.active_branch
         {
             return false;
         }
@@ -407,8 +479,7 @@ impl ObservedInputs {
             }
             for (wt_was, wt_now) in was.worktrees.iter().zip(&now.worktrees) {
                 visit();
-                if wt_was.0 != wt_now.path || wt_was.1 != wt_now.name || wt_was.2 != wt_now.prunable
-                {
+                if wt_was.view() != WorktreeView::from(wt_now) {
                     return false;
                 }
             }
@@ -442,7 +513,74 @@ mod tests {
     }
 
     fn ui(query: &str, toggles: u32) -> UiInputs<'_> {
-        UiInputs { session_rows_always: false, query, toggles }
+        UiInputs {
+            session_rows_always: false,
+            query,
+            toggles,
+            toggles_apply: true,
+            pr_generation: 0,
+            active_workspace: None,
+            active_branch: None,
+        }
+    }
+
+    fn ui_full<'a>(
+        query: &'a str,
+        toggles: u32,
+        toggles_apply: bool,
+        pr_generation: u64,
+        active_workspace: Option<&'a Path>,
+        active_branch: Option<&'a str>,
+    ) -> UiInputs<'a> {
+        UiInputs {
+            session_rows_always: false,
+            query,
+            toggles,
+            toggles_apply,
+            pr_generation,
+            active_workspace,
+            active_branch,
+        }
+    }
+
+    /// Each new field is a way the row set moves without any older field
+    /// moving. Missing one leaves the sidebar showing a stale projection.
+    #[test]
+    fn each_new_ui_input_invalidates_the_snapshot() {
+        let projects: Vec<Project> = Vec::new();
+        let none: [SessionInput<'_>; 0] = [];
+        let wt = PathBuf::from("/repo/wt");
+
+        let base = ui_full("q", 0b01, true, 7, Some(&wt), Some("main"));
+        let captured = ObservedInputs::capture(&projects, none.iter().copied(), base);
+
+        assert!(captured.matches(&projects, none.iter().copied(), base), "control");
+
+        for changed in [
+            ui_full("q", 0b01, false, 7, Some(&wt), Some("main")),
+            ui_full("q", 0b01, true, 8, Some(&wt), Some("main")),
+            ui_full("q", 0b01, true, 7, None, Some("main")),
+            ui_full("q", 0b01, true, 7, Some(&wt), Some("feature")),
+        ] {
+            assert!(
+                !captured.matches(&projects, none.iter().copied(), changed),
+                "a changed input reported unchanged: {changed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_worktree_branch_change_invalidates_the_snapshot() {
+        use crate::sidebar_nav::tests::project;
+
+        let mut a = project("/a", true, &["/a/wt1"]);
+        a.worktrees[0].branch = Some("main".to_string());
+        let base = ObservedInputs::capture(&[a.clone()], std::iter::empty(), ui("", 0));
+
+        let mut changed = a.clone();
+        changed.worktrees[0].branch = Some("feature".to_string());
+
+        assert!(!base.matches(&[changed], std::iter::empty(), ui("", 0)));
     }
 
     /// home, project /a expanded with worktree /a/wt1 holding sessions 1 and 2.
@@ -527,7 +665,15 @@ mod tests {
         assert!(!base.matches(
             &[],
             [session(&HOME, 1, false)].into_iter(),
-            UiInputs { session_rows_always: true, query: "", toggles: 0 },
+            UiInputs {
+                session_rows_always: true,
+                query: "",
+                toggles: 0,
+                toggles_apply: true,
+                pr_generation: 0,
+                active_workspace: None,
+                active_branch: None,
+            },
         ));
 
         // Each session input on its own: attention, id, count.

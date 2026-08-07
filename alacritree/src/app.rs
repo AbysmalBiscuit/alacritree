@@ -16,8 +16,8 @@ use crate::clipboard_image;
 use crate::colors::rgb_to_color32;
 use crate::command_palette::{self, CommandPalette, PaletteAction, PaletteItem};
 use crate::config::{
-    Config, FontConfig, Icons, LastSessionClose, PathStyleConfig, ScrollbarStyle, SidebarFocus,
-    TextEmphasis, UiFont,
+    Config, FontConfig, Icons, LastSessionClose, PathStyleConfig, ScrollbarStyle, SearchScope,
+    SidebarFocus, TextEmphasis, UiFont,
 };
 use crate::doppler;
 use crate::file_drop;
@@ -28,7 +28,7 @@ use crate::panel_filter::{self, PanelFilter};
 use crate::paste;
 use crate::path_style;
 use crate::path_style::PathStyle;
-use crate::pr_status::{PrCache, PrInfo, PrState};
+use crate::pr_status::{self, PrCache, PrInfo, PrState};
 use crate::projects::{Project, Worktree, project_json};
 use crate::scratchpad;
 use crate::session::{
@@ -228,10 +228,13 @@ enum FocusDir {
 /// PTY when the inner TUI should handle it.  An IPC action has no key press
 /// to forward — the caller is typically that inner program declaring it has
 /// no window in the requested direction, and passthrough would bounce the
-/// key straight back to it.
+/// key straight back to it.  A palette action consumed a key press too, but
+/// arrives with the panel still searching over a row the query may have
+/// hidden — so actions that need a browsing cursor are refused at this origin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActionOrigin {
     Keyboard,
+    Palette,
     Ipc,
 }
 
@@ -261,7 +264,7 @@ fn focus_move(
     origin: ActionOrigin,
     tui_running: bool,
 ) -> FocusMove {
-    if origin == ActionOrigin::Keyboard && focus == PaneFocus::Terminal && tui_running {
+    if origin != ActionOrigin::Ipc && focus == PaneFocus::Terminal && tui_running {
         return FocusMove::Passthrough;
     }
     let target = match (focus, dir) {
@@ -275,6 +278,153 @@ fn focus_move(
         Some(t) => FocusMove::Focus(t),
         None => FocusMove::Nothing,
     }
+}
+
+/// Whether a matched binding's key press should reach `action`, given which
+/// pane currently owns keyboard focus. Filter actions are scoped to the
+/// sidebar that owns them so a bare letter like `d` doesn't fire a git-panel
+/// filter while the projects sidebar (or the terminal) has focus, and vice
+/// versa. `terminal_only` actions additionally step aside for the scratchpad
+/// editor, which wants those same keys for native text editing.
+fn valid_for_focus(
+    action: &BindingAction,
+    sidebar_focused: bool,
+    git_focused: bool,
+    scratchpad_focused: bool,
+) -> bool {
+    let focus_ok = match action {
+        BindingAction::Named(n) if n.is_projects_filter_scoped() => sidebar_focused,
+        BindingAction::Named(n) if n.is_git_filter_scoped() => git_focused,
+        BindingAction::Named(n) if n.is_sidebar_scoped() => sidebar_focused,
+        _ => true,
+    };
+    let terminal_only = match action {
+        BindingAction::Chars(_) => true,
+        BindingAction::Named(n) => n.is_terminal_only(),
+        BindingAction::Unsupported(_) => false,
+    };
+    focus_ok && !(scratchpad_focused && terminal_only)
+}
+
+/// Whether a workspace survives the projects panel's toggle dimension.
+fn project_toggles_pass(
+    apply: bool,
+    toggle_sessions: bool,
+    has_sessions: bool,
+    toggle_attention: bool,
+    needs_attention: bool,
+) -> bool {
+    if !apply {
+        return true;
+    }
+    (!toggle_sessions || has_sessions) && (!toggle_attention || needs_attention)
+}
+
+/// The toggle identities the projects panel accepts.  The PR identities exist
+/// only when polling does, or every PR state would read as unknown and the
+/// filters could only ever empty the panel.
+fn project_filter_toggles(pr_status: bool) -> &'static [char] {
+    if pr_status { &['s', 'a', 'o', 'd', 'm', 'c'] } else { &['s', 'a'] }
+}
+
+/// The toggle identities the git panel accepts: modified, deleted, untracked.
+const GIT_FILTER_TOGGLES: &[char] = &['m', 'd', 'u'];
+
+/// The projects-panel toggle a named action flips, or `None` for an action that
+/// is not one of its filters.  `PanelFilter::toggle` ignores an identity it does
+/// not allow and dispatch falls through on an unmatched action, so nothing at
+/// the call site can catch a wrong pairing — assert it here instead.
+fn project_filter_identity(action: NamedAction) -> Option<char> {
+    match action {
+        NamedAction::ToggleSessionsFilter => Some('s'),
+        NamedAction::ToggleAttentionFilter => Some('a'),
+        NamedAction::TogglePrOpenFilter => Some('o'),
+        NamedAction::TogglePrDraftFilter => Some('d'),
+        NamedAction::TogglePrMergedFilter => Some('m'),
+        NamedAction::TogglePrClosedFilter => Some('c'),
+        _ => None,
+    }
+}
+
+/// The git-panel toggle a named action flips, or `None` for an action that is
+/// not one of its filters.
+fn git_filter_identity(action: NamedAction) -> Option<char> {
+    match action {
+        NamedAction::ToggleModifiedFilter => Some('m'),
+        NamedAction::ToggleDeletedFilter => Some('d'),
+        NamedAction::ToggleUntrackedFilter => Some('u'),
+        _ => None,
+    }
+}
+
+/// Whether any toggle dimension narrows the projects panel this frame —
+/// session presence, attention, or PR state. `project_self` falls back to
+/// plain fuzzy matching only when this is false.
+fn any_project_toggle_active(toggle_sessions: bool, toggle_attention: bool, any_pr: bool) -> bool {
+    toggle_sessions || toggle_attention || any_pr
+}
+
+/// Whether a worktree survives the projects panel's PR dimension. Inert
+/// when no PR toggle is active, so a worktree passes regardless of what
+/// `pr_matches` holds for it. Once a PR toggle is active, a worktree
+/// missing from `pr_matches` is excluded — its PR lookup hasn't landed.
+fn worktree_pr_passes(any_pr: bool, pr_matches: &HashMap<PathBuf, bool>, path: &Path) -> bool {
+    !any_pr || pr_matches.get(path).copied().unwrap_or(false)
+}
+
+/// Whether the projects panel is filtering on PR state this frame.  A toggle
+/// the scope has stood down narrows nothing, so it must not pull the cache
+/// generation into the reconciler or reach `gh` for a collapsed project.
+fn any_pr_toggle_active(filter: &PanelFilter, scope: SearchScope) -> bool {
+    filter.toggles_apply(scope)
+        && ['o', 'd', 'm', 'c'].into_iter().any(|key| filter.is_toggled(key))
+}
+
+/// The cache generation the reconciler observes.  Held at `0` unless a PR
+/// filter is active, so a banked result only invalidates a row set that
+/// actually depends on PR state.
+fn pr_generation_for(generation: u64, any_pr_toggle_active: bool) -> u64 {
+    if any_pr_toggle_active { generation } else { 0 }
+}
+
+/// Whether this worktree's PR state is polled this frame.  Collapsed projects
+/// normally cost no `gh` processes, but a PR filter has to see every row or it
+/// would hide worktrees for want of a lookup it declined to start.
+fn should_poll_pr(pr_enabled: bool, expanded: bool, any_pr_toggle: bool) -> bool {
+    pr_enabled && (expanded || any_pr_toggle)
+}
+
+/// Resolves one worktree's PR info against this frame's memo. `lookup` runs
+/// at most once per distinct `path`: a repeated path (the same worktree under
+/// two projects) reuses the banked answer instead of polling `PrCache` twice.
+fn resolve_pr_info<F>(
+    memo: &mut HashMap<PathBuf, Option<PrInfo>>,
+    path: &Path,
+    eligible: bool,
+    lookup: F,
+) -> Option<PrInfo>
+where
+    F: FnOnce() -> Option<PrInfo>,
+{
+    if !eligible {
+        return None;
+    }
+    if let Some(cached) = memo.get(path) {
+        return cached.clone();
+    }
+    let info = lookup();
+    memo.insert(path.to_path_buf(), info.clone());
+    info
+}
+
+/// Whether a git-status row survives the git panel's toggle dimension. Unlike
+/// `project_toggles_pass`, standing this down needs no separate `apply` flag:
+/// forcing all three toggles to `false` already makes `!any` admit every row.
+fn git_toggles_pass(m: bool, d: bool, u: bool, kind: ChangeKind) -> bool {
+    let any = m || d || u;
+    !any || (m && matches!(kind, ChangeKind::Modified | ChangeKind::Renamed))
+        || (d && kind == ChangeKind::Deleted)
+        || (u && matches!(kind, ChangeKind::Untracked | ChangeKind::Added))
 }
 
 pub struct AlacritreeApp {
@@ -301,6 +451,9 @@ pub struct AlacritreeApp {
     /// Fuzzy-search query and `m`/`d`/`u` change-kind toggle state for the git
     /// panel.  Transient: never persisted.
     git_filter: PanelFilter,
+    /// `[ui] search_scope`: whether a live query stands down both panels'
+    /// toggle filters.  Toggled at runtime, never persisted.
+    search_scope: SearchScope,
     /// Git-panel cursor, identified by `(section, path)`.  Rebuilt every render
     /// pass from `git_rows`, so it survives the 1.5 s status refresh.
     git_cursor: Option<git_nav::GitRow>,
@@ -637,6 +790,7 @@ impl AlacritreeApp {
             config.ui.project_name.clone(),
         );
 
+        let pr_status_concurrency = config.ui.pr_status_concurrency;
         let mut app = Self {
             show_left_sidebar: persisted.show_left_sidebar,
             show_right_sidebar: persisted.show_right_sidebar,
@@ -647,8 +801,9 @@ impl AlacritreeApp {
             reorder_mode: false,
             sidebar_auto_shown: false,
             sidebar_cursor_moved: false,
-            project_filter: PanelFilter::new(&['s', 'a']),
-            git_filter: PanelFilter::new(&['m', 'd', 'u']),
+            project_filter: PanelFilter::new(project_filter_toggles(config.ui.pr_status)),
+            git_filter: PanelFilter::new(GIT_FILTER_TOGGLES),
+            search_scope: config.ui.search_scope,
             git_cursor: None,
             git_cursor_moved: false,
             git_rows: Vec::new(),
@@ -704,6 +859,8 @@ impl AlacritreeApp {
             sidebar_focus_written: None,
             sidebar_deferred_close: None,
         };
+
+        app.pr_cache.set_concurrency(pr_status_concurrency);
 
         let wsl_indices: Vec<usize> = app
             .projects
@@ -1562,6 +1719,7 @@ impl AlacritreeApp {
     /// is `ReceiveChar` (alacritty's pass-through marker).
     fn handle_shortcuts(&mut self, ctx: &Context) {
         let sidebar_focused = self.focus == PaneFocus::ProjectsSidebar && !self.palette.is_open();
+        let git_focused = self.focus == PaneFocus::GitSidebar && !self.palette.is_open();
         let scratchpad_focused = self.focus == PaneFocus::Terminal
             && self
                 .active_session_index()
@@ -1580,17 +1738,7 @@ impl AlacritreeApp {
                     let matched: Vec<_> = matched
                         .into_iter()
                         .filter(|a| {
-                            let valid_for_focus = sidebar_focused
-                                || !matches!(a, BindingAction::Named(n) if n.is_sidebar_scoped());
-                            // Terminal byte/scroll bindings would swallow
-                            // useful editor keys like Shift+Home and
-                            // Shift+PageUp. Leave those events for TextEdit.
-                            let terminal_only = match a {
-                                BindingAction::Chars(_) => true,
-                                BindingAction::Named(n) => n.is_terminal_only(),
-                                BindingAction::Unsupported(_) => false,
-                            };
-                            valid_for_focus && !(scratchpad_focused && terminal_only)
+                            valid_for_focus(a, sidebar_focused, git_focused, scratchpad_focused)
                         })
                         // Search actions are owned by the sidebar nav pass; here
                         // their default Enter/Esc/Shift+Esc must fall through to
@@ -1633,18 +1781,29 @@ impl AlacritreeApp {
         let bindings = &self.config.bindings;
         let steps: Vec<SidebarNavStep> = ctx.input_mut(|i| {
             let mut steps = Vec::new();
-            i.events.retain(|ev| match ev {
-                egui::Event::Text(text) => match filter.on_text(text) {
-                    Some(outcome) => {
-                        steps.push(SidebarNavStep::Filter(outcome));
-                        false
+            let text_keys = keys_paired_with_text(&i.events);
+            let mut idx = 0;
+            i.events.retain(|ev| {
+                let produced_text = text_keys[idx];
+                idx += 1;
+                match ev {
+                    egui::Event::Text(text) => match filter.on_text(text) {
+                        Some(outcome) => {
+                            steps.push(SidebarNavStep::Filter(outcome));
+                            false
+                        },
+                        None => true,
                     },
-                    None => true,
-                },
-                egui::Event::Key { key, pressed: true, modifiers, .. } => {
-                    drain_search_or_nav(&mut steps, filter, bindings, *key, *modifiers)
-                },
-                _ => true,
+                    egui::Event::Key { key, pressed: true, modifiers, .. } => drain_search_or_nav(
+                        &mut steps,
+                        filter,
+                        bindings,
+                        *key,
+                        *modifiers,
+                        produced_text,
+                    ),
+                    _ => true,
+                }
             });
             steps
         });
@@ -1725,9 +1884,15 @@ impl AlacritreeApp {
             return sidebar_nav::visible_rows(&self.projects, &listed_sessions);
         }
 
-        let toggle_sessions = self.project_filter.is_toggled('s');
-        let toggle_attention = self.project_filter.is_toggled('a');
-        let any_toggle = toggle_sessions || toggle_attention;
+        let apply = self.project_filter.toggles_apply(self.search_scope);
+        let toggle_sessions = apply && self.project_filter.is_toggled('s');
+        let toggle_attention = apply && self.project_filter.is_toggled('a');
+        let pr_open = apply && self.project_filter.is_toggled('o');
+        let pr_draft = apply && self.project_filter.is_toggled('d');
+        let pr_merged = apply && self.project_filter.is_toggled('m');
+        let pr_closed = apply && self.project_filter.is_toggled('c');
+        let any_pr = pr_open || pr_draft || pr_merged || pr_closed;
+        let any_toggle = any_project_toggle_active(toggle_sessions, toggle_attention, any_pr);
 
         // Precompute every fuzzy result before building the closures: the
         // matcher needs `&mut self.project_filter`, and releasing that borrow
@@ -1748,10 +1913,40 @@ impl AlacritreeApp {
                 .map(|wt| (wt.path.clone(), filter.matches(&wt.name)))
                 .collect()
         };
+        let live_branch = self
+            .current_workspace
+            .as_deref()
+            .and_then(|p| self.git_status.get(p))
+            .and_then(|c| c.current_branch());
+        let current_workspace = self.current_workspace.as_deref();
+        // Skipped outright while the PR dimension is inert: `worktree_pr_passes`
+        // would not read the map, and building it costs a path clone per
+        // worktree on a call that runs whenever the panel is filtering at all.
+        let pr_matches: HashMap<PathBuf, bool> = if any_pr {
+            self.projects
+                .iter()
+                .flat_map(|p| p.worktrees.iter())
+                .map(|wt| {
+                    let branch = pr_status::effective_branch(wt, current_workspace, live_branch);
+                    let state = self.pr_cache.state(&wt.path, branch);
+                    (
+                        wt.path.clone(),
+                        pr_status::pr_pass(state, pr_open, pr_draft, pr_merged, pr_closed),
+                    )
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
 
         let toggles_pass = |key: &WorkspaceKey| {
-            (!toggle_sessions || self.workspace_has_sessions(key))
-                && (!toggle_attention || self.workspace_needs_attention(key))
+            project_toggles_pass(
+                apply,
+                toggle_sessions,
+                self.workspace_has_sessions(key),
+                toggle_attention,
+                self.workspace_needs_attention(key),
+            )
         };
         let home = home_matches && toggles_pass(&None);
         let project_self =
@@ -1759,6 +1954,7 @@ impl AlacritreeApp {
         let mut worktree = |_p: &Project, wt: &Worktree| {
             worktree_matches.get(&wt.path).copied().unwrap_or(false)
                 && toggles_pass(&Some(wt.path.clone()))
+                && worktree_pr_passes(any_pr, &pr_matches, &wt.path)
         };
         sidebar_nav::filtered_rows(
             &self.projects,
@@ -1793,6 +1989,9 @@ impl AlacritreeApp {
     }
 
     fn sidebar_snapshot(&mut self, skip_worktree: Option<&Path>) -> sidebar_focus::TreeSnapshot {
+        let active_workspace = self.current_workspace.as_deref();
+        let active_branch =
+            active_workspace.and_then(|p| self.git_status.get(p)).and_then(|c| c.current_branch());
         let inputs = sidebar_focus::ObservedInputs::capture(
             &self.projects,
             self.session_inputs(),
@@ -1800,6 +1999,13 @@ impl AlacritreeApp {
                 session_rows_always: self.session_rows_always,
                 query: self.project_filter.query(),
                 toggles: self.project_filter.toggle_bits(),
+                toggles_apply: self.project_filter.toggles_apply(self.search_scope),
+                pr_generation: pr_generation_for(
+                    self.pr_cache.generation(),
+                    any_pr_toggle_active(&self.project_filter, self.search_scope),
+                ),
+                active_workspace,
+                active_branch,
             },
         );
         let rows = self.current_project_rows();
@@ -1831,6 +2037,10 @@ impl AlacritreeApp {
         let skip = deferred.as_ref().and_then(|d| d.removed_worktree.clone());
 
         if deferred.is_none() {
+            let active_workspace = self.current_workspace.as_deref();
+            let active_branch = active_workspace
+                .and_then(|p| self.git_status.get(p))
+                .and_then(|c| c.current_branch());
             if let Some(prev) = &self.sidebar_focus_prev {
                 let unchanged = prev.inputs.matches(
                     &self.projects,
@@ -1839,6 +2049,13 @@ impl AlacritreeApp {
                         session_rows_always: self.session_rows_always,
                         query: self.project_filter.query(),
                         toggles: self.project_filter.toggle_bits(),
+                        toggles_apply: self.project_filter.toggles_apply(self.search_scope),
+                        pr_generation: pr_generation_for(
+                            self.pr_cache.generation(),
+                            any_pr_toggle_active(&self.project_filter, self.search_scope),
+                        ),
+                        active_workspace,
+                        active_branch,
                     },
                 );
                 if unchanged {
@@ -2010,18 +2227,29 @@ impl AlacritreeApp {
         let bindings = &self.config.bindings;
         let steps: Vec<SidebarNavStep> = ctx.input_mut(|i| {
             let mut steps = Vec::new();
-            i.events.retain(|ev| match ev {
-                egui::Event::Text(text) => match filter.on_text(text) {
-                    Some(outcome) => {
-                        steps.push(SidebarNavStep::Filter(outcome));
-                        false
+            let text_keys = keys_paired_with_text(&i.events);
+            let mut idx = 0;
+            i.events.retain(|ev| {
+                let produced_text = text_keys[idx];
+                idx += 1;
+                match ev {
+                    egui::Event::Text(text) => match filter.on_text(text) {
+                        Some(outcome) => {
+                            steps.push(SidebarNavStep::Filter(outcome));
+                            false
+                        },
+                        None => true,
                     },
-                    None => true,
-                },
-                egui::Event::Key { key, pressed: true, modifiers, .. } => {
-                    drain_search_or_nav(&mut steps, filter, bindings, *key, *modifiers)
-                },
-                _ => true,
+                    egui::Event::Key { key, pressed: true, modifiers, .. } => drain_search_or_nav(
+                        &mut steps,
+                        filter,
+                        bindings,
+                        *key,
+                        *modifiers,
+                        produced_text,
+                    ),
+                    _ => true,
+                }
             });
             steps
         });
@@ -2095,15 +2323,11 @@ impl AlacritreeApp {
     /// toggles union (`m`: Modified/Renamed, `d`: Deleted, `u`: Untracked/Added).
     /// Conflicted rows and the branch-diff section are handled by `visible_rows`.
     fn filtered_git_rows(&mut self, status: &GitStatus) -> git_nav::GitRows {
-        let m = self.git_filter.is_toggled('m');
-        let d = self.git_filter.is_toggled('d');
-        let u = self.git_filter.is_toggled('u');
-        let any = m || d || u;
-        let kind_pass = move |k: ChangeKind| {
-            !any || (m && matches!(k, ChangeKind::Modified | ChangeKind::Renamed))
-                || (d && k == ChangeKind::Deleted)
-                || (u && matches!(k, ChangeKind::Untracked | ChangeKind::Added))
-        };
+        let apply = self.git_filter.toggles_apply(self.search_scope);
+        let m = apply && self.git_filter.is_toggled('m');
+        let d = apply && self.git_filter.is_toggled('d');
+        let u = apply && self.git_filter.is_toggled('u');
+        let kind_pass = move |k: ChangeKind| git_toggles_pass(m, d, u, k);
         let filter = &mut self.git_filter;
         let mut query_pass = |path: &str| filter.matches(path);
         git_nav::visible_rows(
@@ -2166,6 +2390,16 @@ impl AlacritreeApp {
     }
 
     fn dispatch_action(&mut self, ctx: &Context, action: BindingAction, origin: ActionOrigin) {
+        // A palette row is dispatched with the panel still searching, and the
+        // cursor operations below act on a row the query may have hidden.  The
+        // keyboard path cannot reach here mid-query at all: a letter's text is
+        // swallowed by the query before the binding table sees the key.
+        if origin == ActionOrigin::Palette
+            && matches!(&action, BindingAction::Named(n) if n.requires_project_browsing())
+            && self.project_filter.mode() != panel_filter::Mode::Browsing
+        {
+            return;
+        }
         match action {
             BindingAction::Chars(bytes) => {
                 if let Some(idx) = self.active_session_index() {
@@ -2329,24 +2563,9 @@ impl AlacritreeApp {
                 self.sidebar_cursor_project_jump(-1)
             },
             BindingAction::Named(NamedAction::RefreshProjects) => {
-                // While the fuzzy prompt is open an unmodified `r` is query
-                // input — its Text event already fed the filter — so only a
-                // browsing-mode press (or IPC) refreshes.
-                if origin == ActionOrigin::Ipc
-                    || self.project_filter.mode() == panel_filter::Mode::Browsing
-                {
-                    self.refresh_all_projects(ctx);
-                }
+                self.refresh_all_projects(ctx);
             },
             BindingAction::Named(NamedAction::DeleteSelected) => {
-                // While the fuzzy prompt is open a letter bound here is query
-                // input — its Text event already fed the filter — so only a
-                // browsing-mode press (or IPC) acts.  Mirrors RefreshProjects.
-                if origin != ActionOrigin::Ipc
-                    && self.project_filter.mode() != panel_filter::Mode::Browsing
-                {
-                    return;
-                }
                 match self.sidebar_cursor.clone() {
                     Some(SidebarRow::Session(id)) => self.request_close_session(ctx, id),
                     Some(SidebarRow::Worktree(path)) => self.request_worktree_delete(&path),
@@ -2362,13 +2581,6 @@ impl AlacritreeApp {
                 }
             },
             BindingAction::Named(NamedAction::RenameSelected) => {
-                // Same browsing-mode guard as DeleteSelected: while the fuzzy
-                // prompt is open a letter bound here is query input.
-                if origin != ActionOrigin::Ipc
-                    && self.project_filter.mode() != panel_filter::Mode::Browsing
-                {
-                    return;
-                }
                 // Only project rows carry an editable label; sessions and
                 // worktrees take their names from the terminal title and the
                 // `[ui] worktree_name` template.
@@ -2380,13 +2592,6 @@ impl AlacritreeApp {
                 }
             },
             BindingAction::Named(NamedAction::ToggleProjectExpanded) => {
-                // Same browsing-mode guard as DeleteSelected: while the fuzzy
-                // prompt is open a letter bound here is query input.
-                if origin != ActionOrigin::Ipc
-                    && self.project_filter.mode() != panel_filter::Mode::Browsing
-                {
-                    return;
-                }
                 let Some(cursor) = self.sidebar_cursor.clone() else {
                     return;
                 };
@@ -2457,8 +2662,35 @@ impl AlacritreeApp {
             BindingAction::Named(NamedAction::SidebarSearchCancelToTerminal) => {
                 self.sidebar_search_cancel_to_terminal();
             },
+            BindingAction::Named(NamedAction::ClearProjectFilters) => {
+                self.project_filter.clear_toggles();
+            },
+            BindingAction::Named(NamedAction::ClearGitFilters) => {
+                self.git_filter.clear_toggles();
+                self.after_git_filter_changed();
+            },
+            BindingAction::Named(NamedAction::ToggleSearchScope) => {
+                self.search_scope = match self.search_scope {
+                    SearchScope::Filtered => SearchScope::All,
+                    SearchScope::All => SearchScope::Filtered,
+                };
+            },
+            BindingAction::Named(NamedAction::RefreshPrStatus) => {
+                self.pr_cache.invalidate_all();
+                // The poll sites run while the sidebars paint, and the palette
+                // dispatches after both have; without a wake the re-query would
+                // wait for whatever repaint happened to come next.
+                ctx.request_repaint();
+            },
             BindingAction::Named(other) => {
-                self.dispatch_scroll_or_other(other);
+                if let Some(key) = project_filter_identity(other) {
+                    self.project_filter.toggle(key);
+                } else if let Some(key) = git_filter_identity(other) {
+                    self.git_filter.toggle(key);
+                    self.after_git_filter_changed();
+                } else {
+                    self.dispatch_scroll_or_other(other);
+                }
             },
             BindingAction::Unsupported(name) => {
                 log::debug!("unsupported keyboard binding action: {name}");
@@ -2943,41 +3175,32 @@ impl AlacritreeApp {
         let mut shell_override_changed: Option<PathBuf> = None;
         let mut label_cleared: Option<PathBuf> = None;
         let mut rename_request: Option<RenameState> = None;
-        // Polled up front, expanded projects only: collapsed projects cost no gh
-        // processes, and the panel closure borrows `projects` mutably so the cache
-        // cannot be polled from inside it.
+        // Polled up front: the panel closure borrows `projects` mutably, so the
+        // cache cannot be polled from inside it.
         let pr_enabled = self.config.ui.pr_status;
+        let any_pr_toggle = any_pr_toggle_active(&self.project_filter, self.search_scope);
+        let current_workspace = self.current_workspace.as_deref();
+        let live_branch = current_workspace
+            .and_then(|p| self.git_status.get(p))
+            .and_then(|cache| cache.current_branch());
+        // The same path can be a worktree of two projects, and `PrCache` is
+        // keyed by path alone, so a second poller would only invalidate the
+        // first's lookup and burn a `gh` process every frame.
+        let mut polled: HashMap<PathBuf, Option<PrInfo>> = HashMap::new();
         let mut pr_infos: Vec<Vec<Option<PrInfo>>> = Vec::with_capacity(self.projects.len());
         for project in &self.projects {
             let mut rows = Vec::with_capacity(project.worktrees.len());
             for wt in &project.worktrees {
-                let info = if pr_enabled && project.expanded {
-                    // The right sidebar polls only the active workspace's PR
-                    // cache, using the live `StatusCache` branch (recomputed
-                    // every ~1.5s). Two pollers of the same path must agree on
-                    // a branch or each drain flips `entry.branch` and they
-                    // invalidate each other's lookups forever after an
-                    // in-terminal checkout — so share the live cache there.
-                    // For every other worktree there is only one poller (this
-                    // one), and its cache is created once a workspace goes
-                    // active but never re-polled or pruned after it goes
-                    // inactive again: reading it here would freeze the branch
-                    // at whatever it was on last visit and shadow later
-                    // `refresh_project` updates to `wt.branch`. Use the
-                    // refresh-responsive snapshot instead.
-                    let is_active = self.current_workspace.as_deref() == Some(&wt.path);
-                    let branch = if is_active {
-                        self.git_status
-                            .get(&wt.path)
-                            .and_then(|cache| cache.current_branch())
-                            .or(wt.branch.as_deref())
-                    } else {
-                        wt.branch.as_deref()
-                    };
-                    self.pr_cache.poll(&wt.path, branch, ctx)
-                } else {
-                    None
-                };
+                let info = resolve_pr_info(
+                    &mut polled,
+                    &wt.path,
+                    should_poll_pr(pr_enabled, project.expanded, any_pr_toggle),
+                    || {
+                        let branch =
+                            pr_status::effective_branch(wt, current_workspace, live_branch);
+                        self.pr_cache.poll(&wt.path, branch, ctx)
+                    },
+                );
                 rows.push(info);
             }
             pr_infos.push(rows);
@@ -3013,6 +3236,7 @@ impl AlacritreeApp {
                         &self.project_filter,
                         &self.config.ui.icons.search,
                         &theme,
+                        self.project_filter.toggles_apply(self.search_scope),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icon_button(ui, "+", theme.text_dim, &theme)
@@ -3549,6 +3773,7 @@ impl AlacritreeApp {
                         &self.git_filter,
                         &self.config.ui.icons.search,
                         &theme,
+                        self.git_filter.toggles_apply(self.search_scope),
                     );
                 });
                 ui.separator();
@@ -4996,10 +5221,12 @@ fn panel_header_filter_ui(
     filter: &PanelFilter,
     search_icon: &str,
     theme: &Theme,
+    toggles_apply: bool,
 ) {
     ui.label(RichText::new(title).color(theme.text).strong());
+    let chip = if toggles_apply { theme.accent } else { theme.text_muted };
     for key in filter.active_toggles() {
-        ui.label(RichText::new(format!("[{key}]")).color(theme.accent).monospace().small());
+        ui.label(RichText::new(format!("[{key}]")).color(chip).monospace().small());
     }
     if filter.mode() == panel_filter::Mode::Search || !filter.query().is_empty() {
         let s = theme.ui_scale;
@@ -5020,21 +5247,47 @@ fn panel_header_filter_ui(
     }
 }
 
+/// Which events are key presses whose text the search box will swallow.
+///
+/// egui-winit pushes `Event::Key` and then `Event::Text` adjacently for one
+/// printable press, so adjacency identifies the pair.  The result is positional
+/// rather than a set of triggers: key repeat and the `logical_key.or(physical_key)`
+/// fallback both let two presses in one frame share a `(key, modifiers)`, and
+/// only the occurrence carrying text may be treated as query input.
+fn keys_paired_with_text(events: &[egui::Event]) -> Vec<bool> {
+    events
+        .iter()
+        .enumerate()
+        .map(|(n, ev)| {
+            matches!(ev, egui::Event::Key { pressed: true, .. })
+                && matches!(events.get(n + 1), Some(egui::Event::Text(_)))
+        })
+        .collect()
+}
+
 /// Decide one key event for a focused sidebar panel and record its step.
 ///
-/// In search mode a search-scoped binding match (any modifiers, so `Shift+Esc`
-/// counts) is dispatched through the binding table, keeping `Enter`/`Esc`
-/// rebindable. Otherwise an unmodified key drives the filter or browsing nav; a
-/// modified non-search key is retained for `handle_shortcuts`. Returns whether
-/// the event stays in the queue (`true`) or is consumed here (`false`).
+/// In search mode a key whose text the query already swallowed is consumed
+/// outright — text input is unconditional, so it outranks even a search-scoped
+/// binding on that letter.  Otherwise a search-scoped binding match (any
+/// modifiers, so `Shift+Esc` counts) is dispatched through the binding table,
+/// keeping `Enter`/`Esc` rebindable; an unmodified key drives the filter or
+/// browsing nav; and a modified non-search key is retained for
+/// `handle_shortcuts`.  Returns whether the event stays in the queue (`true`)
+/// or is consumed here (`false`).
 fn drain_search_or_nav(
     steps: &mut Vec<SidebarNavStep>,
     filter: &mut PanelFilter,
     bindings: &[crate::bindings::KeyBinding],
     key: egui::Key,
     modifiers: egui::Modifiers,
+    produced_text: bool,
 ) -> bool {
-    if filter.mode() == panel_filter::Mode::Search {
+    let searching = filter.mode() == panel_filter::Mode::Search;
+    if searching && produced_text {
+        return false;
+    }
+    if searching {
         let mut matched = false;
         for a in crate::bindings::all_matches(bindings, key, modifiers) {
             if let BindingAction::Named(n) = a {
@@ -5055,12 +5308,14 @@ fn drain_search_or_nav(
         steps.push(SidebarNavStep::Filter(outcome));
         return false;
     }
-    // Browsing consumes the whole nav-key set; in search only Space stays
-    // consumed as a no-op, preserving the fake-click guard on the terminal view.
+    // Browsing consumes the whole nav-key set.  In search only Space and Delete
+    // stay consumed as no-ops: Space preserves the fake-click guard on the
+    // terminal view, and Delete is a text-editing key the append-only query has
+    // nothing to do with, so it must not fall through to the cursored row.
     let consume = if filter.mode() == panel_filter::Mode::Browsing {
         is_sidebar_nav_key(key)
     } else {
-        key == egui::Key::Space
+        key == egui::Key::Space || key == egui::Key::Delete
     };
     if consume {
         steps.push(SidebarNavStep::Nav(key));
@@ -6474,7 +6729,7 @@ impl AlacritreeApp {
     fn run_palette_action(&mut self, ctx: &Context, action: PaletteAction) {
         match action {
             PaletteAction::Run(a) => {
-                self.dispatch_action(ctx, BindingAction::Named(a), ActionOrigin::Keyboard);
+                self.dispatch_action(ctx, BindingAction::Named(a), ActionOrigin::Palette);
             },
             PaletteAction::ActivateSession(id) => {
                 self.activate_session_by_id(id);
@@ -7326,6 +7581,9 @@ impl eframe::App for AlacritreeApp {
         self.phases.restart();
         self.glyph_cache.begin_frame(ctx);
         self.poll_project_refreshes();
+        // Unconditional: either sidebar can be hidden, and a drain hung off one
+        // of them would strand every entry the other polled.
+        self.pr_cache.drain_completed();
         self.poll_pending_deletes(ctx);
         self.poll_pending_creates(ctx);
         self.phases.mark("polls");
@@ -7639,6 +7897,50 @@ mod tests {
         v
     }
 
+    fn key_ev(key: egui::Key, pressed: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn text_pairing_marks_only_keys_followed_by_text() {
+        let events = vec![
+            key_ev(egui::Key::A, true),
+            egui::Event::Text("a".into()),
+            key_ev(egui::Key::Enter, true),
+            key_ev(egui::Key::B, true),
+            egui::Event::Text("b".into()),
+        ];
+        assert_eq!(keys_paired_with_text(&events), vec![true, false, false, true, false]);
+    }
+
+    #[test]
+    fn text_pairing_ignores_released_keys_and_orphan_text() {
+        let events = vec![
+            key_ev(egui::Key::A, false),
+            egui::Event::Text("a".into()),
+            egui::Event::Text("pasted".into()),
+        ];
+        assert_eq!(keys_paired_with_text(&events), vec![false, false, false]);
+    }
+
+    /// Two presses sharing one `(key, modifiers)` in a frame: only the occurrence
+    /// actually followed by text is marked. A set keyed by value would mark both.
+    #[test]
+    fn text_pairing_is_per_occurrence_not_per_trigger() {
+        let events = vec![
+            key_ev(egui::Key::A, true),
+            egui::Event::Text("a".into()),
+            key_ev(egui::Key::A, true),
+        ];
+        assert_eq!(keys_paired_with_text(&events), vec![true, false, false]);
+    }
+
     fn searching_filter() -> PanelFilter {
         let mut f = PanelFilter::new(&['s', 'a']);
         f.on_text("/");
@@ -7690,6 +7992,7 @@ mod tests {
             &binds,
             egui::Key::Enter,
             egui::Modifiers::NONE,
+            false,
         );
         assert!(!retain, "a matched search action consumes the key");
         assert!(matches!(
@@ -7701,14 +8004,28 @@ mod tests {
         assert_eq!(f.query(), "foo");
 
         let mut steps = Vec::new();
-        drain_search_or_nav(&mut steps, &mut f, &binds, egui::Key::Escape, egui::Modifiers::NONE);
+        drain_search_or_nav(
+            &mut steps,
+            &mut f,
+            &binds,
+            egui::Key::Escape,
+            egui::Modifiers::NONE,
+            false,
+        );
         assert!(matches!(
             steps.as_slice(),
             [SidebarNavStep::SearchAction(NamedAction::SidebarSearchCancel)]
         ));
 
         let mut steps = Vec::new();
-        drain_search_or_nav(&mut steps, &mut f, &binds, egui::Key::Escape, egui::Modifiers::SHIFT);
+        drain_search_or_nav(
+            &mut steps,
+            &mut f,
+            &binds,
+            egui::Key::Escape,
+            egui::Modifiers::SHIFT,
+            false,
+        );
         assert!(
             matches!(
                 steps.as_slice(),
@@ -7730,6 +8047,7 @@ mod tests {
             &binds,
             egui::Key::ArrowDown,
             egui::Modifiers::NONE,
+            false,
         );
         assert!(matches!(
             steps.as_slice(),
@@ -7744,6 +8062,7 @@ mod tests {
             &binds,
             egui::Key::Space,
             egui::Modifiers::NONE,
+            false,
         );
         assert!(!retain);
         assert!(matches!(steps.as_slice(), [SidebarNavStep::Nav(egui::Key::Space)]));
@@ -7761,6 +8080,7 @@ mod tests {
             &binds,
             egui::Key::Enter,
             egui::Modifiers::NONE,
+            false,
         );
         assert!(!retain, "Enter in browsing is a nav activate, consumed here");
         assert!(matches!(steps.as_slice(), [SidebarNavStep::Nav(egui::Key::Enter)]));
@@ -7773,6 +8093,7 @@ mod tests {
             &binds,
             egui::Key::Enter,
             egui::Modifiers::CTRL,
+            false,
         );
         assert!(retain);
         assert!(steps.is_empty());
@@ -7792,9 +8113,144 @@ mod tests {
             &binds,
             egui::Key::Enter,
             egui::Modifiers::NONE,
+            false,
         );
         assert!(retain, "an unbound Enter in search is retained, not consumed as nav");
         assert!(steps.is_empty());
+    }
+
+    /// A text-producing key in search mode is query input and must not also run a
+    /// binding — including one bound to a search action, since text input is
+    /// unconditional.
+    #[test]
+    fn a_text_key_in_search_is_consumed_before_any_binding() {
+        let binds = crate::bindings::parse_bindings(vec![crate::bindings::RawBinding {
+            key: "G".into(),
+            mods: None,
+            mode: None,
+            chars: None,
+            action: Some("SidebarSearchConfirm".into()),
+            command: None,
+        }]);
+        let mut f = searching_filter();
+
+        let mut steps = Vec::new();
+        let retain = drain_search_or_nav(
+            &mut steps,
+            &mut f,
+            &binds,
+            egui::Key::G,
+            egui::Modifiers::NONE,
+            true,
+        );
+
+        assert!(!retain, "a key carrying query text is consumed");
+        assert!(steps.is_empty(), "and dispatches nothing, not even a search action");
+    }
+
+    /// Shift+letter still produces text, so it must be consumed too. The modifier
+    /// early-return would otherwise let the built-in Shift+R reach RenameSelected.
+    #[test]
+    fn shift_letter_in_search_is_consumed() {
+        let binds = crate::bindings::parse_bindings(vec![]);
+        let mut f = searching_filter();
+
+        let mut steps = Vec::new();
+        let retain = drain_search_or_nav(
+            &mut steps,
+            &mut f,
+            &binds,
+            egui::Key::R,
+            egui::Modifiers::SHIFT,
+            true,
+        );
+
+        assert!(!retain);
+        assert!(steps.is_empty());
+    }
+
+    /// Bare Delete carries no text, so the pairing rule cannot claim it. It is a
+    /// search-box editing key, so it is consumed as a no-op instead of reaching the
+    /// cursored row.
+    #[test]
+    fn bare_delete_in_search_is_consumed_as_a_no_op() {
+        let binds = crate::bindings::parse_bindings(vec![]);
+        let mut f = searching_filter();
+        f.on_text("typed");
+
+        let mut steps = Vec::new();
+        let retain = drain_search_or_nav(
+            &mut steps,
+            &mut f,
+            &binds,
+            egui::Key::Delete,
+            egui::Modifiers::NONE,
+            false,
+        );
+
+        assert!(!retain, "Delete must not reach the cursored row");
+        assert!(
+            matches!(steps.as_slice(), [SidebarNavStep::Nav(egui::Key::Delete)]),
+            "Delete is consumed as a plain nav key, not routed into the filter"
+        );
+        assert_eq!(f.query(), "typed", "an append-only query has no delete");
+    }
+
+    /// Keys that produce no text keep falling through to the binding table, which
+    /// is what lets Home/End/PageUp/PageDown navigate filtered results.
+    #[test]
+    fn non_text_keys_in_search_still_fall_through() {
+        let binds = crate::bindings::parse_bindings(vec![]);
+        for key in [egui::Key::ArrowLeft, egui::Key::ArrowRight, egui::Key::Tab, egui::Key::Home] {
+            let mut f = searching_filter();
+            let mut steps = Vec::new();
+            let retain =
+                drain_search_or_nav(&mut steps, &mut f, &binds, key, egui::Modifiers::NONE, false);
+            assert!(retain, "{key:?} produces no query text and must reach the binding table");
+        }
+    }
+
+    /// Ctrl-modified keys suppress text generation, so they have no query input
+    /// and must reach the binding table to fire user bindings.
+    #[test]
+    fn ctrl_keys_in_search_still_fall_through() {
+        let binds = crate::bindings::parse_bindings(vec![]);
+        let mut f = searching_filter();
+
+        let mut steps = Vec::new();
+        let retain = drain_search_or_nav(
+            &mut steps,
+            &mut f,
+            &binds,
+            egui::Key::C,
+            egui::Modifiers::CTRL,
+            false,
+        );
+
+        assert!(
+            retain,
+            "ctrl-modified key produces no query text and must reach the binding table"
+        );
+    }
+
+    /// Browsing mode is untouched: a letter must reach the binding table, which is
+    /// how the filter toggle actions fire.
+    #[test]
+    fn a_text_key_in_browsing_is_not_consumed_by_the_pairing_rule() {
+        let binds = crate::bindings::parse_bindings(vec![]);
+        let mut f = PanelFilter::new(&['s', 'a']);
+
+        let mut steps = Vec::new();
+        let retain = drain_search_or_nav(
+            &mut steps,
+            &mut f,
+            &binds,
+            egui::Key::S,
+            egui::Modifiers::NONE,
+            true,
+        );
+
+        assert!(retain);
     }
 
     #[test]
@@ -8194,6 +8650,23 @@ mod tests {
         assert_eq!(mv(PaneFocus::Terminal, FocusDir::Right, true), FocusMove::Passthrough);
     }
 
+    /// A palette-dispatched Focus Left/Right is a binding stand-in, so a
+    /// running TUI must see the same passthrough a real keypress would.
+    #[test]
+    fn palette_origin_keeps_the_key_for_a_running_tui() {
+        assert_eq!(
+            focus_move(
+                PaneFocus::Terminal,
+                FocusDir::Left,
+                true,
+                true,
+                ActionOrigin::Palette,
+                true
+            ),
+            FocusMove::Passthrough
+        );
+    }
+
     #[test]
     fn sidebars_never_pass_through() {
         assert_eq!(
@@ -8214,6 +8687,94 @@ mod tests {
             focus_move(PaneFocus::Terminal, FocusDir::Left, false, true, ActionOrigin::Ipc, true),
             FocusMove::Nothing
         );
+    }
+
+    #[test]
+    fn projects_filter_action_valid_when_projects_sidebar_focused() {
+        let action = BindingAction::Named(NamedAction::ToggleSessionsFilter);
+        assert!(valid_for_focus(&action, true, false, false));
+    }
+
+    #[test]
+    fn projects_filter_action_rejected_when_git_sidebar_focused() {
+        let action = BindingAction::Named(NamedAction::ToggleSessionsFilter);
+        assert!(!valid_for_focus(&action, false, true, false));
+    }
+
+    #[test]
+    fn git_filter_action_valid_when_git_sidebar_focused() {
+        let action = BindingAction::Named(NamedAction::ToggleModifiedFilter);
+        assert!(valid_for_focus(&action, false, true, false));
+    }
+
+    #[test]
+    fn git_filter_action_rejected_when_projects_sidebar_focused() {
+        let action = BindingAction::Named(NamedAction::ToggleModifiedFilter);
+        assert!(!valid_for_focus(&action, true, false, false));
+    }
+
+    #[test]
+    fn both_sidebar_filters_rejected_when_terminal_focused() {
+        let projects_action = BindingAction::Named(NamedAction::ToggleSessionsFilter);
+        let git_action = BindingAction::Named(NamedAction::ToggleModifiedFilter);
+        assert!(!valid_for_focus(&projects_action, false, false, false));
+        assert!(!valid_for_focus(&git_action, false, false, false));
+    }
+
+    /// `ScrollPageUp` is unscoped by pane focus, so only the scratchpad
+    /// editor stealing it back (via `terminal_only`) should block it.
+    #[test]
+    fn terminal_only_action_yields_to_the_scratchpad_editor() {
+        let action = BindingAction::Named(NamedAction::ScrollPageUp);
+        assert!(!valid_for_focus(&action, false, false, true));
+        assert!(valid_for_focus(&action, false, false, false));
+    }
+
+    #[test]
+    fn a_wide_search_stands_down_the_project_toggles() {
+        // Toggled on, workspace fails both: excluded while the toggles apply,
+        // included once a wide search stands them down.
+        assert!(!project_toggles_pass(true, true, false, true, false));
+        assert!(project_toggles_pass(false, true, false, true, false));
+    }
+
+    #[test]
+    fn a_wide_search_stands_down_the_git_toggles() {
+        // Toggled on for "modified" only, an untracked row fails while the
+        // toggle applies and passes once a wide search stands it down.
+        assert!(!git_toggles_pass(true, false, false, ChangeKind::Untracked));
+        assert!(git_toggles_pass(false, false, false, ChangeKind::Untracked));
+    }
+
+    #[test]
+    fn a_pr_toggle_alone_makes_any_toggle_active() {
+        assert!(!any_project_toggle_active(false, false, false));
+        assert!(any_project_toggle_active(false, false, true));
+    }
+
+    #[test]
+    fn worktree_pr_passes_is_inert_without_a_pr_toggle() {
+        let path = PathBuf::from("/worktree");
+        let mut pr_matches = HashMap::new();
+        pr_matches.insert(path.clone(), false);
+        assert!(worktree_pr_passes(false, &pr_matches, &path));
+    }
+
+    #[test]
+    fn worktree_pr_passes_follows_the_map_once_a_pr_toggle_is_active() {
+        let path = PathBuf::from("/worktree");
+        let mut pr_matches = HashMap::new();
+        pr_matches.insert(path.clone(), true);
+        assert!(worktree_pr_passes(true, &pr_matches, &path));
+        pr_matches.insert(path.clone(), false);
+        assert!(!worktree_pr_passes(true, &pr_matches, &path));
+    }
+
+    #[test]
+    fn worktree_pr_passes_excludes_a_worktree_missing_from_the_map() {
+        let path = PathBuf::from("/worktree");
+        let pr_matches: HashMap<PathBuf, bool> = HashMap::new();
+        assert!(!worktree_pr_passes(true, &pr_matches, &path));
     }
 
     fn req(file: &str, source: DiffSource) -> DiffRequest {
@@ -8852,5 +9413,151 @@ mod tests {
             snapshot.is_projected(below),
             "a row below the one being deleted must still be navigable"
         );
+    }
+
+    /// Dispatch cannot catch a wrong pairing: `toggle` drops an identity the
+    /// panel does not allow, and an action with no arm falls through to the
+    /// scroll handler.  Swapping two identities here is otherwise invisible.
+    #[test]
+    fn the_projects_filter_actions_map_to_their_identities() {
+        for (action, identity) in [
+            (NamedAction::ToggleSessionsFilter, Some('s')),
+            (NamedAction::ToggleAttentionFilter, Some('a')),
+            (NamedAction::TogglePrOpenFilter, Some('o')),
+            (NamedAction::TogglePrDraftFilter, Some('d')),
+            (NamedAction::TogglePrMergedFilter, Some('m')),
+            (NamedAction::TogglePrClosedFilter, Some('c')),
+            (NamedAction::ClearProjectFilters, None),
+            (NamedAction::ToggleModifiedFilter, None),
+            (NamedAction::ToggleDeletedFilter, None),
+            (NamedAction::ToggleUntrackedFilter, None),
+            (NamedAction::ToggleSearchScope, None),
+            (NamedAction::RefreshPrStatus, None),
+            (NamedAction::Paste, None),
+        ] {
+            assert_eq!(project_filter_identity(action), identity, "{action:?}");
+            if let Some(key) = identity {
+                assert!(
+                    project_filter_toggles(true).contains(&key),
+                    "{action:?} maps to {key}, which the panel would drop"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_git_filter_actions_map_to_their_identities() {
+        for (action, identity) in [
+            (NamedAction::ToggleModifiedFilter, Some('m')),
+            (NamedAction::ToggleDeletedFilter, Some('d')),
+            (NamedAction::ToggleUntrackedFilter, Some('u')),
+            (NamedAction::ClearGitFilters, None),
+            (NamedAction::ToggleSessionsFilter, None),
+            (NamedAction::ToggleAttentionFilter, None),
+            (NamedAction::TogglePrOpenFilter, None),
+            (NamedAction::TogglePrDraftFilter, None),
+            (NamedAction::TogglePrMergedFilter, None),
+            (NamedAction::TogglePrClosedFilter, None),
+            (NamedAction::Paste, None),
+        ] {
+            assert_eq!(git_filter_identity(action), identity, "{action:?}");
+            if let Some(key) = identity {
+                assert!(
+                    GIT_FILTER_TOGGLES.contains(&key),
+                    "{action:?} maps to {key}, which the panel would drop"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_pr_identities_exist_only_when_polling_does() {
+        assert_eq!(project_filter_toggles(false), &['s', 'a']);
+        assert_eq!(project_filter_toggles(true), &['s', 'a', 'o', 'd', 'm', 'c']);
+    }
+
+    /// Guards the staging dependency: the four PR actions already dispatch to
+    /// `project_filter.toggle`, and `toggle` silently ignores an identity the
+    /// filter does not allow — so a narrow slice here makes them dead keys.
+    #[test]
+    fn the_pr_actions_reach_a_configured_projects_filter() {
+        let mut f = PanelFilter::new(project_filter_toggles(true));
+        for key in ['o', 'd', 'm', 'c'] {
+            f.toggle(key);
+            assert!(f.is_toggled(key), "{key} must be a live identity");
+        }
+    }
+
+    #[test]
+    fn any_pr_toggle_active_ignores_the_non_pr_identities() {
+        let mut f = PanelFilter::new(project_filter_toggles(true));
+        assert!(!any_pr_toggle_active(&f, SearchScope::Filtered));
+        f.toggle('s');
+        assert!(
+            !any_pr_toggle_active(&f, SearchScope::Filtered),
+            "a session toggle is not a PR toggle"
+        );
+        f.toggle('o');
+        assert!(any_pr_toggle_active(&f, SearchScope::Filtered));
+    }
+
+    /// A search under `All` stands the toggles down for row selection, so the
+    /// PR dimension narrows nothing — polling collapsed projects for it and
+    /// rebuilding on every banked result would both be pure cost.
+    #[test]
+    fn a_stood_down_pr_toggle_does_not_read_as_active() {
+        let mut f = PanelFilter::new(project_filter_toggles(true));
+        f.toggle('o');
+        f.on_text("/");
+        f.on_text("a");
+
+        assert!(any_pr_toggle_active(&f, SearchScope::Filtered));
+        assert!(!any_pr_toggle_active(&f, SearchScope::All));
+    }
+
+    /// The reconciler must not churn for users who never touch a PR filter:
+    /// every banked result would otherwise rebuild the row set.
+    #[test]
+    fn the_generation_reaches_the_reconciler_only_while_filtering() {
+        assert_eq!(pr_generation_for(7, false), 0);
+        assert_eq!(pr_generation_for(7, true), 7);
+    }
+
+    #[test]
+    fn a_pr_filter_reaches_into_collapsed_projects() {
+        assert!(!should_poll_pr(true, false, false), "collapsed and unfiltered: no lookup");
+        assert!(should_poll_pr(true, false, true), "a PR filter must see collapsed rows");
+        assert!(should_poll_pr(true, true, false));
+        assert!(!should_poll_pr(false, true, true), "disabled means never");
+    }
+
+    /// The same path can be a worktree of two projects, and `PrCache` is keyed
+    /// by path alone — two pollers would burn a `gh` process per frame.
+    #[test]
+    fn a_repeated_path_is_polled_once_but_rendered_everywhere() {
+        let mut memo: HashMap<PathBuf, Option<PrInfo>> = HashMap::new();
+        let lookups = std::cell::Cell::new(0);
+        let path = PathBuf::from("/repo/wt");
+
+        let poll = || {
+            lookups.set(lookups.get() + 1);
+            Some(PrInfo {
+                number: 1,
+                base_branch: "master".into(),
+                url: String::new(),
+                state: PrState::Open,
+            })
+        };
+
+        let first = resolve_pr_info(&mut memo, &path, true, &poll);
+        let second = resolve_pr_info(&mut memo, &path, true, &poll);
+
+        assert_eq!(lookups.get(), 1, "one lookup per path per frame");
+        assert!(second.is_some(), "the duplicate row still renders its badge");
+        assert_eq!(first.map(|i| i.number), second.map(|i| i.number));
+
+        let ineligible = resolve_pr_info(&mut memo, &PathBuf::from("/repo/other"), false, &poll);
+        assert_eq!(lookups.get(), 1, "an ineligible path never runs the lookup");
+        assert!(ineligible.is_none());
     }
 }
