@@ -329,6 +329,23 @@ search_scope       = "filtered"  # whether a sidebar search is confined by the
                                  # the toggles already allow
                                  # "all": a query reaches every row; the
                                  # toggles resume when it empties
+sidebar_tooltips   = "elided"    # when a sidebar row spells its full name out
+                                 # on hover — both sidebars, so a git panel
+                                 # path answers to it like a worktree name
+                                 # "elided" (default): only where the row had
+                                 # to cut the name off
+                                 # "always": on every row — a row without a
+                                 # tooltip ends the run in which egui reopens
+                                 # the next one instantly, so a sweep down the
+                                 # list stalls on each name that fits
+                                 # "off": never
+icon_tooltips      = true        # whether a sidebar icon explains itself on
+                                 # hover (default true) — what a button does
+                                 # ("add project", "close session", …) and what
+                                 # a status badge reports, on both sidebars
+                                 # independent of sidebar_tooltips, which is
+                                 # about a name the row had to cut off: an
+                                 # icon's hint never depends on panel width
 confirm_session_close = "never"  # when the sidebar × asks before killing a PTY:
                                  # "never" (default) | "busy" | "always"
 last_session_close = "respawn"   # closing the on-screen workspace's last
