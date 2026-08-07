@@ -215,7 +215,6 @@ pub fn agent_name_for_glyph(glyph: char) -> Option<&'static str> {
     AGENT_PROCESS_GLYPHS.iter().find(|(_, g)| *g == glyph).map(|(name, _)| *name)
 }
 
-
 /// Plain-text dump of a session's grid for IPC clients.
 pub struct ScreenSnapshot {
     /// Requested scrollback (top) followed by the full visible screen, one

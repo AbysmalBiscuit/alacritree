@@ -381,12 +381,7 @@ impl WorktreeInput {
 
 impl<'a> From<&'a Worktree> for WorktreeView<'a> {
     fn from(wt: &'a Worktree) -> Self {
-        Self {
-            path: &wt.path,
-            name: &wt.name,
-            prunable: wt.prunable,
-            branch: wt.branch.as_deref(),
-        }
+        Self { path: &wt.path, name: &wt.name, prunable: wt.prunable, branch: wt.branch.as_deref() }
     }
 }
 

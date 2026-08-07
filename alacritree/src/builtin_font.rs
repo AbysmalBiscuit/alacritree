@@ -803,8 +803,7 @@ fn powerline_round_drawing(character: char, metrics: &Metrics, offset: &FontDelt
     let height = (metrics.line_height as i32 + offset.y as i32).max(1) as usize;
     let width = (metrics.average_advance as i32 + offset.x as i32).max(1) as usize;
     let stroke_size = calculate_stroke_size(width) as f32;
-    let hollow =
-        character == POWERLINE_ROUND_HOLLOW_LTR || character == POWERLINE_ROUND_HOLLOW_RTL;
+    let hollow = character == POWERLINE_ROUND_HOLLOW_LTR || character == POWERLINE_ROUND_HOLLOW_RTL;
 
     let rx = width as f32;
     let ry = height as f32 / 2.;
