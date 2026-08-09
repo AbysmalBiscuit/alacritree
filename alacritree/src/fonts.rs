@@ -2286,6 +2286,10 @@ mod tests {
         gather_fallback_faces("Consolas", None, Variant::Normal, &skip, 8, &fonts);
 
         assert_eq!(face_coverage_parses(), 0, "a seed already in the scan was parsed anyway");
+        assert!(
+            fonts.seed_coverage.borrow().contains_key(&(seed.path.clone(), seed.face_index)),
+            "the seed was never resolved, so a parse count of zero proves nothing"
+        );
     }
 
     /// A seed the scan cannot answer for is parsed at most once per install,
