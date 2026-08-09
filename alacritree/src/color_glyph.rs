@@ -17,7 +17,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use egui::{ColorImage, Context, TextureHandle, TextureOptions};
 use swash::FontRef;
@@ -46,9 +45,10 @@ impl CachedColorGlyph {
 pub struct ColorGlyphCache {
     /// The fallback chain in egui's own consultation order.
     chain: Vec<ChainFace>,
-    /// Font files behind the chain, read on first use.  A `None` marks a file
-    /// that could not be read, so a broken font is not re-read every frame.
-    files: HashMap<PathBuf, Option<Arc<Vec<u8>>>>,
+    /// Font files behind the chain, borrowed from the mappings `fonts` already
+    /// holds.  A `None` marks a file that would not map, so a broken font is
+    /// not retried on every cache miss.
+    files: HashMap<PathBuf, Option<&'static [u8]>>,
     /// Which chain entry, if any, draws this character in colour.  `None` means
     /// egui's own glyph pipeline owns it.
     source: HashMap<char, Option<usize>>,
@@ -144,7 +144,7 @@ impl ColorGlyphCache {
             let Some(data) = load(&mut self.files, &face.path) else {
                 continue;
             };
-            let claims = FontRef::from_index(&data, face.face_index as usize)
+            let claims = FontRef::from_index(data, face.face_index as usize)
                 .is_some_and(|font| font.charmap().map(c) != 0);
             if claims {
                 return Some(i);
@@ -171,7 +171,7 @@ impl ColorGlyphCache {
         cells: u32,
     ) -> Option<(ColorImage, i32, i32)> {
         let data = load(&mut self.files, &face.path)?;
-        let font = FontRef::from_index(&data, face.face_index as usize)?;
+        let font = FontRef::from_index(data, face.face_index as usize)?;
         let glyph = font.charmap().map(c);
 
         // Ask for the glyph at the cell's height.  Outline-backed colour glyphs
@@ -245,20 +245,20 @@ impl ColorGlyphCache {
 const COLOR_SOURCES: &[Source] =
     &[Source::ColorOutline(0), Source::ColorBitmap(StrikeWith::BestFit)];
 
-/// Read a font file once and keep it, so the chain's larger faces are not
-/// re-read on every cache miss.  A file that cannot be read is remembered as
-/// unreadable rather than retried.
-fn load(files: &mut HashMap<PathBuf, Option<Arc<Vec<u8>>>>, path: &Path) -> Option<Arc<Vec<u8>>> {
-    files
-        .entry(path.to_path_buf())
-        .or_insert_with(|| match std::fs::read(path) {
-            Ok(bytes) => Some(Arc::new(bytes)),
-            Err(e) => {
-                log::debug!("could not read colour font {}: {e}", path.display());
-                None
-            },
-        })
-        .clone()
+/// Borrow the mapping `fonts::map_font_file` already holds for the face rather
+/// than reading the file again: the chain's faces are handed to egui as
+/// mappings, and a second owned copy of a 792 MB collection is 792 MB of
+/// private memory that nothing evicts.
+fn load(files: &mut HashMap<PathBuf, Option<&'static [u8]>>, path: &Path) -> Option<&'static [u8]> {
+    *files.entry(path.to_path_buf()).or_insert_with(|| match crate::fonts::map_font_file(path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            // Every face in the chain mapped during install and `FONT_MAPS`
+            // never evicts, so arriving here means the two have diverged.
+            log::warn!("colour font {} is in the chain but will not map: {e}", path.display());
+            None
+        },
+    })
 }
 
 /// Bilinear resample of an RGBA buffer.  Colour bitmap strikes arrive at the
@@ -305,6 +305,12 @@ fn scale_rgba(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec
 mod tests {
     use super::*;
     use crate::config::{FontConfig, UiFont};
+
+    /// The crate's own baked face, written to a unique path per test.
+    /// `fonts::FONT_MAPS` is global and never cleared, so a test that asserts
+    /// something *about* mapping has to own the path it asserts on.
+    const FIXTURE: &[u8] =
+        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/alacritree-symbols.ttf"));
 
     fn metrics() -> Metrics {
         Metrics { average_advance: 9.0, line_height: 20.0, descent: -4.0 }
@@ -476,5 +482,24 @@ mod tests {
         assert_eq!(cache.entries.len(), 1, "budget was not enforced");
         assert!(cache.bytes > 0);
         assert_eq!(cache.entries.len(), cache.used.len(), "eviction leaked LRU bookkeeping");
+    }
+
+    /// Every chain face is already memory-mapped by `fonts::map_font_file`.
+    /// Reading it again cost 960 MB of private memory on a chain whose primary
+    /// is a 792 MB collection, so pointer identity — not equal contents — is
+    /// what this has to assert.
+    #[test]
+    fn load_returns_the_mapping_rather_than_a_copy() {
+        let path = std::env::temp_dir().join("alacritree_test_color_glyph_load.ttf");
+        std::fs::write(&path, FIXTURE).unwrap();
+
+        let mapped = crate::fonts::map_font_file(&path).expect("the fixture maps");
+        let mut files = HashMap::new();
+        let loaded = load(&mut files, &path).expect("the fixture loads");
+
+        assert!(
+            std::ptr::eq(mapped.as_ptr(), loaded.as_ptr()),
+            "load copied the file instead of borrowing the mapping"
+        );
     }
 }
