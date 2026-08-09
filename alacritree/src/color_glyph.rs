@@ -50,7 +50,8 @@ pub struct ColorGlyphCache {
     /// not retried on every cache miss.
     files: HashMap<PathBuf, Option<&'static [u8]>>,
     /// Which chain entry, if any, draws this character in colour.  `None` means
-    /// egui's own glyph pipeline owns it.
+    /// egui's own glyph pipeline owns it.  The index is what a re-render after
+    /// a budget eviction uses instead of walking the chain again.
     source: HashMap<char, Option<usize>>,
     entries: HashMap<char, CachedColorGlyph>,
     /// Monotonic tick per lookup, so eviction can pick the coldest entry
@@ -61,6 +62,11 @@ pub struct ColorGlyphCache {
     budget: usize,
     cell_size: (u32, u32),
     scale: ScaleContext,
+    /// Chain walks performed, so a test can prove a post-eviction re-render
+    /// answers from `source` instead of re-parsing every earlier face's cmap.
+    /// `usize` rather than an atomic because `claiming_index` takes `&mut self`.
+    #[cfg(test)]
+    chain_walks: usize,
 }
 
 impl ColorGlyphCache {
@@ -76,6 +82,8 @@ impl ColorGlyphCache {
             budget: budget_mb.saturating_mul(1024 * 1024),
             cell_size: (0, 0),
             scale: ScaleContext::new(),
+            #[cfg(test)]
+            chain_walks: 0,
         }
     }
 
@@ -109,16 +117,24 @@ impl ColorGlyphCache {
             self.used.insert(c, now);
             return self.entries.get(&c);
         }
-        // A character already known to have no colour artwork costs one lookup;
-        // the whole grid takes this path on every frame.
-        if self.source.get(&c) == Some(&None) {
-            return None;
-        }
-
         // Only the claiming face is considered.  Looking further down the chain
         // would rasterize from a font egui had already passed over, so the two
         // renderers would disagree about which face owns the character.
-        let index = self.claiming_index(c)?;
+        let index = match self.source.get(&c) {
+            // Known monochrome: egui's own glyph pipeline draws it.  The whole
+            // grid takes this path on every frame, so it costs one lookup.
+            Some(None) => return None,
+            // Re-render after a budget eviction.  The chain is fixed at
+            // construction, so the recorded index still names the same face.
+            Some(Some(i)) => *i,
+            None => match self.claiming_index(c) {
+                Some(i) => i,
+                None => {
+                    self.source.insert(c, None);
+                    return None;
+                },
+            },
+        };
         let face = self.chain[index].clone();
         let glyph = self.rasterize(ctx, c, &face, cell, cells.max(1));
 
@@ -139,6 +155,10 @@ impl ColorGlyphCache {
 
     /// Index of the first face whose cmap claims `c` — the same face egui picks.
     fn claiming_index(&mut self, c: char) -> Option<usize> {
+        #[cfg(test)]
+        {
+            self.chain_walks += 1;
+        }
         for i in 0..self.chain.len() {
             let face = self.chain[i].clone();
             let Some(data) = load(&mut self.files, &face.path) else {
@@ -501,5 +521,65 @@ mod tests {
             std::ptr::eq(mapped.as_ptr(), loaded.as_ptr()),
             "load copied the file instead of borrowing the mapping"
         );
+    }
+
+    /// A character no face in the chain claims must be recorded as egui's, or
+    /// the whole chain is re-walked for it on every frame it is on screen.
+    #[test]
+    fn an_unclaimed_character_is_memoized() {
+        let ctx = Context::default();
+        let path = std::env::temp_dir().join("alacritree_test_unclaimed_memo.ttf");
+        std::fs::write(&path, FIXTURE).unwrap();
+        let chain = vec![ChainFace { path, face_index: 0, color_only: false }];
+        let mut cache = ColorGlyphCache::new(chain, 10);
+
+        // The baked symbols face carries box drawing and chrome glyphs only.
+        let unclaimed = '\u{4E00}';
+        assert!(
+            cache.resolve_claiming_face(unclaimed).is_none(),
+            "the fixture claims U+4E00; this test would prove nothing"
+        );
+
+        assert!(cache.get(&ctx, unclaimed, &metrics(), 1).is_none());
+        assert_eq!(
+            cache.source.get(&unclaimed),
+            Some(&None),
+            "an unclaimed character was not recorded, so every frame re-walks the chain"
+        );
+    }
+
+    /// After an eviction the glyph must be re-rasterized from the chain index
+    /// already recorded for it, not rediscovered by re-parsing the chain.
+    #[test]
+    fn a_post_eviction_rerender_skips_the_chain_walk() {
+        let ctx = Context::default();
+        let Some(chain) = chain_with_color_fonts(&ctx) else {
+            log::warn!("no colour emoji font installed; nothing to assert");
+            return;
+        };
+
+        // `chain_with_color_fonts` proves renderability for U+1F600 alone, so
+        // the second glyph is found rather than assumed.  A throwaway cache
+        // keeps the probe out of the cache under test.
+        let mut probe = ColorGlyphCache::new(chain.clone(), 10);
+        let renderable: Vec<char> = ['\u{1F600}', '\u{1F601}', '\u{2764}', '\u{1F44D}']
+            .into_iter()
+            .filter(|c| probe.get(&ctx, *c, &metrics(), 2).is_some())
+            .collect();
+        if renderable.len() < 2 {
+            log::warn!("fewer than two renderable colour glyphs here; nothing to assert");
+            return;
+        }
+        let (first, second) = (renderable[0], renderable[1]);
+
+        // One byte of budget: each insert evicts everything but itself.
+        let mut cache = ColorGlyphCache { budget: 1, ..ColorGlyphCache::new(chain, 0) };
+        assert!(cache.get(&ctx, first, &metrics(), 2).is_some(), "first glyph did not rasterize");
+        assert!(cache.get(&ctx, second, &metrics(), 2).is_some(), "second glyph did not rasterize");
+        assert!(!cache.entries.contains_key(&first), "the first glyph was not evicted");
+
+        let walks = cache.chain_walks;
+        assert!(cache.get(&ctx, first, &metrics(), 2).is_some(), "re-render after eviction failed");
+        assert_eq!(cache.chain_walks, walks, "the chain was re-walked after an eviction");
     }
 }
