@@ -1143,7 +1143,7 @@ fn gather_fallback_faces(
 /// and a second `install_terminal_fonts` reuses the mappings of the first.
 static FONT_MAPS: OnceLock<Mutex<HashMap<PathBuf, &'static [u8]>>> = OnceLock::new();
 
-fn map_font_file(path: &Path) -> std::io::Result<&'static [u8]> {
+pub(crate) fn map_font_file(path: &Path) -> std::io::Result<&'static [u8]> {
     let mut maps = FONT_MAPS
         .get_or_init(Default::default)
         .lock()
