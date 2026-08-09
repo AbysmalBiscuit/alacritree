@@ -1128,10 +1128,7 @@ fn face_coverage_parses() -> usize {
 /// both path and face index, so the match is exact — face 0 of a collection
 /// file can be an unrelated family.
 #[cfg(not(unix))]
-fn scanned_seed_coverage(
-    fonts: &SystemFonts,
-    face: &ResolvedFace,
-) -> Option<coverage::Coverage> {
+fn scanned_seed_coverage(fonts: &SystemFonts, face: &ResolvedFace) -> Option<coverage::Coverage> {
     fonts
         .scanned_coverage()
         .iter()
