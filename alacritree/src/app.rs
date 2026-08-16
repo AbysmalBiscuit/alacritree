@@ -507,10 +507,11 @@ pub struct AlacritreeApp {
     row_labels: crate::row_label::LabelTemplates,
     config: Config,
     theme: Theme,
-    last_error: Option<String>,
-    /// A modal popup carrying a failure message the user must dismiss —
-    /// louder than `last_error`, used when a background action (e.g. a
-    /// worktree delete) fails after its dialog already closed.
+    /// A modal popup carrying a failure message the user must dismiss.  Every
+    /// failure that has no inline home lands here — a background action (e.g. a
+    /// worktree delete) that failed after its dialog closed, or a shell that
+    /// would not spawn.  Dismissing it leaves the app usable, which an error
+    /// painted over the terminal would not.
     error_dialog: Option<String>,
     quit_dialog_open: bool,
     pending_delete: Option<DeleteRequest>,
@@ -847,7 +848,6 @@ impl AlacritreeApp {
             row_labels,
             config,
             theme,
-            last_error: None,
             error_dialog: None,
             quit_dialog_open: false,
             pending_delete: None,
@@ -897,7 +897,7 @@ impl AlacritreeApp {
         }
 
         if let Err(e) = app.spawn_session(&cc.egui_ctx, None) {
-            app.last_error = Some(format!("failed to spawn shell: {e}"));
+            app.error_dialog = Some(format!("failed to spawn shell: {e}"));
         }
 
         app
@@ -1048,7 +1048,7 @@ impl AlacritreeApp {
             }
             self.active_session.insert(workspace, id);
         } else if let Err(e) = self.spawn_scratchpad(ctx, workspace) {
-            self.last_error = Some(format!("failed to open scratchpad: {e}"));
+            self.error_dialog = Some(format!("failed to open scratchpad: {e}"));
             return;
         }
         self.focus_terminal();
@@ -1104,13 +1104,13 @@ impl AlacritreeApp {
     fn spawn_profile_session(&mut self, ctx: &Context, name: &str) {
         let Some(profile) = self.config.profile(name) else {
             log::warn!("no shell profile named `{name}`");
-            self.last_error = Some(format!("no shell profile named `{name}`"));
+            self.error_dialog = Some(format!("no shell profile named `{name}`"));
             return;
         };
         let (shell, wsl_probe) = profile_session_shell(profile);
         let ws = self.current_workspace.clone();
         if let Err(e) = self.spawn_session_with_shell(ctx, ws, shell, wsl_probe) {
-            self.last_error = Some(format!("failed to spawn profile `{name}`: {e}"));
+            self.error_dialog = Some(format!("failed to spawn profile `{name}`: {e}"));
         }
     }
 
@@ -1157,9 +1157,6 @@ impl AlacritreeApp {
         // click. Switching first would strand the user on a dead workspace
         // with a failed spawn — stay put and let the sidebar re-mark the row.
         if !path.is_dir() {
-            // This is recoverable from the sidebar, so use the dismissible
-            // dialog instead of replacing the terminal with `last_error`
-            // forever.
             self.error_dialog =
                 Some("worktree directory is missing — prune it from the sidebar".to_string());
             if let Some(idx) =
@@ -1187,7 +1184,7 @@ impl AlacritreeApp {
             return;
         }
         if let Err(e) = self.spawn_session(ctx, self.current_workspace.clone()) {
-            self.last_error = Some(format!("failed to spawn shell: {e}"));
+            self.error_dialog = Some(format!("failed to spawn shell: {e}"));
             return;
         }
         // Filling in a missing active entry is self-healing, not navigation.
@@ -1239,7 +1236,7 @@ impl AlacritreeApp {
             && self.config.ui.last_session_close == LastSessionClose::Respawn
         {
             if let Err(e) = self.spawn_session(ctx, workspace) {
-                self.last_error = Some(format!("failed to spawn shell: {e}"));
+                self.error_dialog = Some(format!("failed to spawn shell: {e}"));
             }
             return;
         }
@@ -2475,7 +2472,7 @@ impl AlacritreeApp {
             BindingAction::Named(NamedAction::SpawnNewInstance) => {
                 let ws = self.current_workspace.clone();
                 if let Err(e) = self.spawn_session(ctx, ws) {
-                    self.last_error = Some(format!("failed to spawn shell: {e}"));
+                    self.error_dialog = Some(format!("failed to spawn shell: {e}"));
                 }
             },
             BindingAction::Named(NamedAction::Quit) => {
@@ -2516,7 +2513,7 @@ impl AlacritreeApp {
                             "SpawnProfile{n}: only {} profiles configured",
                             self.config.profiles.len()
                         );
-                        self.last_error = Some(format!("SpawnProfile{n}: no such profile"));
+                        self.error_dialog = Some(format!("SpawnProfile{n}: no such profile"));
                     },
                 }
             },
@@ -3043,7 +3040,7 @@ impl AlacritreeApp {
             let ctx = ui.ctx().clone();
             let ws = self.current_workspace.clone();
             if let Err(e) = self.spawn_session(&ctx, ws) {
-                self.last_error = Some(format!("failed to spawn shell: {e}"));
+                self.error_dialog = Some(format!("failed to spawn shell: {e}"));
             }
         }
         if let Some(name) = spawn_profile {
@@ -3759,12 +3756,17 @@ impl AlacritreeApp {
         }
         if let Some(ws) = spawn_shell_request.take() {
             // Spawning activates the workspace and the new session, matching
-            // Ctrl+T and worktree-creation's open-on-done.
-            self.current_workspace = ws.clone();
-            if let Err(e) = self.spawn_session(ctx, ws) {
-                self.last_error = Some(format!("failed to spawn shell: {e}"));
+            // Ctrl+T and worktree-creation's open-on-done.  A failed spawn
+            // hands the workspace back rather than stranding the user on one
+            // with no shell — the same reasoning as `activate_worktree`.
+            let previous = std::mem::replace(&mut self.current_workspace, ws.clone());
+            match self.spawn_session(ctx, ws) {
+                Ok(_) => workspace_activated = true,
+                Err(e) => {
+                    self.current_workspace = previous;
+                    self.error_dialog = Some(format!("failed to spawn shell: {e}"));
+                },
             }
-            workspace_activated = true;
         }
         if self.config.ui.sidebar_click_focus {
             // A click that picks a workspace or session means "go work
@@ -4241,7 +4243,7 @@ impl AlacritreeApp {
                 self.active_session.insert(Some(workspace), id);
             },
             Err(e) => {
-                self.last_error = Some(format!("failed to open diff: {e}"));
+                self.error_dialog = Some(format!("failed to open diff: {e}"));
             },
         }
     }
@@ -8146,26 +8148,14 @@ impl eframe::App for AlacritreeApp {
             .show(ctx, |ui| {
                 self.show_tab_strip(ui);
 
-                if let Some(err) = self.last_error.as_deref() {
-                    // A preedit can only be finalized or cancelled by the terminal
-                    // view's event drain, so without a session view to run it the
-                    // preedit would go stale and keep shortcuts suppressed forever.
-                    self.ime.clear();
-                    ui.label(
-                        RichText::new(err)
-                            .color(rgb_to_color32(self.config.palette.normal[1]))
-                            .monospace(),
-                    );
-                    return;
-                }
-
                 if self.active_session_index().is_none() {
                     self.adopt_active_session();
                 }
 
                 let Some(idx) = self.active_session_index() else {
-                    // Same rationale as the last_error branch above: without an
-                    // active session view, no code path can advance the preedit.
+                    // A preedit can only be finalized or cancelled by the terminal
+                    // view's event drain, so without a session view to run it the
+                    // preedit would go stale and keep shortcuts suppressed forever.
                     self.ime.clear();
                     ui.label(
                         RichText::new("no session — Ctrl+T to open one").color(theme.text_dim),
