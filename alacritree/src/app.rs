@@ -988,11 +988,13 @@ impl AlacritreeApp {
     /// drops a result the backend could not vouch for and keeps `expanded`,
     /// the shell override, and the label either way.
     fn poll_project_refreshes(&mut self) {
+        let occupied: HashSet<PathBuf> =
+            self.sessions.iter().filter_map(|s| s.working_directory.clone()).collect();
         let projects = &mut self.projects;
         self.project_refreshes.poll(|root, found| {
             match projects.iter_mut().find(|p| p.root == *root) {
                 Some(project) => {
-                    project.apply(found);
+                    project.apply(found, &occupied);
                     Ok(project_json(project))
                 },
                 None => Err(format!("{} is not a project in the sidebar", root.display())),
@@ -1156,7 +1158,9 @@ impl AlacritreeApp {
         // The dir can vanish between discovery marking the row live and the
         // click. Switching first would strand the user on a dead workspace
         // with a failed spawn — stay put and let the sidebar re-mark the row.
-        if !path.is_dir() {
+        // Shells already running there are the exception: they outlive the
+        // directory, and this row is the only way back to them.
+        if !path.is_dir() && !self.workspace_has_sessions(&Some(path.to_path_buf())) {
             self.error_dialog =
                 Some("worktree directory is missing — prune it from the sidebar".to_string());
             if let Some(idx) =
@@ -1183,8 +1187,9 @@ impl AlacritreeApp {
         if self.active_session_index().is_some() {
             return;
         }
-        if let Err(e) = self.spawn_session(ctx, self.current_workspace.clone()) {
-            self.error_dialog = Some(format!("failed to spawn shell: {e}"));
+        let ws = self.current_workspace.clone();
+        if let Err(e) = self.spawn_session(ctx, ws.clone()) {
+            self.report_spawn_failure(ctx, &ws, &e);
             return;
         }
         // Filling in a missing active entry is self-healing, not navigation.
@@ -1235,8 +1240,8 @@ impl AlacritreeApp {
         if verdict != CloseFallback::Stay
             && self.config.ui.last_session_close == LastSessionClose::Respawn
         {
-            if let Err(e) = self.spawn_session(ctx, workspace) {
-                self.error_dialog = Some(format!("failed to spawn shell: {e}"));
+            if let Err(e) = self.spawn_session(ctx, workspace.clone()) {
+                self.report_spawn_failure(ctx, &workspace, &e);
             }
             return;
         }
@@ -1365,6 +1370,22 @@ impl AlacritreeApp {
         Ok(target)
     }
 
+    /// Report a failed spawn, and re-run discovery when the cause was a
+    /// vanished checkout: git may have forgotten the worktree entirely, in
+    /// which case the row should go rather than keep offering a shell that
+    /// cannot start.
+    fn report_spawn_failure(&mut self, ctx: &Context, ws: &WorkspaceKey, e: &std::io::Error) {
+        self.error_dialog = Some(format!("failed to spawn shell: {e}"));
+        let Some(path) = ws.as_deref().filter(|p| !p.is_dir()) else {
+            return;
+        };
+        if let Some(idx) =
+            self.projects.iter().position(|p| p.worktrees.iter().any(|w| w.path == path))
+        {
+            self.refresh_project(ctx, idx);
+        }
+    }
+
     fn workspace_session_indices(&self, ws: &WorkspaceKey) -> Vec<usize> {
         self.sessions
             .iter()
@@ -1454,9 +1475,10 @@ impl AlacritreeApp {
         let mut order: Vec<WorkspaceKey> = vec![None];
         for project in &self.projects {
             for wt in &project.worktrees {
-                // Prunable rows can't host a shell; cycling into one would
-                // just bounce off the activate guard on every keypress.
-                if !wt.prunable {
+                // Prunable rows can't host a *new* shell; cycling into one
+                // would just bounce off the activate guard on every keypress.
+                // One that still holds shells is a real stop on the ring.
+                if !wt.prunable || self.workspace_has_sessions(&Some(wt.path.clone())) {
                     order.push(Some(wt.path.clone()));
                 }
             }
@@ -2471,8 +2493,8 @@ impl AlacritreeApp {
             },
             BindingAction::Named(NamedAction::SpawnNewInstance) => {
                 let ws = self.current_workspace.clone();
-                if let Err(e) = self.spawn_session(ctx, ws) {
-                    self.error_dialog = Some(format!("failed to spawn shell: {e}"));
+                if let Err(e) = self.spawn_session(ctx, ws.clone()) {
+                    self.report_spawn_failure(ctx, &ws, &e);
                 }
             },
             BindingAction::Named(NamedAction::Quit) => {
@@ -3039,8 +3061,8 @@ impl AlacritreeApp {
         if spawn_default {
             let ctx = ui.ctx().clone();
             let ws = self.current_workspace.clone();
-            if let Err(e) = self.spawn_session(&ctx, ws) {
-                self.error_dialog = Some(format!("failed to spawn shell: {e}"));
+            if let Err(e) = self.spawn_session(&ctx, ws.clone()) {
+                self.report_spawn_failure(&ctx, &ws, &e);
             }
         }
         if let Some(name) = spawn_profile {
@@ -3760,11 +3782,11 @@ impl AlacritreeApp {
             // hands the workspace back rather than stranding the user on one
             // with no shell — the same reasoning as `activate_worktree`.
             let previous = std::mem::replace(&mut self.current_workspace, ws.clone());
-            match self.spawn_session(ctx, ws) {
+            match self.spawn_session(ctx, ws.clone()) {
                 Ok(_) => workspace_activated = true,
                 Err(e) => {
                     self.current_workspace = previous;
-                    self.error_dialog = Some(format!("failed to spawn shell: {e}"));
+                    self.report_spawn_failure(ctx, &ws, &e);
                 },
             }
         }
@@ -6517,7 +6539,9 @@ fn worktree_row(
         ui.scroll_to_rect(full_rect, None);
     }
     WorktreeAction {
-        activate: !deleting && resp.clicked() && !delete_clicked && !spawn_clicked && !wt.prunable,
+        // A prunable row is still worth clicking when shells are homed there;
+        // `activate_worktree` turns the ones that aren't into the prune hint.
+        activate: !deleting && resp.clicked() && !delete_clicked && !spawn_clicked,
         delete: delete_clicked,
         spawn: spawn_clicked,
         set_base: set_base_clicked,

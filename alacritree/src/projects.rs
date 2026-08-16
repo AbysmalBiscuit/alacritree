@@ -1,6 +1,6 @@
 //! Enumerate sidebar-added directories and their git worktrees.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use git2::Repository;
@@ -260,11 +260,25 @@ impl Project {
     /// deletion.  `expanded`, `shell_override`, and `label` are user state and
     /// are never touched either way.  One list, so a field cannot be adopted by
     /// the synchronous refresh and dropped by the background one.
-    pub fn apply(&mut self, found: Discovered) {
+    /// `occupied` names the worktrees that still host a live session.  Git
+    /// forgets a worktree the moment it is pruned, but its shells keep
+    /// running, and a row is the only way to reach them — so a dropped
+    /// worktree with sessions is kept as prunable rather than removed.
+    pub fn apply(&mut self, found: Discovered, occupied: &HashSet<PathBuf>) {
         if !found.authoritative {
             return;
         }
-        self.worktrees = found.project.worktrees;
+        let mut worktrees = found.project.worktrees;
+        let stranded: Vec<Worktree> = self
+            .worktrees
+            .drain(..)
+            .filter(|wt| {
+                occupied.contains(&wt.path) && !worktrees.iter().any(|fresh| fresh.path == wt.path)
+            })
+            .map(|wt| Worktree { prunable: true, upstream: None, ..wt })
+            .collect();
+        worktrees.extend(stranded);
+        self.worktrees = worktrees;
         self.default_branch = found.project.default_branch;
         self.home = found.project.home;
     }
@@ -540,10 +554,13 @@ mod tests {
         ];
 
         let before = project.worktrees.clone();
-        project.apply(Discovered {
-            project: Project::placeholder(project.root.clone()),
-            authoritative: false,
-        });
+        project.apply(
+            Discovered {
+                project: Project::placeholder(project.root.clone()),
+                authoritative: false,
+            },
+            &HashSet::new(),
+        );
 
         assert_eq!(project.worktrees.len(), before.len());
         assert_eq!(project.worktrees[1].name, "feature");
@@ -561,10 +578,57 @@ mod tests {
         fresh.worktrees.clear();
         fresh.default_branch = Some("main".to_string());
 
-        project.apply(Discovered { project: fresh, authoritative: true });
+        project.apply(Discovered { project: fresh, authoritative: true }, &HashSet::new());
 
         assert!(project.worktrees.is_empty());
         assert_eq!(project.default_branch.as_deref(), Some("main"));
+    }
+
+    /// `git worktree prune` drops the worktree from discovery while its shells
+    /// keep running.  Dropping the row too would leave them with nowhere to be
+    /// reached from.
+    #[test]
+    fn apply_keeps_a_dropped_worktree_that_still_holds_sessions() {
+        let mut project = Project::placeholder(PathBuf::from("/repo"));
+        project.worktrees = vec![Worktree {
+            name: "gone".to_string(),
+            path: PathBuf::from("/repo-worktrees/gone"),
+            branch: Some("feature".to_string()),
+            is_main: false,
+            prunable: false,
+            upstream: None,
+        }];
+
+        let mut fresh = Project::placeholder(PathBuf::from("/repo"));
+        fresh.worktrees.clear();
+        let occupied = HashSet::from([PathBuf::from("/repo-worktrees/gone")]);
+
+        project.apply(Discovered::found(fresh), &occupied);
+
+        let kept = project.worktrees.first().expect("the row survives its checkout");
+        assert_eq!(kept.path, PathBuf::from("/repo-worktrees/gone"));
+        assert_eq!(kept.branch.as_deref(), Some("feature"), "the branch still names the row");
+        assert!(kept.prunable, "but it can no longer host a new shell");
+    }
+
+    #[test]
+    fn apply_drops_a_worktree_once_its_last_session_is_gone() {
+        let mut project = Project::placeholder(PathBuf::from("/repo"));
+        project.worktrees = vec![Worktree {
+            name: "gone".to_string(),
+            path: PathBuf::from("/repo-worktrees/gone"),
+            branch: None,
+            is_main: false,
+            prunable: true,
+            upstream: None,
+        }];
+
+        let mut fresh = Project::placeholder(PathBuf::from("/repo"));
+        fresh.worktrees.clear();
+
+        project.apply(Discovered::found(fresh), &HashSet::new());
+
+        assert!(project.worktrees.is_empty());
     }
 
     #[test]
@@ -767,7 +831,7 @@ worktree /home/lev/wt/tmp\0HEAD 0011223344556677\0detached\0\0";
         fresh.default_branch = Some("main".to_string());
         fresh.home = Some("/home/lev".to_string());
 
-        existing.apply(Discovered::found(fresh));
+        existing.apply(Discovered::found(fresh), &HashSet::new());
 
         assert_eq!(existing.home.as_deref(), Some("/home/lev"));
         assert_eq!(existing.default_branch.as_deref(), Some("main"));
