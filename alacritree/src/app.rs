@@ -1014,6 +1014,11 @@ impl AlacritreeApp {
             Some(Ok(results)) => {
                 self.liveness.adopt(results, now);
                 self.liveness_probe = None;
+                // This runs after the rows painted, so the answers that just
+                // landed are one frame late. Without asking for that frame the
+                // new styling waits out a whole interval, or never arrives at
+                // all once the grace window has closed.
+                ctx.request_repaint();
             },
             // A worker still running is the backpressure: a path slower than
             // the interval stretches freshness instead of stacking up probes,
