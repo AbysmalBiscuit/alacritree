@@ -34,15 +34,19 @@ pub enum Liveness {
     Unknown,
 }
 
-/// Read `path`'s state.  `metadata` rather than `is_dir` so the difference
-/// between "not there" and "could not tell" survives: `is_dir` folds every
-/// error into `false`.
+/// Whether `path` is still a worktree checkout, which is `.git`'s presence
+/// rather than the directory's.  `git worktree remove` deletes the contents
+/// first and only then the directory itself, so a remove that loses the last
+/// step — the usual outcome on Windows, where a shell sitting in the directory
+/// pins it — leaves an empty husk behind.  Git calls that worktree gone and
+/// refuses to remove it twice ("validation failed: '<path>/.git' does not
+/// exist"); stat'ing the directory would call it alive.
+///
+/// `metadata` rather than `exists` so the difference between "not there" and
+/// "could not tell" survives: `exists` folds every error into `false`.
 pub fn probe(path: &Path) -> Liveness {
-    match std::fs::metadata(path) {
-        Ok(meta) if meta.is_dir() => Liveness::Present,
-        // Something is there but cannot host a shell, which is all the flag
-        // governs.
-        Ok(_) => Liveness::Missing,
+    match std::fs::metadata(path.join(".git")) {
+        Ok(_) => Liveness::Present,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Liveness::Missing,
         Err(_) => Liveness::Unknown,
     }
@@ -121,6 +125,33 @@ mod tests {
 
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)
+    }
+
+    #[test]
+    fn a_checkout_with_its_git_link_is_present() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".git"), "gitdir: /somewhere/.git/worktrees/x").unwrap();
+
+        assert_eq!(probe(dir.path()), Liveness::Present);
+    }
+
+    /// `git worktree remove` deletes the contents and only then the directory,
+    /// so on Windows a shell sitting in it leaves this behind.  Git treats the
+    /// worktree as gone; stat'ing the directory would not.
+    #[test]
+    fn the_husk_left_by_a_half_finished_remove_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert_eq!(probe(dir.path()), Liveness::Missing);
+    }
+
+    #[test]
+    fn a_checkout_deleted_outright_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        drop(dir);
+
+        assert_eq!(probe(&path), Liveness::Missing);
     }
 
     #[test]
