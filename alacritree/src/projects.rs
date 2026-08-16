@@ -167,7 +167,7 @@ impl Project {
                     .clone()
                     .or_else(|| rec.head.as_ref().map(|h| h.chars().take(7).collect()));
                 let wt_name = if i == 0 { "main".to_string() } else { display_name(&path) };
-                let prunable = i != 0 && !path.is_dir();
+                let prunable = i != 0 && crate::worktree_liveness::is_gone(&path);
                 let upstream = rec.branch.as_deref().and_then(|b| upstreams.get(b).cloned());
                 Worktree { name: wt_name, path, branch, is_main: i == 0, prunable, upstream }
             })
@@ -224,10 +224,12 @@ impl Project {
                     let upstream = lookup(&branch, detached);
                     worktrees.push(Worktree {
                         name: name.to_string(),
-                        // Directory existence, not git2's `is_prunable`, is
-                        // the signal: a *locked* worktree with a missing dir
-                        // is not git-prunable but still can't host a shell.
-                        prunable: !path.is_dir(),
+                        // The checkout's own `.git`, not git2's `is_prunable`: a
+                        // *locked* worktree with a missing checkout is not
+                        // git-prunable but still cannot host a shell, and a
+                        // half-finished remove leaves the directory behind
+                        // without it.
+                        prunable: crate::worktree_liveness::is_gone(&path),
                         path,
                         branch,
                         is_main: false,

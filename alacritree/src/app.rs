@@ -1078,9 +1078,19 @@ impl AlacritreeApp {
         ctx: &Context,
         working_directory: WorkspaceKey,
     ) -> std::io::Result<SessionId> {
-        // Before the PTY exists, so the shell can't race `doppler run`
-        // against the scope write.
         if let Some(dir) = &working_directory {
+            // A checkout git has forgotten is refused here rather than in
+            // `Session::spawn`, which can only see whether the directory
+            // exists — a half-finished `git worktree remove` leaves one that
+            // does.  Refusing here is what keeps the greyed row's promise.
+            if self.worktree_gone(dir) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("worktree is no longer checked out: {}", dir.display()),
+                ));
+            }
+            // Before the PTY exists, so the shell can't race `doppler run`
+            // against the scope write.
             self.sync_doppler_scopes(dir.clone());
         }
         let (shell, wsl_probe) = self.resolve_shell(&working_directory);
@@ -1231,7 +1241,7 @@ impl AlacritreeApp {
         // with a failed spawn — stay put and let the sidebar re-mark the row.
         // Shells already running there are the exception: they outlive the
         // directory, and this row is the only way back to them.
-        if !path.is_dir() && !self.workspace_has_sessions(&Some(path.to_path_buf())) {
+        if self.worktree_gone(path) && !self.workspace_has_sessions(&Some(path.to_path_buf())) {
             self.error_dialog =
                 Some("worktree directory is missing — prune it from the sidebar".to_string());
             if let Some(idx) =
@@ -1376,7 +1386,7 @@ impl AlacritreeApp {
         // Discovery marking can be stale; a dir deleted since the last
         // refresh should still get the prune flow, not a doomed
         // `git worktree remove`.
-        let prunable = wt.prunable || !wt.path.is_dir();
+        let prunable = wt.prunable || worktree_liveness::is_gone(&wt.path);
         self.pending_delete = Some(DeleteRequest {
             project_idx,
             worktree_path: wt.path.clone(),
@@ -1441,13 +1451,31 @@ impl AlacritreeApp {
         Ok(target)
     }
 
+    /// Whether the sidebar worktree at `path` is one git no longer recognises,
+    /// which is the single question the row's styling, this guard and the
+    /// delete flow all ask — a greyed row that still spawns a shell would be
+    /// the inconsistency this exists to remove.
+    ///
+    /// Main checkouts and non-git project roots have no `.git` link to lose,
+    /// so they fall back to the directory itself; so does a path no project
+    /// lists, which is the safe default for a caller we cannot place.
+    fn worktree_gone(&self, path: &Path) -> bool {
+        let linked = self
+            .projects
+            .iter()
+            .flat_map(|p| &p.worktrees)
+            .find(|wt| wt.path == path)
+            .is_some_and(|wt| !wt.is_main);
+        if linked { worktree_liveness::is_gone(path) } else { !path.is_dir() }
+    }
+
     /// Report a failed spawn, and re-run discovery when the cause was a
     /// vanished checkout: git may have forgotten the worktree entirely, in
     /// which case the row should go rather than keep offering a shell that
     /// cannot start.
     fn report_spawn_failure(&mut self, ctx: &Context, ws: &WorkspaceKey, e: &std::io::Error) {
         self.error_dialog = Some(format!("failed to spawn shell: {e}"));
-        let Some(path) = ws.as_deref().filter(|p| !p.is_dir()) else {
+        let Some(path) = ws.as_deref().filter(|p| self.worktree_gone(p)) else {
             return;
         };
         if let Some(idx) =

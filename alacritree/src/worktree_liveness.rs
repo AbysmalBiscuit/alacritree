@@ -52,6 +52,15 @@ pub fn probe(path: &Path) -> Liveness {
     }
 }
 
+/// Whether git would call this checkout gone.  The single question the row,
+/// the activate guard, the spawn guard and discovery all ask, so a greyed row
+/// and a refused shell never disagree about the same directory.  A probe that
+/// could not tell answers `false`: an unreachable filesystem must not turn
+/// into a refusal.
+pub fn is_gone(path: &Path) -> bool {
+    probe(path) == Liveness::Missing
+}
+
 /// Probe results keyed by worktree path, plus when the next batch is due.
 /// Entries live only as long as the sidebar keeps drawing their path, so a
 /// project the user removes does not leave its worktrees behind.
