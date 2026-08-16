@@ -897,6 +897,12 @@ pub struct UiTheme {
     /// from local refs only — nothing fetches, so a branch deleted on the remote
     /// still reads as tracked until something prunes.
     pub upstream_status: bool,
+    /// Re-check on a 1.5 s tick whether each listed worktree's checkout is
+    /// still on disk, so a `git worktree remove` typed into one of our own
+    /// sessions greys the row without waiting for a manual refresh.  On by
+    /// default; the escape hatch exists because the probe is a `stat` per
+    /// listed row and an exotic filesystem could make that expensive.
+    pub worktree_liveness: bool,
     /// `[ui] pr_status_concurrency`: max `gh` lookups in flight at once.
     /// Defaults to 8; clamped to ≥ 1, since a cold cache spawns one lookup
     /// per eligible worktree in a single frame and an unbounded cap would
@@ -953,6 +959,7 @@ impl Default for UiTheme {
             session_display: SessionDisplay::default(),
             pr_status: false,
             upstream_status: false,
+            worktree_liveness: true,
             pr_status_concurrency: DEFAULT_CONCURRENCY,
             icons: Icons::default(),
             focus_outline: FocusOutline::default(),
@@ -1711,6 +1718,7 @@ struct RawUi {
     scrollbar: Option<String>,
     pr_status: Option<bool>,
     upstream_status: Option<bool>,
+    worktree_liveness: Option<bool>,
     /// Max `gh` lookups in flight at once.  Defaults to 8; clamped to ≥ 1.
     pr_status_concurrency: Option<usize>,
     font: RawUiFont,
@@ -1886,6 +1894,7 @@ impl RawConfig {
             },
             pr_status: self.ui.pr_status.unwrap_or(false),
             upstream_status: self.ui.upstream_status.unwrap_or(false),
+            worktree_liveness: self.ui.worktree_liveness.unwrap_or(true),
             pr_status_concurrency: self
                 .ui
                 .pr_status_concurrency

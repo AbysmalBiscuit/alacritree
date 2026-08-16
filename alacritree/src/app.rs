@@ -46,6 +46,7 @@ use crate::state::{self, PersistedProject};
 use crate::terminal_view;
 use crate::upstream::UpstreamState;
 use crate::worktree::{self as wt, CreateRequest, Progress};
+use crate::worktree_liveness;
 use crate::wsl::{self, ShellChoice};
 use crate::wsl_helper::{self, WslProbe};
 
@@ -354,6 +355,12 @@ fn project_filter_toggles(pr_status: bool) -> &'static [char] {
 /// The toggle identities the git panel accepts: modified, deleted, untracked.
 const GIT_FILTER_TOGGLES: &[char] = &['m', 'd', 'u'];
 
+/// How long after the user's last event the worktree liveness tick keeps
+/// asking for frames.  Long enough that a `git worktree remove` typed at a
+/// prompt finishes and greys its row; short enough that a window left open
+/// goes back to producing no frames at all.
+const PROBE_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The projects-panel toggle a named action flips, or `None` for an action that
 /// is not one of its filters.  `PanelFilter::toggle` ignores an identity it does
 /// not allow and dispatch falls through on an unmatched action, so nothing at
@@ -562,6 +569,15 @@ pub struct AlacritreeApp {
     /// `pending_project_refresh` — resolved off the UI thread, adopted in
     /// `wsl_delta_path`.
     pending_delta: HashMap<String, Receiver<Option<String>>>,
+    /// Row styling only — never `Worktree::prunable`, which the delete flow
+    /// reads to choose between removing a worktree and pruning it.
+    liveness: worktree_liveness::LivenessCache,
+    /// The probe worker in flight, if any.  One at a time: a path slower than
+    /// the interval stretches freshness rather than queueing more work.
+    liveness_probe: Option<Receiver<Vec<(PathBuf, worktree_liveness::Liveness)>>>,
+    /// When the user last gave the app an event.  Timed wake-ups are armed
+    /// only just after one, so an app left open overnight goes fully quiet.
+    last_input: Instant,
     /// Rows behind the last-built focus snapshot. Paint reuses this until the
     /// next rebuild instead of recomputing the projection every frame.
     sidebar_rows_cache: Option<Vec<SidebarRow>>,
@@ -876,6 +892,9 @@ impl AlacritreeApp {
             project_refreshes: Default::default(),
             wsl_delta_paths: HashMap::new(),
             pending_delta: HashMap::new(),
+            liveness: Default::default(),
+            liveness_probe: None,
+            last_input: Instant::now(),
             sidebar_rows_cache: None,
             sidebar_focus_prev: None,
             sidebar_anchor: None,
@@ -974,6 +993,53 @@ impl AlacritreeApp {
             ctx.request_repaint();
         });
         self.project_refreshes.start(root, rx);
+    }
+
+    /// Keep the worktree rows the sidebar just drew honest about whether their
+    /// checkout is still there.  Discovery only re-runs when something asks it
+    /// to, so a `git worktree remove` typed into one of our own sessions would
+    /// otherwise leave the row looking live until the user pressed refresh.
+    ///
+    /// `request_repaint_after` is what carries the tick across a terminal that
+    /// has gone quiet — egui paints on demand, so without it the probe would
+    /// never run a second time.  It is armed only for a short window after the
+    /// user last touched the app, because an unconditional 1.5 s wake-up is
+    /// not just a repaint: every frame runs `StatusCache::poll` and
+    /// `PrCache::poll` from the git sidebar's paint, both on the same
+    /// staleness interval, so a permanent heartbeat would spawn a git status
+    /// walk and a `gh` lookup forever on an app nobody is using.
+    fn poll_worktree_liveness(&mut self, ctx: &Context, drawn: &[PathBuf]) {
+        let now = Instant::now();
+        match self.liveness_probe.as_ref().map(Receiver::try_recv) {
+            Some(Ok(results)) => {
+                self.liveness.adopt(results, now);
+                self.liveness_probe = None;
+            },
+            // A worker still running is the backpressure: a path slower than
+            // the interval stretches freshness instead of stacking up probes,
+            // and its own `request_repaint` brings us back here.
+            Some(Err(TryRecvError::Empty)) => return,
+            Some(Err(TryRecvError::Disconnected)) => self.liveness_probe = None,
+            None => {},
+        }
+
+        if !drawn.is_empty() {
+            let batch = self.liveness.batch(drawn);
+            let (tx, rx) = mpsc::channel();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let results =
+                    batch.iter().map(|p| (p.clone(), worktree_liveness::probe(p))).collect();
+                let _ = tx.send(results);
+                ctx.request_repaint();
+            });
+            self.liveness_probe = Some(rx);
+            return;
+        }
+
+        if self.config.ui.worktree_liveness && self.last_input.elapsed() < PROBE_GRACE {
+            ctx.request_repaint_after(self.liveness.wait(now));
+        }
     }
 
     /// Re-run worktree discovery for every project — the keyboard/IPC
@@ -3072,6 +3138,15 @@ impl AlacritreeApp {
     }
 
     fn show_project_sidebar(&mut self, ctx: &Context, panel_frame: Frame) -> egui::Rect {
+        // Only rows that actually paint are worth a liveness probe, and which
+        // ones those are is not known until the tree, its filters and its
+        // collapsed projects have all had their say.  Deciding *before* the
+        // walk that this frame is not a probe frame is what keeps the other
+        // ~89 frames of every 90 from collecting anything at all.
+        let probing = self.config.ui.worktree_liveness
+            && self.liveness_probe.is_none()
+            && self.liveness.wants_probe(Instant::now());
+        let drawn_worktrees: std::cell::RefCell<Vec<PathBuf>> = Default::default();
         let activate_request: std::cell::Cell<Option<PathBuf>> = std::cell::Cell::new(None);
         let delete_request: std::cell::Cell<Option<PathBuf>> = std::cell::Cell::new(None);
         let create_request: std::cell::Cell<Option<usize>> = std::cell::Cell::new(None);
@@ -3645,9 +3720,23 @@ impl AlacritreeApp {
                                 );
                                 let wt_scroll = scrolls(is_cursor);
                                 let is_deleting = deleting_paths.contains(&wt.path);
+                                // A `\\wsl.localhost\` stat boots the distro's
+                                // 9P server, so probing one would restart a VM
+                                // the user had shut down and hold it resident
+                                // for as long as its worktrees are listed.
+                                // WSL rows keep discovery's word.
+                                if probing
+                                    && matches!(
+                                        wsl::classify(&wt.path),
+                                        wsl::Location::Windows(_)
+                                    )
+                                {
+                                    drawn_worktrees.borrow_mut().push(wt.path.clone());
+                                }
                                 let action = worktree_row(
                                     ui,
                                     wt,
+                                    self.liveness.missing(&wt.path),
                                     worktree_labels
                                         .get(idx)
                                         .and_then(|v| v.get(wt_idx))
@@ -3790,6 +3879,7 @@ impl AlacritreeApp {
                 },
             }
         }
+        self.poll_worktree_liveness(ctx, &drawn_worktrees.into_inner());
         if self.config.ui.sidebar_click_focus {
             // A click that picks a workspace or session means "go work
             // there", so it focuses the terminal; other panel clicks focus
@@ -6348,6 +6438,11 @@ fn upstream_badge<'a>(
 fn worktree_row(
     ui: &mut egui::Ui,
     wt: &Worktree,
+    // What the liveness probe has seen since discovery ran, if anything.
+    // `Some` overrides `wt.prunable` in both directions; `None` leaves it
+    // standing.  Kept out of the flag itself because that also picks between
+    // `git worktree remove` and a prune, and a probe must never decide that.
+    missing: Option<bool>,
     display_name: &str,
     pr: Option<&PrInfo>,
     is_active: bool,
@@ -6372,6 +6467,9 @@ fn worktree_row(
     // The leading and trailing groups run as sibling closures, so the status
     // slot's hint travels out separately and joins the rest afterwards.
     let mut status_hint = None;
+    // Discovery's word, corrected by whatever the probe has seen since.  The
+    // main worktree is never offered for pruning, so it never greys either.
+    let prunable = missing.map_or(wt.prunable, |gone| gone && !wt.is_main);
     // right: 0 keeps the worktree `×` at the same x as the project row's `×`,
     // which has no frame margin and sits flush against the panel's outer padding.
     let frame = Frame::default().inner_margin(Margin { left: 16, right: 0, top: 3, bottom: 3 });
@@ -6382,7 +6480,7 @@ fn worktree_row(
             } else {
                 (&icons.worktree, DEFAULT_WORKTREE_ICON)
             };
-            let name_color = if wt.prunable || deleting {
+            let name_color = if prunable || deleting {
                 theme.text_muted
             } else if is_active {
                 theme.text
@@ -6421,11 +6519,8 @@ fn worktree_row(
                         return;
                     }
                     if !wt.is_main {
-                        let hover = if wt.prunable {
-                            "prune worktree"
-                        } else {
-                            "delete worktree and branch"
-                        };
+                        let hover =
+                            if prunable { "prune worktree" } else { "delete worktree and branch" };
                         let btn = styled_icon_button(
                             ui,
                             &icons.delete_worktree,
@@ -6492,7 +6587,7 @@ fn worktree_row(
         hints.add(rect, hint);
     }
     let resp = hints.apply(resp, theme.icon_tooltips, |resp| {
-        if wt.prunable {
+        if prunable {
             resp.on_hover_text("worktree directory is missing — × prunes it")
         } else {
             name_tooltip(resp, display_name, name_elided, theme.sidebar_tooltips)
@@ -8098,6 +8193,9 @@ impl eframe::App for AlacritreeApp {
             .as_ref()
             .map(|_| (std::time::Instant::now(), crate::frame_log::output_wait()));
         self.grid_paint = std::time::Duration::ZERO;
+        if ctx.input(|i| !i.events.is_empty()) {
+            self.last_input = Instant::now();
+        }
         self.phases.restart();
         self.glyph_cache.begin_frame(ctx);
         self.poll_project_refreshes();
@@ -9996,7 +10094,8 @@ mod tests {
 
         let texts = texts_while_hovering(140.0, |ui| {
             worktree_row(
-                ui, &wt, &wt.name, None, true, false, false, false, None, false, &icons, &theme,
+                ui, &wt, None, &wt.name, None, true, false, false, false, None, false, &icons,
+                &theme,
             );
         });
 
@@ -10156,7 +10255,8 @@ mod tests {
         let output = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 worktree_row(
-                    ui, &wt, &wt.name, None, true, false, false, false, None, false, &icons, &theme,
+                    ui, &wt, None, &wt.name, None, true, false, false, false, None, false, &icons,
+                    &theme,
                 );
             });
         });
@@ -10279,6 +10379,7 @@ mod tests {
             worktree_row(
                 ui,
                 &wt,
+                None,
                 &wt.name,
                 Some(&pr),
                 true,
@@ -10587,7 +10688,8 @@ mod tests {
         let output = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 worktree_row(
-                    ui, &wt, &wt.name, None, true, false, false, false, None, false, &icons, &theme,
+                    ui, &wt, None, &wt.name, None, true, false, false, false, None, false, &icons,
+                    &theme,
                 );
             });
         });
@@ -10640,7 +10742,8 @@ mod tests {
 
             let texts = texts_while_hovering(140.0, |ui| {
                 worktree_row(
-                    ui, &wt, name, None, true, false, false, false, None, false, &icons, &theme,
+                    ui, &wt, None, name, None, true, false, false, false, None, false, &icons,
+                    &theme,
                 );
             });
 
@@ -10702,6 +10805,7 @@ mod tests {
                 worktree_row(
                     ui,
                     &wt,
+                    None,
                     &wt.name,
                     Some(&pr),
                     true,
