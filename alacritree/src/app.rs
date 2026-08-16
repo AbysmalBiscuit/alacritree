@@ -1004,11 +1004,17 @@ impl AlacritreeApp {
     /// has gone quiet — egui paints on demand, so without it the probe would
     /// never run a second time.  It is armed only for a short window after the
     /// user last touched the app, because an unconditional 1.5 s wake-up is
-    /// not just a repaint: every frame runs `StatusCache::poll` and
-    /// `PrCache::poll` from the git sidebar's paint, both on the same
-    /// staleness interval, so a permanent heartbeat would spawn a git status
-    /// walk and a `gh` lookup forever on an app nobody is using.
-    fn poll_worktree_liveness(&mut self, ctx: &Context, drawn: &[PathBuf]) {
+    /// not just a repaint: every frame runs `StatusCache::poll` from the git
+    /// sidebar's paint on the same staleness interval, so a permanent
+    /// heartbeat would spawn a git status walk forever on an app nobody is
+    /// using.
+    ///
+    /// `probing` is the sidebar's decision, not a re-derivation: only it knows
+    /// whether the walk that produced `drawn` was collecting at all, and an
+    /// empty `drawn` on a probe frame ("nothing eligible painted") has to
+    /// restart the interval where an empty `drawn` on any other frame must
+    /// leave it alone.
+    fn poll_worktree_liveness(&mut self, ctx: &Context, probing: bool, drawn: &[PathBuf]) {
         let now = Instant::now();
         match self.liveness_probe.as_ref().map(Receiver::try_recv) {
             Some(Ok(results)) => {
@@ -1028,22 +1034,30 @@ impl AlacritreeApp {
             None => {},
         }
 
-        if !drawn.is_empty() {
+        if probing {
             let batch = self.liveness.batch(drawn);
-            let (tx, rx) = mpsc::channel();
-            let ctx = ctx.clone();
-            std::thread::spawn(move || {
-                let results =
-                    batch.iter().map(|p| (p.clone(), worktree_liveness::probe(p))).collect();
-                let _ = tx.send(results);
-                ctx.request_repaint();
-            });
-            self.liveness_probe = Some(rx);
-            return;
+            if batch.is_empty() {
+                // No worker will land to close the interval, so close it here.
+                self.liveness.adopt(Vec::new(), now);
+            } else {
+                let (tx, rx) = mpsc::channel();
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    let results =
+                        batch.iter().map(|p| (p.clone(), worktree_liveness::probe(p))).collect();
+                    let _ = tx.send(results);
+                    ctx.request_repaint();
+                });
+                self.liveness_probe = Some(rx);
+                return;
+            }
         }
 
-        if self.config.ui.worktree_liveness && self.last_input.elapsed() < PROBE_GRACE {
-            ctx.request_repaint_after(self.liveness.wait(now));
+        if self.config.ui.worktree_liveness
+            && self.last_input.elapsed() < PROBE_GRACE
+            && let Some(wait) = self.liveness.wait(now)
+        {
+            ctx.request_repaint_after(wait);
         }
     }
 
@@ -1058,13 +1072,19 @@ impl AlacritreeApp {
     /// Adopt completed background discoveries through `Project::apply`, which
     /// drops a result the backend could not vouch for and keeps `expanded`,
     /// the shell override, and the label either way.
+    ///
+    /// Runs every frame, so the occupied-directory set is built inside the
+    /// callback: hoisting it would clone every session's path on every repaint
+    /// terminal output happened to trigger, for the discoveries that are not
+    /// running.
     fn poll_project_refreshes(&mut self) {
-        let occupied: HashSet<PathBuf> =
-            self.sessions.iter().filter_map(|s| s.working_directory.clone()).collect();
+        let sessions = &self.sessions;
         let projects = &mut self.projects;
         self.project_refreshes.poll(|root, found| {
             match projects.iter_mut().find(|p| p.root == *root) {
                 Some(project) => {
+                    let occupied: HashSet<PathBuf> =
+                        sessions.iter().filter_map(|s| s.working_directory.clone()).collect();
                     project.apply(found, &occupied);
                     Ok(project_json(project))
                 },
@@ -1077,6 +1097,21 @@ impl AlacritreeApp {
         &mut self,
         ctx: &Context,
         working_directory: WorkspaceKey,
+    ) -> std::io::Result<SessionId> {
+        let (shell, wsl_probe) = self.resolve_shell(&working_directory);
+        self.spawn_session_with_shell(ctx, working_directory, shell, wsl_probe)
+    }
+
+    /// The one path every shell reaches, which is why the checkout guard and
+    /// the Doppler sync live here rather than in `spawn_session`: a named
+    /// profile arrives with its shell already chosen and would otherwise open
+    /// in a checkout Ctrl+T refuses.
+    fn spawn_session_with_shell(
+        &mut self,
+        ctx: &Context,
+        working_directory: WorkspaceKey,
+        shell: Option<Shell>,
+        wsl_probe: Option<WslProbe>,
     ) -> std::io::Result<SessionId> {
         if let Some(dir) = &working_directory {
             // A checkout git has forgotten is refused here rather than in
@@ -1093,17 +1128,6 @@ impl AlacritreeApp {
             // against the scope write.
             self.sync_doppler_scopes(dir.clone());
         }
-        let (shell, wsl_probe) = self.resolve_shell(&working_directory);
-        self.spawn_session_with_shell(ctx, working_directory, shell, wsl_probe)
-    }
-
-    fn spawn_session_with_shell(
-        &mut self,
-        ctx: &Context,
-        working_directory: WorkspaceKey,
-        shell: Option<Shell>,
-        wsl_probe: Option<WslProbe>,
-    ) -> std::io::Result<SessionId> {
         let session = Session::spawn(
             ctx.clone(),
             &self.config,
@@ -1459,13 +1483,18 @@ impl AlacritreeApp {
     /// Main checkouts and non-git project roots have no `.git` link to lose,
     /// so they fall back to the directory itself; so does a path no project
     /// lists, which is the safe default for a caller we cannot place.
+    ///
+    /// The same path can be listed by two projects, so any row that calls it a
+    /// linked worktree decides.  Taking the first match instead would let
+    /// sidebar order pick the weaker test, and the husk of a linked checkout
+    /// would read as alive.
     fn worktree_gone(&self, path: &Path) -> bool {
         let linked = self
             .projects
             .iter()
             .flat_map(|p| &p.worktrees)
-            .find(|wt| wt.path == path)
-            .is_some_and(|wt| !wt.is_main);
+            .filter(|wt| wt.path == path)
+            .any(|wt| !wt.is_main);
         if linked { worktree_liveness::is_gone(path) } else { !path.is_dir() }
     }
 
@@ -3912,7 +3941,7 @@ impl AlacritreeApp {
                 },
             }
         }
-        self.poll_worktree_liveness(ctx, &drawn_worktrees.into_inner());
+        self.poll_worktree_liveness(ctx, probing, &drawn_worktrees.into_inner());
         if self.config.ui.sidebar_click_focus {
             // A click that picks a workspace or session means "go work
             // there", so it focuses the terminal; other panel clicks focus

@@ -94,37 +94,39 @@ impl LivenessCache {
     }
 
     /// Take the batch to probe, forgetting every path the sidebar no longer
-    /// draws.  All visible paths go in together: they are checked on one
-    /// worker, so splitting them by individual freshness would buy nothing.
+    /// draws — including all of them, when a filter or a collapsed project
+    /// leaves nothing eligible.  All visible paths go in together: they are
+    /// checked on one worker, so splitting them by individual freshness would
+    /// buy nothing.
     pub fn batch(&mut self, visible: &[PathBuf]) -> Vec<PathBuf> {
         self.states.retain(|path, _| visible.contains(path));
         visible.to_vec()
     }
 
-    /// An `Unknown` result keeps whatever the last definite answer was: a
-    /// distro that stops answering must not silently grey out every row it
-    /// owns.  The interval restarts either way, so an unreachable path is
-    /// retried on the tick rather than on every frame.
+    /// An `Unknown` result replaces the last answer rather than preserving
+    /// it.  Keeping it would leave the row claiming a checkout is gone while
+    /// `is_gone` — which has no memory, and refuses to call an unreadable path
+    /// missing — lets that same path spawn a shell.  Forgetting instead makes
+    /// both say "cannot tell" and hands the row back to discovery's word.
+    ///
+    /// A round that probed nothing still restarts the interval, so a frame
+    /// with no eligible rows cannot leave `wants_probe` true forever.
     pub fn adopt(&mut self, results: Vec<(PathBuf, Liveness)>, now: Instant) {
         for (path, state) in results {
-            match state {
-                Liveness::Unknown => {
-                    self.states.entry(path).or_insert(Liveness::Unknown);
-                },
-                definite => {
-                    self.states.insert(path, definite);
-                },
-            }
+            self.states.insert(path, state);
         }
         self.next_probe = Some(now + FRESH_FOR);
     }
 
-    /// How long until the next batch is due, for `request_repaint_after`.
+    /// How long until the next batch is due, for `request_repaint_after`, or
+    /// `None` when no batch has ever run and there is nothing to wake up for.
     /// Without that wake-up the sidebar would only re-probe when something
     /// else happened to draw a frame, and a worktree deleted from an otherwise
-    /// idle terminal would stay marked live indefinitely.
-    pub fn wait(&self, now: Instant) -> Duration {
-        self.next_probe.map_or(Duration::ZERO, |due| due.saturating_duration_since(now))
+    /// idle terminal would stay marked live indefinitely.  The `Option` is
+    /// what keeps "no deadline" from collapsing into a zero wait, which
+    /// `request_repaint_after` reads as "repaint now" — every frame, forever.
+    pub fn wait(&self, now: Instant) -> Option<Duration> {
+        self.next_probe.map(|due| due.saturating_duration_since(now))
     }
 }
 
@@ -190,22 +192,37 @@ mod tests {
         assert_eq!(cache.missing(&p("/a")), Some(true));
     }
 
-    /// A distro that stops answering turns every path it owns `Unknown`.
-    /// Letting that grey the rows would report a deleted worktree every time
-    /// WSL hiccups.
+    /// A distro that stops answering turns every path it owns `Unknown`.  The
+    /// row has to stop claiming those checkouts are gone, because `is_gone`
+    /// has already stopped refusing to spawn shells in them.
     #[test]
-    fn an_unknown_result_leaves_the_last_answer_standing() {
+    fn an_unknown_result_forgets_the_last_answer() {
         let now = Instant::now();
         let mut cache = LivenessCache::default();
         cache.adopt(vec![(p("/a"), Liveness::Missing)], now);
 
         cache.adopt(vec![(p("/a"), Liveness::Unknown)], now + FRESH_FOR);
 
-        assert_eq!(cache.missing(&p("/a")), Some(true), "the last definite answer stands");
+        assert_eq!(cache.missing(&p("/a")), None, "neither greyed nor vouched for");
         assert!(
             !cache.wants_probe(now + FRESH_FOR),
             "but the failed probe still restarts the tick"
         );
+    }
+
+    /// A frame whose rows are all collapsed, filtered away or on WSL probes
+    /// nothing.  Leaving the interval open would keep `wait` at zero, and the
+    /// caller's `request_repaint_after` would then ask for the next frame on
+    /// every frame.
+    #[test]
+    fn a_round_that_probed_nothing_still_restarts_the_interval() {
+        let now = Instant::now();
+        let mut cache = LivenessCache::default();
+
+        cache.adopt(Vec::new(), now);
+
+        assert!(!cache.wants_probe(now + FRESH_FOR / 2));
+        assert_eq!(cache.wait(now), Some(FRESH_FOR));
     }
 
     /// `git worktree add` on the same path brings the checkout back; the row
@@ -236,10 +253,12 @@ mod tests {
     fn the_wait_counts_down_to_the_next_batch() {
         let now = Instant::now();
         let mut cache = LivenessCache::default();
+        assert_eq!(cache.wait(now), None, "nothing to wake up for before the first batch");
+
         cache.adopt(vec![(p("/a"), Liveness::Present)], now);
 
-        assert_eq!(cache.wait(now + FRESH_FOR / 2), FRESH_FOR / 2);
+        assert_eq!(cache.wait(now + FRESH_FOR / 2), Some(FRESH_FOR / 2));
         // An overdue tick asks for the next frame, not a negative span.
-        assert_eq!(cache.wait(now + FRESH_FOR * 2), Duration::ZERO);
+        assert_eq!(cache.wait(now + FRESH_FOR * 2), Some(Duration::ZERO));
     }
 }
