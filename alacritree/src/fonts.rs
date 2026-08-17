@@ -38,6 +38,7 @@ pub const BOLD_ITALIC_FAMILY: &str = "alacritree_bold_italic";
 /// font that already has a glyph keeps rendering it.
 const SYMBOLS_FONT: &[u8] = include_bytes!("../assets/alacritree-symbols.ttf");
 const SYMBOLS_ID: &str = "alacritree_symbols";
+const USER_FALLBACK_ID: &str = "alacritree_fallback_";
 
 const NORMAL_FONT_ID: &str = "alacritree_terminal_normal";
 const BOLD_FONT_ID: &str = "alacritree_terminal_bold";
@@ -590,7 +591,7 @@ fn register_user_fallbacks(
             }
             continue;
         }
-        let id = format!("alacritree_fallback_{}", defs.font_data.len());
+        let id = format!("{USER_FALLBACK_ID}{}", defs.font_data.len());
         let tweak = fallback_tweak(book.primary_height_ratio, bytes, resolved.face_index);
         let data = FontData { index: resolved.face_index, tweak, ..FontData::from_static(bytes) };
         defs.font_data.insert(id.clone(), Arc::new(data));
@@ -947,6 +948,14 @@ fn build_font_definitions(
     let mut defs = FontDefinitions::default();
     let normal_face = (normal_bytes, normal_match.face_index);
 
+    // egui seeds these families with faces of its own, and they are worth
+    // keeping — `Ubuntu-Light` is what draws `√` when the terminal font cannot.
+    // But `Ubuntu-Light` also fills the legacy Adobe PUA slots, where U+F001
+    // and U+F002 hold the `fi`/`fl` ligatures, and Nerd Fonts put icons at
+    // those codepoints.  Left where egui put them they answer before anything
+    // the user configured, so they are lifted out here and appended last.
+    let bundled = take_bundled_faces(&mut defs);
+
     insert_face(&mut defs, NORMAL_FONT_ID, normal_bytes, normal_match.face_index);
     register_default_family(&mut defs, FontFamily::Monospace, NORMAL_FONT_ID);
     register_default_family(&mut defs, FontFamily::Proportional, NORMAL_FONT_ID);
@@ -997,8 +1006,27 @@ fn build_font_definitions(
 
     install_ui_font(&mut defs, ui, fonts);
     install_symbol_fallback(&mut defs, ui);
+    restore_bundled_faces(&mut defs, bundled);
 
     Some((defs, book.chain))
+}
+
+/// The families egui fills in `FontDefinitions::default()`, emptied so that
+/// registration builds each one from the configured faces alone.
+fn take_bundled_faces(defs: &mut FontDefinitions) -> Vec<(FontFamily, Vec<String>)> {
+    [FontFamily::Monospace, FontFamily::Proportional]
+        .into_iter()
+        .map(|family| {
+            let faces = std::mem::take(defs.families.entry(family.clone()).or_default());
+            (family, faces)
+        })
+        .collect()
+}
+
+fn restore_bundled_faces(defs: &mut FontDefinitions, bundled: Vec<(FontFamily, Vec<String>)>) {
+    for (family, faces) in bundled {
+        defs.families.entry(family).or_default().extend(faces);
+    }
 }
 
 /// Append every font from fontconfig's trimmed sort to `target_families` so
@@ -1061,7 +1089,7 @@ fn register_fallback_faces(
             );
             continue;
         }
-        let id = format!("alacritree_fallback_{}", defs.font_data.len());
+        let id = format!("{USER_FALLBACK_ID}{}", defs.font_data.len());
         let tweak = fallback_tweak(book.primary_height_ratio, bytes, face.face_index);
         let data = FontData { index: face.face_index, tweak, ..FontData::from_static(bytes) };
         defs.font_data.insert(id.clone(), Arc::new(data));
@@ -1988,6 +2016,51 @@ mod tests {
 
         assert_eq!(defs.font_data[NORMAL_FONT_ID].index, resolved.face_index);
         assert_eq!(chain[0].face_index, resolved.face_index);
+    }
+
+    #[test]
+    fn egui_bundled_faces_answer_after_the_configured_fallbacks() {
+        // `FontDefinitions::default()` seeds Monospace with epaint's own faces,
+        // and `Ubuntu-Light` among them fills the legacy Adobe PUA slots, where
+        // U+F001 and U+F002 hold the `fi`/`fl` ligatures.  Nerd Fonts put icons
+        // at those codepoints, so a bundled face left ahead of the configured
+        // fallbacks answers first and a magnifier draws as `fl`.  They stay in
+        // the list — epaint ships `Ubuntu-Light` for `√` and friends — but only
+        // once every configured face has had its turn.
+        let bundled = FontDefinitions::default().families[&FontFamily::Monospace].clone();
+        assert!(!bundled.is_empty(), "egui bundles a monospace family");
+
+        let fonts = SystemFonts::with_cache_dir(None);
+        let Some(family) = fonts.db().faces().find_map(|face| {
+            let name = face.families.first().map(|(name, _)| name.clone())?;
+            resolve_face(&name, None, Variant::Normal, &fonts).map(|_| name)
+        }) else {
+            // Nothing installed resolves here; there is no chain to order.
+            return;
+        };
+
+        let path = write_parseable_font("alacritree_test_bundled_last.ttf");
+        let config = crate::config::FontConfig {
+            normal: crate::config::FontFace { family: Some(family), style: None },
+            fallback: vec![path.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        let defs =
+            build_font_definitions(&config, &UiFont::default(), &fonts).expect("family resolves").0;
+        std::fs::remove_file(&path).ok();
+
+        let mono = &defs.families[&FontFamily::Monospace];
+        let configured = mono
+            .iter()
+            .position(|id| id.starts_with(USER_FALLBACK_ID))
+            .expect("the configured fallback registered");
+        for id in &bundled {
+            let at = mono
+                .iter()
+                .position(|listed| listed == id)
+                .unwrap_or_else(|| panic!("egui's bundled '{id}' was dropped, not demoted"));
+            assert!(at > configured, "egui's bundled '{id}' answers before a configured fallback");
+        }
     }
 
     #[test]
