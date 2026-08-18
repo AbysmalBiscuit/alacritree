@@ -1603,10 +1603,8 @@ impl AlacritreeApp {
         let mut order: Vec<WorkspaceKey> = vec![None];
         for project in &self.projects {
             for wt in &project.worktrees {
-                // Prunable rows can't host a *new* shell; cycling into one
-                // would just bounce off the activate guard on every keypress.
-                // One that still holds shells is a real stop on the ring.
-                if !wt.prunable || self.workspace_has_sessions(&Some(wt.path.clone())) {
+                let has_sessions = self.workspace_has_sessions(&Some(wt.path.clone()));
+                if worktree_is_switchable(wt, self.liveness.missing(&wt.path), has_sessions) {
                     order.push(Some(wt.path.clone()));
                 }
             }
@@ -6531,7 +6529,7 @@ fn worktree_row(
     let mut status_hint = None;
     // Discovery's word, corrected by whatever the probe has seen since.  The
     // main worktree is never offered for pruning, so it never greys either.
-    let prunable = missing.map_or(wt.prunable, |gone| gone && !wt.is_main);
+    let prunable = worktree_looks_gone(wt, missing);
     // right: 0 keeps the worktree `×` at the same x as the project row's `×`,
     // which has no frame margin and sits flush against the panel's outer padding.
     let frame = Frame::default().inner_margin(Margin { left: 16, right: 0, top: 3, bottom: 3 });
@@ -6703,6 +6701,18 @@ fn worktree_row(
         spawn: spawn_clicked,
         set_base: set_base_clicked,
     }
+}
+
+/// The liveness cache corrects discovery for paint and navigation only. Keep
+/// this shared so a row that has just gone grey cannot remain a dead stop in
+/// the workspace ring. Main checkouts are never prune candidates, even when
+/// their project is a non-git directory with no .git entry.
+fn worktree_looks_gone(wt: &Worktree, missing: Option<bool>) -> bool {
+    missing.map_or(wt.prunable, |gone| gone && !wt.is_main)
+}
+
+fn worktree_is_switchable(wt: &Worktree, missing: Option<bool>, has_sessions: bool) -> bool {
+    !worktree_looks_gone(wt, missing) || has_sessions
 }
 
 struct SessionRowAction {
@@ -8552,6 +8562,35 @@ mod tests {
 
     fn ws(p: &str) -> WorkspaceKey {
         Some(PathBuf::from(p))
+    }
+
+    #[test]
+    fn a_grey_worktree_only_stays_in_the_workspace_ring_while_it_holds_sessions() {
+        let wt = Worktree {
+            name: "gone".into(),
+            path: PathBuf::from("/repo-worktrees/gone"),
+            branch: Some("feature".into()),
+            is_main: false,
+            prunable: false,
+            upstream: None,
+        };
+
+        assert!(!worktree_is_switchable(&wt, Some(true), false));
+        assert!(worktree_is_switchable(&wt, Some(true), true));
+    }
+
+    #[test]
+    fn a_main_checkout_never_looks_prunable_from_the_row_probe() {
+        let wt = Worktree {
+            name: "main".into(),
+            path: PathBuf::from("/plain-project"),
+            branch: None,
+            is_main: true,
+            prunable: false,
+            upstream: None,
+        };
+
+        assert!(!worktree_looks_gone(&wt, Some(true)));
     }
 
     /// Apply `move_target` to a concrete list so the drag semantics (drop
