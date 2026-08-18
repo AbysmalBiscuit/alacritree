@@ -59,6 +59,67 @@ fn glyph_job(ch: char, face: Face, size: f32) -> LayoutJob {
     job
 }
 
+/// How far past its cell a glyph may reach before it counts as over-wide.
+/// Cell width is floored to whole device pixels, so an ordinary glyph's
+/// advance is routinely a fraction wider than the cell derived from it and a
+/// bare comparison would call every glyph on screen over-wide.  WezTerm
+/// allows the same 25% before it acts on a glyph.
+const OVERFLOW_SLACK: f32 = 1.25;
+
+/// Ceiling on how many extra cells one glyph may claim, mirroring kitty's
+/// `MAX_NUM_EXTRA_GLYPHS_PUA`.  A face reporting an absurd advance must not
+/// swallow the rest of the line.
+pub const MAX_EXTRA_CELLS: usize = 4;
+
+/// How many cells a laid-out glyph should be drawn across, given how many
+/// blank cells follow it.
+///
+/// A Nerd Font icon is sized to its own face's em, which on a narrow cell —
+/// a CJK-derived face's half-width advance, say — is wider than the column
+/// the terminal gave it.  kitty grows such a glyph over the blanks that
+/// follow rather than letting it overrun them; blanks are the only cells it
+/// may take, since anything else is a character it would paint over.
+pub fn grown_cells(glyph_w: f32, cell_w: f32, spare: usize) -> usize {
+    if !(glyph_w > cell_w * OVERFLOW_SLACK) || cell_w <= 0.0 {
+        return 1;
+    }
+    let wanted = (glyph_w / cell_w).ceil() as usize;
+    wanted.clamp(1, 1 + spare.min(MAX_EXTRA_CELLS))
+}
+
+/// Whether an over-wide glyph for `c` may be drawn across the blanks that
+/// follow it.
+///
+/// Only the private use areas, where Nerd Font and Powerline icons live.  A
+/// letter served by an over-wide fallback face is never a candidate however
+/// far it overruns, which is what makes growing safe to do unconditionally —
+/// kitty draws the same line, restricting it to private-use, symbol and
+/// dingbat codepoints from a non-primary face.
+///
+/// The two ranges held back are kitty's own `narrow_symbols` default.  Those
+/// marks read as part of the segment beside them rather than as icons in
+/// their own right, so a wider one looks wrong where a clipped one only looks
+/// cramped.
+pub fn may_grow(c: char) -> bool {
+    matches!(
+        c,
+        '\u{e000}'..='\u{f8ff}' | '\u{f0000}'..='\u{ffffd}' | '\u{100000}'..='\u{10fffd}'
+    ) && !matches!(c, '\u{e0a0}'..='\u{e0a3}' | '\u{e0c0}'..='\u{e0c7}')
+}
+
+/// How far right to nudge a laid-out glyph so it sits centred on the cells it
+/// was granted.
+///
+/// Never negative.  The span is capped by the blanks actually available, so a
+/// glyph can end up wider than the cells it got; centring on that span would
+/// put it left of its own cell, over the character before it.  Such a glyph
+/// stays where it started and overruns to the right, as it does with growth
+/// off.
+pub fn growth_offset(glyph_w: f32, cell_w: f32, spare: usize) -> f32 {
+    let cells = grown_cells(glyph_w, cell_w, spare);
+    ((cells as f32 * cell_w - glyph_w) / 2.0).max(0.0)
+}
+
 /// The font atlas a set of galleys was laid out against.  A galley's mesh
 /// stores atlas positions, so it only means anything while that atlas is the
 /// one being sampled.
@@ -241,6 +302,77 @@ mod tests {
             atlas_pos(&repacked),
             "cache served a galley addressing the discarded atlas"
         );
+    }
+
+    /// The cell is floored to whole device pixels, so an ordinary glyph's
+
+    /// Icons live in the private use areas.  Nothing else grows, whatever
+    /// face served it and however far it overruns.
+    #[test]
+    fn only_private_use_codepoints_grow() {
+        assert!(may_grow('\u{e0b0}'), "a powerline separator");
+        assert!(may_grow('\u{f057}'), "a Nerd Font icon");
+        assert!(may_grow('\u{f0000}'), "supplementary private use");
+        assert!(!may_grow('M'), "a letter");
+        assert!(!may_grow('\u{fb01}'), "a ligature from a presentation-forms block");
+        assert!(!may_grow('\u{4f60}'), "a CJK ideograph");
+    }
+
+    /// kitty's `narrow_symbols` default holds these back: they read as part of
+    /// the segment beside them, so a wider one looks wrong.
+    #[test]
+    fn the_powerline_marks_kitty_holds_back_do_not_grow() {
+        for c in ['\u{e0a0}', '\u{e0a3}', '\u{e0c0}', '\u{e0c7}'] {
+            assert!(!may_grow(c), "U+{:04X} grew", c as u32);
+        }
+        assert!(may_grow('\u{e0a4}'), "the range stops where kitty's does");
+    }
+    /// advance is routinely a shade wider than the cell measured from it.
+    #[test]
+    fn a_glyph_that_fits_its_cell_asks_for_nothing() {
+        assert_eq!(grown_cells(10.0, 10.0, 4), 1);
+        assert_eq!(grown_cells(10.4, 10.0, 4), 1, "inside the slack");
+    }
+
+    /// Growing over a cell that holds a character would draw the glyph on top
+    /// of it, which is worse than the overflow being clipped.
+    #[test]
+    fn an_over_wide_glyph_with_nowhere_to_go_stays_in_its_cell() {
+        assert_eq!(grown_cells(20.0, 10.0, 0), 1);
+    }
+
+    #[test]
+    fn an_over_wide_glyph_takes_only_the_cells_it_needs() {
+        assert_eq!(grown_cells(20.0, 10.0, 1), 2);
+        assert_eq!(grown_cells(20.0, 10.0, 4), 2, "spare cells it does not need");
+        assert_eq!(grown_cells(20.0, 10.0, 3), 2);
+    }
+
+    /// kitty's `MAX_NUM_EXTRA_GLYPHS_PUA`: a glyph reporting an absurd advance
+    /// must not swallow the rest of the line.
+    #[test]
+    fn growth_is_capped_however_much_room_there_is() {
+        assert_eq!(grown_cells(60.0, 10.0, 6), 1 + MAX_EXTRA_CELLS);
+    }
+
+    /// The span is capped by the blanks actually available, so a glyph can be
+    /// wider than the cells it was granted.  Centring on that span would put
+    /// it left of its own cell, over the character before it — worse than the
+    /// right-hand overrun growth exists to avoid.
+    #[test]
+    fn a_glyph_too_wide_for_the_room_it_gets_is_not_pulled_left() {
+        assert_eq!(growth_offset(25.0, 10.0, 1), 0.0);
+        assert_eq!(growth_offset(60.0, 10.0, 6), 0.0);
+    }
+
+    #[test]
+    fn a_grown_glyph_sits_centred_on_its_span() {
+        assert_eq!(growth_offset(18.0, 10.0, 1), 1.0);
+    }
+
+    #[test]
+    fn a_glyph_that_fits_is_not_nudged() {
+        assert_eq!(growth_offset(10.0, 10.0, 4), 0.0);
     }
 
     #[test]
