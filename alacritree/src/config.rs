@@ -1374,6 +1374,7 @@ struct RawFont {
     /// Also alacritree-only, so it belongs in `alacritree.toml` alongside
     /// `fallback`.
     color_glyphs: Option<bool>,
+    /// Alacritree-only as well, so `alacritree.toml` is its home.
     wide_glyph_growth: Option<bool>,
     color_glyph_cache_mb: Option<usize>,
 }

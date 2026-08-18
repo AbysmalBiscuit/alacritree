@@ -193,6 +193,12 @@ commonly authored with exactly that trailing space (`" "`).
 
 Off by default, since it moves glyphs that render acceptably today.
 
+Two things it leaves alone. A double-width character already owns two columns
+and is sized to them, so it never grows — it also never shares a run, since
+the flags marking its second column end one. And a block cursor parked on a
+grown glyph redraws it at its own cell while the cursor is there, so the
+glyph shifts back for as long as the cursor sits on it.
+
 ### Clickable links
 
 URL detection mirrors Alacritty's default URL hint behaviour:
