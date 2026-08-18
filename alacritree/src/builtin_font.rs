@@ -103,6 +103,14 @@ const POWERLINE_ROUND_LTR: char = '\u{e0b4}';
 const POWERLINE_ROUND_HOLLOW_LTR: char = '\u{e0b5}';
 const POWERLINE_ROUND_RTL: char = '\u{e0b6}';
 const POWERLINE_ROUND_HOLLOW_RTL: char = '\u{e0b7}';
+const POWERLINE_LOWER_LEFT_TRIANGLE: char = '\u{e0b8}';
+const POWERLINE_BACKSLASH_SEPARATOR: char = '\u{e0b9}';
+const POWERLINE_LOWER_RIGHT_TRIANGLE: char = '\u{e0ba}';
+const POWERLINE_FORWARD_SLASH_SEPARATOR: char = '\u{e0bb}';
+const POWERLINE_UPPER_LEFT_TRIANGLE: char = '\u{e0bc}';
+const POWERLINE_FORWARD_SLASH_SEPARATOR_ALT: char = '\u{e0bd}';
+const POWERLINE_UPPER_RIGHT_TRIANGLE: char = '\u{e0be}';
+const POWERLINE_BACKSLASH_SEPARATOR_ALT: char = '\u{e0bf}';
 
 /// Subset of `crossfont::Metrics` consumed by the built-in renderer.  Only
 /// the three fields actually referenced inside `box_drawing` /
@@ -141,7 +149,7 @@ pub fn is_builtin_glyph(c: char) -> bool {
         '\u{2500}'..='\u{259f}'
             | '\u{1fb00}'..='\u{1fb3b}'
             | '\u{1fb82}'..='\u{1fb8b}'
-            | POWERLINE_TRIANGLE_LTR..=POWERLINE_ROUND_HOLLOW_RTL
+            | POWERLINE_TRIANGLE_LTR..=POWERLINE_BACKSLASH_SEPARATOR_ALT
     )
 }
 
@@ -159,11 +167,15 @@ pub fn builtin_glyph(
         },
         // Powerline symbols: '','','',''
         POWERLINE_TRIANGLE_LTR..=POWERLINE_ARROW_RTL => {
-            powerline_drawing(character, metrics, offset)?
+            powerline_drawing(character, metrics, offset)
         },
         // Rounded powerline caps: '','','',''
         POWERLINE_ROUND_LTR..=POWERLINE_ROUND_HOLLOW_RTL => {
             powerline_round_drawing(character, metrics, offset)
+        },
+        // Corner triangles and diagonal separators: '','','','','','','',''
+        POWERLINE_LOWER_LEFT_TRIANGLE..=POWERLINE_BACKSLASH_SEPARATOR_ALT => {
+            powerline_corner_drawing(character, metrics, offset)
         },
         _ => return None,
     };
@@ -722,60 +734,37 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &FontDelta) -> Builti
     }
 }
 
-fn powerline_drawing(
-    character: char,
-    metrics: &Metrics,
-    offset: &FontDelta,
-) -> Option<BuiltinGlyph> {
-    let height = (metrics.line_height as i32 + offset.y as i32) as usize;
-    let width = (metrics.average_advance as i32 + offset.x as i32) as usize;
-    let extra_thickness = calculate_stroke_size(width) as i32 - 1;
+/// Pointed powerline separators (U+E0B0..=U+E0B3).
+///
+/// Upstream alacritty draws the edges at a fixed 45° and declines the character
+/// outright when that would put the tip outside the cell — a font whose cell is
+/// much taller than it is wide, as a CJK-derived face's half-width cell is.
+/// Declining hands the separator to a fallback face, which sizes it to its own
+/// em rather than the cell and overruns the neighbouring column.  The edges
+/// here converge on the cell's far edge instead, so the tip lands inside the
+/// cell at any aspect ratio and there is no case left to decline.  Windows
+/// Terminal and kitty both build these from cell proportions for the same
+/// reason.
+fn powerline_drawing(character: char, metrics: &Metrics, offset: &FontDelta) -> BuiltinGlyph {
+    let height = (metrics.line_height as i32 + offset.y as i32).max(1) as usize;
+    let width = (metrics.average_advance as i32 + offset.x as i32).max(1) as usize;
 
     let mut canvas = Canvas::new(width, height);
+    let tip_x = width as f32 - 1.;
+    // Half the cell's height, which is also the row the tip sits on.  Clamped
+    // so a one-row cell still has something to divide by.
+    let half_height = ((height as f32 - 1.) / 2.).max(1.);
+    let filled = !matches!(character, POWERLINE_ARROW_LTR | POWERLINE_ARROW_RTL);
+    // An arm's thickness is measured horizontally: the edges of a cell taller
+    // than it is wide are steep, so horizontal is near enough perpendicular.
+    let arm = calculate_stroke_size(width) as f32;
 
-    let slope = 1;
-    let top_y = 1;
-    let bottom_y = height as i32 - top_y - 1;
-
-    // Start with offset `1` and draw until the intersection of the f(x) = slope * x + 1 and
-    // g(x) = H - slope * x - 1 lines. The intersection happens when f(x) = g(x), which is at
-    // x = (H - 2) / (2 * slope).
-    let x_intersection = (height as i32 + 1) / 2 - 1;
-
-    // Don't use built-in font if we'd cut the tip too much, for example when the font is really
-    // narrow.
-    if x_intersection - width as i32 > 1 {
-        return None;
-    }
-
-    let top_line = (0..x_intersection).map(|x| line_equation(slope, x, top_y));
-    let bottom_line = (0..x_intersection).map(|x| line_equation(-slope, x, bottom_y));
-
-    // Inner lines to make arrows thicker.
-    let mut top_inner_line = (0..x_intersection - extra_thickness)
-        .map(|x| line_equation(slope, x, top_y + extra_thickness));
-    let mut bottom_inner_line = (0..x_intersection - extra_thickness)
-        .map(|x| line_equation(-slope, x, bottom_y - extra_thickness));
-
-    // NOTE: top_line and bottom_line have the same amount of iterations.
-    for (p1, p2) in top_line.zip(bottom_line) {
-        if character == POWERLINE_TRIANGLE_LTR || character == POWERLINE_TRIANGLE_RTL {
-            canvas.draw_rect(0., p1.1, p1.0 + 1., 1., COLOR_FILL);
-            canvas.draw_rect(0., p2.1, p2.0 + 1., 1., COLOR_FILL);
-        } else if character == POWERLINE_ARROW_LTR || character == POWERLINE_ARROW_RTL {
-            let p3 = top_inner_line.next().unwrap_or(p2);
-            let p4 = bottom_inner_line.next().unwrap_or(p1);
-
-            // If we can't fit the entire arrow in the cell, we cut off the tip of the arrow by
-            // drawing a rectangle between the two lines.
-            if p1.0 as usize + 1 == width {
-                canvas.draw_rect(p1.0, p1.1, 1., p2.1 - p1.1 + 1., COLOR_FILL);
-                break;
-            } else {
-                canvas.draw_rect(p1.0, p1.1, 1., p3.1 - p1.1 + 1., COLOR_FILL);
-                canvas.draw_rect(p4.0, p4.1, 1., p2.1 - p4.1 + 1., COLOR_FILL);
-            }
-        }
+    for y in 0..height {
+        // Rounded, not truncated: on an even-height cell the apex falls between
+        // two rows, and truncating leaves both of them short of the far edge.
+        let edge = (tip_x * (half_height - (y as f32 - half_height).abs()) / half_height).round();
+        let start = if filled { 0. } else { (edge + 1. - arm).max(0.) };
+        canvas.draw_rect(start, y as f32, edge + 1. - start, 1., COLOR_FILL);
     }
 
     if character == POWERLINE_TRIANGLE_RTL || character == POWERLINE_ARROW_RTL {
@@ -783,14 +772,71 @@ fn powerline_drawing(
     }
 
     let top = height as i32 + metrics.descent as i32;
-    Some(BuiltinGlyph {
+    BuiltinGlyph {
         image: canvas.into_color_image(),
         top,
         left: 0,
         height: height as i32,
         width: width as i32,
         advance: (width as i32, height as i32),
-    })
+    }
+}
+
+/// Fill the half of the cell lying on one side of a diagonal.  `backslash`
+/// picks the top-left-to-bottom-right diagonal over the other one, `fill_left`
+/// which side of it is solid.
+fn fill_diagonal_half(canvas: &mut Canvas, backslash: bool, fill_left: bool) {
+    let right = canvas.width as f32 - 1.;
+    let bottom = (canvas.height as f32 - 1.).max(1.);
+    for y in 0..canvas.height {
+        let along = y as f32 / bottom;
+        let edge = (right * if backslash { along } else { 1. - along }).round();
+        let (start, end) = if fill_left { (0., edge) } else { (edge, right) };
+        canvas.draw_rect(start, y as f32, end - start + 1., 1., COLOR_FILL);
+    }
+}
+
+/// Corner triangles and diagonal separators (U+E0B8..=U+E0BF).  Upstream
+/// alacritty leaves these to the font, where the same em-versus-cell mismatch
+/// that afflicts the pointed separators applies; Windows Terminal and kitty
+/// both draw them.  The block repeats two of its glyphs — U+E0BD is U+E0BB
+/// again and U+E0BF is U+E0B9 again — which is what the block contains, not an
+/// oversight here.
+fn powerline_corner_drawing(
+    character: char,
+    metrics: &Metrics,
+    offset: &FontDelta,
+) -> BuiltinGlyph {
+    let height = (metrics.line_height as i32 + offset.y as i32).max(1) as usize;
+    let width = (metrics.average_advance as i32 + offset.x as i32).max(1) as usize;
+
+    let mut canvas = Canvas::new(width, height);
+    let right = width as f32 - 1.;
+    let bottom = (height as f32 - 1.).max(1.);
+    let backslash = |canvas: &mut Canvas| canvas.draw_line(0., 0., right, bottom);
+    let forward_slash = |canvas: &mut Canvas| canvas.draw_line(0., bottom, right, 0.);
+
+    // In codepoint order, as the block itself runs.
+    match character {
+        POWERLINE_LOWER_LEFT_TRIANGLE => fill_diagonal_half(&mut canvas, true, true),
+        POWERLINE_BACKSLASH_SEPARATOR => backslash(&mut canvas),
+        POWERLINE_LOWER_RIGHT_TRIANGLE => fill_diagonal_half(&mut canvas, false, false),
+        POWERLINE_FORWARD_SLASH_SEPARATOR => forward_slash(&mut canvas),
+        POWERLINE_UPPER_LEFT_TRIANGLE => fill_diagonal_half(&mut canvas, false, true),
+        POWERLINE_FORWARD_SLASH_SEPARATOR_ALT => forward_slash(&mut canvas),
+        POWERLINE_UPPER_RIGHT_TRIANGLE => fill_diagonal_half(&mut canvas, true, false),
+        _ => backslash(&mut canvas), // POWERLINE_BACKSLASH_SEPARATOR_ALT
+    }
+
+    let top = height as i32 + metrics.descent as i32;
+    BuiltinGlyph {
+        image: canvas.into_color_image(),
+        top,
+        left: 0,
+        height: height as i32,
+        width: width as i32,
+        advance: (width as i32, height as i32),
+    }
 }
 
 /// Rounded powerline caps (U+E0B4..=U+E0B7).  Upstream alacritty leaves these
@@ -1141,10 +1187,6 @@ fn calculate_stroke_size(cell_width: usize) -> usize {
     cmp::max((cell_width as f32 / 8.).round() as usize, 1)
 }
 
-fn line_equation(slope: i32, x: i32, offset: i32) -> (f32, f32) {
-    (x as f32, (slope * x + offset) as f32)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1152,12 +1194,14 @@ mod tests {
     const CELL_W: usize = 10;
     const CELL_H: usize = 21;
 
-    fn metrics() -> Metrics {
-        Metrics { average_advance: CELL_W as f64, line_height: CELL_H as f64, descent: 0.0 }
+    fn glyph(c: char) -> BuiltinGlyph {
+        glyph_in(c, CELL_W, CELL_H)
     }
 
-    fn glyph(c: char) -> BuiltinGlyph {
-        builtin_glyph(c, &metrics(), &FontDelta::default(), &FontDelta::default())
+    fn glyph_in(c: char, width: usize, height: usize) -> BuiltinGlyph {
+        let metrics =
+            Metrics { average_advance: width as f64, line_height: height as f64, descent: 0.0 };
+        builtin_glyph(c, &metrics, &FontDelta::default(), &FontDelta::default())
             .unwrap_or_else(|| panic!("U+{:04X} is not drawn by the built-in font", c as u32))
     }
 
@@ -1229,6 +1273,113 @@ mod tests {
         for c in ['\u{e0b0}', '\u{e0b1}', '\u{e0b2}', '\u{e0b3}'] {
             assert!(is_builtin_glyph(c), "U+{:04X} must remain built-in", c as u32);
             glyph(c);
+        }
+    }
+
+    /// A CJK-derived font's half-width cell is far taller than it is wide.  A
+    /// separator drawn at a fixed 45° would put its tip outside such a cell, and
+    /// declining to draw it hands the character to a fallback face that sizes it
+    /// to its own em — twice the column, overrunning the neighbour.
+    #[test]
+    fn pointed_separators_are_drawn_in_a_half_width_cell() {
+        for c in ['\u{e0b0}', '\u{e0b1}', '\u{e0b2}', '\u{e0b3}'] {
+            let glyph = glyph_in(c, 6, 21);
+            assert_eq!(glyph.width, 6, "U+{:04X} width", c as u32);
+            assert_eq!(glyph.height, 21, "U+{:04X} height", c as u32);
+        }
+    }
+
+    /// The tip is what makes a separator meet the next segment cleanly, so it
+    /// has to land on the cell's far edge whatever the cell's proportions are.
+    #[test]
+    fn the_separator_tip_reaches_the_far_cell_edge_at_any_aspect() {
+        for (width, height) in [(21, 21), (10, 21), (6, 21), (7, 21), (4, 12)] {
+            let ltr = glyph_in('\u{e0b0}', width, height);
+            let mid_y = (height - 1) / 2;
+            assert_eq!(
+                alpha_at(&ltr, width - 1, mid_y),
+                255,
+                "U+E0B0 tip missing at mid height in a {width}x{height} cell"
+            );
+
+            let rtl = glyph_in('\u{e0b2}', width, height);
+            assert_eq!(
+                alpha_at(&rtl, 0, mid_y),
+                255,
+                "U+E0B2 tip missing at mid height in a {width}x{height} cell"
+            );
+        }
+    }
+
+    /// The solid separator has to cover the whole column height where it joins
+    /// the segment, or the coloured background shows through as a seam.
+    #[test]
+    fn the_solid_separator_spans_the_full_cell_height() {
+        let glyph = glyph_in('\u{e0b0}', 6, 21);
+        assert_eq!(alpha_at(&glyph, 0, 0), 255, "top-left corner must be filled");
+        assert_eq!(alpha_at(&glyph, 0, 20), 255, "bottom-left corner must be filled");
+    }
+
+    /// Every codepoint the painter is told to route through the bitmap cache
+    /// must actually produce a glyph, or the cell silently renders blank.
+    #[test]
+    fn every_claimed_powerline_codepoint_is_drawn() {
+        for c in ('\u{e0b0}'..='\u{e0bf}').filter(|c| is_builtin_glyph(*c)) {
+            glyph(c);
+        }
+        for c in '\u{e0b0}'..='\u{e0bf}' {
+            assert!(is_builtin_glyph(c), "U+{:04X} must be built-in", c as u32);
+        }
+    }
+
+    /// The corner triangles fill the half of the cell they are named for; the
+    /// opposite corner stays clear so the segment colour shows through.
+    #[test]
+    fn corner_triangles_fill_their_named_corner() {
+        let (left, right, top, bottom) = (0, CELL_W - 1, 0, CELL_H - 1);
+        for (c, filled, empty) in [
+            (POWERLINE_LOWER_LEFT_TRIANGLE, (left, bottom), (right, top)),
+            (POWERLINE_LOWER_RIGHT_TRIANGLE, (right, bottom), (left, top)),
+            (POWERLINE_UPPER_LEFT_TRIANGLE, (left, top), (right, bottom)),
+            (POWERLINE_UPPER_RIGHT_TRIANGLE, (right, top), (left, bottom)),
+        ] {
+            let glyph = glyph(c);
+            assert_eq!(
+                alpha_at(&glyph, filled.0, filled.1),
+                255,
+                "U+{:04X} corner {filled:?} must be filled",
+                c as u32
+            );
+            assert_eq!(
+                alpha_at(&glyph, empty.0, empty.1),
+                0,
+                "U+{:04X} corner {empty:?} must stay empty",
+                c as u32
+            );
+        }
+    }
+
+    /// The diagonal separators run corner to corner.  U+E0BD repeats U+E0BB and
+    /// U+E0BF repeats U+E0B9 — that is what the block contains.
+    #[test]
+    fn diagonal_separators_run_corner_to_corner() {
+        for c in ['\u{e0b9}', '\u{e0bf}'] {
+            let glyph = glyph(c);
+            assert!(alpha_at(&glyph, 0, 0) > 0, "U+{:04X} must start top-left", c as u32);
+            assert!(
+                alpha_at(&glyph, CELL_W - 1, CELL_H - 1) > 0,
+                "U+{:04X} must end bottom-right",
+                c as u32
+            );
+        }
+        for c in ['\u{e0bb}', '\u{e0bd}'] {
+            let glyph = glyph(c);
+            assert!(
+                alpha_at(&glyph, 0, CELL_H - 1) > 0,
+                "U+{:04X} must start bottom-left",
+                c as u32
+            );
+            assert!(alpha_at(&glyph, CELL_W - 1, 0) > 0, "U+{:04X} must end top-right", c as u32);
         }
     }
 }
