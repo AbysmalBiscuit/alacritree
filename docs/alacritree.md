@@ -171,6 +171,23 @@ seamless cells regardless of the user's monospace font choice — borders,
 braille blocks, and powerline separators always tile perfectly. The behaviour
 can be toggled with `font.builtin_box_drawing = false`.
 
+### Over-wide glyphs
+
+An icon outside the built-in ranges comes from whichever fallback face has it,
+sized to *that* face's em rather than to the cell. On a narrow cell — a
+CJK-derived face's half-width advance, say — a Nerd Font icon is wider than
+the column the terminal gave it and spills into the next one, where the next
+run's background paints over the part that escaped.
+
+`font.wide_glyph_growth = true` draws such a glyph across the blank cells that
+follow it instead, centred on the span it ends up with, up to four extra
+cells. Blanks are the only cells it may take; anything else is a character it
+would paint over. This is kitty's behaviour — alacritty and Windows Terminal
+both let the overflow happen. Icons are commonly authored with a trailing
+space (`" "`), which is exactly the room this needs.
+
+Off by default, since it moves glyphs that render acceptably today.
+
 ### Clickable links
 
 URL detection mirrors Alacritty's default URL hint behaviour:

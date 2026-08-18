@@ -103,6 +103,12 @@ pub struct FontConfig {
     /// through to the first fallback face that has ordinary outlines, so
     /// emoji render monochrome rather than in colour.
     pub color_glyphs: bool,
+    /// Draw an over-wide glyph across the blank cells that follow it instead
+    /// of letting it overrun them.  A Nerd Font icon is sized to its own
+    /// face's em, so on a narrow cell it is wider than the column the
+    /// terminal gave it; kitty grows such a glyph, alacritty and Windows
+    /// Terminal let it overflow.  Off keeps the overflow.
+    pub wide_glyph_growth: bool,
     /// Ceiling on the rasterized colour glyph cache.  The cache is already
     /// bounded by how many codepoints the colour fonts cover (a few thousand),
     /// but that ceiling moves with cell size and with the fallback list, so it
@@ -1054,6 +1060,7 @@ impl Default for FontConfig {
             builtin_box_drawing: true,
             fallback: Vec::new(),
             color_glyphs: true,
+            wide_glyph_growth: false,
             color_glyph_cache_mb: 10,
         }
     }
@@ -1367,6 +1374,7 @@ struct RawFont {
     /// Also alacritree-only, so it belongs in `alacritree.toml` alongside
     /// `fallback`.
     color_glyphs: Option<bool>,
+    wide_glyph_growth: Option<bool>,
     color_glyph_cache_mb: Option<usize>,
 }
 
@@ -1979,6 +1987,9 @@ impl RawConfig {
         }
         if let Some(mb) = self.font.color_glyph_cache_mb {
             font.color_glyph_cache_mb = mb;
+        }
+        if let Some(g) = self.font.wide_glyph_growth {
+            font.wide_glyph_growth = g;
         }
 
         // ---- Cursor ----
@@ -2676,6 +2687,14 @@ mod tests {
     #[test]
     fn font_fallback_defaults_empty() {
         assert!(parse("").font.fallback.is_empty());
+    }
+
+    /// Growth moves glyphs that render acceptably today, so it waits to be
+    /// asked for.
+    #[test]
+    fn wide_glyph_growth_is_off_until_asked_for() {
+        assert!(!parse("").font.wide_glyph_growth);
+        assert!(parse("[font]\nwide_glyph_growth = true").font.wide_glyph_growth);
     }
 
     #[test]

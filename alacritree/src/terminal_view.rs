@@ -17,7 +17,7 @@ use crate::color_glyph::{CachedColorGlyph, ColorGlyphCache};
 use crate::colors::{background, foreground, resolve, rgb_to_color32};
 use crate::config::Config;
 use crate::fonts::{BOLD_FAMILY, BOLD_ITALIC_FAMILY, ITALIC_FAMILY};
-use crate::glyph_cache::{Face, GlyphCache};
+use crate::glyph_cache::{Face, GlyphCache, MAX_EXTRA_CELLS, grown_cells};
 use crate::input::event_to_bytes;
 use crate::links::{self, Link};
 use crate::mouse;
@@ -1073,7 +1073,7 @@ fn paint_run(
             Face::new(style.flags.contains(Flags::BOLD), style.flags.contains(Flags::ITALIC));
         let glyph_dx = config.font.glyph_offset.x as f32;
         let glyph_dy = config.font.glyph_offset.y as f32;
-        for (i, ch) in run.chars().enumerate() {
+        for (i, (byte, ch)) in run.char_indices().enumerate() {
             if ch == ' ' {
                 continue;
             }
@@ -1101,9 +1101,24 @@ fn paint_run(
                 continue;
             }
             let galley = glyphs.get(ctx, ch, face, font_id.size);
+            // A glyph wider than its cell is drawn across the blanks that
+            // follow rather than over the top of them, centred on the span it
+            // ends up with, the way kitty grows one.
+            let grow_dx = if config.font.wide_glyph_growth {
+                let spare = run[byte + ch.len_utf8()..]
+                    .chars()
+                    .take(MAX_EXTRA_CELLS)
+                    .take_while(|c| *c == ' ')
+                    .count();
+                let glyph_w = galley.size().x;
+                let cells = grown_cells(glyph_w, cell_w, spare);
+                if cells > 1 { (cells as f32 * cell_w - glyph_w) / 2.0 } else { 0.0 }
+            } else {
+                0.0
+            };
             painter.add(
                 egui::epaint::TextShape::new(
-                    Pos2::new(cell_x + glyph_dx, y + glyph_dy),
+                    Pos2::new(cell_x + glyph_dx + grow_dx, y + glyph_dy),
                     galley,
                     fg,
                 )
@@ -1512,6 +1527,125 @@ mod tests {
             egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect_cells(s, glyphs, fills)),
             _ => {},
         }
+    }
+
+    /// A context whose monospace fallback is scaled far past the primary face,
+    /// so a character the primary lacks comes back several times wider than
+    /// the cell — a Nerd Font icon against a half-width cell, in miniature.
+    fn ctx_with_oversized_fallback() -> egui::Context {
+        let ctx = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        let mut fallback = (*fonts.font_data["Ubuntu-Light"]).clone();
+        fallback.tweak.scale = 4.0;
+        fonts.font_data.insert("Ubuntu-Light".into(), std::sync::Arc::new(fallback));
+        let mono = fonts.families[&FontFamily::Monospace].clone();
+        for name in [BOLD_FAMILY, ITALIC_FAMILY, BOLD_ITALIC_FAMILY] {
+            fonts.families.insert(FontFamily::Name(name.into()), mono.clone());
+        }
+        ctx.set_fonts(fonts);
+        ctx
+    }
+
+    /// Where each glyph of a painted frame was placed.
+    fn painted_at(
+        ctx: &egui::Context,
+        session: &mut Session,
+        config: &Config,
+        caches: &mut Caches,
+        screen: Vec2,
+    ) -> Vec<(String, f32)> {
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, screen)),
+            ..Default::default()
+        };
+        let out = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(
+                    ui,
+                    session,
+                    config,
+                    true,
+                    &mut caches.builtin,
+                    &mut caches.ime,
+                    &mut caches.colors,
+                    &mut caches.glyphs,
+                    &mut caches.snapshot,
+                );
+            });
+        });
+        let mut found = Vec::new();
+        for clipped in &out.shapes {
+            collect_positions(&clipped.shape, &mut found);
+        }
+        found
+    }
+
+    fn collect_positions(shape: &egui::Shape, out: &mut Vec<(String, f32)>) {
+        match shape {
+            egui::Shape::Text(text) => out.push((text.galley.text().to_owned(), text.pos.x)),
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect_positions(s, out)),
+            _ => {},
+        }
+    }
+
+    /// An icon sized to its own face's em overruns a narrower cell.  With
+    /// growth on it is drawn across the blanks that follow instead, centred on
+    /// the span it was granted; the glyphs beside it do not move.
+    #[test]
+    fn an_over_wide_glyph_is_centred_over_the_blanks_after_it() {
+        // U+FB01 is absent from the primary face, so it comes back from the
+        // oversized fallback rather than at the cell's width.
+        const ROW: &[u8] = "M\u{fb01}".as_bytes();
+        let ctx = ctx_with_oversized_fallback();
+        let mut config = Config::default();
+        let screen = Vec2::new(640.0, 480.0);
+        let x_of = |painted: &[(String, f32)], ch: &str| {
+            painted
+                .iter()
+                .find(|(g, _)| g == ch)
+                .unwrap_or_else(|| panic!("{ch} was not painted"))
+                .1
+        };
+
+        let plain = {
+            let (mut session, _dir) = headless_session(&ctx, &config);
+            let mut caches = Caches::new();
+            painted_at(&ctx, &mut session, &config, &mut caches, screen);
+            let (cols, rows) = (session.size.columns, session.size.screen_lines);
+            {
+                let mut term = session.term.lock();
+                term.resize(TermSize::new(cols, rows));
+                Processor::<StdSyncHandler>::new().advance(&mut *term, ROW);
+            }
+            painted_at(&ctx, &mut session, &config, &mut caches, screen)
+        };
+        let (anchor, cell_w) = (x_of(&plain, "M"), x_of(&plain, "\u{fb01}") - x_of(&plain, "M"));
+
+        config.font.wide_glyph_growth = true;
+        let grown = {
+            let (mut session, _dir) = headless_session(&ctx, &config);
+            let mut caches = Caches::new();
+            painted_at(&ctx, &mut session, &config, &mut caches, screen);
+            let (cols, rows) = (session.size.columns, session.size.screen_lines);
+            {
+                let mut term = session.term.lock();
+                term.resize(TermSize::new(cols, rows));
+                Processor::<StdSyncHandler>::new().advance(&mut *term, ROW);
+            }
+            painted_at(&ctx, &mut session, &config, &mut caches, screen)
+        };
+
+        let glyph_w =
+            ctx.fonts(|f| f.glyph_width(&FontId::monospace(config.font.egui_size()), '\u{fb01}'));
+        let cells = crate::glyph_cache::grown_cells(glyph_w, cell_w, MAX_EXTRA_CELLS);
+        assert!(cells > 1, "the fixture's fallback glyph is not over-wide");
+
+        assert_eq!(x_of(&grown, "M"), anchor, "growth moved a glyph that fits its cell");
+        let start = anchor + cell_w;
+        let left = x_of(&grown, "\u{fb01}") - start;
+        let right = start + cells as f32 * cell_w - (x_of(&grown, "\u{fb01}") + glyph_w);
+        assert!(left > 0.5, "the over-wide glyph was left in its own cell");
+        assert!((left - right).abs() < 0.5, "not centred: {left} left, {right} right");
     }
 
     /// The snapshot resolves every cell's foreground, background and face

@@ -59,6 +59,34 @@ fn glyph_job(ch: char, face: Face, size: f32) -> LayoutJob {
     job
 }
 
+/// How far past its cell a glyph may reach before it counts as over-wide.
+/// Cell width is floored to whole device pixels, so an ordinary glyph's
+/// advance is routinely a fraction wider than the cell derived from it and a
+/// bare comparison would call every glyph on screen over-wide.  WezTerm
+/// allows the same 25% before it acts on a glyph.
+const OVERFLOW_SLACK: f32 = 1.25;
+
+/// Ceiling on how many extra cells one glyph may claim, mirroring kitty's
+/// `MAX_NUM_EXTRA_GLYPHS_PUA`.  A face reporting an absurd advance must not
+/// swallow the rest of the line.
+pub const MAX_EXTRA_CELLS: usize = 4;
+
+/// How many cells a laid-out glyph should be drawn across, given how many
+/// blank cells follow it.
+///
+/// A Nerd Font icon is sized to its own face's em, which on a narrow cell —
+/// a CJK-derived face's half-width advance, say — is wider than the column
+/// the terminal gave it.  kitty grows such a glyph over the blanks that
+/// follow rather than letting it overrun them; blanks are the only cells it
+/// may take, since anything else is a character it would paint over.
+pub fn grown_cells(glyph_w: f32, cell_w: f32, spare: usize) -> usize {
+    if !(glyph_w > cell_w * OVERFLOW_SLACK) || cell_w <= 0.0 {
+        return 1;
+    }
+    let wanted = (glyph_w / cell_w).ceil() as usize;
+    wanted.clamp(1, 1 + spare.min(MAX_EXTRA_CELLS))
+}
+
 /// The font atlas a set of galleys was laid out against.  A galley's mesh
 /// stores atlas positions, so it only means anything while that atlas is the
 /// one being sampled.
@@ -241,6 +269,35 @@ mod tests {
             atlas_pos(&repacked),
             "cache served a galley addressing the discarded atlas"
         );
+    }
+
+    /// The cell is floored to whole device pixels, so an ordinary glyph's
+    /// advance is routinely a shade wider than the cell measured from it.
+    #[test]
+    fn a_glyph_that_fits_its_cell_asks_for_nothing() {
+        assert_eq!(grown_cells(10.0, 10.0, 4), 1);
+        assert_eq!(grown_cells(10.4, 10.0, 4), 1, "inside the slack");
+    }
+
+    /// Growing over a cell that holds a character would draw the glyph on top
+    /// of it, which is worse than the overflow being clipped.
+    #[test]
+    fn an_over_wide_glyph_with_nowhere_to_go_stays_in_its_cell() {
+        assert_eq!(grown_cells(20.0, 10.0, 0), 1);
+    }
+
+    #[test]
+    fn an_over_wide_glyph_takes_only_the_cells_it_needs() {
+        assert_eq!(grown_cells(20.0, 10.0, 1), 2);
+        assert_eq!(grown_cells(20.0, 10.0, 4), 2, "spare cells it does not need");
+        assert_eq!(grown_cells(20.0, 10.0, 3), 2);
+    }
+
+    /// kitty's `MAX_NUM_EXTRA_GLYPHS_PUA`: a glyph reporting an absurd advance
+    /// must not swallow the rest of the line.
+    #[test]
+    fn growth_is_capped_however_much_room_there_is() {
+        assert_eq!(grown_cells(60.0, 10.0, 6), 1 + MAX_EXTRA_CELLS);
     }
 
     #[test]
