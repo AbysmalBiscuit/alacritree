@@ -87,6 +87,26 @@ pub fn grown_cells(glyph_w: f32, cell_w: f32, spare: usize) -> usize {
     wanted.clamp(1, 1 + spare.min(MAX_EXTRA_CELLS))
 }
 
+/// Whether an over-wide glyph for `c` may be drawn across the blanks that
+/// follow it.
+///
+/// Only the private use areas, where Nerd Font and Powerline icons live.  A
+/// letter served by an over-wide fallback face is never a candidate however
+/// far it overruns, which is what makes growing safe to do unconditionally —
+/// kitty draws the same line, restricting it to private-use, symbol and
+/// dingbat codepoints from a non-primary face.
+///
+/// The two ranges held back are kitty's own `narrow_symbols` default.  Those
+/// marks read as part of the segment beside them rather than as icons in
+/// their own right, so a wider one looks wrong where a clipped one only looks
+/// cramped.
+pub fn may_grow(c: char) -> bool {
+    matches!(
+        c,
+        '\u{e000}'..='\u{f8ff}' | '\u{f0000}'..='\u{ffffd}' | '\u{100000}'..='\u{10fffd}'
+    ) && !matches!(c, '\u{e0a0}'..='\u{e0a3}' | '\u{e0c0}'..='\u{e0c7}')
+}
+
 /// How far right to nudge a laid-out glyph so it sits centred on the cells it
 /// was granted.
 ///
@@ -285,6 +305,28 @@ mod tests {
     }
 
     /// The cell is floored to whole device pixels, so an ordinary glyph's
+
+    /// Icons live in the private use areas.  Nothing else grows, whatever
+    /// face served it and however far it overruns.
+    #[test]
+    fn only_private_use_codepoints_grow() {
+        assert!(may_grow('\u{e0b0}'), "a powerline separator");
+        assert!(may_grow('\u{f057}'), "a Nerd Font icon");
+        assert!(may_grow('\u{f0000}'), "supplementary private use");
+        assert!(!may_grow('M'), "a letter");
+        assert!(!may_grow('\u{fb01}'), "a ligature from a presentation-forms block");
+        assert!(!may_grow('\u{4f60}'), "a CJK ideograph");
+    }
+
+    /// kitty's `narrow_symbols` default holds these back: they read as part of
+    /// the segment beside them, so a wider one looks wrong.
+    #[test]
+    fn the_powerline_marks_kitty_holds_back_do_not_grow() {
+        for c in ['\u{e0a0}', '\u{e0a3}', '\u{e0c0}', '\u{e0c7}'] {
+            assert!(!may_grow(c), "U+{:04X} grew", c as u32);
+        }
+        assert!(may_grow('\u{e0a4}'), "the range stops where kitty's does");
+    }
     /// advance is routinely a shade wider than the cell measured from it.
     #[test]
     fn a_glyph_that_fits_its_cell_asks_for_nothing() {

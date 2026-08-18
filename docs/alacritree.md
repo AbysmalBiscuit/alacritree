@@ -171,7 +171,7 @@ seamless cells regardless of the user's monospace font choice — borders,
 braille blocks, and powerline separators always tile perfectly. The behaviour
 can be toggled with `font.builtin_box_drawing = false`.
 
-### Over-wide glyphs
+### Over-wide icons
 
 An icon outside the built-in ranges comes from whichever fallback face has it,
 sized to *that* face's em rather than to the cell. On a narrow cell — a
@@ -179,25 +179,29 @@ CJK-derived face's half-width advance, say — a Nerd Font icon is wider than
 the column the terminal gave it and spills into the next one, where the next
 run's background paints over the part that escaped.
 
-`font.wide_glyph_growth = true` draws such a glyph across the blank cells that
-follow it instead, centred on the span it ends up with, up to four extra
-cells. This is kitty's behaviour; alacritty and Windows Terminal both let the
-overflow happen.
+Such an icon is drawn across the blank cells that follow it instead, centred
+on the span it ends up with, up to four extra cells. This is kitty's
+behaviour; alacritty and Windows Terminal both let the overflow happen.
 
-Blanks are the only cells it may take — anything else is a character it would
-paint over — and a glyph wanting more room than it gets stays where it is
+Only the private use areas grow. A letter that happens to arrive from an
+over-wide fallback face keeps its cell however far it overruns, which is why
+this needs no switch — ordinary text can never move. `U+E0A0`–`U+E0A3` and
+`U+E0C0`–`U+E0C7` are held back as well, matching kitty's `narrow_symbols`
+default: those marks read as part of the segment beside them, so a wider one
+looks wrong where a clipped one only looks cramped.
+
+Blanks are the only cells an icon may take — anything else is a character it
+would paint over — and one wanting more room than it gets stays where it is
 rather than being pulled left. A blank draws nothing but its background, so it
 counts even when its foreground differs from the icon's, which is what lets an
 icon and the differently-highlighted space beside it share a run. Icons are
 commonly authored with exactly that trailing space (`" "`).
 
-Off by default, since it moves glyphs that render acceptably today.
-
 Two things it leaves alone. A double-width character already owns two columns
 and is sized to them, so it never grows — it also never shares a run, since
 the flags marking its second column end one. And a block cursor parked on a
-grown glyph redraws it at its own cell while the cursor is there, so the
-glyph shifts back for as long as the cursor sits on it.
+grown icon redraws it at its own cell while the cursor is there, so the icon
+shifts back for as long as the cursor sits on it.
 
 ### Clickable links
 

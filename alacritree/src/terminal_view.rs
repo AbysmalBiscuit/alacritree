@@ -17,7 +17,7 @@ use crate::color_glyph::{CachedColorGlyph, ColorGlyphCache};
 use crate::colors::{background, foreground, resolve, rgb_to_color32};
 use crate::config::Config;
 use crate::fonts::{BOLD_FAMILY, BOLD_ITALIC_FAMILY, ITALIC_FAMILY};
-use crate::glyph_cache::{Face, GlyphCache, MAX_EXTRA_CELLS, growth_offset};
+use crate::glyph_cache::{Face, GlyphCache, MAX_EXTRA_CELLS, growth_offset, may_grow};
 use crate::input::event_to_bytes;
 use crate::links::{self, Link};
 use crate::mouse;
@@ -1120,10 +1120,10 @@ fn paint_run(
                 continue;
             }
             let galley = glyphs.get(ctx, ch, face, font_id.size);
-            // A glyph wider than its cell is drawn across the blanks that
-            // follow rather than over the top of them, centred on the span it
-            // ends up with, the way kitty grows one.
-            let grow_dx = if config.font.wide_glyph_growth {
+            // A private-use icon wider than its cell is drawn across the
+            // blanks that follow rather than over the top of them, centred on
+            // the span it ends up with, the way kitty grows one.
+            let grow_dx = if may_grow(ch) {
                 let spare = run[byte + ch.len_utf8()..]
                     .chars()
                     .take(MAX_EXTRA_CELLS)
@@ -1589,19 +1589,6 @@ mod tests {
     /// A context whose monospace fallback is scaled far past the primary face,
     /// so a character the primary lacks comes back several times wider than
     /// the cell — a Nerd Font icon against a half-width cell, in miniature.
-    fn ctx_with_oversized_fallback() -> egui::Context {
-        let ctx = egui::Context::default();
-        let mut fonts = egui::FontDefinitions::default();
-        let mut fallback = (*fonts.font_data["Ubuntu-Light"]).clone();
-        fallback.tweak.scale = 4.0;
-        fonts.font_data.insert("Ubuntu-Light".into(), std::sync::Arc::new(fallback));
-        let mono = fonts.families[&FontFamily::Monospace].clone();
-        for name in [BOLD_FAMILY, ITALIC_FAMILY, BOLD_ITALIC_FAMILY] {
-            fonts.families.insert(FontFamily::Name(name.into()), mono.clone());
-        }
-        ctx.set_fonts(fonts);
-        ctx
-    }
 
     /// Where each glyph of a painted frame was placed.
     fn painted_at(
@@ -1644,6 +1631,31 @@ mod tests {
             _ => {},
         }
     }
+    /// A context whose monospace fallbacks are scaled far past the primary
+    /// face, so a character the primary lacks comes back several times wider
+    /// than the cell — a Nerd Font icon against a half-width cell, in
+    /// miniature.  U+E600 arrives from the bundled icon font, U+FB01 from
+    /// Ubuntu-Light.
+    fn ctx_with_oversized_fallback() -> egui::Context {
+        let ctx = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        // Scaled to overrun by more than the slack but by less than the four
+        // extra cells growth may claim, so the icon is centred rather than
+        // refused for want of room.
+        for (name, scale) in
+            [("Ubuntu-Light", 4.0), ("emoji-icon-font", 2.0), ("NotoEmoji-Regular", 2.0)]
+        {
+            let mut fallback = (*fonts.font_data[name]).clone();
+            fallback.tweak.scale = scale;
+            fonts.font_data.insert(name.into(), std::sync::Arc::new(fallback));
+        }
+        let mono = fonts.families[&FontFamily::Monospace].clone();
+        for name in [BOLD_FAMILY, ITALIC_FAMILY, BOLD_ITALIC_FAMILY] {
+            fonts.families.insert(FontFamily::Name(name.into()), mono.clone());
+        }
+        ctx.set_fonts(fonts);
+        ctx
+    }
 
     /// Every glyph's x position after one frame of a terminal fed `row`.
     fn painted_row(
@@ -1668,54 +1680,75 @@ mod tests {
         painted.iter().find(|(g, _)| g == ch).unwrap_or_else(|| panic!("{ch} was not painted")).1
     }
 
-    /// An icon sized to its own face's em overruns a narrower cell.  With
-    /// growth on it is drawn across the blanks that follow instead, centred on
-    /// the span it was granted; the glyphs beside it do not move.
-    ///
-    /// U+FB01 is absent from the primary face, so it comes back from the
-    /// oversized fallback rather than at the cell's width.
+    /// The cell's width and the left edge of column 0, read off a painted row
+    /// of characters the primary face serves at its own advance.
+    fn cell_geometry(ctx: &egui::Context, config: &Config, screen: Vec2) -> (f32, f32) {
+        let row = painted_row(ctx, config, screen, b"MM");
+        let xs: Vec<f32> = row.iter().filter(|(g, _)| g == "M").map(|(_, x)| *x).collect();
+        let (first, second) = (xs[0].min(xs[1]), xs[0].max(xs[1]));
+        (first, second - first)
+    }
+
+    /// An icon sized to its own face's em overruns a narrower cell.  It is
+    /// drawn across the blanks that follow instead, centred on the span it was
+    /// granted.
     #[test]
-    fn an_over_wide_glyph_is_centred_over_the_blanks_after_it() {
+    fn an_over_wide_icon_is_centred_over_the_blanks_after_it() {
         let ctx = ctx_with_oversized_fallback();
-        let mut config = Config::default();
+        let config = Config::default();
         let screen = Vec2::new(640.0, 480.0);
+        let (origin, cell_w) = cell_geometry(&ctx, &config, screen);
 
-        let plain = painted_row(&ctx, &config, screen, "M\u{fb01}".as_bytes());
-        let (anchor, cell_w) = (x_of(&plain, "M"), x_of(&plain, "\u{fb01}") - x_of(&plain, "M"));
-
-        config.font.wide_glyph_growth = true;
-        let grown = painted_row(&ctx, &config, screen, "M\u{fb01}".as_bytes());
+        let painted = painted_row(&ctx, &config, screen, "M\u{e600}".as_bytes());
 
         let glyph_w =
-            ctx.fonts(|f| f.glyph_width(&FontId::monospace(config.font.egui_size()), '\u{fb01}'));
+            ctx.fonts(|f| f.glyph_width(&FontId::monospace(config.font.egui_size()), '\u{e600}'));
         let cells = crate::glyph_cache::grown_cells(glyph_w, cell_w, MAX_EXTRA_CELLS);
         assert!(cells > 1, "the fixture's fallback glyph is not over-wide");
 
-        assert_eq!(x_of(&grown, "M"), anchor, "growth moved a glyph that fits its cell");
-        let start = anchor + cell_w;
-        let left = x_of(&grown, "\u{fb01}") - start;
-        let right = start + cells as f32 * cell_w - (x_of(&grown, "\u{fb01}") + glyph_w);
-        assert!(left > 0.5, "the over-wide glyph was left in its own cell");
+        let start = origin + cell_w;
+        let left = x_of(&painted, "\u{e600}") - start;
+        let right = start + cells as f32 * cell_w - (x_of(&painted, "\u{e600}") + glyph_w);
+        assert!(left > 0.5, "the over-wide icon was left in its own cell");
         assert!((left - right).abs() < 0.5, "not centred: {left} left, {right} right");
     }
 
-    /// Growth may only claim blanks, so a glyph can want more cells than it
+    /// Growth may only claim blanks, so an icon can want more cells than it
     /// gets.  Centring it on the shorter span would put it left of its own
     /// cell, over the character before it — worse than the right-hand overrun
     /// growth exists to avoid.  It stays where it is instead.
     #[test]
-    fn an_over_wide_glyph_is_not_pulled_left_when_the_room_falls_short() {
+    fn an_over_wide_icon_is_not_pulled_left_when_the_room_falls_short() {
         let ctx = ctx_with_oversized_fallback();
-        let mut config = Config::default();
+        let config = Config::default();
         let screen = Vec2::new(640.0, 480.0);
+        let (origin, cell_w) = cell_geometry(&ctx, &config, screen);
 
-        let plain = painted_row(&ctx, &config, screen, "M\u{fb01}X".as_bytes());
-        let placed = x_of(&plain, "\u{fb01}");
+        let painted = painted_row(&ctx, &config, screen, "M\u{e600} X".as_bytes());
 
-        config.font.wide_glyph_growth = true;
-        let grown = painted_row(&ctx, &config, screen, "M\u{fb01}X".as_bytes());
+        assert_eq!(
+            x_of(&painted, "\u{e600}"),
+            origin + cell_w,
+            "the icon was pulled left of its own cell"
+        );
+    }
 
-        assert_eq!(x_of(&grown, "\u{fb01}"), placed, "the glyph was pulled left of its own cell");
+    /// Growth is for icons.  A letter that happens to arrive from an over-wide
+    /// fallback face keeps its cell, so ordinary text never moves — which is
+    /// what makes growing safe to do without a switch.
+    #[test]
+    fn an_over_wide_letter_is_not_grown() {
+        let ctx = ctx_with_oversized_fallback();
+        let config = Config::default();
+        let screen = Vec2::new(640.0, 480.0);
+        let (origin, cell_w) = cell_geometry(&ctx, &config, screen);
+
+        let painted = painted_row(&ctx, &config, screen, "M\u{fb01}".as_bytes());
+
+        let glyph_w =
+            ctx.fonts(|f| f.glyph_width(&FontId::monospace(config.font.egui_size()), '\u{fb01}'));
+        assert!(glyph_w > cell_w * 1.25, "the fixture's letter is not over-wide");
+        assert_eq!(x_of(&painted, "\u{fb01}"), origin + cell_w, "a letter was grown");
     }
 
     /// The snapshot resolves every cell's foreground, background and face
