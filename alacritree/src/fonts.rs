@@ -1024,8 +1024,22 @@ fn take_bundled_faces(defs: &mut FontDefinitions) -> Vec<(FontFamily, Vec<String
 }
 
 fn restore_bundled_faces(defs: &mut FontDefinitions, bundled: Vec<(FontFamily, Vec<String>)>) {
+    let proportional = bundled
+        .iter()
+        .find(|(family, _)| *family == FontFamily::Proportional)
+        .map(|(_, faces)| faces.clone())
+        .unwrap_or_default();
     for (family, faces) in bundled {
         defs.families.entry(family).or_default().extend(faces);
+    }
+    // UI variants used to inherit these through Proportional. They are built
+    // while the bundled faces are lifted out, so append the same last-resort
+    // list explicitly after the symbol fallback has been installed.
+    for family in [UI_BOLD_FAMILY, UI_ITALIC_FAMILY, UI_BOLD_ITALIC_FAMILY] {
+        defs.families
+            .entry(FontFamily::Name(family.into()))
+            .or_default()
+            .extend(proportional.iter().cloned());
     }
 }
 
@@ -2027,8 +2041,11 @@ mod tests {
         // fallbacks answers first and a magnifier draws as `fl`.  They stay in
         // the list — epaint ships `Ubuntu-Light` for `√` and friends — but only
         // once every configured face has had its turn.
-        let bundled = FontDefinitions::default().families[&FontFamily::Monospace].clone();
-        assert!(!bundled.is_empty(), "egui bundles a monospace family");
+        let defaults = FontDefinitions::default();
+        let bundled_monospace = defaults.families[&FontFamily::Monospace].clone();
+        let bundled_proportional = defaults.families[&FontFamily::Proportional].clone();
+        assert!(!bundled_monospace.is_empty(), "egui bundles a monospace family");
+        assert!(!bundled_proportional.is_empty(), "egui bundles a proportional family");
 
         let fonts = SystemFonts::with_cache_dir(None);
         let Some(family) = fonts.db().faces().find_map(|face| {
@@ -2049,17 +2066,27 @@ mod tests {
             build_font_definitions(&config, &UiFont::default(), &fonts).expect("family resolves").0;
         std::fs::remove_file(&path).ok();
 
-        let mono = &defs.families[&FontFamily::Monospace];
-        let configured = mono
-            .iter()
-            .position(|id| id.starts_with(USER_FALLBACK_ID))
-            .expect("the configured fallback registered");
-        for id in &bundled {
-            let at = mono
+        for (family, bundled) in [
+            (FontFamily::Monospace, &bundled_monospace),
+            (FontFamily::Proportional, &bundled_proportional),
+            (FontFamily::Name(UI_BOLD_FAMILY.into()), &bundled_proportional),
+            (FontFamily::Name(UI_ITALIC_FAMILY.into()), &bundled_proportional),
+            (FontFamily::Name(UI_BOLD_ITALIC_FAMILY.into()), &bundled_proportional),
+        ] {
+            let ids = &defs.families[&family];
+            let configured = ids
                 .iter()
-                .position(|listed| listed == id)
-                .unwrap_or_else(|| panic!("egui's bundled '{id}' was dropped, not demoted"));
-            assert!(at > configured, "egui's bundled '{id}' answers before a configured fallback");
+                .position(|id| id.starts_with(USER_FALLBACK_ID))
+                .unwrap_or_else(|| panic!("the configured fallback registered in {family:?}"));
+            for id in bundled {
+                let at = ids.iter().position(|listed| listed == id).unwrap_or_else(|| {
+                    panic!("egui's bundled '{id}' was dropped from {family:?}, not demoted")
+                });
+                assert!(
+                    at > configured,
+                    "egui's bundled '{id}' answers before a configured fallback in {family:?}"
+                );
+            }
         }
     }
 
