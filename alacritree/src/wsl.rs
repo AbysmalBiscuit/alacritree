@@ -342,13 +342,9 @@ pub fn run_batch(distro: &str, script: &str, args: &[&str]) -> Result<Vec<u8>, S
     Ok(output.stdout)
 }
 
-/// Resolve `delta`'s absolute path inside `distro`, as the user's login shell
-/// sees it.  `wsl.exe --exec sh` only inherits the default system PATH, which
-/// omits per-user install dirs like `~/.cargo/bin`; sourcing the login shell
-/// (`getent passwd` → the user's shell, run with `-lc`) picks up the profile
-/// that puts delta on PATH.  One wsl.exe round trip — call off the UI thread.
-/// Returns `None` when delta isn't found; callers must not cache that, so an
-/// install mid-session is picked up on the next attempt.
+/// Resolve `delta`'s absolute path inside `distro`.  Returns `None` when delta
+/// isn't found; callers must not cache that, so an install mid-session is
+/// picked up on the next attempt.
 pub fn discover_delta(distro: &str) -> Option<String> {
     // The helper's hello already resolved delta through the login shell; a
     // missing capability is not a cached miss — fall through and re-check
@@ -356,21 +352,56 @@ pub fn discover_delta(distro: &str) -> Option<String> {
     if let Some(path) = crate::wsl_helper::capability_delta(distro) {
         return Some(path);
     }
-    let script = r#"s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); [ -x "$s" ] || s=${SHELL:-/bin/sh}; exec "$s" -lc 'command -v delta'"#;
+    probe_tools(distro, &["delta"]).ok()?.into_iter().next().flatten()
+}
+
+/// Resolve each of `programs` inside `distro` as the user's login shell sees
+/// them, in one wsl.exe round trip — call off the UI thread.  Results are
+/// positional: a program that is not on that PATH comes back `None`.
+///
+/// `wsl.exe --exec sh` inherits only the default system PATH, which omits
+/// per-user install dirs like `~/.cargo/bin`; sourcing the login shell
+/// (`getent passwd` → the user's shell, run with `-lc`) picks up the profile
+/// that puts them there.  `|| echo` keeps a missing program's slot occupied,
+/// and is written the way the resident helper's hello line writes it because
+/// that form works in fish as well as in POSIX shells.
+///
+/// Program names are interpolated into the script, so they must be literals —
+/// nothing a user typed belongs here.
+pub fn probe_tools(distro: &str, programs: &[&str]) -> Result<Vec<Option<String>>, String> {
+    let probes: Vec<String> = programs.iter().map(|p| format!("command -v {p} || echo")).collect();
+    let script = format!(
+        r#"s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); [ -x "$s" ] || s=${{SHELL:-/bin/sh}}; exec "$s" -lc '{}'"#,
+        probes.join("; ")
+    );
     let output = command(distro, None)
         .arg("sh")
         .arg("-c")
         .arg(script)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+        .map_err(|e| format!("failed to run wsl.exe: {e}"))?;
+    // Empty stdout with a failing exit means wsl.exe itself refused, not that
+    // the probes came back empty-handed.
+    if !output.status.success() && output.stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() { "wsl.exe failed".to_string() } else { stderr });
     }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() { None } else { Some(path) }
+    Ok(parse_tool_paths(&output.stdout, programs.len()))
+}
+
+/// One line per program asked for, in order; an empty line is a program the
+/// login shell could not find.  A short answer — the shell died partway —
+/// pads with `None` rather than sliding every later result onto the wrong
+/// name.
+fn parse_tool_paths(stdout: &[u8], count: usize) -> Vec<Option<String>> {
+    let text = String::from_utf8_lossy(stdout);
+    let mut lines = text.lines();
+    (0..count)
+        .map(|_| lines.next().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string))
+        .collect()
 }
 
 /// Split batched stdout on `SECTION_SEP`.  Always returns at least one
@@ -614,6 +645,30 @@ mod tests {
         );
         assert_eq!(ShellChoice::parse("profile:"), None);
         assert_eq!(ShellChoice::Profile("pwsh".to_string()).to_state_string(), "profile:pwsh");
+    }
+
+    #[test]
+    fn reads_one_probe_line_per_program() {
+        let stdout = b"/usr/bin/git\n\n/home/lev/.local/bin/gh\n";
+        assert_eq!(
+            parse_tool_paths(stdout, 3),
+            vec![
+                Some("/usr/bin/git".to_string()),
+                None,
+                Some("/home/lev/.local/bin/gh".to_string())
+            ]
+        );
+    }
+
+    /// A truncated answer must not slide the surviving paths onto the names
+    /// that follow them — reporting delta's path as doppler's is worse than
+    /// reporting neither.
+    #[test]
+    fn a_short_probe_answer_pads_rather_than_shifts() {
+        assert_eq!(
+            parse_tool_paths(b"/usr/bin/git\n", 3),
+            vec![Some("/usr/bin/git".to_string()), None, None]
+        );
     }
 
     /// Live round trip against the default distro.  Requires WSL; run
