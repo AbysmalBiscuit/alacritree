@@ -46,6 +46,7 @@ use crate::state::{self, PersistedProject};
 use crate::terminal_view;
 use crate::upstream::UpstreamState;
 use crate::worktree::{self as wt, CreateRequest, Progress};
+use crate::worktree_liveness;
 use crate::wsl::{self, ShellChoice};
 use crate::wsl_helper::{self, WslProbe};
 
@@ -354,6 +355,12 @@ fn project_filter_toggles(pr_status: bool) -> &'static [char] {
 /// The toggle identities the git panel accepts: modified, deleted, untracked.
 const GIT_FILTER_TOGGLES: &[char] = &['m', 'd', 'u'];
 
+/// How long after the user's last event the worktree liveness tick keeps
+/// asking for frames.  Long enough that a `git worktree remove` typed at a
+/// prompt finishes and greys its row; short enough that a window left open
+/// goes back to producing no frames at all.
+const PROBE_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The projects-panel toggle a named action flips, or `None` for an action that
 /// is not one of its filters.  `PanelFilter::toggle` ignores an identity it does
 /// not allow and dispatch falls through on an unmatched action, so nothing at
@@ -507,10 +514,11 @@ pub struct AlacritreeApp {
     row_labels: crate::row_label::LabelTemplates,
     config: Config,
     theme: Theme,
-    last_error: Option<String>,
-    /// A modal popup carrying a failure message the user must dismiss —
-    /// louder than `last_error`, used when a background action (e.g. a
-    /// worktree delete) fails after its dialog already closed.
+    /// A modal popup carrying a failure message the user must dismiss.  Every
+    /// failure that has no inline home lands here — a background action (e.g. a
+    /// worktree delete) that failed after its dialog closed, or a shell that
+    /// would not spawn.  Dismissing it leaves the app usable, which an error
+    /// painted over the terminal would not.
     error_dialog: Option<String>,
     quit_dialog_open: bool,
     pending_delete: Option<DeleteRequest>,
@@ -561,6 +569,15 @@ pub struct AlacritreeApp {
     /// `pending_project_refresh` — resolved off the UI thread, adopted in
     /// `wsl_delta_path`.
     pending_delta: HashMap<String, Receiver<Option<String>>>,
+    /// Row styling only — never `Worktree::prunable`, which the delete flow
+    /// reads to choose between removing a worktree and pruning it.
+    liveness: worktree_liveness::LivenessCache,
+    /// The probe worker in flight, if any.  One at a time: a path slower than
+    /// the interval stretches freshness rather than queueing more work.
+    liveness_probe: Option<Receiver<Vec<(PathBuf, worktree_liveness::Liveness)>>>,
+    /// When the user last gave the app an event.  Timed wake-ups are armed
+    /// only just after one, so an app left open overnight goes fully quiet.
+    last_input: Instant,
     /// Rows behind the last-built focus snapshot. Paint reuses this until the
     /// next rebuild instead of recomputing the projection every frame.
     sidebar_rows_cache: Option<Vec<SidebarRow>>,
@@ -847,7 +864,6 @@ impl AlacritreeApp {
             row_labels,
             config,
             theme,
-            last_error: None,
             error_dialog: None,
             quit_dialog_open: false,
             pending_delete: None,
@@ -876,6 +892,9 @@ impl AlacritreeApp {
             project_refreshes: Default::default(),
             wsl_delta_paths: HashMap::new(),
             pending_delta: HashMap::new(),
+            liveness: Default::default(),
+            liveness_probe: None,
+            last_input: Instant::now(),
             sidebar_rows_cache: None,
             sidebar_focus_prev: None,
             sidebar_anchor: None,
@@ -897,7 +916,7 @@ impl AlacritreeApp {
         }
 
         if let Err(e) = app.spawn_session(&cc.egui_ctx, None) {
-            app.last_error = Some(format!("failed to spawn shell: {e}"));
+            app.error_dialog = Some(format!("failed to spawn shell: {e}"));
         }
 
         app
@@ -976,6 +995,72 @@ impl AlacritreeApp {
         self.project_refreshes.start(root, rx);
     }
 
+    /// Keep the worktree rows the sidebar just drew honest about whether their
+    /// checkout is still there.  Discovery only re-runs when something asks it
+    /// to, so a `git worktree remove` typed into one of our own sessions would
+    /// otherwise leave the row looking live until the user pressed refresh.
+    ///
+    /// `request_repaint_after` is what carries the tick across a terminal that
+    /// has gone quiet — egui paints on demand, so without it the probe would
+    /// never run a second time.  It is armed only for a short window after the
+    /// user last touched the app, because an unconditional 1.5 s wake-up is
+    /// not just a repaint: every frame runs `StatusCache::poll` from the git
+    /// sidebar's paint on the same staleness interval, so a permanent
+    /// heartbeat would spawn a git status walk forever on an app nobody is
+    /// using.
+    ///
+    /// `probing` is the sidebar's decision, not a re-derivation: only it knows
+    /// whether the walk that produced `drawn` was collecting at all, and an
+    /// empty `drawn` on a probe frame ("nothing eligible painted") has to
+    /// restart the interval where an empty `drawn` on any other frame must
+    /// leave it alone.
+    fn poll_worktree_liveness(&mut self, ctx: &Context, probing: bool, drawn: &[PathBuf]) {
+        let now = Instant::now();
+        match self.liveness_probe.as_ref().map(Receiver::try_recv) {
+            Some(Ok(results)) => {
+                self.liveness.adopt(results, now);
+                self.liveness_probe = None;
+                // This runs after the rows painted, so the answers that just
+                // landed are one frame late. Without asking for that frame the
+                // new styling waits out a whole interval, or never arrives at
+                // all once the grace window has closed.
+                ctx.request_repaint();
+            },
+            // A worker still running is the backpressure: a path slower than
+            // the interval stretches freshness instead of stacking up probes,
+            // and its own `request_repaint` brings us back here.
+            Some(Err(TryRecvError::Empty)) => return,
+            Some(Err(TryRecvError::Disconnected)) => self.liveness_probe = None,
+            None => {},
+        }
+
+        if probing {
+            let batch = self.liveness.batch(drawn);
+            if batch.is_empty() {
+                // No worker will land to close the interval, so close it here.
+                self.liveness.adopt(Vec::new(), now);
+            } else {
+                let (tx, rx) = mpsc::channel();
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    let results =
+                        batch.iter().map(|p| (p.clone(), worktree_liveness::probe(p))).collect();
+                    let _ = tx.send(results);
+                    ctx.request_repaint();
+                });
+                self.liveness_probe = Some(rx);
+                return;
+            }
+        }
+
+        if self.config.ui.worktree_liveness
+            && self.last_input.elapsed() < PROBE_GRACE
+            && let Some(wait) = self.liveness.wait(now)
+        {
+            ctx.request_repaint_after(wait);
+        }
+    }
+
     /// Re-run worktree discovery for every project — the keyboard/IPC
     /// equivalent of pressing each row's refresh button in turn.
     fn refresh_all_projects(&mut self, ctx: &Context) {
@@ -987,12 +1072,20 @@ impl AlacritreeApp {
     /// Adopt completed background discoveries through `Project::apply`, which
     /// drops a result the backend could not vouch for and keeps `expanded`,
     /// the shell override, and the label either way.
+    ///
+    /// Runs every frame, so the occupied-directory set is built inside the
+    /// callback: hoisting it would clone every session's path on every repaint
+    /// terminal output happened to trigger, for the discoveries that are not
+    /// running.
     fn poll_project_refreshes(&mut self) {
+        let sessions = &self.sessions;
         let projects = &mut self.projects;
         self.project_refreshes.poll(|root, found| {
             match projects.iter_mut().find(|p| p.root == *root) {
                 Some(project) => {
-                    project.apply(found);
+                    let occupied: HashSet<PathBuf> =
+                        sessions.iter().filter_map(|s| s.working_directory.clone()).collect();
+                    project.apply(found, &occupied);
                     Ok(project_json(project))
                 },
                 None => Err(format!("{} is not a project in the sidebar", root.display())),
@@ -1005,15 +1098,14 @@ impl AlacritreeApp {
         ctx: &Context,
         working_directory: WorkspaceKey,
     ) -> std::io::Result<SessionId> {
-        // Before the PTY exists, so the shell can't race `doppler run`
-        // against the scope write.
-        if let Some(dir) = &working_directory {
-            self.sync_doppler_scopes(dir.clone());
-        }
         let (shell, wsl_probe) = self.resolve_shell(&working_directory);
         self.spawn_session_with_shell(ctx, working_directory, shell, wsl_probe)
     }
 
+    /// The one path every shell reaches, which is why the checkout guard and
+    /// the Doppler sync live here rather than in `spawn_session`: a named
+    /// profile arrives with its shell already chosen and would otherwise open
+    /// in a checkout Ctrl+T refuses.
     fn spawn_session_with_shell(
         &mut self,
         ctx: &Context,
@@ -1021,6 +1113,21 @@ impl AlacritreeApp {
         shell: Option<Shell>,
         wsl_probe: Option<WslProbe>,
     ) -> std::io::Result<SessionId> {
+        if let Some(dir) = &working_directory {
+            // A checkout git has forgotten is refused here rather than in
+            // `Session::spawn`, which can only see whether the directory
+            // exists — a half-finished `git worktree remove` leaves one that
+            // does.  Refusing here is what keeps the greyed row's promise.
+            if self.worktree_gone(dir) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("worktree is no longer checked out: {}", dir.display()),
+                ));
+            }
+            // Before the PTY exists, so the shell can't race `doppler run`
+            // against the scope write.
+            self.sync_doppler_scopes(dir.clone());
+        }
         let session = Session::spawn(
             ctx.clone(),
             &self.config,
@@ -1048,7 +1155,7 @@ impl AlacritreeApp {
             }
             self.active_session.insert(workspace, id);
         } else if let Err(e) = self.spawn_scratchpad(ctx, workspace) {
-            self.last_error = Some(format!("failed to open scratchpad: {e}"));
+            self.error_dialog = Some(format!("failed to open scratchpad: {e}"));
             return;
         }
         self.focus_terminal();
@@ -1104,13 +1211,13 @@ impl AlacritreeApp {
     fn spawn_profile_session(&mut self, ctx: &Context, name: &str) {
         let Some(profile) = self.config.profile(name) else {
             log::warn!("no shell profile named `{name}`");
-            self.last_error = Some(format!("no shell profile named `{name}`"));
+            self.error_dialog = Some(format!("no shell profile named `{name}`"));
             return;
         };
         let (shell, wsl_probe) = profile_session_shell(profile);
         let ws = self.current_workspace.clone();
         if let Err(e) = self.spawn_session_with_shell(ctx, ws, shell, wsl_probe) {
-            self.last_error = Some(format!("failed to spawn profile `{name}`: {e}"));
+            self.error_dialog = Some(format!("failed to spawn profile `{name}`: {e}"));
         }
     }
 
@@ -1156,10 +1263,9 @@ impl AlacritreeApp {
         // The dir can vanish between discovery marking the row live and the
         // click. Switching first would strand the user on a dead workspace
         // with a failed spawn — stay put and let the sidebar re-mark the row.
-        if !path.is_dir() {
-            // This is recoverable from the sidebar, so use the dismissible
-            // dialog instead of replacing the terminal with `last_error`
-            // forever.
+        // Shells already running there are the exception: they outlive the
+        // directory, and this row is the only way back to them.
+        if self.worktree_gone(path) && !self.workspace_has_sessions(&Some(path.to_path_buf())) {
             self.error_dialog =
                 Some("worktree directory is missing — prune it from the sidebar".to_string());
             if let Some(idx) =
@@ -1186,8 +1292,9 @@ impl AlacritreeApp {
         if self.active_session_index().is_some() {
             return;
         }
-        if let Err(e) = self.spawn_session(ctx, self.current_workspace.clone()) {
-            self.last_error = Some(format!("failed to spawn shell: {e}"));
+        let ws = self.current_workspace.clone();
+        if let Err(e) = self.spawn_session(ctx, ws.clone()) {
+            self.report_spawn_failure(ctx, &ws, &e);
             return;
         }
         // Filling in a missing active entry is self-healing, not navigation.
@@ -1238,8 +1345,8 @@ impl AlacritreeApp {
         if verdict != CloseFallback::Stay
             && self.config.ui.last_session_close == LastSessionClose::Respawn
         {
-            if let Err(e) = self.spawn_session(ctx, workspace) {
-                self.last_error = Some(format!("failed to spawn shell: {e}"));
+            if let Err(e) = self.spawn_session(ctx, workspace.clone()) {
+                self.report_spawn_failure(ctx, &workspace, &e);
             }
             return;
         }
@@ -1303,7 +1410,7 @@ impl AlacritreeApp {
         // Discovery marking can be stale; a dir deleted since the last
         // refresh should still get the prune flow, not a doomed
         // `git worktree remove`.
-        let prunable = wt.prunable || !wt.path.is_dir();
+        let prunable = wt.prunable || worktree_liveness::is_gone(&wt.path);
         self.pending_delete = Some(DeleteRequest {
             project_idx,
             worktree_path: wt.path.clone(),
@@ -1366,6 +1473,45 @@ impl AlacritreeApp {
             self.current_workspace = target.clone();
         }
         Ok(target)
+    }
+
+    /// Whether the sidebar worktree at `path` is one git no longer recognises,
+    /// which is the single question the row's styling, this guard and the
+    /// delete flow all ask — a greyed row that still spawns a shell would be
+    /// the inconsistency this exists to remove.
+    ///
+    /// Main checkouts and non-git project roots have no `.git` link to lose,
+    /// so they fall back to the directory itself; so does a path no project
+    /// lists, which is the safe default for a caller we cannot place.
+    ///
+    /// The same path can be listed by two projects, so any row that calls it a
+    /// linked worktree decides.  Taking the first match instead would let
+    /// sidebar order pick the weaker test, and the husk of a linked checkout
+    /// would read as alive.
+    fn worktree_gone(&self, path: &Path) -> bool {
+        let linked = self
+            .projects
+            .iter()
+            .flat_map(|p| &p.worktrees)
+            .filter(|wt| wt.path == path)
+            .any(|wt| !wt.is_main);
+        if linked { worktree_liveness::is_gone(path) } else { !path.is_dir() }
+    }
+
+    /// Report a failed spawn, and re-run discovery when the cause was a
+    /// vanished checkout: git may have forgotten the worktree entirely, in
+    /// which case the row should go rather than keep offering a shell that
+    /// cannot start.
+    fn report_spawn_failure(&mut self, ctx: &Context, ws: &WorkspaceKey, e: &std::io::Error) {
+        self.error_dialog = Some(format!("failed to spawn shell: {e}"));
+        let Some(path) = ws.as_deref().filter(|p| self.worktree_gone(p)) else {
+            return;
+        };
+        if let Some(idx) =
+            self.projects.iter().position(|p| p.worktrees.iter().any(|w| w.path == path))
+        {
+            self.refresh_project(ctx, idx);
+        }
     }
 
     fn workspace_session_indices(&self, ws: &WorkspaceKey) -> Vec<usize> {
@@ -1457,9 +1603,8 @@ impl AlacritreeApp {
         let mut order: Vec<WorkspaceKey> = vec![None];
         for project in &self.projects {
             for wt in &project.worktrees {
-                // Prunable rows can't host a shell; cycling into one would
-                // just bounce off the activate guard on every keypress.
-                if !wt.prunable {
+                let has_sessions = self.workspace_has_sessions(&Some(wt.path.clone()));
+                if worktree_is_switchable(wt, self.liveness.missing(&wt.path), has_sessions) {
                     order.push(Some(wt.path.clone()));
                 }
             }
@@ -2474,8 +2619,8 @@ impl AlacritreeApp {
             },
             BindingAction::Named(NamedAction::SpawnNewInstance) => {
                 let ws = self.current_workspace.clone();
-                if let Err(e) = self.spawn_session(ctx, ws) {
-                    self.last_error = Some(format!("failed to spawn shell: {e}"));
+                if let Err(e) = self.spawn_session(ctx, ws.clone()) {
+                    self.report_spawn_failure(ctx, &ws, &e);
                 }
             },
             BindingAction::Named(NamedAction::Quit) => {
@@ -2516,7 +2661,7 @@ impl AlacritreeApp {
                             "SpawnProfile{n}: only {} profiles configured",
                             self.config.profiles.len()
                         );
-                        self.last_error = Some(format!("SpawnProfile{n}: no such profile"));
+                        self.error_dialog = Some(format!("SpawnProfile{n}: no such profile"));
                     },
                 }
             },
@@ -3042,8 +3187,8 @@ impl AlacritreeApp {
         if spawn_default {
             let ctx = ui.ctx().clone();
             let ws = self.current_workspace.clone();
-            if let Err(e) = self.spawn_session(&ctx, ws) {
-                self.last_error = Some(format!("failed to spawn shell: {e}"));
+            if let Err(e) = self.spawn_session(&ctx, ws.clone()) {
+                self.report_spawn_failure(&ctx, &ws, &e);
             }
         }
         if let Some(name) = spawn_profile {
@@ -3053,6 +3198,15 @@ impl AlacritreeApp {
     }
 
     fn show_project_sidebar(&mut self, ctx: &Context, panel_frame: Frame) -> egui::Rect {
+        // Only rows that actually paint are worth a liveness probe, and which
+        // ones those are is not known until the tree, its filters and its
+        // collapsed projects have all had their say.  Deciding *before* the
+        // walk that this frame is not a probe frame is what keeps the other
+        // ~89 frames of every 90 from collecting anything at all.
+        let probing = self.config.ui.worktree_liveness
+            && self.liveness_probe.is_none()
+            && self.liveness.wants_probe(Instant::now());
+        let drawn_worktrees: std::cell::RefCell<Vec<PathBuf>> = Default::default();
         let activate_request: std::cell::Cell<Option<PathBuf>> = std::cell::Cell::new(None);
         let delete_request: std::cell::Cell<Option<PathBuf>> = std::cell::Cell::new(None);
         let create_request: std::cell::Cell<Option<usize>> = std::cell::Cell::new(None);
@@ -3626,9 +3780,23 @@ impl AlacritreeApp {
                                 );
                                 let wt_scroll = scrolls(is_cursor);
                                 let is_deleting = deleting_paths.contains(&wt.path);
+                                // A `\\wsl.localhost\` stat boots the distro's
+                                // 9P server, so probing one would restart a VM
+                                // the user had shut down and hold it resident
+                                // for as long as its worktrees are listed.
+                                // WSL rows keep discovery's word.
+                                if probing
+                                    && matches!(
+                                        wsl::classify(&wt.path),
+                                        wsl::Location::Windows(_)
+                                    )
+                                {
+                                    drawn_worktrees.borrow_mut().push(wt.path.clone());
+                                }
                                 let action = worktree_row(
                                     ui,
                                     wt,
+                                    self.liveness.missing(&wt.path),
                                     worktree_labels
                                         .get(idx)
                                         .and_then(|v| v.get(wt_idx))
@@ -3759,13 +3927,19 @@ impl AlacritreeApp {
         }
         if let Some(ws) = spawn_shell_request.take() {
             // Spawning activates the workspace and the new session, matching
-            // Ctrl+T and worktree-creation's open-on-done.
-            self.current_workspace = ws.clone();
-            if let Err(e) = self.spawn_session(ctx, ws) {
-                self.last_error = Some(format!("failed to spawn shell: {e}"));
+            // Ctrl+T and worktree-creation's open-on-done.  A failed spawn
+            // hands the workspace back rather than stranding the user on one
+            // with no shell — the same reasoning as `activate_worktree`.
+            let previous = std::mem::replace(&mut self.current_workspace, ws.clone());
+            match self.spawn_session(ctx, ws.clone()) {
+                Ok(_) => workspace_activated = true,
+                Err(e) => {
+                    self.current_workspace = previous;
+                    self.report_spawn_failure(ctx, &ws, &e);
+                },
             }
-            workspace_activated = true;
         }
+        self.poll_worktree_liveness(ctx, probing, &drawn_worktrees.into_inner());
         if self.config.ui.sidebar_click_focus {
             // A click that picks a workspace or session means "go work
             // there", so it focuses the terminal; other panel clicks focus
@@ -4241,7 +4415,7 @@ impl AlacritreeApp {
                 self.active_session.insert(Some(workspace), id);
             },
             Err(e) => {
-                self.last_error = Some(format!("failed to open diff: {e}"));
+                self.error_dialog = Some(format!("failed to open diff: {e}"));
             },
         }
     }
@@ -6324,6 +6498,11 @@ fn upstream_badge<'a>(
 fn worktree_row(
     ui: &mut egui::Ui,
     wt: &Worktree,
+    // What the liveness probe has seen since discovery ran, if anything.
+    // `Some` overrides `wt.prunable` in both directions; `None` leaves it
+    // standing.  Kept out of the flag itself because that also picks between
+    // `git worktree remove` and a prune, and a probe must never decide that.
+    missing: Option<bool>,
     display_name: &str,
     pr: Option<&PrInfo>,
     is_active: bool,
@@ -6348,6 +6527,9 @@ fn worktree_row(
     // The leading and trailing groups run as sibling closures, so the status
     // slot's hint travels out separately and joins the rest afterwards.
     let mut status_hint = None;
+    // Discovery's word, corrected by whatever the probe has seen since.  The
+    // main worktree is never offered for pruning, so it never greys either.
+    let prunable = worktree_looks_gone(wt, missing);
     // right: 0 keeps the worktree `×` at the same x as the project row's `×`,
     // which has no frame margin and sits flush against the panel's outer padding.
     let frame = Frame::default().inner_margin(Margin { left: 16, right: 0, top: 3, bottom: 3 });
@@ -6358,7 +6540,7 @@ fn worktree_row(
             } else {
                 (&icons.worktree, DEFAULT_WORKTREE_ICON)
             };
-            let name_color = if wt.prunable || deleting {
+            let name_color = if prunable || deleting {
                 theme.text_muted
             } else if is_active {
                 theme.text
@@ -6397,11 +6579,8 @@ fn worktree_row(
                         return;
                     }
                     if !wt.is_main {
-                        let hover = if wt.prunable {
-                            "prune worktree"
-                        } else {
-                            "delete worktree and branch"
-                        };
+                        let hover =
+                            if prunable { "prune worktree" } else { "delete worktree and branch" };
                         let btn = styled_icon_button(
                             ui,
                             &icons.delete_worktree,
@@ -6468,7 +6647,7 @@ fn worktree_row(
         hints.add(rect, hint);
     }
     let resp = hints.apply(resp, theme.icon_tooltips, |resp| {
-        if wt.prunable {
+        if prunable {
             resp.on_hover_text("worktree directory is missing — × prunes it")
         } else {
             name_tooltip(resp, display_name, name_elided, theme.sidebar_tooltips)
@@ -6515,11 +6694,25 @@ fn worktree_row(
         ui.scroll_to_rect(full_rect, None);
     }
     WorktreeAction {
-        activate: !deleting && resp.clicked() && !delete_clicked && !spawn_clicked && !wt.prunable,
+        // A prunable row is still worth clicking when shells are homed there;
+        // `activate_worktree` turns the ones that aren't into the prune hint.
+        activate: !deleting && resp.clicked() && !delete_clicked && !spawn_clicked,
         delete: delete_clicked,
         spawn: spawn_clicked,
         set_base: set_base_clicked,
     }
+}
+
+/// The liveness cache corrects discovery for paint and navigation only. Keep
+/// this shared so a row that has just gone grey cannot remain a dead stop in
+/// the workspace ring. Main checkouts are never prune candidates, even when
+/// their project is a non-git directory with no .git entry.
+fn worktree_looks_gone(wt: &Worktree, missing: Option<bool>) -> bool {
+    missing.map_or(wt.prunable, |gone| gone && !wt.is_main)
+}
+
+fn worktree_is_switchable(wt: &Worktree, missing: Option<bool>, has_sessions: bool) -> bool {
+    !worktree_looks_gone(wt, missing) || has_sessions
 }
 
 struct SessionRowAction {
@@ -8072,6 +8265,9 @@ impl eframe::App for AlacritreeApp {
             .as_ref()
             .map(|_| (std::time::Instant::now(), crate::frame_log::output_wait()));
         self.grid_paint = std::time::Duration::ZERO;
+        if ctx.input(|i| !i.events.is_empty()) {
+            self.last_input = Instant::now();
+        }
         self.phases.restart();
         self.glyph_cache.begin_frame(ctx);
         self.poll_project_refreshes();
@@ -8146,26 +8342,14 @@ impl eframe::App for AlacritreeApp {
             .show(ctx, |ui| {
                 self.show_tab_strip(ui);
 
-                if let Some(err) = self.last_error.as_deref() {
-                    // A preedit can only be finalized or cancelled by the terminal
-                    // view's event drain, so without a session view to run it the
-                    // preedit would go stale and keep shortcuts suppressed forever.
-                    self.ime.clear();
-                    ui.label(
-                        RichText::new(err)
-                            .color(rgb_to_color32(self.config.palette.normal[1]))
-                            .monospace(),
-                    );
-                    return;
-                }
-
                 if self.active_session_index().is_none() {
                     self.adopt_active_session();
                 }
 
                 let Some(idx) = self.active_session_index() else {
-                    // Same rationale as the last_error branch above: without an
-                    // active session view, no code path can advance the preedit.
+                    // A preedit can only be finalized or cancelled by the terminal
+                    // view's event drain, so without a session view to run it the
+                    // preedit would go stale and keep shortcuts suppressed forever.
                     self.ime.clear();
                     ui.label(
                         RichText::new("no session — Ctrl+T to open one").color(theme.text_dim),
@@ -8378,6 +8562,35 @@ mod tests {
 
     fn ws(p: &str) -> WorkspaceKey {
         Some(PathBuf::from(p))
+    }
+
+    #[test]
+    fn a_grey_worktree_only_stays_in_the_workspace_ring_while_it_holds_sessions() {
+        let wt = Worktree {
+            name: "gone".into(),
+            path: PathBuf::from("/repo-worktrees/gone"),
+            branch: Some("feature".into()),
+            is_main: false,
+            prunable: false,
+            upstream: None,
+        };
+
+        assert!(!worktree_is_switchable(&wt, Some(true), false));
+        assert!(worktree_is_switchable(&wt, Some(true), true));
+    }
+
+    #[test]
+    fn a_main_checkout_never_looks_prunable_from_the_row_probe() {
+        let wt = Worktree {
+            name: "main".into(),
+            path: PathBuf::from("/plain-project"),
+            branch: None,
+            is_main: true,
+            prunable: false,
+            upstream: None,
+        };
+
+        assert!(!worktree_looks_gone(&wt, Some(true)));
     }
 
     /// Apply `move_target` to a concrete list so the drag semantics (drop
@@ -9982,7 +10195,8 @@ mod tests {
 
         let texts = texts_while_hovering(140.0, |ui| {
             worktree_row(
-                ui, &wt, &wt.name, None, true, false, false, false, None, false, &icons, &theme,
+                ui, &wt, None, &wt.name, None, true, false, false, false, None, false, &icons,
+                &theme,
             );
         });
 
@@ -10142,7 +10356,8 @@ mod tests {
         let output = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 worktree_row(
-                    ui, &wt, &wt.name, None, true, false, false, false, None, false, &icons, &theme,
+                    ui, &wt, None, &wt.name, None, true, false, false, false, None, false, &icons,
+                    &theme,
                 );
             });
         });
@@ -10265,6 +10480,7 @@ mod tests {
             worktree_row(
                 ui,
                 &wt,
+                None,
                 &wt.name,
                 Some(&pr),
                 true,
@@ -10573,7 +10789,8 @@ mod tests {
         let output = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 worktree_row(
-                    ui, &wt, &wt.name, None, true, false, false, false, None, false, &icons, &theme,
+                    ui, &wt, None, &wt.name, None, true, false, false, false, None, false, &icons,
+                    &theme,
                 );
             });
         });
@@ -10626,7 +10843,8 @@ mod tests {
 
             let texts = texts_while_hovering(140.0, |ui| {
                 worktree_row(
-                    ui, &wt, name, None, true, false, false, false, None, false, &icons, &theme,
+                    ui, &wt, None, name, None, true, false, false, false, None, false, &icons,
+                    &theme,
                 );
             });
 
@@ -10688,6 +10906,7 @@ mod tests {
                 worktree_row(
                     ui,
                     &wt,
+                    None,
                     &wt.name,
                     Some(&pr),
                     true,

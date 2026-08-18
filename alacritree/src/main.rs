@@ -52,6 +52,7 @@ mod terminal_view;
 mod test_util;
 mod upstream;
 mod worktree;
+mod worktree_liveness;
 mod wsl;
 mod wsl_helper;
 
