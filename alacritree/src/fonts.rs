@@ -14,6 +14,8 @@
 //! symbols and box-drawing characters that aren't in the primary face.
 
 use std::cell::OnceCell;
+#[cfg(not(unix))]
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -109,6 +111,10 @@ struct SystemFonts {
     coverage: OnceCell<Vec<(coverage::Candidate, coverage::Coverage)>>,
     #[cfg(not(unix))]
     cache_location: CacheLocation,
+    /// `RefCell` rather than `OnceCell` because the map is keyed and grows;
+    /// `&self` access matches `db` and `coverage`.
+    #[cfg(not(unix))]
+    seed_coverage: RefCell<HashMap<(PathBuf, u32), Option<coverage::Coverage>>>,
 }
 
 impl SystemFonts {
@@ -145,6 +151,24 @@ impl SystemFonts {
             };
             scan_coverage(self.db(), cache_path.as_deref())
         })
+    }
+
+    /// Coverage of a resolved seed face, computed at most once per install.
+    /// The four variant seeds and the UI family commonly resolve to the same
+    /// one or two files, and a miss is cached too so an unresolvable seed is
+    /// not retried once per variant.
+    #[cfg(not(unix))]
+    fn seed_coverage(&self, face: &ResolvedFace) -> Option<coverage::Coverage> {
+        let key = (face.path.clone(), face.face_index);
+        if let Some(hit) = self.seed_coverage.borrow().get(&key) {
+            return hit.clone();
+        }
+        // The borrow above is released here, so the fallback parse cannot
+        // panic against the borrow_mut below.
+        let computed = scanned_seed_coverage(self, face)
+            .or_else(|| face_coverage(&face.path, face.face_index));
+        self.seed_coverage.borrow_mut().insert(key, computed.clone());
+        computed
     }
 }
 
@@ -1081,12 +1105,47 @@ fn cmap_coverage(face: &ttf_parser::Face) -> Option<coverage::Coverage> {
     Some(coverage::Coverage::from_codepoints(codepoints))
 }
 
+#[cfg(all(not(unix), test))]
+thread_local! {
+    /// Per-thread because the Windows fallback tests call
+    /// `gather_fallback_faces` concurrently at the default thread count, and a
+    /// process-wide count would fold their parses into whichever test asserts.
+    static FACE_COVERAGE_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(not(unix), test))]
+fn reset_face_coverage_parses() {
+    FACE_COVERAGE_PARSES.with(|n| n.set(0));
+}
+
+#[cfg(all(not(unix), test))]
+fn face_coverage_parses() -> usize {
+    FACE_COVERAGE_PARSES.with(|n| n.get())
+}
+
+/// The scan already carries every system face and is disk-cached across
+/// launches, so a seed found here costs no parse at all.  `Candidate` carries
+/// both path and face index, so the match is exact — face 0 of a collection
+/// file can be an unrelated family.
+#[cfg(not(unix))]
+fn scanned_seed_coverage(fonts: &SystemFonts, face: &ResolvedFace) -> Option<coverage::Coverage> {
+    fonts
+        .scanned_coverage()
+        .iter()
+        .find(|(candidate, _)| {
+            candidate.path == face.path && candidate.face_index == face.face_index
+        })
+        .map(|(_, coverage)| coverage.clone())
+}
+
 /// Coverage of an already-resolved primary face, read at its resolved face
 /// index — face 0 of a collection file can be an unrelated family.
 #[cfg(not(unix))]
 fn face_coverage(path: &Path, face_index: u32) -> Option<coverage::Coverage> {
-    let data = std::fs::read(path).ok()?;
-    let parsed = ttf_parser::Face::parse(&data, face_index).ok()?;
+    #[cfg(test)]
+    FACE_COVERAGE_PARSES.with(|n| n.set(n.get() + 1));
+    let data = map_font_file(path).ok()?;
+    let parsed = ttf_parser::Face::parse(data, face_index).ok()?;
     cmap_coverage(&parsed)
 }
 
@@ -1103,7 +1162,7 @@ fn gather_fallback_faces(
     fonts: &SystemFonts,
 ) -> Vec<FallbackFace> {
     let seed_coverage = resolve_face(family, style, variant, fonts)
-        .and_then(|face| face_coverage(&face.path, face.face_index))
+        .and_then(|face| fonts.seed_coverage(&face))
         .unwrap_or_default();
 
     let mut candidates: Vec<_> = fonts
@@ -1143,7 +1202,7 @@ fn gather_fallback_faces(
 /// and a second `install_terminal_fonts` reuses the mappings of the first.
 static FONT_MAPS: OnceLock<Mutex<HashMap<PathBuf, &'static [u8]>>> = OnceLock::new();
 
-fn map_font_file(path: &Path) -> std::io::Result<&'static [u8]> {
+pub(crate) fn map_font_file(path: &Path) -> std::io::Result<&'static [u8]> {
     let mut maps = FONT_MAPS
         .get_or_init(Default::default)
         .lock()
@@ -1161,6 +1220,17 @@ fn map_font_file(path: &Path) -> std::io::Result<&'static [u8]> {
     let bytes: &'static [u8] = Box::leak(Box::new(mmap));
     maps.insert(path.to_path_buf(), bytes);
     Ok(bytes)
+}
+
+/// Whether `path` already has a mapping.  Test-only: nothing in the app needs
+/// to ask, and a release build should not carry the lookup.  Gated on
+/// `not(unix)` because its only caller is Windows-gated; otherwise this
+/// test-only helper is dead code on Linux.
+#[cfg(all(test, not(unix)))]
+fn is_mapped(path: &Path) -> bool {
+    FONT_MAPS.get().is_some_and(|maps| {
+        maps.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(path)
+    })
 }
 
 fn insert_face(defs: &mut FontDefinitions, id: &str, bytes: &'static [u8], face_index: u32) {
@@ -2188,6 +2258,73 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         seen
+    }
+
+    /// A seed the coverage scan already carries must not be parsed again — the
+    /// scan is disk-cached across launches and the parse is a whole-file read.
+    #[cfg(not(unix))]
+    #[test]
+    fn a_seed_present_in_the_scan_is_not_parsed_again() {
+        let fonts = SystemFonts::with_cache_dir(None);
+        let Some(seed) = resolve_face("Consolas", None, Variant::Normal, &fonts) else {
+            log::warn!("Consolas is not installed; nothing to assert");
+            return;
+        };
+        // A seed missing from the scan would pass this by falling through, so
+        // its presence is the precondition, not an assumption.
+        assert!(
+            fonts.scanned_coverage().iter().any(|(candidate, _)| candidate.path == seed.path
+                && candidate.face_index == seed.face_index),
+            "the seed is absent from the scan; this test would prove nothing"
+        );
+
+        reset_face_coverage_parses();
+        let skip = HashSet::new();
+        gather_fallback_faces("Consolas", None, Variant::Normal, &skip, 8, &fonts);
+
+        assert_eq!(face_coverage_parses(), 0, "a seed already in the scan was parsed anyway");
+        assert!(
+            fonts.seed_coverage.borrow().contains_key(&(seed.path.clone(), seed.face_index)),
+            "the seed was never resolved, so a parse count of zero proves nothing"
+        );
+    }
+
+    /// A seed the scan cannot answer for is parsed at most once per install,
+    /// however many variant chains ask for it.
+    #[cfg(not(unix))]
+    #[test]
+    fn a_seed_outside_the_scan_is_parsed_once_per_install() {
+        let fonts = SystemFonts::with_cache_dir(None);
+        let path = write_parseable_font("alacritree_test_seed_memo.ttf");
+        let family = path.to_str().expect("the temp path is utf-8");
+        let seed = resolve_face(family, None, Variant::Normal, &fonts).expect("a path resolves");
+        // An explicit path is not automatically outside the scan: a system
+        // font's own path resolves the same way, and the scan contains it.
+        assert!(
+            !fonts.scanned_coverage().iter().any(|(candidate, _)| candidate.path == seed.path
+                && candidate.face_index == seed.face_index),
+            "the fixture is in the scan; this test would prove nothing"
+        );
+
+        reset_face_coverage_parses();
+        let skip = HashSet::new();
+        gather_fallback_faces(family, None, Variant::Normal, &skip, 8, &fonts);
+        gather_fallback_faces(family, None, Variant::Normal, &skip, 8, &fonts);
+
+        assert_eq!(face_coverage_parses(), 1, "the seed was re-parsed for the second chain");
+    }
+
+    /// The fallback parse borrows the mapping like every other font read in
+    /// this module, rather than pulling a whole collection onto the heap.
+    #[cfg(not(unix))]
+    #[test]
+    fn face_coverage_maps_the_file_instead_of_reading_it() {
+        let path = write_parseable_font("alacritree_test_face_coverage_maps.ttf");
+        assert!(!is_mapped(&path), "the fixture path must be untouched by other tests");
+
+        let _ = face_coverage(&path, 0);
+
+        assert!(is_mapped(&path), "face_coverage read the file instead of mapping it");
     }
 }
 
