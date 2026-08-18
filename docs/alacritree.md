@@ -579,8 +579,53 @@ session closed, the same ordinal rule the cursor slides by.
 Alacritty's palette, cursor, scrolling, window padding, shell, env, and binding
 tables are read by the same `Raw*` structs, so those parts of an existing
 `alacritty.toml` carry over. The structs cover the fields alacritree acts on
-rather than Alacritty's full schema — see `config.rs` for what a given table
-actually accepts.
+rather than Alacritty's full schema — the JSON Schema below lists exactly what
+a given table accepts.
+
+### Editor support — completion and validation
+
+Alacritree publishes a JSON Schema for everything it reads out of the two
+files. Editors that speak the TOML language server — [taplo][taplo] and the
+[Even Better TOML][ebt] VS Code extension built on it — use it for key
+completion, hover documentation and validation.
+
+Point a config at it by running:
+
+```sh
+alacritree schema init                        # the alacritree.toml in use
+alacritree schema init path/to/alacritty.toml # or a specific file
+```
+
+which prepends a header naming the published schema:
+
+```toml
+#:schema https://github.com/mathix420/alacritree/releases/latest/download/alacritree-config.json
+```
+
+`latest/download` always resolves to the newest released schema. To validate
+against the version you actually run, name your tag instead —
+`releases/download/v0.9.0/alacritree-config.json`. A file that already carries
+a `#:schema` header is left alone, so the command is safe to re-run.
+
+`alacritree schema` prints the document to stdout if you would rather host it
+yourself or point at a local copy; it is also committed at
+`schema/alacritree-config.json` in this repository.
+
+Two things worth knowing about what the schema does and does not do:
+
+- **Unknown keys are not errors.** The two files are layers, and
+  `alacritty.toml` legitimately carries keys only the real alacritty acts on —
+  `[hints]`, `[bell]`, `[mouse]`, `[general] import`. Those get no completion,
+  but they are not flagged.
+- **Closed-value keys are completed.** `confirm_session_close`, `scrollbar`,
+  `sidebar_focus`, `search_scope`, `sidebar_tooltips`, `last_session_close`,
+  `path_style.*` and `drop.quote` offer their accepted spellings. Keys where
+  Alacritty accepts more than one spelling for the same value — cursor `shape`
+  and `blinking`, binding `action` — are deliberately left unconstrained, so a
+  working config is never marked wrong.
+
+[taplo]: https://taplo.tamasfe.dev/
+[ebt]: https://marketplace.visualstudio.com/items?itemName=tamasfe.even-better-toml
 
 ### Icon styling
 

@@ -2,6 +2,7 @@
 //! against egui input events.
 
 use egui::{Key, Modifiers};
+use schemars::JsonSchema;
 use serde::Deserialize;
 
 #[derive(Debug, Clone)]
@@ -390,19 +391,59 @@ impl NamedAction {
     }
 }
 
-#[derive(Debug, Deserialize)]
+/// One `[[keyboard.bindings]]` entry.  A binding needs `key`, plus exactly one
+/// of `chars`, `action` or `command` to say what pressing it does.
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct RawBinding {
+    /// The key, as alacritty spells it: a character (`"A"`), a named key
+    /// (`"F5"`, `"PageUp"`), or a scancode.  A key alacritree cannot map is
+    /// dropped with a warning.
     pub key: String,
+    /// Modifiers held with the key, joined by `|`: `"Control"`, `"Shift"`,
+    /// `"Alt"`, `"Super"`.  Unset means no modifiers.
     #[serde(default)]
     pub mods: Option<String>,
+    /// Terminal mode the binding applies in, e.g. `"Vi"` or `"~Search"`.
+    /// alacritree tracks neither mode, so a binding with a `mode` is read and
+    /// ignored.
     #[serde(default)]
     pub mode: Option<String>,
+    /// Bytes to write to the PTY, with the usual escapes (`\x1b`, `\u001b`).
     #[serde(default)]
     pub chars: Option<String>,
+    /// Named action to run, e.g. `"Paste"`, `"ToggleLeftSidebar"`.  Not
+    /// enumerated here: the shared `alacritty.toml` legitimately carries
+    /// actions only the real alacritty implements, and alacritree ignores
+    /// those rather than rejecting them.  `docs/keyboard-shortcuts.md` lists
+    /// what alacritree acts on.
     #[serde(default)]
     pub action: Option<String>,
+    /// External program to run.  alacritree parses it so the binding still
+    /// displaces alacritty's default for that key, but never runs it.
     #[serde(default)]
+    #[schemars(with = "Option<BindingCommand>")]
     pub command: Option<toml::Value>,
+}
+
+// Exists only to describe `RawBinding::command`, which is read as an opaque
+// `toml::Value` because alacritree needs no more than the fact that the key
+// was claimed.  Never constructed.
+/// An external program to run, as either a bare path or a table with
+/// arguments.
+#[derive(JsonSchema)]
+#[schemars(untagged, rename = "BindingCommand")]
+#[allow(dead_code)]
+enum BindingCommand {
+    /// Just the program.
+    Program(String),
+    /// Program and its arguments.
+    Detailed {
+        /// Path to the program.
+        program: String,
+        /// Arguments passed to the program.  Optional.
+        #[schemars(default)]
+        args: Vec<String>,
+    },
 }
 
 pub fn parse_bindings(raw: Vec<RawBinding>) -> Vec<KeyBinding> {

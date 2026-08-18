@@ -23,7 +23,7 @@ install-updater = false
 create-release = false
 # Downstream packaging (AUR/homebrew/scoop re-dispatch, macOS .app bundle)
 # runs after all assets are uploaded.
-post-announce-jobs = ["./publish-downstream", "./release-macos-app"]
+post-announce-jobs = ["./publish-downstream", "./release-macos-app", "./release-config-schema"]
 # .tar.gz over dist's default .tar.xz: every downstream consumer (PKGBUILD,
 # formula, scoop) already handles gzip, and AUR makepkg extracts it natively.
 unix-archive = ".tar.gz"
