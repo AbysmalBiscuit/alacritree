@@ -87,6 +87,19 @@ pub fn grown_cells(glyph_w: f32, cell_w: f32, spare: usize) -> usize {
     wanted.clamp(1, 1 + spare.min(MAX_EXTRA_CELLS))
 }
 
+/// How far right to nudge a laid-out glyph so it sits centred on the cells it
+/// was granted.
+///
+/// Never negative.  The span is capped by the blanks actually available, so a
+/// glyph can end up wider than the cells it got; centring on that span would
+/// put it left of its own cell, over the character before it.  Such a glyph
+/// stays where it started and overruns to the right, as it does with growth
+/// off.
+pub fn growth_offset(glyph_w: f32, cell_w: f32, spare: usize) -> f32 {
+    let cells = grown_cells(glyph_w, cell_w, spare);
+    ((cells as f32 * cell_w - glyph_w) / 2.0).max(0.0)
+}
+
 /// The font atlas a set of galleys was laid out against.  A galley's mesh
 /// stores atlas positions, so it only means anything while that atlas is the
 /// one being sampled.
@@ -298,6 +311,26 @@ mod tests {
     #[test]
     fn growth_is_capped_however_much_room_there_is() {
         assert_eq!(grown_cells(60.0, 10.0, 6), 1 + MAX_EXTRA_CELLS);
+    }
+
+    /// The span is capped by the blanks actually available, so a glyph can be
+    /// wider than the cells it was granted.  Centring on that span would put
+    /// it left of its own cell, over the character before it — worse than the
+    /// right-hand overrun growth exists to avoid.
+    #[test]
+    fn a_glyph_too_wide_for_the_room_it_gets_is_not_pulled_left() {
+        assert_eq!(growth_offset(25.0, 10.0, 1), 0.0);
+        assert_eq!(growth_offset(60.0, 10.0, 6), 0.0);
+    }
+
+    #[test]
+    fn a_grown_glyph_sits_centred_on_its_span() {
+        assert_eq!(growth_offset(18.0, 10.0, 1), 1.0);
+    }
+
+    #[test]
+    fn a_glyph_that_fits_is_not_nudged() {
+        assert_eq!(growth_offset(10.0, 10.0, 4), 0.0);
     }
 
     #[test]

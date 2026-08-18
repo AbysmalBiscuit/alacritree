@@ -17,7 +17,7 @@ use crate::color_glyph::{CachedColorGlyph, ColorGlyphCache};
 use crate::colors::{background, foreground, resolve, rgb_to_color32};
 use crate::config::Config;
 use crate::fonts::{BOLD_FAMILY, BOLD_ITALIC_FAMILY, ITALIC_FAMILY};
-use crate::glyph_cache::{Face, GlyphCache, MAX_EXTRA_CELLS, grown_cells};
+use crate::glyph_cache::{Face, GlyphCache, MAX_EXTRA_CELLS, growth_offset};
 use crate::input::event_to_bytes;
 use crate::links::{self, Link};
 use crate::mouse;
@@ -764,6 +764,23 @@ impl Style {
         }
         Self { fg: cell.fg, bg: cell.bg, flags }
     }
+
+    /// Whether a blank cell styled as `other` can be painted as part of a run
+    /// in this style.
+    ///
+    /// A blank draws nothing but its background, so its foreground is free to
+    /// differ — unless something in the run paints with the foreground, which
+    /// underlines, strikeout and reverse video all do.  Keeping the two
+    /// together is what lets an over-wide glyph grow into the space an icon is
+    /// authored with, since growth may only claim blanks its own run holds;
+    /// kitty reaches the same place by copying the icon's foreground into the
+    /// blank.
+    fn absorbs(&self, other: &Self, blank: bool) -> bool {
+        blank
+            && other.bg == self.bg
+            && other.flags == self.flags
+            && !self.flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT | Flags::INVERSE)
+    }
 }
 
 /// The visible grid, copied out from under the terminal lock.
@@ -845,7 +862,9 @@ impl GridSnapshot {
                 let text_start = self.text.len();
                 while col < cols {
                     let cell = &cells[Column(col)];
-                    if Style::from_cell(cell, in_link(line, Column(col))) != style
+                    let cell_style = Style::from_cell(cell, in_link(line, Column(col)));
+                    let blank = matches!(cell.c, ' ' | '\0');
+                    if (cell_style != style && !style.absorbs(&cell_style, blank))
                         || is_selected(selection_range.as_ref(), line, Column(col)) != selected
                     {
                         break;
@@ -1110,9 +1129,7 @@ fn paint_run(
                     .take(MAX_EXTRA_CELLS)
                     .take_while(|c| *c == ' ')
                     .count();
-                let glyph_w = galley.size().x;
-                let cells = grown_cells(glyph_w, cell_w, spare);
-                if cells > 1 { (cells as f32 * cell_w - glyph_w) / 2.0 } else { 0.0 }
+                growth_offset(galley.size().x, cell_w, spare)
             } else {
                 0.0
             };
@@ -1529,6 +1546,46 @@ mod tests {
         }
     }
 
+    /// A blank paints nothing but its background, so a run can hold one in
+    /// whatever foreground it carries.  Icons are authored with a trailing
+    /// space that the surrounding highlight usually owns, and an over-wide
+    /// glyph can only grow into blanks its own run holds.
+    #[test]
+    fn a_blank_in_another_foreground_joins_the_run() {
+        let term = term_running(b"\x1b[31mA\x1b[39m \x1b[31mB");
+        let mut snapshot = GridSnapshot::new();
+
+        snapshot.capture(&term, &Config::default(), None, true);
+
+        let run = snapshot
+            .runs
+            .iter()
+            .find(|r| snapshot.text[r.text.clone()].starts_with('A'))
+            .expect("a run holding 'A'");
+        assert!(
+            snapshot.text[run.text.clone()].starts_with("A "),
+            "the blank after 'A' left the run"
+        );
+    }
+
+    /// An underline spans the whole run and is drawn in the run's foreground,
+    /// so a blank carrying a different one would come out underlined in the
+    /// wrong colour.
+    #[test]
+    fn an_underlined_blank_in_another_foreground_keeps_its_own_run() {
+        let term = term_running(b"\x1b[4;31mA\x1b[39m \x1b[31mB");
+        let mut snapshot = GridSnapshot::new();
+
+        snapshot.capture(&term, &Config::default(), None, true);
+
+        let run = snapshot
+            .runs
+            .iter()
+            .find(|r| snapshot.text[r.text.clone()].starts_with('A'))
+            .expect("a run holding 'A'");
+        assert_eq!(&snapshot.text[run.text.clone()], "A", "an underlined blank was absorbed");
+    }
+
     /// A context whose monospace fallback is scaled far past the primary face,
     /// so a character the primary lacks comes back several times wider than
     /// the cell — a Nerd Font icon against a half-width cell, in miniature.
@@ -1588,52 +1645,46 @@ mod tests {
         }
     }
 
+    /// Every glyph's x position after one frame of a terminal fed `row`.
+    fn painted_row(
+        ctx: &egui::Context,
+        config: &Config,
+        screen: Vec2,
+        row: &[u8],
+    ) -> Vec<(String, f32)> {
+        let (mut session, _dir) = headless_session(ctx, config);
+        let mut caches = Caches::new();
+        painted_at(ctx, &mut session, config, &mut caches, screen);
+        let (cols, rows) = (session.size.columns, session.size.screen_lines);
+        {
+            let mut term = session.term.lock();
+            term.resize(TermSize::new(cols, rows));
+            Processor::<StdSyncHandler>::new().advance(&mut *term, row);
+        }
+        painted_at(ctx, &mut session, config, &mut caches, screen)
+    }
+
+    fn x_of(painted: &[(String, f32)], ch: &str) -> f32 {
+        painted.iter().find(|(g, _)| g == ch).unwrap_or_else(|| panic!("{ch} was not painted")).1
+    }
+
     /// An icon sized to its own face's em overruns a narrower cell.  With
     /// growth on it is drawn across the blanks that follow instead, centred on
     /// the span it was granted; the glyphs beside it do not move.
+    ///
+    /// U+FB01 is absent from the primary face, so it comes back from the
+    /// oversized fallback rather than at the cell's width.
     #[test]
     fn an_over_wide_glyph_is_centred_over_the_blanks_after_it() {
-        // U+FB01 is absent from the primary face, so it comes back from the
-        // oversized fallback rather than at the cell's width.
-        const ROW: &[u8] = "M\u{fb01}".as_bytes();
         let ctx = ctx_with_oversized_fallback();
         let mut config = Config::default();
         let screen = Vec2::new(640.0, 480.0);
-        let x_of = |painted: &[(String, f32)], ch: &str| {
-            painted
-                .iter()
-                .find(|(g, _)| g == ch)
-                .unwrap_or_else(|| panic!("{ch} was not painted"))
-                .1
-        };
 
-        let plain = {
-            let (mut session, _dir) = headless_session(&ctx, &config);
-            let mut caches = Caches::new();
-            painted_at(&ctx, &mut session, &config, &mut caches, screen);
-            let (cols, rows) = (session.size.columns, session.size.screen_lines);
-            {
-                let mut term = session.term.lock();
-                term.resize(TermSize::new(cols, rows));
-                Processor::<StdSyncHandler>::new().advance(&mut *term, ROW);
-            }
-            painted_at(&ctx, &mut session, &config, &mut caches, screen)
-        };
+        let plain = painted_row(&ctx, &config, screen, "M\u{fb01}".as_bytes());
         let (anchor, cell_w) = (x_of(&plain, "M"), x_of(&plain, "\u{fb01}") - x_of(&plain, "M"));
 
         config.font.wide_glyph_growth = true;
-        let grown = {
-            let (mut session, _dir) = headless_session(&ctx, &config);
-            let mut caches = Caches::new();
-            painted_at(&ctx, &mut session, &config, &mut caches, screen);
-            let (cols, rows) = (session.size.columns, session.size.screen_lines);
-            {
-                let mut term = session.term.lock();
-                term.resize(TermSize::new(cols, rows));
-                Processor::<StdSyncHandler>::new().advance(&mut *term, ROW);
-            }
-            painted_at(&ctx, &mut session, &config, &mut caches, screen)
-        };
+        let grown = painted_row(&ctx, &config, screen, "M\u{fb01}".as_bytes());
 
         let glyph_w =
             ctx.fonts(|f| f.glyph_width(&FontId::monospace(config.font.egui_size()), '\u{fb01}'));
@@ -1646,6 +1697,25 @@ mod tests {
         let right = start + cells as f32 * cell_w - (x_of(&grown, "\u{fb01}") + glyph_w);
         assert!(left > 0.5, "the over-wide glyph was left in its own cell");
         assert!((left - right).abs() < 0.5, "not centred: {left} left, {right} right");
+    }
+
+    /// Growth may only claim blanks, so a glyph can want more cells than it
+    /// gets.  Centring it on the shorter span would put it left of its own
+    /// cell, over the character before it — worse than the right-hand overrun
+    /// growth exists to avoid.  It stays where it is instead.
+    #[test]
+    fn an_over_wide_glyph_is_not_pulled_left_when_the_room_falls_short() {
+        let ctx = ctx_with_oversized_fallback();
+        let mut config = Config::default();
+        let screen = Vec2::new(640.0, 480.0);
+
+        let plain = painted_row(&ctx, &config, screen, "M\u{fb01}X".as_bytes());
+        let placed = x_of(&plain, "\u{fb01}");
+
+        config.font.wide_glyph_growth = true;
+        let grown = painted_row(&ctx, &config, screen, "M\u{fb01}X".as_bytes());
+
+        assert_eq!(x_of(&grown, "\u{fb01}"), placed, "the glyph was pulled left of its own cell");
     }
 
     /// The snapshot resolves every cell's foreground, background and face

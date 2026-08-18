@@ -181,10 +181,15 @@ run's background paints over the part that escaped.
 
 `font.wide_glyph_growth = true` draws such a glyph across the blank cells that
 follow it instead, centred on the span it ends up with, up to four extra
-cells. Blanks are the only cells it may take; anything else is a character it
-would paint over. This is kitty's behaviour — alacritty and Windows Terminal
-both let the overflow happen. Icons are commonly authored with a trailing
-space (`" "`), which is exactly the room this needs.
+cells. This is kitty's behaviour; alacritty and Windows Terminal both let the
+overflow happen.
+
+Blanks are the only cells it may take — anything else is a character it would
+paint over — and a glyph wanting more room than it gets stays where it is
+rather than being pulled left. A blank draws nothing but its background, so it
+counts even when its foreground differs from the icon's, which is what lets an
+icon and the differently-highlighted space beside it share a run. Icons are
+commonly authored with exactly that trailing space (`" "`).
 
 Off by default, since it moves glyphs that render acceptably today.
 
