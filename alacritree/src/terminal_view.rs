@@ -1000,19 +1000,33 @@ fn paint_grid(
     ctx: &egui::Context,
 ) {
     let bg_color = background(&config.palette);
+    // Every background goes down before any glyph does.  A background is an
+    // opaque fill over the whole run, so painting one run at a time cuts off
+    // whatever the run before it overhung into its first cell — which is how a
+    // Nerd Font icon a shade wider than its cell loses its right edge.
+    // Alacritty's renderer already works this way: one background pass over
+    // the whole batch, then the text passes (`renderer/text/gles2.rs`).
     for run in &snapshot.runs {
-        paint_run(
+        paint_run_background(
             painter,
             rect,
             &snapshot.text[run.text.clone()],
-            run.start_col,
-            rect.min.y + run.row as f32 * cell_h,
+            run,
             cell_w,
             cell_h,
+            bg_color,
+        );
+    }
+    for run in &snapshot.runs {
+        paint_run_glyphs(
+            painter,
+            rect,
+            &snapshot.text[run.text.clone()],
             run,
             config,
             font_id,
-            bg_color,
+            cell_w,
+            cell_h,
             ppp,
             metrics,
             builtin_glyphs,
@@ -1057,19 +1071,41 @@ fn font_for_flags(flags: Flags, normal: &FontId) -> FontId {
     FontId::new(normal.size, family)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn paint_run(
+/// The cells `style` covers, in screen points.
+fn run_rect(rect: Rect, run: &str, style: &Run, cell_w: f32, cell_h: f32) -> Rect {
+    let width = run.chars().count() as f32 * cell_w;
+    let x = rect.min.x + style.start_col as f32 * cell_w;
+    let y = rect.min.y + style.row as f32 * cell_h;
+    Rect::from_min_size(Pos2::new(x, y), Vec2::new(width, cell_h))
+}
+
+/// A run matching the terminal's own background needs no fill: the window is
+/// already that colour, and emitting one shape per run would multiply the
+/// frame's geometry for nothing.
+fn paint_run_background(
     painter: &egui::Painter,
     rect: Rect,
     run: &str,
-    start_col: usize,
-    y: f32,
+    style: &Run,
     cell_w: f32,
     cell_h: f32,
+    default_bg: Color32,
+) {
+    if style.bg != default_bg || style.selected {
+        painter.rect_filled(run_rect(rect, run, style, cell_w, cell_h), 0.0, style.bg);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_run_glyphs(
+    painter: &egui::Painter,
+    rect: Rect,
+    run: &str,
     style: &Run,
     config: &Config,
     font_id: &FontId,
-    default_bg: Color32,
+    cell_w: f32,
+    cell_h: f32,
     ppp: f32,
     metrics: &Metrics,
     builtin_glyphs: &mut BuiltinGlyphCache,
@@ -1077,14 +1113,9 @@ fn paint_run(
     glyphs: &mut GlyphCache,
     ctx: &egui::Context,
 ) {
-    let (fg, bg) = (style.fg, style.bg);
-    let width = run.chars().count() as f32 * cell_w;
-    let x = rect.min.x + start_col as f32 * cell_w;
-    let bg_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(width, cell_h));
-
-    if bg != default_bg || style.selected {
-        painter.rect_filled(bg_rect, 0.0, bg);
-    }
+    let fg = style.fg;
+    let cells = run_rect(rect, run, style, cell_w, cell_h);
+    let (x, y) = (cells.min.x, cells.min.y);
 
     if !style.flags.contains(Flags::HIDDEN) {
         // Per-glyph paint: egui's run layout drifts off the cursor's `col * cell_w` grid (worse with zoom).
@@ -1144,6 +1175,9 @@ fn paint_run(
         }
     }
 
+    // Decorations belong to the glyph pass: drawn with the backgrounds, the
+    // next run's fill would bury them.
+    let width = cells.width();
     if style.flags.intersects(Flags::ALL_UNDERLINES) {
         let uy = y + cell_h - 1.5;
         painter
@@ -1749,6 +1783,99 @@ mod tests {
             ctx.fonts(|f| f.glyph_width(&FontId::monospace(config.font.egui_size()), '\u{fb01}'));
         assert!(glyph_w > cell_w * 1.25, "the fixture's letter is not over-wide");
         assert_eq!(x_of(&painted, "\u{fb01}"), origin + cell_w, "a letter was grown");
+    }
+
+    /// One shape from a painted frame, reduced to the two kinds whose order
+    /// decides what survives: a solid fill, and a glyph drawn on top of it.
+    #[derive(Debug, PartialEq)]
+    enum Painted {
+        Fill(Color32),
+        Glyph(String),
+    }
+
+    /// Everything a frame painted, in paint order.
+    fn painted_order(
+        ctx: &egui::Context,
+        session: &mut Session,
+        config: &Config,
+        caches: &mut Caches,
+        screen: Vec2,
+    ) -> Vec<Painted> {
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, screen)),
+            ..Default::default()
+        };
+        let out = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(
+                    ui,
+                    session,
+                    config,
+                    true,
+                    &mut caches.builtin,
+                    &mut caches.ime,
+                    &mut caches.colors,
+                    &mut caches.glyphs,
+                    &mut caches.snapshot,
+                );
+            });
+        });
+        let mut painted = Vec::new();
+        for clipped in &out.shapes {
+            collect_order(&clipped.shape, &mut painted);
+        }
+        painted
+    }
+
+    fn collect_order(shape: &egui::Shape, out: &mut Vec<Painted>) {
+        match shape {
+            egui::Shape::Rect(rect) => out.push(Painted::Fill(rect.fill)),
+            egui::Shape::Text(text) => out.push(Painted::Glyph(text.galley.text().to_owned())),
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect_order(s, out)),
+            _ => {},
+        }
+    }
+
+    /// A run's background is an opaque fill over the whole run, so painting the
+    /// runs one at a time cuts off whatever the run before overhung into its
+    /// first cell — an icon a shade wider than its cell loses its right edge
+    /// wherever a colour changes.  Backgrounds all go down first instead.
+    #[test]
+    fn every_background_is_painted_before_any_glyph() {
+        let config = Config::default();
+        let ctx = ctx_with_terminal_faces();
+        let (mut session, _dir) = headless_session(&ctx, &config);
+        let mut caches = Caches::new();
+        let screen = Vec2::new(640.0, 480.0);
+
+        painted_order(&ctx, &mut session, &config, &mut caches, screen);
+        let (cols, rows) = (session.size.columns, session.size.screen_lines);
+        let red = {
+            let mut term = session.term.lock();
+            term.resize(TermSize::new(cols, rows));
+            // A block cursor fills its cell after every run has painted, which
+            // would fail this on its own; DECTCEM leaves the run passes alone.
+            Processor::<StdSyncHandler>::new().advance(&mut *term, b"\x1b[?25lM\x1b[41mX");
+            rgb_to_color32(resolve(
+                AnsiColor::Named(alacritty_terminal::vte::ansi::NamedColor::Red),
+                Flags::empty(),
+                term.colors(),
+                &config.palette,
+                false,
+            ))
+        };
+
+        let painted = painted_order(&ctx, &mut session, &config, &mut caches, screen);
+
+        let fill = painted
+            .iter()
+            .position(|p| *p == Painted::Fill(red))
+            .expect("the red run painted no background");
+        let glyph = painted
+            .iter()
+            .position(|p| matches!(p, Painted::Glyph(g) if g == "M"))
+            .expect("M was not painted");
+        assert!(fill < glyph, "a background was painted over the glyph before it");
     }
 
     /// The snapshot resolves every cell's foreground, background and face
