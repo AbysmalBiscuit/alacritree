@@ -86,17 +86,17 @@ pub fn show(
 
     let painter = ui.painter_at(rect);
 
-    let hovered_link = hovered_link(ui, &response, session, rect, cell_w, cell_h, cols, rows);
-    if hovered_link.is_some() {
+    let peek = peek_term(ui, &response, session, rect, cell_w, cell_h, cols, rows);
+    if peek.link.is_some() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
     // Apps that negotiate mouse tracking want the raw button/motion stream, not
     // local selection — matching alacritty, Shift is the escape hatch that still
     // selects text while the app is in mouse mode.
-    let mouse_mode = session.term.lock().mode().intersects(TermMode::MOUSE_MODE);
+    let mouse_mode = peek.mode.intersects(TermMode::MOUSE_MODE);
     let report_mouse = mouse_mode && !ui.input(|i| i.modifiers.shift);
     if report_mouse {
-        handle_mouse_reporting(ui, session, rect, cell_w, cell_h, cols, rows);
+        handle_mouse_reporting(ui, session, rect, cell_w, cell_h, cols, rows, &peek);
     } else {
         handle_selection(
             ui,
@@ -108,11 +108,11 @@ pub fn show(
             cell_h,
             cols,
             rows,
-            hovered_link.as_ref(),
+            peek.link.as_ref(),
         );
     }
-    handle_wheel_scroll(ui, &response, session, config, rect, cell_w, cell_h, cols, rows);
-    dispatch_input(ui, &response, session, ime, allow_focus);
+    handle_wheel_scroll(ui, &response, session, config, rect, cell_w, cell_h, cols, rows, &peek);
+    dispatch_input(ui, &response, session, ime, allow_focus, peek.mode);
     // Built-in renderer expects the *unadjusted* pixel cell size so it can
     // re-apply `font.offset` itself — passing `cell_w * ppp` (which already
     // includes the offset) would double-add it.  Descent is zero here: the
@@ -129,7 +129,7 @@ pub fn show(
     snapshot.capture(
         &session.term.lock(),
         config,
-        hovered_link.as_ref().map(|l| &l.bounds),
+        peek.link.as_ref().map(|l| &l.bounds),
         // The preedit overlay replaces the cursor while composing
         // (alacritty hides it the same way, display/content.rs).
         ime.preedit().is_some(),
@@ -163,7 +163,7 @@ pub fn show(
         // (TextEdit passes its whole widget rect there, which for a
         // fullscreen terminal would pin the popup to the window corner).
         let caret = preedit_caret
-            .or_else(|| cursor_cell_rect(session, rect, cell_w, cell_h))
+            .or_else(|| cursor_cell_rect(snapshot, rect, cell_w, cell_h))
             .unwrap_or(rect);
         ui.ctx().output_mut(|o| {
             o.ime = Some(egui::output::IMEOutput { rect: caret, cursor_rect: caret });
@@ -187,11 +187,9 @@ fn dispatch_input(
     session: &mut Session,
     ime: &mut crate::ime::Ime,
     allow_focus: bool,
+    mode: TermMode,
 ) {
     if allow_focus && response.has_focus() {
-        // Kitty-protocol and mouse modes negotiated by the running app decide
-        // how events encode, so the encoder needs the live terminal mode.
-        let mode = *session.term.lock().mode();
         let consumed = ui.input(|i| consume_events(&i.events, mode));
         for event in consumed {
             match event {
@@ -270,11 +268,23 @@ fn pointer_owns_grid(
     rect.contains(pos) && ctx.layer_id_at(pos).is_none_or(|l| l == grid_layer)
 }
 
-/// Resolve the link under the mouse pointer, if any.  Returns `None` when the
-/// pointer is outside the grid, when no link covers that cell, or when the
-/// pointer is being used for an active drag (so click-to-open never fights
-/// with text selection).
-fn hovered_link(
+/// Everything a frame's input handlers need from the terminal, read under one
+/// lock.
+///
+/// The PTY reader leases the terminal for the whole of every parse, so each
+/// separate `lock()` a frame takes queues behind one.  Reading these together
+/// keeps a burst of output from costing the frame one parse per handler.
+struct TermPeek {
+    mode: TermMode,
+    display_offset: i32,
+    /// Link under the mouse pointer.  `None` when the pointer is outside the
+    /// grid, when no link covers that cell, or when the pointer is driving a
+    /// drag, so click-to-open never fights with text selection.
+    link: Option<Link>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn peek_term(
     ui: &Ui,
     response: &Response,
     session: &Session,
@@ -283,18 +293,21 @@ fn hovered_link(
     cell_h: f32,
     cols: usize,
     rows: usize,
-) -> Option<Link> {
-    if response.dragged() {
-        return None;
-    }
-    let pos = ui.input(|i| i.pointer.hover_pos())?;
-    if !pointer_owns_grid(ui.ctx(), ui.layer_id(), rect, pos) {
-        return None;
-    }
+) -> TermPeek {
+    // Resolved before the lock: `layer_id_at` walks egui's layer list and has
+    // no business running with the terminal held.
+    let hover = (!response.dragged())
+        .then(|| ui.input(|i| i.pointer.hover_pos()))
+        .flatten()
+        .filter(|pos| pointer_owns_grid(ui.ctx(), ui.layer_id(), rect, *pos));
+
     let term = session.term.lock();
     let display_offset = term.grid().display_offset() as i32;
-    let (point, _) = cell_at_pos(pos, rect, cell_w, cell_h, cols, rows, display_offset);
-    links::link_at(&term, point)
+    let link = hover.and_then(|pos| {
+        let (point, _) = cell_at_pos(pos, rect, cell_w, cell_h, cols, rows, display_offset);
+        links::link_at(&term, point)
+    });
+    TermPeek { mode: *term.mode(), display_offset, link }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -433,8 +446,9 @@ fn handle_mouse_reporting(
     cell_h: f32,
     cols: usize,
     rows: usize,
+    peek: &TermPeek,
 ) {
-    let mode = *session.term.lock().mode();
+    let mode = peek.mode;
     let motion_tracked = mode.intersects(TermMode::MOUSE_MOTION | TermMode::MOUSE_DRAG);
 
     enum Raw {
@@ -477,7 +491,7 @@ fn handle_mouse_reporting(
         return;
     }
 
-    let display_offset = session.term.lock().grid().display_offset() as i32;
+    let display_offset = peek.display_offset;
     let mut bytes = Vec::new();
     for raw in raws {
         match raw {
@@ -539,6 +553,7 @@ fn handle_wheel_scroll(
     cell_h: f32,
     cols: usize,
     rows: usize,
+    peek: &TermPeek,
 ) {
     if !response.hovered() {
         return;
@@ -556,10 +571,9 @@ fn handle_wheel_scroll(
         return;
     }
     // Mouse-tracking apps receive wheel reports addressed to the hovered cell.
-    let pointer_cell = ui.input(|i| i.pointer.hover_pos()).map(|pos| {
-        let display_offset = session.term.lock().grid().display_offset() as i32;
-        cell_at_pos(pos, rect, cell_w, cell_h, cols, rows, display_offset).0
-    });
+    let pointer_cell = ui
+        .input(|i| i.pointer.hover_pos())
+        .map(|pos| cell_at_pos(pos, rect, cell_w, cell_h, cols, rows, peek.display_offset).0);
     let cell_w_pt = cell_w as f64;
     let cell_h_pt = cell_h as f64;
     for (unit, delta, modifiers) in wheels {
@@ -571,7 +585,17 @@ fn handle_wheel_scroll(
                 delta.y as f64 * session.size.screen_lines as f64 * cell_h_pt,
             ),
         };
-        apply_scroll(session, config, dx_pt, dy_pt, cell_w_pt, cell_h_pt, modifiers, pointer_cell);
+        apply_scroll(
+            session,
+            config,
+            dx_pt,
+            dy_pt,
+            cell_w_pt,
+            cell_h_pt,
+            modifiers,
+            pointer_cell,
+            peek.mode,
+        );
     }
 }
 
@@ -585,8 +609,8 @@ fn apply_scroll(
     cell_h_pt: f64,
     modifiers: Modifiers,
     pointer_cell: Option<Point>,
+    mode: TermMode,
 ) {
-    let mode = *session.term.lock().mode();
     let mouse_mode = mode.intersects(TermMode::MOUSE_MODE);
     // ConPTY interprets a pager's alternate-screen switch itself and repaints
     // onto the primary screen, so ALT_SCREEN never reaches this Term on
@@ -740,16 +764,10 @@ fn consumed_event(event: &Event, next: Option<&Event>, mode: TermMode) -> Option
 
 /// Viewport rect of the terminal cursor's cell; `None` while the cursor is
 /// scrolled out of view.
-fn cursor_cell_rect(session: &Session, rect: Rect, cell_w: f32, cell_h: f32) -> Option<Rect> {
-    let term = session.term.lock();
-    let grid = term.grid();
-    let cursor = grid.cursor.point;
-    let line = cursor.line.0 + grid.display_offset() as i32;
-    if line < 0 || line >= grid.screen_lines() as i32 {
-        return None;
-    }
+fn cursor_cell_rect(snapshot: &GridSnapshot, rect: Rect, cell_w: f32, cell_h: f32) -> Option<Rect> {
+    let (column, row) = snapshot.caret?;
     Some(Rect::from_min_size(
-        Pos2::new(rect.min.x + cursor.column.0 as f32 * cell_w, rect.min.y + line as f32 * cell_h),
+        Pos2::new(rect.min.x + column as f32 * cell_w, rect.min.y + row as f32 * cell_h),
         Vec2::new(cell_w, cell_h),
     ))
 }
@@ -803,6 +821,10 @@ pub struct GridSnapshot {
     text: String,
     runs: Vec<Run>,
     cursor: Option<CursorSnapshot>,
+    /// Viewport cell holding the terminal cursor, recorded whether or not the
+    /// cursor is drawn: the IME candidate window follows the caret even while
+    /// the running app keeps the cursor hidden.
+    caret: Option<(usize, i32)>,
 }
 
 /// A span of cells sharing one resolved style, indexing into
@@ -841,6 +863,7 @@ impl GridSnapshot {
         self.text.clear();
         self.runs.clear();
         self.cursor = None;
+        self.caret = None;
 
         let runtime_palette = term.colors();
         let grid = term.grid();
@@ -904,12 +927,11 @@ impl GridSnapshot {
 
         let cursor_point: Point = grid.cursor.point;
         let cursor_row = cursor_point.line.0 + display_offset;
+        let in_view = cursor_row >= 0 && cursor_row < screen_lines;
+        self.caret = in_view.then_some((cursor_point.column.0, cursor_row));
+
         let shape = cursor_shape(term);
-        if cursor_hidden
-            || matches!(shape, CursorShape::Hidden)
-            || cursor_row < 0
-            || cursor_row >= screen_lines
-        {
+        if cursor_hidden || matches!(shape, CursorShape::Hidden) || !in_view {
             return;
         }
 
@@ -1623,6 +1645,30 @@ mod tests {
             .find(|r| snapshot.text[r.text.clone()].starts_with('A'))
             .expect("a run holding 'A'");
         assert_eq!(&snapshot.text[run.text.clone()], "A", "an underlined blank was absorbed");
+    }
+
+    /// The IME candidate window is placed from the caret, so the caret has to
+    /// keep tracking the cursor cell while the running app has the cursor
+    /// hidden (`CSI ?25l`).  Only the drawn cursor goes away; losing the cell
+    /// too would pin the candidate popup to the corner of the grid.
+    #[test]
+    fn a_hidden_cursor_still_leaves_a_caret() {
+        let term = term_running(b"\x1b[?25labc");
+        let mut snapshot = GridSnapshot::new();
+
+        snapshot.capture(&term, &Config::default(), None, false);
+
+        assert!(snapshot.cursor.is_none(), "a hidden cursor was drawn");
+        assert_eq!(snapshot.caret, Some((3, 0)), "the caret lost the cursor cell");
+        assert_eq!(
+            cursor_cell_rect(
+                &snapshot,
+                Rect::from_min_size(Pos2::ZERO, Vec2::new(80.0, 24.0)),
+                8.0,
+                16.0
+            ),
+            Some(Rect::from_min_size(Pos2::new(24.0, 0.0), Vec2::new(8.0, 16.0))),
+        );
     }
 
     /// A context whose monospace fallback is scaled far past the primary face,
@@ -2623,7 +2669,18 @@ mod tests {
         // One wheel notch down: a cell height of pixels.  The default
         // `scrolling.multiplier` of 3 turns it into three pager lines.
         let config = Config::default();
-        apply_scroll(&mut session, &config, 0.0, -16.0, 8.0, 16.0, Modifiers::default(), None);
+        let mode = *session.term.lock().mode();
+        apply_scroll(
+            &mut session,
+            &config,
+            0.0,
+            -16.0,
+            8.0,
+            16.0,
+            Modifiers::default(),
+            None,
+            mode,
+        );
 
         wait_for_top_line(&session, "line 4 ").unwrap_or_else(|top| {
             panic!("the wheel tick did not scroll the pager; top line: {top:?}")
