@@ -15,13 +15,13 @@ mod conpty;
 
 use blocking::{UnblockedReader, UnblockedWriter};
 use conpty::Conpty as Backend;
-use miow::pipe::{AnonRead, AnonWrite};
+use miow::pipe::AnonWrite;
 use polling::{Event, Poller};
 
 pub const PTY_CHILD_EVENT_TOKEN: usize = 1;
 pub const PTY_READ_WRITE_TOKEN: usize = 2;
 
-type ReadPipe = UnblockedReader<AnonRead>;
+type ReadPipe = UnblockedReader<std::fs::File>;
 type WritePipe = UnblockedWriter<AnonWrite>;
 
 pub struct Pty {
