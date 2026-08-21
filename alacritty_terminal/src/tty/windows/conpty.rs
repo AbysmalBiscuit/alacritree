@@ -1,16 +1,25 @@
 use log::{info, warn};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
+use std::fs::File;
 use std::io::{Error, Result};
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::IntoRawHandle;
+use std::os::windows::io::{HandleOrInvalid, IntoRawHandle, OwnedHandle};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::{mem, ptr};
 
-use windows_sys::Win32::Foundation::{HANDLE, S_OK};
+use windows_sys::Win32::Foundation::{GENERIC_WRITE, HANDLE, S_OK};
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
+    PIPE_ACCESS_INBOUND,
+};
 use windows_sys::Win32::System::Console::{
     COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::System::Pipes::{
+    CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
+};
 use windows_sys::core::{HRESULT, PWSTR};
 use windows_sys::{s, w};
 
@@ -111,11 +120,10 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
     let api = ConptyApi::new();
     let mut pty_handle: HPCON = 0;
 
-    // Passing 0 as the size parameter allows the "system default" buffer
-    // size to be used. There may be small performance and memory advantages
-    // to be gained by tuning this in the future, but it's likely a reasonable
-    // start point.
-    let (conout, conout_pty_handle) = miow::pipe::anonymous(0)?;
+    let (conout, conout_pty_handle) = conout_pipe()?;
+
+    // The console reads its input only as fast as the child asks for it, so
+    // the system default buffer is enough on this side.
     let (conin_pty_handle, conin) = miow::pipe::anonymous(0)?;
 
     // Create the Pseudo Console, using the pipes.
@@ -241,6 +249,75 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
     let conpty = Conpty { handle: pty_handle as HPCON, api };
 
     Ok(Pty::new(conpty, conout, conin, child_watcher))
+}
+
+/// How much the console may buffer before a write has to wait on the terminal.
+///
+/// Matches Windows Terminal's `ConptyConnection`.
+const CONOUT_BUFFER_SIZE: u32 = 128 * 1024;
+
+/// Create the pipe the console writes its output into, with an asynchronous end
+/// for the console and a synchronous one for us.
+///
+/// The console emits a frame as a single `WriteFile` carrying an `OVERLAPPED`,
+/// and waits on that write only once it has the next frame ready. A synchronous
+/// pipe ignores the `OVERLAPPED` and blocks the write until the terminal has
+/// drained every byte, so the console sits idle for as long as the terminal
+/// parses and the terminal sits idle for as long as the console builds the next
+/// frame. The two never overlap, and a burst costs the sum of both instead of
+/// the larger. An asynchronous end completes the write out of band and lets
+/// them run at once.
+///
+/// Mirrors `Utils::CreateOverlappedPipe`, which is how Windows Terminal builds
+/// the same pipe.
+/// A pipe has to be named to be opened twice with different flags, and
+/// `FILE_FLAG_FIRST_PIPE_INSTANCE` is what keeps the name from being a way in:
+/// creation fails outright if anything already holds the name, so the client
+/// below can only ever reach the instance created here. A process that squats
+/// the name can stop a terminal from opening; it cannot be handed its output.
+fn conout_pipe() -> Result<(File, OwnedHandle)> {
+    static NEXT_ID: AtomicU32 = AtomicU32::new(0);
+
+    let name = format!(
+        "\\\\.\\pipe\\alacritty-conout-{}-{}",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed),
+    );
+    let name = win32_string(&name);
+
+    // SAFETY: `name` is nul-terminated and outlives both calls, and each
+    // returned handle is adopted before anything else can fail.
+    let read = unsafe {
+        let handle = CreateNamedPipeW(
+            name.as_ptr(),
+            PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            1,
+            CONOUT_BUFFER_SIZE,
+            CONOUT_BUFFER_SIZE,
+            0,
+            ptr::null(),
+        );
+        HandleOrInvalid::from_raw_handle(handle as _)
+    };
+    let read = OwnedHandle::try_from(read).map_err(|_| Error::last_os_error())?;
+
+    // SAFETY: as above. Dropping `read` on the error path closes the server end.
+    let write = unsafe {
+        let handle = CreateFileW(
+            name.as_ptr(),
+            GENERIC_WRITE,
+            0,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OVERLAPPED,
+            ptr::null_mut(),
+        );
+        HandleOrInvalid::from_raw_handle(handle as _)
+    };
+    let write = OwnedHandle::try_from(write).map_err(|_| Error::last_os_error())?;
+
+    Ok((File::from(read), write))
 }
 
 // Windows environment variables are case-insensitive, and the caller is responsible for
