@@ -59,6 +59,58 @@ fn glyph_job(ch: char, face: Face, size: f32) -> LayoutJob {
     job
 }
 
+/// One terminal cell, in points.  Passed when `[font] cell_fitting` is on, and
+/// `None` otherwise.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Cell {
+    pub width: f32,
+    pub height: f32,
+}
+
+/// A laid-out glyph and where in its cell it goes.
+#[derive(Clone)]
+pub struct Glyph {
+    pub galley: Arc<Galley>,
+    /// Points to add to the top of the cell.  Non-zero only for a glyph laid
+    /// out below the configured size, whose shorter line would otherwise leave
+    /// all the slack beneath it.
+    pub dy: f32,
+}
+
+/// How small fitting may take a glyph.  An overrun past this is a face with
+/// broken metrics rather than a wide one, and a smudge reads worse than a
+/// glyph crossing into its neighbour.
+const MIN_FIT_SCALE: f32 = 0.25;
+
+/// epaint rounds a font's raster size to whole pixels, so scaling by the
+/// measured overrun can still land a hair over the cell.  A second pass
+/// measures what the rounding left and settles it.
+const FIT_PASSES: usize = 2;
+
+/// Lay `ch` out, shrinking it to the cells it occupies when `cell` is given.
+/// Fallback faces are drawn at the primary's point size, so an icon face with
+/// a wider em than the terminal font spills into the next cell untouched.
+fn lay_out(ctx: &Context, ch: char, face: Face, size: f32, cell: Option<Cell>) -> Glyph {
+    let mut galley = ctx.fonts(|f| f.layout_job(glyph_job(ch, face, size)));
+    let Some(cell) = cell else {
+        return Glyph { galley, dy: 0.0 };
+    };
+
+    let span = cell.width * crate::ime::char_cells(ch) as f32;
+    let mut scale = 1.0_f32;
+    for _ in 0..FIT_PASSES {
+        let step = span / galley.size().x;
+        if !step.is_finite() || step >= 1.0 {
+            break;
+        }
+        scale = (scale * step).max(MIN_FIT_SCALE);
+        galley = ctx.fonts(|f| f.layout_job(glyph_job(ch, face, size * scale)));
+    }
+
+    let dy = if scale < 1.0 { ((cell.height - galley.size().y) * 0.5).max(0.0) } else { 0.0 };
+    Glyph { galley, dy }
+}
+
 /// The font atlas a set of galleys was laid out against.  A galley's mesh
 /// stores atlas positions, so it only means anything while that atlas is the
 /// one being sampled.
@@ -98,11 +150,14 @@ pub struct GlyphCache {
     /// Point size the cached galleys were laid out at.  A font-size change
     /// (zoom, config reload) invalidates every one of them.
     size: f32,
+    /// The cell the entries were fitted to, so a metrics change that leaves
+    /// the point size alone still discards them.
+    cell: Option<Cell>,
     /// The atlas the entries were laid out against, once a frame has observed
     /// one.  `None` before the first `begin_frame`, when there is nothing
     /// cached to invalidate.
     atlas: Option<AtlasState>,
-    entries: HashMap<(char, Face), Arc<Galley>>,
+    entries: HashMap<(char, Face), Glyph>,
 }
 
 impl GlyphCache {
@@ -126,19 +181,27 @@ impl GlyphCache {
         self.atlas = Some(now);
     }
 
-    /// The galley for `ch` in `face`, laid out once and reused.  Colour is not
+    /// The glyph for `ch` in `face`, laid out once and reused.  Colour is not
     /// baked in: callers override it per cell.
-    pub fn get(&mut self, ctx: &Context, ch: char, face: Face, size: f32) -> Arc<Galley> {
-        if self.size != size {
+    pub fn get(
+        &mut self,
+        ctx: &Context,
+        ch: char,
+        face: Face,
+        size: f32,
+        cell: Option<Cell>,
+    ) -> Glyph {
+        if self.size != size || self.cell != cell {
             self.entries.clear();
             self.size = size;
+            self.cell = cell;
         }
-        if let Some(galley) = self.entries.get(&(ch, face)) {
-            return galley.clone();
+        if let Some(glyph) = self.entries.get(&(ch, face)) {
+            return glyph.clone();
         }
-        let galley = ctx.fonts(|f| f.layout_job(glyph_job(ch, face, size)));
-        self.entries.insert((ch, face), galley.clone());
-        galley
+        let glyph = lay_out(ctx, ch, face, size, cell);
+        self.entries.insert((ch, face), glyph.clone());
+        glyph
     }
 
     #[cfg(test)]
@@ -167,6 +230,109 @@ mod tests {
         ctx
     }
 
+    /// A context whose only monospace face is a deliberately oversized one,
+    /// standing in for a fallback whose em is wider than the terminal font's.
+    /// The cell every test pairs it with comes from `ctx()`, the unscaled
+    /// face, so each glyph here overruns exactly the way a fallback does.
+    fn oversized_ctx() -> Context {
+        const OVERSIZED: &str = "oversized";
+        let ctx = Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        let mut data = (*fonts.font_data["Hack"]).clone();
+        data.tweak.scale = 4.0;
+        fonts.font_data.insert(OVERSIZED.into(), Arc::new(data));
+        for family in [
+            FontFamily::Monospace,
+            FontFamily::Name(BOLD_FAMILY.into()),
+            FontFamily::Name(ITALIC_FAMILY.into()),
+            FontFamily::Name(BOLD_ITALIC_FAMILY.into()),
+        ] {
+            fonts.families.insert(family, vec![OVERSIZED.into()]);
+        }
+        ctx.set_fonts(fonts);
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        ctx
+    }
+
+    /// The cell the terminal derives from its primary face: one `'a'` wide.
+    fn terminal_cell(size: f32) -> Cell {
+        let galley = lay_out(&ctx(), 'a', Face::Normal, size, None).galley;
+        Cell { width: galley.size().x, height: galley.size().y }
+    }
+
+    /// A fallback face is drawn at the primary's point size, not fitted to its
+    /// cell, so a wider em spills into the neighbouring column.
+    #[test]
+    fn an_oversized_glyph_is_shrunk_into_its_cell() {
+        let ctx = oversized_ctx();
+        let cell = terminal_cell(14.0);
+        let mut cache = GlyphCache::new();
+
+        let loose = cache.get(&ctx, 'a', Face::Normal, 14.0, None).galley.size().x;
+        assert!(loose > cell.width, "the face is not overrunning, so this cannot detect fitting");
+
+        let mut cache = GlyphCache::new();
+        let fitted = cache.get(&ctx, 'a', Face::Normal, 14.0, Some(cell)).galley.size().x;
+
+        assert!(fitted <= cell.width, "{fitted} wide in a {} cell", cell.width);
+    }
+
+    /// Fitting shrinks the whole glyph, so a fitted line is shorter than the
+    /// cell.  Left at the cell's top it would hang with all the slack beneath
+    /// it, out of line with the text around it.
+    #[test]
+    fn a_shrunken_glyph_is_centred_in_the_line() {
+        let ctx = oversized_ctx();
+
+        assert!(
+            GlyphCache::new().get(&ctx, 'a', Face::Normal, 14.0, Some(terminal_cell(14.0))).dy
+                > 0.0
+        );
+    }
+
+    /// Only glyphs that overrun are touched: shrinking one that already fits
+    /// would resize ordinary text.
+    #[test]
+    fn a_glyph_that_already_fits_is_laid_out_untouched() {
+        let ctx = oversized_ctx();
+        let roomy = Cell { width: 500.0, height: 500.0 };
+        let mut cache = GlyphCache::new();
+
+        let glyph = cache.get(&ctx, 'a', Face::Normal, 14.0, Some(roomy));
+
+        assert_eq!(glyph.galley.size(), lay_out(&ctx, 'a', Face::Normal, 14.0, None).galley.size());
+        assert_eq!(glyph.dy, 0.0);
+    }
+
+    /// A character claiming two columns is fitted to both of them rather than
+    /// squeezed into the first.
+    #[test]
+    fn a_double_width_character_is_fitted_to_both_its_cells() {
+        let ctx = oversized_ctx();
+        let cell = terminal_cell(14.0);
+        let mut cache = GlyphCache::new();
+
+        let fitted = cache.get(&ctx, '😀', Face::Normal, 14.0, Some(cell)).galley.size().x;
+
+        assert!(fitted <= cell.width * 2.0, "{fitted} wide in two {} cells", cell.width);
+        assert!(fitted > cell.width, "{fitted} was squeezed into one {} cell", cell.width);
+    }
+
+    /// Cell size follows the font's metrics, which a family change moves
+    /// without moving the point size.  Galleys fitted to the old cell would
+    /// keep their old scale until the cache happened to miss.
+    #[test]
+    fn a_cell_size_change_discards_the_cached_glyphs() {
+        let ctx = oversized_ctx();
+        let cell = terminal_cell(14.0);
+        let mut cache = GlyphCache::new();
+        cache.get(&ctx, 'a', Face::Normal, 14.0, Some(cell));
+
+        cache.get(&ctx, 'a', Face::Normal, 14.0, Some(Cell { width: cell.width * 2.0, ..cell }));
+
+        assert_eq!(cache.len(), 1, "galleys fitted to the old cell survived the change");
+    }
+
     /// The whole point: painting the same character again must not lay it out
     /// again, however many cells show it.
     #[test]
@@ -175,7 +341,7 @@ mod tests {
         let mut cache = GlyphCache::new();
 
         for _ in 0..100 {
-            cache.get(&ctx, 'a', Face::Normal, 14.0);
+            cache.get(&ctx, 'a', Face::Normal, 14.0, None);
         }
 
         assert_eq!(cache.len(), 1);
@@ -189,7 +355,7 @@ mod tests {
         let mut cache = GlyphCache::new();
 
         for face in [Face::Normal, Face::Bold, Face::Italic, Face::BoldItalic] {
-            cache.get(&ctx, 'a', face, 14.0);
+            cache.get(&ctx, 'a', face, 14.0, None);
         }
 
         assert_eq!(cache.len(), 4);
@@ -201,9 +367,9 @@ mod tests {
     fn a_font_size_change_discards_the_cached_galleys() {
         let ctx = ctx();
         let mut cache = GlyphCache::new();
-        cache.get(&ctx, 'a', Face::Normal, 14.0);
+        cache.get(&ctx, 'a', Face::Normal, 14.0, None);
 
-        cache.get(&ctx, 'b', Face::Normal, 20.0);
+        cache.get(&ctx, 'b', Face::Normal, 20.0, None);
 
         assert_eq!(cache.len(), 1, "galleys laid out at the old size survived a size change");
     }
@@ -223,12 +389,12 @@ mod tests {
         let ctx = ctx();
         let mut cache = GlyphCache::new();
         cache.begin_frame(&ctx);
-        let before = atlas_pos(&cache.get(&ctx, 'a', Face::Normal, 14.0));
+        let before = atlas_pos(&cache.get(&ctx, 'a', Face::Normal, 14.0, None).galley);
 
         ctx.set_pixels_per_point(2.0);
         let _ = ctx.run(egui::RawInput::default(), |_| {});
         cache.begin_frame(&ctx);
-        let served = atlas_pos(&cache.get(&ctx, 'a', Face::Normal, 14.0));
+        let served = atlas_pos(&cache.get(&ctx, 'a', Face::Normal, 14.0, None).galley);
 
         let repacked = ctx.fonts(|f| f.layout_job(glyph_job('a', Face::Normal, 14.0)));
         assert_ne!(

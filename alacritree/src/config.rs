@@ -103,6 +103,12 @@ pub struct FontConfig {
     /// through to the first fallback face that has ordinary outlines, so
     /// emoji render monochrome rather than in colour.
     pub color_glyphs: bool,
+    /// Shrink a glyph that lays out wider than the cells it occupies until it
+    /// fits them.  Fallback faces are drawn at the primary's point size, so an
+    /// icon face with a wider em than the terminal font spills into the next
+    /// column; Windows Terminal and WezTerm scale it down instead.  Off by
+    /// default, because it changes how existing configurations render.
+    pub cell_fitting: bool,
     /// Ceiling on the rasterized colour glyph cache.  The cache is already
     /// bounded by how many codepoints the colour fonts cover (a few thousand),
     /// but that ceiling moves with cell size and with the fallback list, so it
@@ -1054,6 +1060,7 @@ impl Default for FontConfig {
             builtin_box_drawing: true,
             fallback: Vec::new(),
             color_glyphs: true,
+            cell_fitting: false,
             color_glyph_cache_mb: 10,
         }
     }
@@ -1364,9 +1371,10 @@ struct RawFont {
     /// warns about unknown keys, so putting it in the shared `alacritty.toml`
     /// would make the real alacritty noisy.
     fallback: Option<Vec<String>>,
-    /// Also alacritree-only, so it belongs in `alacritree.toml` alongside
+    /// Also alacritree-only, so they belong in `alacritree.toml` alongside
     /// `fallback`.
     color_glyphs: Option<bool>,
+    cell_fitting: Option<bool>,
     color_glyph_cache_mb: Option<usize>,
 }
 
@@ -1976,6 +1984,9 @@ impl RawConfig {
         font.fallback = self.font.fallback.clone().unwrap_or_default();
         if let Some(c) = self.font.color_glyphs {
             font.color_glyphs = c;
+        }
+        if let Some(f) = self.font.cell_fitting {
+            font.cell_fitting = f;
         }
         if let Some(mb) = self.font.color_glyph_cache_mb {
             font.color_glyph_cache_mb = mb;
@@ -2676,6 +2687,14 @@ mod tests {
     #[test]
     fn font_fallback_defaults_empty() {
         assert!(parse("").font.fallback.is_empty());
+    }
+
+    /// Fitting resizes glyphs an existing configuration already renders, so it
+    /// has to be asked for.
+    #[test]
+    fn cell_fitting_is_off_until_asked_for() {
+        assert!(!parse("").font.cell_fitting);
+        assert!(parse("[font]\ncell_fitting = true").font.cell_fitting);
     }
 
     #[test]

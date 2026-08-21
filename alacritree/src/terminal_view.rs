@@ -17,6 +17,7 @@ use crate::color_glyph::{CachedColorGlyph, ColorGlyphCache};
 use crate::colors::{background, foreground, resolve, rgb_to_color32};
 use crate::config::Config;
 use crate::fonts::{BOLD_FAMILY, BOLD_ITALIC_FAMILY, ITALIC_FAMILY};
+use crate::glyph_cache;
 use crate::glyph_cache::{Face, GlyphCache};
 use crate::input::event_to_bytes;
 use crate::links::{self, Link};
@@ -1073,6 +1074,8 @@ fn paint_run(
             Face::new(style.flags.contains(Flags::BOLD), style.flags.contains(Flags::ITALIC));
         let glyph_dx = config.font.glyph_offset.x as f32;
         let glyph_dy = config.font.glyph_offset.y as f32;
+        let cell =
+            config.font.cell_fitting.then_some(glyph_cache::Cell { width: cell_w, height: cell_h });
         for (i, ch) in run.chars().enumerate() {
             if ch == ' ' {
                 continue;
@@ -1100,11 +1103,11 @@ fn paint_run(
                 paint_color_glyph(painter, cached, cell_x, y, ppp);
                 continue;
             }
-            let galley = glyphs.get(ctx, ch, face, font_id.size);
+            let glyph = glyphs.get(ctx, ch, face, font_id.size, cell);
             painter.add(
                 egui::epaint::TextShape::new(
-                    Pos2::new(cell_x + glyph_dx, y + glyph_dy),
-                    galley,
+                    Pos2::new(cell_x + glyph_dx, y + glyph_dy + glyph.dy),
+                    glyph.galley,
                     fg,
                 )
                 .with_override_text_color(fg),
