@@ -13,6 +13,10 @@ impl GridCell for usize {
         *self = *template;
     }
 
+    fn owns_storage(&self) -> bool {
+        false
+    }
+
     fn flags(&self) -> &Flags {
         unimplemented!();
     }

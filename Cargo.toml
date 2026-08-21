@@ -5,6 +5,7 @@ members = [
     "alacritty_terminal",
     "alacritty_config",
     "alacritty_config_derive",
+    "vte",
 ]
 resolver = "2"
 
@@ -33,3 +34,7 @@ x11-clipboard = { git = "https://github.com/quininer/x11-clipboard.git", rev = "
 # when the clipboard isn't text (e.g. holds an image) — matches alacritty's
 # raw 0x16 forwarding and lets TUIs like Claude Code do their own wl-paste.
 egui-winit = { path = "egui-winit" }
+# Vendored vte handing whole runs of printable text to the performer in one
+# call instead of a `char` at a time, so the terminal can write a run into a
+# row without repeating the per-character setup.
+vte = { path = "vte" }

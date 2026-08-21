@@ -2,6 +2,7 @@
 
 use std::ops::{Index, IndexMut, Range};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{cmp, mem, ptr, slice, str};
 
 #[cfg(feature = "serde")]
@@ -29,6 +30,10 @@ use crate::vte::ansi::{
 pub mod cell;
 pub mod color;
 pub mod search;
+
+/// Measurement scaffolding: picks between the batched run write and the write
+/// per character it replaced.  Remove once the two have been compared.
+pub static BATCH_INPUT: AtomicBool = AtomicBool::new(true);
 
 /// Minimum number of columns.
 ///
@@ -979,6 +984,90 @@ impl<T> Term<T> {
         self.damage_cursor();
     }
 
+    /// Write the leading printable ASCII of `text` into the cursor's row,
+    /// returning how many bytes landed there.
+    ///
+    /// Printable ASCII is always one cell wide and maps to itself, so a run of
+    /// it can share one row lookup instead of repeating the width and charset
+    /// work per character. Zero means the head of `text` is outside that shape
+    /// and belongs to [`Term::input`], which is still the only path handling
+    /// wide glyphs, charset mapping and cells carrying heap storage.
+    fn write_run(&mut self, text: &str) -> usize
+    where
+        T: EventListener,
+    {
+        // Printable ASCII is always one cell wide and maps to itself, which is
+        // what lets the run skip the width and charset lookups.
+        let bytes = text.as_bytes();
+        if !matches!(bytes.first(), Some(0x20..=0x7e)) {
+            return 0;
+        }
+
+        let wide = Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER;
+        let template = &self.grid.cursor.template;
+        if self.mode.contains(TermMode::INSERT)
+            || template.extra.is_some()
+            || template.flags.intersects(wide | Flags::LEADING_WIDE_CHAR_SPACER)
+            || self.grid.cursor.charsets[self.active_charset] != StandardCharset::Ascii
+        {
+            return 0;
+        }
+
+        if self.grid.cursor.input_needs_wrap {
+            self.wrapline();
+
+            // Line wrapping is off, so the cursor stays put and every character
+            // rewrites the last column. Only the general path tracks that.
+            if self.grid.cursor.input_needs_wrap {
+                return 0;
+            }
+        }
+
+        let fg = self.grid.cursor.template.fg;
+        let bg = self.grid.cursor.template.bg;
+        let flags = self.grid.cursor.template.flags;
+        let columns = self.columns();
+        let start = self.grid.cursor.point.column;
+        let line = self.grid.cursor.point.line;
+
+        // The run stops at the row's end regardless, so looking for the
+        // printable prefix any further would rescan the rest of the input once
+        // per row and turn a long run into quadratic work.
+        let reach = cmp::min(bytes.len(), columns - start.0);
+        let mut count =
+            bytes[..reach].iter().position(|&b| !matches!(b, 0x20..=0x7e)).unwrap_or(reach);
+
+        let row = &mut self.grid[line];
+
+        // Overwriting a fullwidth cell means repairing its partner, so stop the
+        // run at the first one and leave that character to the general path.
+        if let Some(first) =
+            row[start..start + count].iter().position(|cell| cell.flags.intersects(wide))
+        {
+            if first == 0 {
+                return 0;
+            }
+            count = first;
+        }
+
+        for (cell, &byte) in row[start..start + count].iter_mut().zip(&bytes[..count]) {
+            cell.c = byte as char;
+            cell.fg = fg;
+            cell.bg = bg;
+            cell.flags = flags;
+            cell.extra = None;
+        }
+
+        if start.0 + count < columns {
+            self.grid.cursor.point.column = Column(start.0 + count);
+        } else {
+            self.grid.cursor.point.column = Column(columns - 1);
+            self.grid.cursor.input_needs_wrap = true;
+        }
+
+        count
+    }
+
     /// Write `c` to the cell at the cursor position.
     #[inline(always)]
     fn write_at_cursor(&mut self, c: char) {
@@ -987,6 +1076,10 @@ impl<T> Term<T> {
         let bg = self.grid.cursor.template.bg;
         let flags = self.grid.cursor.template.flags;
         let extra = self.grid.cursor.template.extra.clone();
+        if extra.is_some() {
+            let line = self.grid.cursor.point.line;
+            self.grid[line].mark_owns_storage();
+        }
 
         let mut cursor_cell = self.grid.cursor_cell();
 
@@ -1080,6 +1173,7 @@ impl<T: EventListener> Handler for Term<T> {
                 column.0 = column.saturating_sub(1);
             }
 
+            self.grid[line].mark_owns_storage();
             self.grid[line][column].push_zerowidth(c);
             return;
         }
@@ -1134,6 +1228,27 @@ impl<T: EventListener> Handler for Term<T> {
             self.grid.cursor.point.column += 1;
         } else {
             self.grid.cursor.input_needs_wrap = true;
+        }
+    }
+
+    #[inline]
+    fn input_str(&mut self, text: &str) {
+        if !BATCH_INPUT.load(Ordering::Relaxed) {
+            for c in text.chars() {
+                self.input(c);
+            }
+            return;
+        }
+
+        let mut rest = text;
+        while let Some(c) = rest.chars().next() {
+            let written = self.write_run(rest);
+            if written == 0 {
+                self.input(c);
+                rest = &rest[c.len_utf8()..];
+            } else {
+                rest = &rest[written..];
+            }
         }
     }
 
@@ -2755,6 +2870,101 @@ mod tests {
         term.input('a');
 
         assert_eq!(term.grid()[cursor].c, '▒');
+    }
+
+    /// Every visible cell's content, for comparing two terminals.
+    fn screen(term: &Term<VoidListener>) -> Vec<(char, Color, Color, Flags, Vec<char>)> {
+        let mut cells = Vec::new();
+        for line in 0..term.screen_lines() as i32 {
+            for column in 0..term.columns() {
+                let cell = &term.grid()[Line(line)][Column(column)];
+                let zerowidth = cell.zerowidth().unwrap_or(&[]).to_vec();
+                cells.push((cell.c, cell.fg, cell.bg, cell.flags, zerowidth));
+            }
+        }
+        cells
+    }
+
+    /// Writing a run has to leave the terminal exactly as writing its
+    /// characters one at a time does, including wherever the run is declined
+    /// and handed back character by character.
+    #[test]
+    fn input_str_matches_per_character_input() {
+        // Narrow, so runs cross the wrap and the scroll region.
+        let size = TermSize::new(7, 5);
+
+        type Setup = fn(&mut Term<VoidListener>);
+        let cases: &[(Setup, &str)] = &[
+            (|_| {}, "abc"),
+            (|_| {}, "abcdefghij"),
+            (|_| {}, "wrap me across several lines please"),
+            (|_| {}, "wideは mid ですrun"),
+            (|_| {}, "a\u{0301}bc"),
+            // Fullwidth cells under the run: overwriting one means repairing
+            // its partner, which for these three sits outside the run.
+            (
+                |term| {
+                    for c in "ははは".chars() {
+                        term.input(c);
+                    }
+                    term.goto(0, 0);
+                },
+                "abc",
+            ),
+            (
+                |term| {
+                    for c in "ははは".chars() {
+                        term.input(c);
+                    }
+                    term.goto(0, 1);
+                },
+                "abc",
+            ),
+            (
+                |term| {
+                    for c in "ははは".chars() {
+                        term.input(c);
+                    }
+                    term.goto(0, 0);
+                },
+                "abcd",
+            ),
+            (|term| term.set_mode(NamedMode::Insert.into()), "insert"),
+            (
+                |term| term.terminal_attribute(Attr::Background(Color::Named(NamedColor::Red))),
+                "colored run",
+            ),
+            (
+                |term| {
+                    term.configure_charset(
+                        CharsetIndex::G0,
+                        StandardCharset::SpecialCharacterAndLineDrawing,
+                    )
+                },
+                "abcjk",
+            ),
+        ];
+
+        for (index, (setup, text)) in cases.iter().enumerate() {
+            let mut batched = Term::new(Config::default(), &size, VoidListener);
+            let mut single = Term::new(Config::default(), &size, VoidListener);
+            setup(&mut batched);
+            setup(&mut single);
+
+            batched.input_str(text);
+            for c in text.chars() {
+                single.input(c);
+            }
+
+            let case = format!("case {index}: {text:?}");
+            assert_eq!(screen(&batched), screen(&single), "{case}");
+            assert_eq!(batched.grid().cursor.point, single.grid().cursor.point, "{case}");
+            assert_eq!(
+                batched.grid().cursor.input_needs_wrap,
+                single.grid().cursor.input_needs_wrap,
+                "{case}",
+            );
+        }
     }
 
     #[test]

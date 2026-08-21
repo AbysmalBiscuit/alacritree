@@ -151,7 +151,10 @@ impl<T> Storage<T> {
     /// instructions. This implementation achieves the swap in only 8 movups
     /// instructions.
     pub fn swap(&mut self, a: Line, b: Line) {
-        debug_assert_eq!(mem::size_of::<Row<T>>(), mem::size_of::<usize>() * 4);
+        // Row is word-aligned and word-sized throughout, which is what makes
+        // the qword copy below cover it exactly.
+        debug_assert_eq!(mem::size_of::<Row<T>>() % mem::size_of::<usize>(), 0);
+        let words = (mem::size_of::<Row<T>>() / mem::size_of::<usize>()) as isize;
 
         let a = self.compute_index(a);
         let b = self.compute_index(b);
@@ -167,7 +170,7 @@ impl<T> Storage<T> {
             //
             // The optimizer unrolls this loop and vectorizes it.
             let mut tmp: MaybeUninit<usize>;
-            for i in 0..4 {
+            for i in 0..words {
                 tmp = *a_ptr.offset(i);
                 *a_ptr.offset(i) = *b_ptr.offset(i);
                 *b_ptr.offset(i) = tmp;
@@ -278,6 +281,10 @@ mod tests {
 
         fn reset(&mut self, template: &Self) {
             *self = *template;
+        }
+
+        fn owns_storage(&self) -> bool {
+            false
         }
 
         fn flags(&self) -> &Flags {

@@ -252,6 +252,11 @@ impl GridCell for Cell {
     fn reset(&mut self, template: &Self) {
         *self = Cell { bg: template.bg, ..Cell::default() };
     }
+
+    #[inline]
+    fn owns_storage(&self) -> bool {
+        self.extra.is_some()
+    }
 }
 
 impl From<Color> for Cell {

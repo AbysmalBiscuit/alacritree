@@ -16,7 +16,7 @@ mod storage;
 #[cfg(test)]
 mod tests;
 
-pub use self::row::Row;
+pub use self::row::{BULK_RESET, Row};
 use self::storage::Storage;
 
 pub trait GridCell: Sized {
@@ -25,6 +25,13 @@ pub trait GridCell: Sized {
 
     /// Perform an opinionated cell reset based on a template cell.
     fn reset(&mut self, template: &Self);
+
+    /// Whether the cell owns heap storage, which has to be dropped before the
+    /// cell may be overwritten.
+    ///
+    /// Clearing a row is most of what scrolling costs, and a row where this
+    /// holds for no cell can be cleared as one bulk copy.
+    fn owns_storage(&self) -> bool;
 
     fn flags(&self) -> &Flags;
     fn flags_mut(&mut self) -> &mut Flags;
