@@ -74,6 +74,9 @@ impl RearmingReader {
     /// Stops on the read that comes up empty, which is what lets `piper`
     /// install the waker that announces the next byte.
     fn drain_pipe(&mut self) -> io::Result<()> {
+        let started = std::time::Instant::now();
+        let mut drained = 0usize;
+        let mut hit_empty = false;
         let Self { pty, staged, .. } = self;
         while staged.len() < DRAIN_AHEAD {
             let base = staged.len();
@@ -81,12 +84,17 @@ impl RearmingReader {
             match pty.reader().read(&mut staged[base..]) {
                 Ok(0) => {
                     staged.truncate(base);
+                    hit_empty = true;
                     break;
                 },
-                Ok(read) => staged.truncate(base + read),
+                Ok(read) => {
+                    drained += read;
+                    staged.truncate(base + read);
+                },
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => staged.truncate(base),
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                     staged.truncate(base);
+                    hit_empty = true;
                     break;
                 },
                 Err(err) => {
@@ -95,12 +103,14 @@ impl RearmingReader {
                 },
             }
         }
+        crate::stall_probe::drain(started.elapsed(), drained, hit_empty);
         Ok(())
     }
 }
 
 impl Read for RearmingReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        crate::stall_probe::read_slice(buf.len());
         if self.taken == self.staged.len() {
             self.staged.clear();
             self.taken = 0;
@@ -142,6 +152,7 @@ impl EventedReadWrite for RearmingPty {
         interest: Event,
         poll_opts: PollMode,
     ) -> io::Result<()> {
+        crate::stall_probe::set_poller(poll);
         self.reader.poller = Some(poll.clone());
         unsafe { self.reader.pty.register(poll, interest, poll_opts) }
     }
@@ -152,6 +163,7 @@ impl EventedReadWrite for RearmingPty {
         interest: Event,
         poll_opts: PollMode,
     ) -> io::Result<()> {
+        crate::stall_probe::set_poller(poll);
         self.reader.poller = Some(poll.clone());
         self.reader.pty.reregister(poll, interest, poll_opts)
     }

@@ -44,6 +44,7 @@ mod session;
 mod sidebar_focus;
 mod sidebar_nav;
 mod stale_exe;
+mod stall_probe;
 mod state;
 #[cfg(test)]
 mod steady_state;
@@ -116,6 +117,15 @@ fn main() -> eframe::Result<()> {
     attach_parent_console();
     if let Some(code) = cli::run(cli::Cli::parse()) {
         std::process::exit(code);
+    }
+
+    // Measurement scaffolding: turns the parse optimisations off so one build
+    // can be timed both ways in the same window.  Remove with the probe.
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let off = |name: &str| std::env::var(name).as_deref() == Ok("0");
+        alacritty_terminal::grid::BULK_RESET.store(!off("ALACRITREE_BULK_RESET"), Relaxed);
+        alacritty_terminal::term::BATCH_INPUT.store(!off("ALACRITREE_BATCH_INPUT"), Relaxed);
     }
 
     // Only the GUI path records crashes.  Every subcommand exits before config

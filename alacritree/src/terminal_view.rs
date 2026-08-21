@@ -124,16 +124,22 @@ pub fn show(
         line_height: (cell_h_pt * ppp).floor() as f64,
         descent: 0.0,
     };
-    // The guard is a temporary so it is dropped at the end of this statement:
-    // nothing below may run while the terminal is locked.
+    // The guard is dropped immediately after the capture: nothing below may
+    // run while the terminal is locked.
+    let lock_started = std::time::Instant::now();
+    let term_guard = session.term.lock();
+    let waited = lock_started.elapsed();
+    let held_started = std::time::Instant::now();
     snapshot.capture(
-        &session.term.lock(),
+        &term_guard,
         config,
         peek.link.as_ref().map(|l| &l.bounds),
         // The preedit overlay replaces the cursor while composing
         // (alacritty hides it the same way, display/content.rs).
         ime.preedit().is_some(),
     );
+    drop(term_guard);
+    crate::stall_probe::frame(waited, held_started.elapsed());
     paint_grid(
         &painter,
         rect,
@@ -312,13 +318,19 @@ fn peek_term(
         .flatten()
         .filter(|pos| pointer_owns_grid(ui.ctx(), ui.layer_id(), rect, *pos));
 
+    let lock_started = std::time::Instant::now();
     let term = session.term.lock();
+    let waited = lock_started.elapsed();
+    let held_started = std::time::Instant::now();
     let display_offset = term.grid().display_offset() as i32;
     let link = hover.and_then(|pos| {
         let (point, _) = cell_at_pos(pos, rect, cell_w, cell_h, cols, rows, display_offset);
         links::link_at(&term, point)
     });
-    TermPeek { mode: *term.mode(), display_offset, link }
+    let peek = TermPeek { mode: *term.mode(), display_offset, link };
+    drop(term);
+    crate::stall_probe::lock_sample(waited, held_started.elapsed());
+    peek
 }
 
 #[allow(clippy::too_many_arguments)]

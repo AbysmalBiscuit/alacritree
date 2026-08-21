@@ -66,6 +66,7 @@ const SPINNER_COALESCE: Duration = Duration::from_millis(120);
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: TermEvent) {
+        crate::stall_probe::wakeup();
         // A hidden session's grid is not on screen, so a repaint for it would
         // redraw the *visible* session to the same pixels.  Nothing then
         // drains the channel either, which is why the payload-free events must
@@ -1165,6 +1166,7 @@ impl Session {
 
         let term = Term::new(term_config(config), &size, proxy.clone());
         let term = Arc::new(FairMutex::new(term));
+        crate::stall_probe::watch(&term);
 
         let id = next_session_id();
         let env = session_env(&config.env, &kind, id);

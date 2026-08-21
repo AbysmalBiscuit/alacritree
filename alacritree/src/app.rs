@@ -8260,6 +8260,7 @@ impl eframe::App for AlacritreeApp {
     }
 
     fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
+        let update_started = std::time::Instant::now();
         let frame_started = self
             .frame_log
             .as_ref()
@@ -8450,6 +8451,7 @@ impl eframe::App for AlacritreeApp {
         self.reconcile_sidebar_focus(ctx);
         self.phases.mark("reap");
         self.phases.report_if_slow();
+        crate::stall_probe::update_tick(update_started.elapsed());
 
         if let (Some(log), Some((started, waited))) = (self.frame_log.as_mut(), frame_started) {
             log.record(crate::frame_log::Timings {
