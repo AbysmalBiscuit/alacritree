@@ -990,7 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn a_disabled_recorder_writes_no_reason_line() {
+    fn a_disabled_call_writes_nothing_and_does_not_burn_the_latch() {
         with_recorder(|dir| {
             set_enabled(false);
 
@@ -998,6 +998,13 @@ mod tests {
 
             let entries: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().collect();
             assert!(entries.is_empty(), "wrote {} files while disabled", entries.len());
+
+            set_enabled(true);
+            session_begin();
+            record_reason(ExitReason::UserQuit);
+
+            let text = artifact_text();
+            assert!(text.contains("exit reason: user-quit"), "reason missing:\n{text}");
         });
     }
 
