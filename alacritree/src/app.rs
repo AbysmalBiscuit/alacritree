@@ -7355,11 +7355,24 @@ impl AlacritreeApp {
     }
 
     /// Everything the palette can act on this frame: every runnable keyboard
-    /// action, then each open session, then each switchable workspace.  Rebuilt
-    /// each frame — cheap beside ranking, and always current as sessions and
-    /// worktrees come and go.
+    /// action, then each configured shell profile, then each open session,
+    /// then each switchable workspace.  Rebuilt each frame — cheap beside
+    /// ranking, and always current as sessions and worktrees come and go.
     fn palette_items(&self) -> Vec<PaletteItem> {
         let mut items = command_palette::action_items(&self.config.bindings);
+        for (i, profile) in self.config.profiles.iter().enumerate() {
+            let index = i + 1;
+            // SpawnProfile only binds indices 1..=9; past that there is no
+            // config name to search by.
+            let config_name =
+                if index <= 9 { format!("SpawnProfile{index}") } else { String::new() };
+            let command = std::iter::once(profile.program.as_str())
+                .chain(profile.args.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let keys = command_palette::profile_keys(&self.config.bindings, index as u8);
+            items.push(PaletteItem::profile(profile.name.clone(), command, keys, &config_name));
+        }
         for session in &self.sessions {
             let ws = self.workspace_label(&session.working_directory);
             items.push(PaletteItem::session(
@@ -7437,6 +7450,10 @@ impl AlacritreeApp {
                         error: None,
                     });
                 }
+            },
+            PaletteAction::SpawnProfile(name) => {
+                self.spawn_profile_session(ctx, &name);
+                self.focus_terminal();
             },
         }
     }
