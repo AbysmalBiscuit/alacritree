@@ -51,6 +51,8 @@ mod terminal_view;
 #[cfg(test)]
 mod test_util;
 mod upstream;
+#[cfg(windows)]
+mod win_session;
 mod worktree;
 mod worktree_liveness;
 mod wsl;
@@ -162,7 +164,15 @@ fn main() -> eframe::Result<()> {
     let result = eframe::run_native(
         "Alacritree",
         native_options,
-        Box::new(move |cc| Ok(Box::new(AlacritreeApp::new(cc, config)))),
+        Box::new(move |cc| {
+            // The hook exists to write a record a disabled recorder would drop,
+            // so it is not installed at all when the gate is off.
+            #[cfg(windows)]
+            if config.debug.crash_log {
+                win_session::install(cc);
+            }
+            Ok(Box::new(AlacritreeApp::new(cc, config)))
+        }),
     );
 
     // Only reached when `run_native` returns.  A panic unwinds past this — winit

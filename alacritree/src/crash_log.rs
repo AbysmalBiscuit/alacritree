@@ -180,6 +180,9 @@ pub const EXIT_ERROR_MARKER: &str = "exit error:";
 pub const EXIT_REASON_MARKER: &str = "exit reason:";
 
 /// Why the process is on its way out, as far as alacritree could tell.
+// The three OS reasons are only ever constructed by the Windows session-end
+// hook, which does not compile elsewhere.
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitReason {
     UserQuit,
