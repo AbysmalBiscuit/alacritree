@@ -6728,7 +6728,6 @@ fn worktree_row(
     let mut set_base_clicked = false;
     let mut spawn_profile_clicked: Option<String> = None;
     resp.context_menu(|ui| {
-        ui.set_max_width(WORKTREE_MENU_MAX_WIDTH);
         if ui.button("Set base branch…").clicked() {
             set_base_clicked = true;
             ui.close_menu();
@@ -6736,6 +6735,7 @@ fn worktree_row(
         if !profiles.is_empty() {
             ui.separator();
             ui.label(RichText::new("Open session").color(theme.text_muted).small());
+            ui.set_max_width(WORKTREE_MENU_MAX_WIDTH);
             for (i, (name, command)) in profiles.iter().enumerate() {
                 let btn = ui.button(profile_menu_label(i + 1, name));
                 if btn.on_hover_text(command.as_str()).clicked() {
