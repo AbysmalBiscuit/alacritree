@@ -23,7 +23,7 @@ use crate::config::{
     DEFAULT_UPSTREAM_DIVERGED_ICON, DEFAULT_UPSTREAM_GONE_ICON, DEFAULT_UPSTREAM_LEVEL_ICON,
     DEFAULT_UPSTREAM_UNTRACKED_ICON, DEFAULT_WORKTREE_ICON, DEFAULT_WORKTREE_MAIN_ICON, FontConfig,
     IconStyle, Icons, LastSessionClose, PathStyleConfig, ScrollbarStyle, SearchScope, SidebarFocus,
-    SidebarTooltips, TextEmphasis, UiFont,
+    SidebarTooltips, TextEmphasis, UiFont, profile_command,
 };
 use crate::doppler;
 use crate::file_drop;
@@ -1207,25 +1207,35 @@ impl AlacritreeApp {
 
     /// Spawn a named profile into the current workspace, bypassing the
     /// override/auto resolution chain — the user asked for this profile
-    /// explicitly.
+    /// explicitly.  Raises `error_dialog` directly: this wrapper's three
+    /// callers (the `SpawnProfileN` keybinding, the tab strip `+`, and the
+    /// palette) have no stale-row state to reconcile, unlike the sidebar's
+    /// `spawn_profile_session_in` caller.
     fn spawn_profile_session(&mut self, ctx: &Context, name: &str) {
         let ws = self.current_workspace.clone();
-        self.spawn_profile_session_in(ctx, name, ws);
+        if let Err(e) = self.spawn_profile_session_in(ctx, name, ws) {
+            self.error_dialog = Some(format!("failed to spawn profile `{name}`: {e}"));
+        }
     }
 
     /// Spawn a named profile into an arbitrary workspace — the worktree
     /// sidebar's profile menu targets the row it was opened on, which is
-    /// often not the workspace currently on screen.
-    fn spawn_profile_session_in(&mut self, ctx: &Context, name: &str, ws: WorkspaceKey) {
+    /// often not the workspace currently on screen.  Returns the error
+    /// instead of raising `error_dialog` itself so the sidebar caller can
+    /// run it through `report_spawn_failure`, matching `spawn_shell_request`.
+    fn spawn_profile_session_in(
+        &mut self,
+        ctx: &Context,
+        name: &str,
+        ws: WorkspaceKey,
+    ) -> std::io::Result<SessionId> {
         let Some(profile) = self.config.profile(name) else {
-            log::warn!("no shell profile named `{name}`");
-            self.error_dialog = Some(format!("no shell profile named `{name}`"));
-            return;
+            let msg = format!("no shell profile named `{name}`");
+            log::warn!("{msg}");
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, msg));
         };
         let (shell, wsl_probe) = profile_session_shell(profile);
-        if let Err(e) = self.spawn_session_with_shell(ctx, ws, shell, wsl_probe) {
-            self.error_dialog = Some(format!("failed to spawn profile `{name}`: {e}"));
-        }
+        self.spawn_session_with_shell(ctx, ws, shell, wsl_probe)
     }
 
     /// Shell for a workspace; `None` means "no override" — `Session::spawn`
@@ -3361,18 +3371,8 @@ impl AlacritreeApp {
             self.config.profiles.iter().map(|p| p.name.clone()).collect();
         // Name + command pairs for the worktree row's "Open session" menu —
         // the command is only ever shown as hover text, never painted.
-        let worktree_profiles: Vec<(String, String)> = self
-            .config
-            .profiles
-            .iter()
-            .map(|p| {
-                let command = std::iter::once(p.program.as_str())
-                    .chain(p.args.iter().map(String::as_str))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                (p.name.clone(), command)
-            })
-            .collect();
+        let worktree_profiles: Vec<(String, String)> =
+            self.config.profiles.iter().map(|p| (p.name.clone(), profile_command(p))).collect();
         let mut shell_override_changed: Option<PathBuf> = None;
         let mut label_cleared: Option<PathBuf> = None;
         let mut rename_request: Option<RenameState> = None;
@@ -3967,16 +3967,18 @@ impl AlacritreeApp {
             }
         }
         if let Some((path, name)) = spawn_profile_request.take() {
-            // Same activate-on-success shape as `spawn_shell_request`, but
-            // `spawn_profile_session_in` already reports its own failure
-            // through `error_dialog` rather than a `Result` — a grown session
-            // count is what stands in for success here.
+            // Same activate-on-success and stale-row-recovery shape as
+            // `spawn_shell_request`: a stale worktree row's `+` reaches
+            // `report_spawn_failure` today, and a profile picked from the
+            // same row's menu must un-grey it the same way.
             let ws = Some(path);
-            let sessions_before = self.sessions.len();
-            self.spawn_profile_session_in(ctx, &name, ws.clone());
-            if self.sessions.len() > sessions_before {
-                self.current_workspace = ws;
-                workspace_activated = true;
+            let previous = std::mem::replace(&mut self.current_workspace, ws.clone());
+            match self.spawn_profile_session_in(ctx, &name, ws.clone()) {
+                Ok(_) => workspace_activated = true,
+                Err(e) => {
+                    self.current_workspace = previous;
+                    self.report_spawn_failure(ctx, &ws, &e);
+                },
             }
         }
         self.poll_worktree_liveness(ctx, probing, &drawn_worktrees.into_inner());
@@ -7437,10 +7439,7 @@ impl AlacritreeApp {
             // config name to search by.
             let config_name =
                 if index <= 9 { format!("SpawnProfile{index}") } else { String::new() };
-            let command = std::iter::once(profile.program.as_str())
-                .chain(profile.args.iter().map(String::as_str))
-                .collect::<Vec<_>>()
-                .join(" ");
+            let command = profile_command(profile);
             let keys = command_palette::profile_keys(&self.config.bindings, index as u8);
             items.push(PaletteItem::profile(profile.name.clone(), command, keys, &config_name));
         }
