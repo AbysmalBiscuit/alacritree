@@ -1209,13 +1209,20 @@ impl AlacritreeApp {
     /// override/auto resolution chain — the user asked for this profile
     /// explicitly.
     fn spawn_profile_session(&mut self, ctx: &Context, name: &str) {
+        let ws = self.current_workspace.clone();
+        self.spawn_profile_session_in(ctx, name, ws);
+    }
+
+    /// Spawn a named profile into an arbitrary workspace — the worktree
+    /// sidebar's profile menu targets the row it was opened on, which is
+    /// often not the workspace currently on screen.
+    fn spawn_profile_session_in(&mut self, ctx: &Context, name: &str, ws: WorkspaceKey) {
         let Some(profile) = self.config.profile(name) else {
             log::warn!("no shell profile named `{name}`");
             self.error_dialog = Some(format!("no shell profile named `{name}`"));
             return;
         };
         let (shell, wsl_probe) = profile_session_shell(profile);
-        let ws = self.current_workspace.clone();
         if let Err(e) = self.spawn_session_with_shell(ctx, ws, shell, wsl_probe) {
             self.error_dialog = Some(format!("failed to spawn profile `{name}`: {e}"));
         }
@@ -3211,6 +3218,8 @@ impl AlacritreeApp {
         let delete_request: std::cell::Cell<Option<PathBuf>> = std::cell::Cell::new(None);
         let create_request: std::cell::Cell<Option<usize>> = std::cell::Cell::new(None);
         let spawn_shell_request: std::cell::Cell<Option<WorkspaceKey>> = std::cell::Cell::new(None);
+        let spawn_profile_request: std::cell::Cell<Option<(PathBuf, String)>> =
+            std::cell::Cell::new(None);
         let activate_session_request: std::cell::Cell<Option<(WorkspaceKey, SessionId)>> =
             std::cell::Cell::new(None);
         let close_session_request: std::cell::Cell<Option<SessionId>> = std::cell::Cell::new(None);
@@ -3350,6 +3359,20 @@ impl AlacritreeApp {
         let icons = self.config.ui.icons.clone();
         let profile_names: Vec<String> =
             self.config.profiles.iter().map(|p| p.name.clone()).collect();
+        // Name + command pairs for the worktree row's "Open session" menu —
+        // the command is only ever shown as hover text, never painted.
+        let worktree_profiles: Vec<(String, String)> = self
+            .config
+            .profiles
+            .iter()
+            .map(|p| {
+                let command = std::iter::once(p.program.as_str())
+                    .chain(p.args.iter().map(String::as_str))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (p.name.clone(), command)
+            })
+            .collect();
         let mut shell_override_changed: Option<PathBuf> = None;
         let mut label_cleared: Option<PathBuf> = None;
         let mut rename_request: Option<RenameState> = None;
@@ -3812,6 +3835,7 @@ impl AlacritreeApp {
                                     wt_attention,
                                     wt_glyph,
                                     is_deleting,
+                                    &worktree_profiles,
                                     &icons,
                                     &theme,
                                 );
@@ -3826,6 +3850,9 @@ impl AlacritreeApp {
                                 }
                                 if action.set_base {
                                     base_picker_request.set(Some(wt.path.clone()));
+                                }
+                                if let Some(name) = action.spawn_profile {
+                                    spawn_profile_request.set(Some((wt.path.clone(), name)));
                                 }
                                 let session_rows = worktree_session_rows
                                     .get(idx)
@@ -3937,6 +3964,19 @@ impl AlacritreeApp {
                     self.current_workspace = previous;
                     self.report_spawn_failure(ctx, &ws, &e);
                 },
+            }
+        }
+        if let Some((path, name)) = spawn_profile_request.take() {
+            // Same activate-on-success shape as `spawn_shell_request`, but
+            // `spawn_profile_session_in` already reports its own failure
+            // through `error_dialog` rather than a `Result` — a grown session
+            // count is what stands in for success here.
+            let ws = Some(path);
+            let sessions_before = self.sessions.len();
+            self.spawn_profile_session_in(ctx, &name, ws.clone());
+            if self.sessions.len() > sessions_before {
+                self.current_workspace = ws;
+                workspace_activated = true;
             }
         }
         self.poll_worktree_liveness(ctx, probing, &drawn_worktrees.into_inner());
@@ -5984,6 +6024,8 @@ struct WorktreeAction {
     delete: bool,
     spawn: bool,
     set_base: bool,
+    /// Name of the profile picked from the row's "Open session" menu, if any.
+    spawn_profile: Option<String>,
 }
 
 /// Everything a sidebar session row needs, snapshotted before the panel
@@ -6495,6 +6537,17 @@ fn upstream_badge<'a>(
     }
 }
 
+/// Width the worktree row's context menu is held to, so a long profile name
+/// wraps onto a second line instead of stretching the popup to fit it.
+const WORKTREE_MENU_MAX_WIDTH: f32 = 220.0;
+
+/// The "index. name" label for a profile entry in the worktree row's "Open
+/// session" menu, 1-based to match `SpawnProfile1`..`SpawnProfile9` in the
+/// palette.
+fn profile_menu_label(index: usize, name: &str) -> String {
+    format!("{index}. {name}")
+}
+
 fn worktree_row(
     ui: &mut egui::Ui,
     wt: &Worktree,
@@ -6511,6 +6564,10 @@ fn worktree_row(
     attention: bool,
     agent_glyph: Option<char>,
     deleting: bool,
+    // Shell profiles offered in the row's "Open session" menu: `.0` is the
+    // profile name (spawned and shown as the button label), `.1` is the
+    // command shown on hover.
+    profiles: &[(String, String)],
     icons: &Icons,
     theme: &Theme,
 ) -> WorktreeAction {
@@ -6669,10 +6726,23 @@ fn worktree_row(
     }
 
     let mut set_base_clicked = false;
+    let mut spawn_profile_clicked: Option<String> = None;
     resp.context_menu(|ui| {
+        ui.set_max_width(WORKTREE_MENU_MAX_WIDTH);
         if ui.button("Set base branch…").clicked() {
             set_base_clicked = true;
             ui.close_menu();
+        }
+        if !profiles.is_empty() {
+            ui.separator();
+            ui.label(RichText::new("Open session").color(theme.text_muted).small());
+            for (i, (name, command)) in profiles.iter().enumerate() {
+                let btn = ui.button(profile_menu_label(i + 1, name));
+                if btn.on_hover_text(command.as_str()).clicked() {
+                    spawn_profile_clicked = Some(name.clone());
+                    ui.close_menu();
+                }
+            }
         }
     });
 
@@ -6700,6 +6770,7 @@ fn worktree_row(
         delete: delete_clicked,
         spawn: spawn_clicked,
         set_base: set_base_clicked,
+        spawn_profile: spawn_profile_clicked,
     }
 }
 
@@ -9052,6 +9123,12 @@ mod tests {
     }
 
     #[test]
+    fn profile_menu_label_numbers_from_one() {
+        assert_eq!(profile_menu_label(1, "WSL"), "1. WSL");
+        assert_eq!(profile_menu_label(2, "cmd"), "2. cmd");
+    }
+
+    #[test]
     fn base_branch_precedence_is_override_then_pr_then_default() {
         let f = effective_base_branch;
         assert_eq!(f(Some("develop"), Some("main"), Some("master")), Some("develop".into()));
@@ -10212,7 +10289,19 @@ mod tests {
 
         let texts = texts_while_hovering(140.0, |ui| {
             worktree_row(
-                ui, &wt, None, &wt.name, None, true, false, false, false, None, false, &icons,
+                ui,
+                &wt,
+                None,
+                &wt.name,
+                None,
+                true,
+                false,
+                false,
+                false,
+                None,
+                false,
+                &[],
+                &icons,
                 &theme,
             );
         });
@@ -10373,7 +10462,19 @@ mod tests {
         let output = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 worktree_row(
-                    ui, &wt, None, &wt.name, None, true, false, false, false, None, false, &icons,
+                    ui,
+                    &wt,
+                    None,
+                    &wt.name,
+                    None,
+                    true,
+                    false,
+                    false,
+                    false,
+                    None,
+                    false,
+                    &[],
+                    &icons,
                     &theme,
                 );
             });
@@ -10506,6 +10607,7 @@ mod tests {
                 false,
                 None,
                 false,
+                &[],
                 &icons,
                 theme,
             );
@@ -10806,7 +10908,19 @@ mod tests {
         let output = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 worktree_row(
-                    ui, &wt, None, &wt.name, None, true, false, false, false, None, false, &icons,
+                    ui,
+                    &wt,
+                    None,
+                    &wt.name,
+                    None,
+                    true,
+                    false,
+                    false,
+                    false,
+                    None,
+                    false,
+                    &[],
+                    &icons,
                     &theme,
                 );
             });
@@ -10860,7 +10974,19 @@ mod tests {
 
             let texts = texts_while_hovering(140.0, |ui| {
                 worktree_row(
-                    ui, &wt, None, name, None, true, false, false, false, None, false, &icons,
+                    ui,
+                    &wt,
+                    None,
+                    name,
+                    None,
+                    true,
+                    false,
+                    false,
+                    false,
+                    None,
+                    false,
+                    &[],
+                    &icons,
                     &theme,
                 );
             });
@@ -10932,6 +11058,7 @@ mod tests {
                     false,
                     None,
                     false,
+                    &[],
                     &icons,
                     &theme,
                 );
