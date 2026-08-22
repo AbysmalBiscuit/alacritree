@@ -25,6 +25,7 @@ use crate::config::{
     IconStyle, Icons, LastSessionClose, PathStyleConfig, ScrollbarStyle, SearchScope, SidebarFocus,
     SidebarTooltips, TextEmphasis, UiFont, profile_command,
 };
+use crate::crash_log::{self, ExitReason};
 use crate::doppler;
 use crate::file_drop;
 use crate::git_nav::{self, GitSection, SectionCount};
@@ -8108,6 +8109,7 @@ impl AlacritreeApp {
 
         if confirm_via_key || quit_clicked {
             self.quit_dialog_open = false;
+            crash_log::record_reason(ExitReason::UserQuit);
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         } else if cancel_via_key || cancel_clicked || modal.should_close() {
             self.quit_dialog_open = false;
@@ -8357,6 +8359,13 @@ impl eframe::App for AlacritreeApp {
         }
         self.phases.restart();
         self.glyph_cache.begin_frame(ctx);
+        // The latch is what makes this safe to run on every close path: a quit
+        // through the dialog has already recorded `user-quit`, and on Windows a
+        // session end has already recorded its own reason, so this only ever
+        // fires for a close nothing else explained.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            crash_log::record_reason(ExitReason::WindowClosed);
+        }
         self.poll_project_refreshes();
         // Unconditional: either sidebar can be hidden, and a drain hung off one
         // of them would strand every entry the other polled.
