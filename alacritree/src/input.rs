@@ -26,7 +26,7 @@ pub fn event_to_bytes(event: &Event, mode: TermMode) -> Option<Vec<u8>> {
 
 pub fn key_to_bytes(key: Key, mods: Modifiers, mode: TermMode) -> Option<Vec<u8>> {
     if should_build_kitty(key, mods, mode)
-        && let Some(bytes) = kitty_sequence(key, mods)
+        && let Some(bytes) = kitty_sequence(key, mods, mode)
     {
         return Some(bytes);
     }
@@ -103,12 +103,13 @@ fn should_build_kitty(key: Key, mods: Modifiers, mode: TermMode) -> bool {
 /// control keys plus modified printables.  Arrows, F-keys and the editing
 /// block keep their legacy CSI encodings even under the kitty protocol, so
 /// they fall through to `named_key_bytes`.
-fn kitty_sequence(key: Key, mods: Modifiers) -> Option<Vec<u8>> {
-    let code: u32 = match key {
-        Key::Tab => 9,
-        Key::Enter => 13,
-        Key::Escape => 27,
-        Key::Backspace => 127,
+fn kitty_sequence(key: Key, mods: Modifiers, mode: TermMode) -> Option<Vec<u8>> {
+    // Keys with a fixed code have no shifted form to report beside it.
+    let (code, alternate): (u32, Option<u32>) = match key {
+        Key::Tab => (9, None),
+        Key::Enter => (13, None),
+        Key::Escape => (27, None),
+        Key::Backspace => (127, None),
         _ => {
             // winit reports AltGr as Ctrl+Alt; the composed character arrives
             // via Event::Text, same as on the legacy path.
@@ -119,12 +120,32 @@ fn kitty_sequence(key: Key, mods: Modifiers) -> Option<Vec<u8>> {
             // modifier field.  Shifted punctuation arrives as its own logical
             // key in egui and carries no layout info, so it is used as-is —
             // upstream resolves it via winit's key_without_modifiers.
-            u32::from(key_char(key, false)?)
+            let code = u32::from(key_char(key, false)?);
+            (code, shifted_alternate(key, mods, mode).filter(|alternate| *alternate != code))
         },
     };
+    let payload = match alternate {
+        Some(alternate) => format!("{code}:{alternate}"),
+        None => code.to_string(),
+    };
     let m = kitty_mods(mods);
-    let seq = if m == 0 { format!("\x1b[{code}u") } else { format!("\x1b[{code};{}u", m + 1) };
+    let seq =
+        if m == 0 { format!("\x1b[{payload}u") } else { format!("\x1b[{payload};{}u", m + 1) };
     Some(seq.into_bytes())
+}
+
+/// The shifted character an app recovers `D` from, given a key code that is
+/// always the unshifted `d`.  The protocol allows this field only while Shift
+/// is held, and only apps setting `REPORT_ALTERNATE_KEYS` ask for it; without
+/// it a shifted letter reaches the app as `d` plus a shift bit, which matches
+/// neither `d` nor `D` in a keymap.  Layout-shifted punctuation stays out of
+/// reach — egui reports it as its own logical key, with no unshifted base to
+/// pair it with.
+fn shifted_alternate(key: Key, mods: Modifiers, mode: TermMode) -> Option<u32> {
+    if !mods.shift || !mode.contains(TermMode::REPORT_ALTERNATE_KEYS) {
+        return None;
+    }
+    Some(u32::from(key_char(key, true)?))
 }
 
 /// Encoding for keys that never produce composed text.  Because no
@@ -567,5 +588,72 @@ mod tests {
             "terminal ignored the kitty enable sequence; mode is {mode:?}"
         );
         assert_eq!(super::key_to_bytes(Key::Enter, M::SHIFT, mode), Some(b"\x1b[13;2u".to_vec()));
+    }
+
+    /// The flag set yazi pushes on startup (`CSI > 29 u`), minus the
+    /// associated-text bit, which alacritree does not report.
+    const REPORT_ALL_ALTERNATES: TermMode =
+        REPORT_ALL.union(DISAMBIGUATE).union(TermMode::REPORT_ALTERNATE_KEYS);
+
+    #[test]
+    fn kitty_alternate_keys_reports_the_shifted_letter() {
+        assert_eq!(
+            super::key_to_bytes(Key::D, M::SHIFT, REPORT_ALL_ALTERNATES),
+            Some(b"\x1b[100:68;2u".to_vec())
+        );
+        assert_eq!(
+            super::key_to_bytes(Key::C, ctrl_shift(), REPORT_ALL_ALTERNATES),
+            Some(b"\x1b[99:67;6u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_alternate_keys_are_omitted_without_the_flag() {
+        assert_eq!(
+            super::key_to_bytes(Key::D, M::SHIFT, REPORT_ALL),
+            Some(b"\x1b[100;2u".to_vec())
+        );
+    }
+
+    /// The kitty spec allows the alternate field only while Shift is held, and
+    /// a key with no distinct shifted form has nothing to report either way.
+    #[test]
+    fn kitty_alternate_keys_need_shift_and_a_different_character() {
+        assert_eq!(
+            super::key_to_bytes(Key::D, M::CTRL, REPORT_ALL_ALTERNATES),
+            Some(b"\x1b[100;5u".to_vec())
+        );
+        assert_eq!(
+            super::key_to_bytes(Key::Comma, M::SHIFT, REPORT_ALL_ALTERNATES),
+            Some(b"\x1b[44;2u".to_vec())
+        );
+    }
+
+    /// Yazi keys `D` off the shifted codepoint and has no config syntax for the
+    /// unshifted-`d`-plus-shift state alacritree used to leave it in, so the
+    /// press did nothing at all.  Drives yazi's own enable sequence through the
+    /// terminal so the negotiation and the encoding are covered as one path.
+    #[test]
+    fn shifted_letter_carries_its_alternate_once_an_app_asks_for_them() {
+        use alacritty_terminal::Term;
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+
+        use crate::config::Config;
+        use crate::session::{TermSize, term_config};
+
+        let size = TermSize::new(80, 24);
+        let mut term = Term::new(term_config(&Config::default()), &size, VoidListener);
+
+        // `CSI > 29 u`: disambiguate | alternate keys | all keys as escapes |
+        // associated text, exactly what yazi pushes on startup.
+        Processor::<StdSyncHandler>::new().advance(&mut term, b"\x1b[>29u");
+
+        let mode = *term.mode();
+        assert!(
+            mode.contains(TermMode::REPORT_ALTERNATE_KEYS),
+            "terminal ignored the alternate-keys request; mode is {mode:?}"
+        );
+        assert_eq!(super::key_to_bytes(Key::D, M::SHIFT, mode), Some(b"\x1b[100:68;2u".to_vec()));
     }
 }
