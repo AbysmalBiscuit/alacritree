@@ -195,6 +195,11 @@ projects still exist on disk, and whether a running instance is reachable. It
 needs no running window — "nothing happens when I run it" is exactly when it
 gets used.
 
+On Windows it also reports each installed WSL distro and where `git`, `gh`,
+`delta` and `doppler` resolve *inside* it. Those are the paths alacritree uses
+for a project that lives in a distro, and nothing else ever names them: a
+distro without `git` shows an empty git panel rather than an error.
+
 It exits non-zero only when something is genuinely broken. A missing optional
 tool is a warning, and a tool driving a feature you have never opted into (an
 absent `doppler` on a machine with no Doppler config) is not even that — a report

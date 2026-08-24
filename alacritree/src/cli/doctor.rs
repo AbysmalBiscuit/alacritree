@@ -12,9 +12,10 @@
 //! It answers without a running instance, because "nothing happens when I run
 //! it" is precisely when it gets used.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -95,9 +96,12 @@ pub fn run(as_json: bool, socket: Option<&Path>) -> i32 {
 fn report(socket: Option<&Path>) -> Vec<Check> {
     let config = config::load();
 
+    // Rows are grouped by section on the way out, so each section has to be
+    // added in one run — a section split in two prints its header twice.
     let mut checks = binary_checks();
     checks.extend(gh_auth_check());
     checks.push(shell_check(config.shell.as_ref()));
+    checks.extend(wsl_checks(&wsl::distros()));
     checks.extend(config_checks(&config::diagnose()));
     checks.extend(persisted_state_checks(&config));
     checks.extend(ipc_checks(socket, config.ipc_socket));
@@ -186,6 +190,134 @@ fn gh_auth_check() -> Option<Check> {
         let detail = "not authenticated — PR base branches fall back to the repo default";
         check("binaries", "gh auth", Status::Warn, detail)
     })
+}
+
+/// The tools alacritree resolves inside a distro, and the order a probe
+/// answers in.  `doppler` is here even though nothing runs it there yet,
+/// because [`wsl_doppler_check`] is the only place that says so.
+const WSL_TOOLS: [&str; 4] = ["git", "gh", "delta", "doppler"];
+
+/// One wsl.exe round trip per distro, in parallel and on a deadline: a distro
+/// whose VM is cold takes seconds to answer and one that is wedged never
+/// does, and a report that hangs is worse than one that says it could not
+/// tell.
+const WSL_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// What a probe of one distro found — a path per entry of [`WSL_TOOLS`] — or
+/// why the distro could not be asked.
+type Probe = Result<Vec<Option<String>>, String>;
+
+/// What each installed distro can actually do for alacritree.  Nothing else
+/// reports on the inside of a distro: git, gh and delta are resolved there
+/// silently, and their absence looks exactly like a repository with nothing
+/// to say.  Empty when WSL is not installed, which is also every non-Windows
+/// machine.
+fn wsl_checks(distros: &[wsl::WslDistro]) -> Vec<Check> {
+    if distros.is_empty() {
+        return Vec::new();
+    }
+    let names: Vec<String> = distros
+        .iter()
+        .map(|d| if d.is_default { format!("{} (default)", d.name) } else { d.name.clone() })
+        .collect();
+
+    let probes = probe_distros(distros);
+    let mut checks = vec![check("wsl", "distros", Status::Ok, names.join(", "))];
+    checks.extend(probes.iter().map(|(name, probe)| wsl_distro_check(name, probe)));
+    checks.extend(wsl_doppler_check(&probes));
+    checks
+}
+
+fn probe_distros(distros: &[wsl::WslDistro]) -> Vec<(String, Probe)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    for distro in distros {
+        let tx = tx.clone();
+        let name = distro.name.clone();
+        std::thread::spawn(move || {
+            let probe = wsl::probe_tools(&name, &WSL_TOOLS);
+            let _ = tx.send((name, probe));
+        });
+    }
+    drop(tx);
+
+    let deadline = Instant::now() + WSL_PROBE_TIMEOUT;
+    let mut answered: HashMap<String, Probe> = HashMap::new();
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        match rx.recv_timeout(remaining) {
+            Ok((name, probe)) => {
+                answered.insert(name, probe);
+            },
+            Err(_) => break,
+        }
+    }
+
+    distros
+        .iter()
+        .map(|d| {
+            let probe = answered
+                .remove(&d.name)
+                .unwrap_or_else(|| Err(format!("no answer in {}s", WSL_PROBE_TIMEOUT.as_secs())));
+            (d.name.clone(), probe)
+        })
+        .collect()
+}
+
+fn wsl_distro_check(name: &str, probe: &Probe) -> Check {
+    let found = match probe {
+        Ok(found) => found,
+        // Not alacritree's fault, but every project inside the distro is
+        // unreadable until it starts.
+        Err(e) => return check("wsl", name, Status::Warn, format!("unreachable — {e}")),
+    };
+
+    let mut present = Vec::new();
+    let mut missing = Vec::new();
+    for tool in WSL_TOOLS {
+        match tool_path(found, tool) {
+            Some(path) => present.push(format!("{tool} {path}")),
+            None => missing.push(tool),
+        }
+    }
+    let mut detail =
+        if present.is_empty() { "nothing found".to_string() } else { present.join(", ") };
+    if !missing.is_empty() {
+        detail.push_str(&format!("; no {}", missing.join(", ")));
+    }
+
+    // git is what reads a project that lives in the distro; without it the
+    // sidebar lists the worktree and can say nothing else about it.
+    let status = if tool_path(found, "git").is_some() { Status::Ok } else { Status::Warn };
+    check("wsl", name, status, detail)
+}
+
+/// Scope mirroring runs the Windows `doppler` against Windows paths, so a
+/// distro's own doppler is never consulted and a WSL project's worktrees come
+/// out unscoped however well doppler is set up inside the distro.  Someone
+/// who installed it there did so expecting otherwise.
+fn wsl_doppler_check(probes: &[(String, Probe)]) -> Option<Check> {
+    let distros: Vec<&str> = probes
+        .iter()
+        .filter(|(_, probe)| {
+            probe.as_ref().is_ok_and(|found| tool_path(found, "doppler").is_some())
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if distros.is_empty() {
+        return None;
+    }
+    let detail = format!(
+        "installed in {} — scope mirroring only runs the Windows doppler, so worktrees of a \
+         project inside a distro are not scoped",
+        distros.join(", ")
+    );
+    Some(check("wsl", "doppler", Status::Warn, detail))
+}
+
+/// Where a probe put `tool`, by name rather than by index, so [`WSL_TOOLS`]
+/// can be reordered without silently renaming everyone's results.
+fn tool_path<'a>(found: &'a [Option<String>], tool: &str) -> Option<&'a str> {
+    let slot = WSL_TOOLS.iter().position(|t| *t == tool)?;
+    found.get(slot)?.as_deref()
 }
 
 /// A configured shell that cannot be resolved takes every session with it: the
@@ -621,6 +753,69 @@ mod tests {
     fn doppler_is_only_worth_warning_about_once_it_has_been_set_up() {
         assert_eq!(doppler_need(true), Need::Optional);
         assert_eq!(doppler_need(false), Need::Unused);
+    }
+
+    fn probe(paths: &[Option<&str>]) -> Probe {
+        Ok(paths.iter().map(|p| p.map(str::to_string)).collect())
+    }
+
+    /// Nothing to say on a machine without WSL, which includes every
+    /// non-Windows one — a section of rows about an absent subsystem is noise
+    /// in the report that has to stay readable.
+    #[test]
+    fn no_distros_means_no_wsl_section() {
+        assert!(wsl_checks(&[]).is_empty());
+    }
+
+    /// The whole point of the section: git, gh and delta are resolved inside
+    /// the distro and nothing else ever names the paths they resolved to.
+    #[test]
+    fn a_distro_reports_where_each_tool_resolved() {
+        let found = probe(&[Some("/usr/bin/git"), Some("/home/lev/.local/bin/gh"), None, None]);
+        let detail = wsl_distro_check("Ubuntu", &found).detail;
+        assert!(detail.contains("git /usr/bin/git"), "{detail:?}");
+        assert!(detail.contains("gh /home/lev/.local/bin/gh"), "{detail:?}");
+        assert!(detail.contains("no delta, doppler"), "{detail:?}");
+    }
+
+    /// A distro without git reads as a repository with nothing to report:
+    /// the sidebar lists the worktree, the git panel stays empty, and no
+    /// error is ever shown.
+    #[test]
+    fn a_distro_without_git_warns() {
+        assert_eq!(wsl_distro_check("Ubuntu", &probe(&[None; 4])).status, Status::Warn);
+        assert_eq!(
+            wsl_distro_check("Ubuntu", &probe(&[Some("/usr/bin/git"), None, None, None])).status,
+            Status::Ok
+        );
+    }
+
+    #[test]
+    fn a_distro_that_cannot_be_reached_says_why() {
+        let probe: Probe = Err("no answer in 15s".to_string());
+        let check = wsl_distro_check("Ubuntu", &probe);
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("no answer in 15s"), "{:?}", check.detail);
+    }
+
+    /// Doppler inside a distro is set up by someone who expects worktrees
+    /// there to inherit its scopes.  They do not, and the app never says so.
+    #[test]
+    fn doppler_inside_a_distro_is_reported_as_unused() {
+        let probes = vec![
+            ("Ubuntu".to_string(), probe(&[None, None, None, Some("/usr/bin/doppler")])),
+            ("kali-linux".to_string(), probe(&[None; 4])),
+        ];
+        let check = wsl_doppler_check(&probes).expect("a warning about the unused doppler");
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("Ubuntu"), "{:?}", check.detail);
+        assert!(!check.detail.contains("kali-linux"), "{:?}", check.detail);
+    }
+
+    #[test]
+    fn no_distro_has_doppler_and_nothing_is_said() {
+        let probes = vec![("Ubuntu".to_string(), probe(&[None; 4]))];
+        assert!(wsl_doppler_check(&probes).is_none());
     }
 
     /// A missing optional tool has to say what it costs, or the reader has no
