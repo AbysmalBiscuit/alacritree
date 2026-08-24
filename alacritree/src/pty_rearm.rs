@@ -41,17 +41,78 @@ use polling::{Event, PollMode, Poller};
 /// batches the loop can be interrupted between.
 const READ_CHUNK: usize = 32 * 1024;
 
+/// How much one visit may pull out of the console pipe ahead of the read loop.
+///
+/// The pipe between the console and the read loop is a ring of exactly this
+/// size, filled by a thread that parks when it runs out of room.  The loop
+/// stops taking bytes after `MAX_LOCKED_READ`, so left to itself it empties
+/// sixty-four kilobytes per visit and goes back to the poller.  The ring stays
+/// full, the filling thread stays parked, and the console blocks on its own
+/// writes.  Draining the whole ring into a staging buffer first decouples the
+/// two: the filler keeps running at the console's pace while the loop takes
+/// what it can hold.
+const DRAIN_AHEAD: usize = PIPE_CAPACITY;
+
+/// Mirrors `alacritty_terminal::tty::windows::conpty::PIPE_CAPACITY`, which is
+/// private.
+const PIPE_CAPACITY: usize = 0x10_0000;
+
 /// Owns the PTY because `EventedReadWrite` hands out `&mut Self::Reader`, and
 /// only the type holding the reader can supply that.
 pub struct RearmingReader {
     pty: Pty,
     poller: Option<Arc<Poller>>,
+    /// Bytes taken out of the pipe ahead of the read loop, and how far the loop
+    /// has got through them.
+    staged: Vec<u8>,
+    taken: usize,
+}
+
+impl RearmingReader {
+    /// Empty the console pipe into the staging buffer.
+    ///
+    /// Stops on the read that comes up empty, which is what lets `piper`
+    /// install the waker that announces the next byte.
+    fn drain_pipe(&mut self) -> io::Result<()> {
+        let Self { pty, staged, .. } = self;
+        while staged.len() < DRAIN_AHEAD {
+            let base = staged.len();
+            staged.resize(base + READ_CHUNK, 0);
+            match pty.reader().read(&mut staged[base..]) {
+                Ok(0) => {
+                    staged.truncate(base);
+                    break;
+                },
+                Ok(read) => staged.truncate(base + read),
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => staged.truncate(base),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    staged.truncate(base);
+                    break;
+                },
+                Err(err) => {
+                    staged.truncate(base);
+                    return Err(err);
+                },
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Read for RearmingReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let chunk = buf.len().min(READ_CHUNK);
-        let read = self.pty.reader().read(&mut buf[..chunk])?;
+        if self.taken == self.staged.len() {
+            self.staged.clear();
+            self.taken = 0;
+            self.drain_pipe()?;
+        }
+
+        let end = (self.taken + buf.len().min(READ_CHUNK)).min(self.staged.len());
+        let staged = &self.staged[self.taken..end];
+        let read = staged.len();
+        buf[..read].copy_from_slice(staged);
+        self.taken = end;
+
         if read > 0 {
             if let Some(poller) = &self.poller {
                 let _ = poller.post(CompletionPacket::new(Event::readable(PTY_READ_WRITE_TOKEN)));
@@ -67,7 +128,7 @@ pub struct RearmingPty {
 
 impl RearmingPty {
     pub fn new(pty: Pty) -> Self {
-        Self { reader: RearmingReader { pty, poller: None } }
+        Self { reader: RearmingReader { pty, poller: None, staged: Vec::new(), taken: 0 } }
     }
 }
 
