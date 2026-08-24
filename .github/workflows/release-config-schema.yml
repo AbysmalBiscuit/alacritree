@@ -1,0 +1,39 @@
+name: Release config schema
+
+# Post-announce hook for the dist pipeline. `alacritree schema` names
+# `releases/latest/download/alacritree-config.json` as the schema's id, so a
+# config carrying the `#:schema` header only resolves once that asset exists on
+# every release.
+#
+# The file is uploaded from the checkout rather than regenerated here: the
+# `config_schema` integration test fails the build when the committed copy and
+# the config types disagree, so at a release tag they are the same document and
+# building one would only cost a compile.
+on:
+  workflow_call:
+    inputs:
+      plan:
+        description: "dist plan (JSON), provided by the dist workflow"
+        required: true
+        type: string
+
+jobs:
+  schema:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Upload alacritree-config.json
+        env:
+          GH_TOKEN: ${{ secrets.ALACRITREE_BOT_TOKEN }}
+          PLAN: ${{ inputs.plan }}
+        run: |
+          set -euo pipefail
+          # Tolerate tags cut before the schema landed on master.
+          if [[ ! -f schema/alacritree-config.json ]]; then
+            echo "No schema/alacritree-config.json at this tag; skipping."
+            exit 0
+          fi
+          tag=$(jq -r '.announcement_tag' <<< "$PLAN")
+          gh release upload "$tag" schema/alacritree-config.json \
+            --repo "$GITHUB_REPOSITORY" --clobber

@@ -58,6 +58,9 @@ notify-rust = "4"
 interprocess = { version = "2.4.2", default-features = false }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
+# Derives the JSON Schema for the config from the same `Raw*` structs serde
+# reads, so the published schema cannot drift from what the parser accepts.
+schemars = "1.2"
 nucleo-matcher = "0.3"
 
 [dev-dependencies]

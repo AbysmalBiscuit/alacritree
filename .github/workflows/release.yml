@@ -311,3 +311,12 @@ jobs:
     with:
       plan: ${{ needs.plan.outputs.val }}
     secrets: inherit
+
+  custom-release-config-schema:
+    needs:
+      - plan
+      - announce
+    uses: ./.github/workflows/release-config-schema.yml
+    with:
+      plan: ${{ needs.plan.outputs.val }}
+    secrets: inherit

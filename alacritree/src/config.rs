@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle, Rgb};
 use egui::Color32;
+use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::bindings::{self, KeyBinding};
@@ -1181,6 +1182,27 @@ fn installed_config(stem: &str, suffix: &str) -> Option<PathBuf> {
     candidate.exists().then_some(candidate)
 }
 
+/// Where an `alacritree.toml` belongs when none exists yet: the head of the
+/// search path, so a file written there is the one [`load`] picks up.
+pub fn preferred_alacritree_path() -> PathBuf {
+    alacritty_config_dir().join("alacritree.toml")
+}
+
+#[cfg(not(windows))]
+fn alacritty_config_dir() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| home::home_dir().map(|h| h.join(".config")))
+        .unwrap_or_else(|| PathBuf::from(".config"))
+        .join("alacritty")
+}
+
+#[cfg(windows)]
+fn alacritty_config_dir() -> PathBuf {
+    std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_default().join("alacritty")
+}
+
 pub fn load() -> Config {
     let (files, merged) = assemble();
     for file in &files {
@@ -1300,25 +1322,68 @@ fn merge_tables(
     base
 }
 
-// --- Raw deserialization ---------------------------------------------------
+/// The JSON Schema for a config file, reflected off the same `Raw*` structs
+/// serde reads, so the published schema cannot describe a key the parser does
+/// not accept.  Lives here rather than beside the CLI command that prints it
+/// because those structs are private to this module.
+pub fn json_schema() -> schemars::Schema {
+    schemars::schema_for!(RawConfig)
+}
 
-#[derive(Debug, Default, Deserialize)]
+// --- Raw deserialization ---------------------------------------------------
+//
+// These structs are the whole of what alacritree reads out of the two TOML
+// files, so they are also what `alacritree schema` reflects over to publish a
+// JSON Schema.  Every field's doc comment becomes the hover text an editor
+// shows for that key; a field left undocumented is a key nobody can look up
+// without reading this file.
+//
+// Fields whose value is a closed set carry `#[schemars(extend("enum" = ...))]`
+// so an editor completes and checks the spellings.  Only keys with one
+// spelling per value get one: the cursor parser below accepts `"Block"` and
+// `"block"` alike, and an `enum` listing one of the pair would mark a working
+// config as an error.
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawConfig {
+    /// Terminal palette: the sixteen ANSI colors plus the primary, cursor and
+    /// selection pairs.
     colors: RawColors,
+    /// alacritree's own presentation: sidebar colors, icons, tooltips, shell
+    /// profiles, and everything else the terminal grid does not own.  Belongs
+    /// in `alacritree.toml` — upstream alacritty warns about it.
     ui: RawUi,
+    /// Where alacritree creates git worktrees.  `alacritree.toml` only.
     workspace: RawWorkspace,
+    /// The terminal grid's font: the four faces, size, cell offsets, and
+    /// alacritree's fallback chain.
     font: RawFont,
+    /// Cursor shape, blinking, and how it renders when unfocused.
     cursor: RawCursor,
+    /// Scrollback depth and mouse-wheel step.
     scrolling: RawScrolling,
+    /// Window padding and background opacity.
     window: RawWindow,
+    /// Environment variables added to every process alacritree spawns,
+    /// including the shell.  Entries here may override variables alacritree
+    /// sets itself.
     #[serde(default)]
     env: HashMap<String, String>,
+    /// The program each session runs.
     terminal: RawTerminal,
+    /// What counts as a word when double-clicking, and whether a selection
+    /// reaches the clipboard on its own.
     selection: RawSelection,
+    /// Key bindings.  Arrays concatenate across the two files, so bindings
+    /// written in `alacritree.toml` add to the shared ones rather than
+    /// replacing them.
     keyboard: RawKeyboard,
+    /// Options that fit no other table.
     general: RawGeneral,
+    /// Diagnostics written to disk.
     debug: RawDebug,
+    /// How alacritree talks to WSL distros.  `alacritree.toml` only.
     wsl: RawWsl,
 }
 
@@ -1326,37 +1391,62 @@ struct RawConfig {
 /// lives in the shared `alacritty.toml`, so disabling alacritty's socket
 /// disables ours too — the two sockets are separate files, but the intent
 /// ("no IPC") is the same.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawGeneral {
+    /// Offer the local socket that `alacritree <command>` and the MCP bridge
+    /// connect to.  Default `true`.
     ipc_socket: Option<bool>,
+    /// Directory sessions on the home tab start in; worktree tabs always start
+    /// in their checkout.  A leading `~` expands to the home directory.  Unset
+    /// inherits the launching process's directory.
     working_directory: Option<String>,
 }
 
 /// alacritty's `[debug]` section, plus one alacritree-only key.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawDebug {
+    /// Write an artifact when the process panics.  alacritree-only, so it
+    /// belongs in `alacritree.toml`.  Default `true`: a crash that leaves no
+    /// record is the failure this exists to prevent.
     crash_log: Option<bool>,
+    /// Keep the log file after quitting.  Upstream's name and upstream's
+    /// default (`false`).
     persistent_logging: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawKeyboard {
+    /// Key bindings, as `[[keyboard.bindings]]` entries.  Vi- and search-mode
+    /// bindings are accepted and ignored: alacritree tracks neither mode.
     bindings: Vec<bindings::RawBinding>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawFont {
+    /// Font size in points.  Default `11.25`.
     size: Option<f32>,
+    /// The face ordinary text is drawn with.
     normal: RawFontFace,
+    /// The bold face.  An unset family falls back to `normal`'s.
     bold: RawFontFace,
+    /// The italic face.  An unset family falls back to `normal`'s.
     italic: RawFontFace,
+    /// The bold-italic face.  An unset family falls back to `normal`'s.
     bold_italic: RawFontFace,
+    /// Extra space around each cell in pixels: `y` is line spacing, `x` is
+    /// letter spacing.  Default `{ x = 0, y = 0 }`.
     offset: RawFontDelta,
+    /// Where the glyph sits inside its cell, in pixels.  Increasing `x` moves
+    /// it right, increasing `y` moves it up.  Built-in glyphs ignore this,
+    /// matching alacritty.
     glyph_offset: RawFontDelta,
+    /// Draw box-drawing (U+2500–U+259F), legacy computing (U+1FB00–U+1FB3B)
+    /// and Powerline (U+E0B0–U+E0BF) characters with the built-in renderer
+    /// instead of the font.  Default `true`.
     builtin_box_drawing: Option<bool>,
     /// Ordered list of fallback font families or font file paths, tried in
     /// order after the four primary faces and before the automatic system
@@ -1364,153 +1454,227 @@ struct RawFont {
     /// warns about unknown keys, so putting it in the shared `alacritty.toml`
     /// would make the real alacritty noisy.
     fallback: Option<Vec<String>>,
-    /// Also alacritree-only, so it belongs in `alacritree.toml` alongside
-    /// `fallback`.
+    /// Draw emoji from their font's colour tables.  Turning this off falls
+    /// through to the first fallback face with ordinary outlines, so emoji
+    /// render monochrome.  Also alacritree-only, so it belongs in
+    /// `alacritree.toml` alongside `fallback`.  Default `true`.
     color_glyphs: Option<bool>,
+    /// Budget in megabytes for the rasterized colour-glyph cache.  The cache
+    /// is already bounded by how many codepoints the colour fonts cover, but
+    /// that ceiling moves with cell size and with the fallback list.
     color_glyph_cache_mb: Option<usize>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawFontFace {
+    /// Family name as the system font database spells it, e.g.
+    /// `"JetBrainsMono Nerd Font"`.
     family: Option<String>,
+    /// Style within the family, e.g. `"Regular"`, `"Bold"`, `"Italic"`.
     style: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawFontDelta {
+    /// Horizontal offset in pixels.
     x: Option<i8>,
+    /// Vertical offset in pixels.
     y: Option<i8>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawCursor {
+    /// Cursor shape and blinking.  Older alacritty configs write just
+    /// `style = "Block"` rather than `style.shape = "Block"`; both are
+    /// accepted.
     style: Option<RawCursorStyle>,
-    /// Older alacritty configs accept just `style = "Block"` rather than
-    /// `style.shape = "Block"`.  We allow both via `RawCursorStyle`.
+    /// Render the cursor as a hollow box when the window is not focused.
+    /// Default `true`.
     unfocused_hollow: Option<bool>,
+    /// Blink interval in milliseconds.  Default `750`.
     blink_interval: Option<u64>,
+    /// Seconds after which the cursor stops blinking; `0` never stops.
+    /// Default `5`.
     blink_timeout: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(untagged)]
 enum RawCursorStyle {
+    /// Just the shape: `"Block"`, `"Underline"`, `"Beam"`, `"HollowBlock"` or
+    /// `"Hidden"`.  Lowercase spellings are accepted too.
     Shape(String),
-    Detailed { shape: Option<String>, blinking: Option<String> },
+    /// Shape and blinking together.
+    Detailed {
+        /// `"Block"`, `"Underline"`, `"Beam"`, `"HollowBlock"` or `"Hidden"`.
+        /// Lowercase spellings are accepted too.
+        shape: Option<String>,
+        /// `"Never"`, `"Off"`, `"On"` or `"Always"`.  alacritree has no vi
+        /// mode, so `On` and `Always` both blink and the other two do not.
+        blinking: Option<String>,
+    },
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawScrolling {
+    /// Maximum number of lines kept in the scrollback buffer.
+    /// Default `10000`.
     history: Option<u32>,
+    /// Lines scrolled per mouse-wheel increment.  Default `3`.
     multiplier: Option<u8>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawWindow {
+    /// Blank space around the terminal grid, in pixels, added at both
+    /// opposing sides.
     padding: Option<RawPadding>,
+    /// Background opacity from `0.0` (transparent) to `1.0` (opaque).
+    /// Changing it requires a restart: transparency is a window flag set
+    /// before the window exists.  Default `1.0`.
     opacity: Option<f32>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawPadding {
+    /// Horizontal padding in pixels.
     x: Option<f32>,
+    /// Vertical padding in pixels.
     y: Option<f32>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawTerminal {
+    /// The program each session runs, as either a bare path or a table with
+    /// arguments.  Unset uses `$SHELL` (the login shell as a fallback) on
+    /// Unix and PowerShell on Windows.
     shell: Option<RawShell>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(untagged)]
 enum RawShell {
+    /// Just the program, e.g. `"/bin/zsh"`.
     Program(String),
+    /// Program and its arguments.
     Detailed {
+        /// Path to the program, e.g. `"/bin/zsh"`.
         program: String,
+        /// Arguments passed to the program.
         #[serde(default)]
         args: Vec<String>,
     },
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawSelection {
+    /// Characters that separate "semantic words" for double-click selection.
     semantic_escape_chars: Option<String>,
+    /// Copy selected text to the system clipboard as soon as it is selected.
+    /// Default `false`.
     save_to_clipboard: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawColors {
+    /// Default foreground and background, plus the bright and dim foreground
+    /// variants.
     #[serde(default)]
     primary: RawPrimary,
+    /// Colors the cursor is drawn with.
     #[serde(default)]
     cursor: RawInverted,
+    /// Colors a selection is drawn with.
     #[serde(default)]
     selection: RawInverted,
+    /// The eight normal ANSI colors (0–7).
     #[serde(default)]
     normal: RawSet,
+    /// The eight bright ANSI colors (8–15).
     #[serde(default)]
     bright: RawSet,
+    /// The eight dim ANSI colors.  Unset derives them from `normal`.
     #[serde(default)]
     dim: Option<RawSet>,
+    /// Overrides within the 16–255 range of the 256-color palette.  Unlisted
+    /// indices keep their standard values.
     #[serde(default)]
     indexed_colors: Vec<RawIndexed>,
+    /// Draw bold text with the bright color variants.  Default `false`.
     #[serde(default)]
     draw_bold_text_with_bright_colors: bool,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawPrimary {
+    /// Default text color.
     foreground: Option<RgbStr>,
+    /// Default background color.
     background: Option<RgbStr>,
+    /// Foreground for bold text, used only when
+    /// `draw_bold_text_with_bright_colors` is `true`.  Unset uses
+    /// `foreground`.
     bright_foreground: Option<RgbStr>,
+    /// Foreground for dimmed text.  Unset derives it from `foreground`.
     dim_foreground: Option<RgbStr>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawInverted {
     /// Foreground glyph color.  Alacritty calls this `text`; we accept both.
     text: Option<RgbStr>,
     /// Background block color.  Alacritty calls this `cursor`; we accept both.
     cursor: Option<RgbStr>,
+    /// Alias for `text`.
     foreground: Option<RgbStr>,
+    /// Alias for `cursor`.
     background: Option<RgbStr>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawSet {
+    /// ANSI color 0.
     black: Option<RgbStr>,
+    /// ANSI color 1.
     red: Option<RgbStr>,
+    /// ANSI color 2.
     green: Option<RgbStr>,
+    /// ANSI color 3.
     yellow: Option<RgbStr>,
+    /// ANSI color 4.
     blue: Option<RgbStr>,
+    /// ANSI color 5.
     magenta: Option<RgbStr>,
+    /// ANSI color 6.
     cyan: Option<RgbStr>,
+    /// ANSI color 7.
     white: Option<RgbStr>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct RawIndexed {
+    /// Palette slot to override, 16–255.
     index: u8,
+    /// The color that slot takes.
     color: RgbStr,
 }
 
 /// Top-level `[wsl]`: platform-integration options.  Lives outside `[ui]`
 /// because nothing here is presentation — it governs how the app talks to
 /// distros.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawWsl {
     /// Keep a resident helper process per distro for foreground probes,
@@ -1528,31 +1692,54 @@ struct RawWsl {
 /// `[ui.icons]`: sidebar glyph overrides.  A bare string sets the glyph
 /// alone; a table also styles color/weight/slant/size.  Any glyph works, so
 /// Nerd Font users can substitute their own icons.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawIcons {
+    /// The panel search box.
     search: Option<RawIconStyle>,
+    /// A project's main checkout.
     worktree_main: Option<RawIconStyle>,
+    /// A linked worktree.
     worktree: Option<RawIconStyle>,
+    /// A terminal session row.
     session: Option<RawIconStyle>,
+    /// The home tab, whose sessions inherit the launch directory.
     home: Option<RawIconStyle>,
+    /// An expanded project.
     project_expanded: Option<RawIconStyle>,
+    /// A collapsed project.
     project_collapsed: Option<RawIconStyle>,
+    /// A branch with an open pull request.
     pr_open: Option<RawIconStyle>,
+    /// A branch whose pull request is a draft.
     pr_draft: Option<RawIconStyle>,
+    /// A branch whose pull request was merged.
     pr_merged: Option<RawIconStyle>,
+    /// A branch whose pull request was closed unmerged.
     pr_closed: Option<RawIconStyle>,
+    /// A branch level with its upstream.
     upstream_level: Option<RawIconStyle>,
+    /// A branch that has both moved ahead of and fallen behind its upstream.
     upstream_diverged: Option<RawIconStyle>,
+    /// A branch whose upstream no longer exists locally.
     upstream_gone: Option<RawIconStyle>,
+    /// A branch that tracks nothing.
     upstream_untracked: Option<RawIconStyle>,
+    /// The "add project" button.
     add_project: Option<RawIconStyle>,
+    /// The "new worktree" button.
     new_worktree: Option<RawIconStyle>,
+    /// The "new session" button.
     new_session: Option<RawIconStyle>,
+    /// The "remove project" button.
     remove_project: Option<RawIconStyle>,
+    /// The "delete worktree" button.
     delete_worktree: Option<RawIconStyle>,
+    /// The "close session" button.
     close_session: Option<RawIconStyle>,
+    /// The "refresh" button.
     refresh: Option<RawIconStyle>,
+    /// The drag handle a row is reordered by.
     reorder: Option<RawIconStyle>,
 }
 
@@ -1591,20 +1778,30 @@ fn build_icons(raw: RawIcons) -> Icons {
     }
 }
 
+// The bare form is listed first so a plain string never attempts the table
+// arm.
 /// A styled icon override: either a bare glyph string (`worktree = "◆"`) or a
-/// table (`worktree = { glyph = "◆", color = "#ff5555", bold = true }`).  The
-/// bare form is listed first so a plain string never attempts the table arm.
-#[derive(Debug, Deserialize)]
+/// table (`worktree = { glyph = "◆", color = "#ff5555", bold = true }`).
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(untagged)]
 enum RawIconStyle {
+    /// The glyph alone.
     Glyph(String),
+    /// The glyph with styling.
     Table {
+        /// The character to draw.  Unset keeps the built-in glyph and applies
+        /// only the styling.
         glyph: Option<String>,
+        /// Glyph color.  Unset inherits the row's foreground.
         color: Option<RgbStr>,
+        /// Draw the glyph bold.
         #[serde(default)]
         bold: bool,
+        /// Draw the glyph italic.
         #[serde(default)]
         italic: bool,
+        /// Point size, clamped to a minimum of `1.0`.  Unset uses the sidebar
+        /// font size.
         size: Option<f32>,
     },
 }
@@ -1624,7 +1821,7 @@ impl From<RawIconStyle> for IconStyle {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawUiWsl {
     /// Deprecated location: `[wsl] automount_root` supersedes this and wins
@@ -1632,7 +1829,7 @@ struct RawUiWsl {
     automount_root: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawSessionDisplay {
     /// Show a workspace's sidebar session row even with a single session.
@@ -1641,149 +1838,260 @@ struct RawSessionDisplay {
     tabs_always: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawUiFont {
+    /// Family for sidebars, tabs and dialogs.  Unset uses the terminal font.
     family: Option<String>,
+    /// Point size for the sidebar font.
     size: Option<f32>,
+    /// Family used where the sidebar draws bold.  Unset uses `family`.
     bold_family: Option<String>,
+    /// Family used where the sidebar draws italic.  Unset uses `family`.
     italic_family: Option<String>,
+    /// Family used where the sidebar draws bold italic.  Unset uses `family`.
     bold_italic_family: Option<String>,
+    /// Draw the sidebar's own symbols from the bundled subset rather than from
+    /// the configured family, so a font missing them still renders.
     builtin_symbols: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawFocusOutline {
+    /// Outline the sidebar when it holds keyboard focus.
     sidebar: Option<bool>,
+    /// Outline the terminal when it holds keyboard focus.
     terminal: Option<bool>,
+    /// Outline color.  Unset uses the sidebar accent.
     color: Option<RgbStr>,
+    /// Outline thickness in pixels.
     thickness: Option<f32>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawUiDrop {
+    /// Accept dropped files at all.  `false` turns every target off.
     enabled: Option<bool>,
+    /// Write a dropped file's path into the terminal.
     terminal: Option<bool>,
+    /// Let a file dropped on the projects sidebar add its repository.
     sidebar: Option<bool>,
+    /// Write a dropped file's path into the workspace scratchpad.
     scratchpad: Option<bool>,
+    /// How a path is quoted for the shell that receives it.  The five concrete
+    /// modes are wezterm's `quote_dropped_files` values.
+    #[schemars(extend("enum" = [
+        "auto",
+        "none",
+        "spaces_only",
+        "posix",
+        "windows",
+        "windows_always_quoted"
+    ]))]
     quote: Option<String>,
+    /// Rewrite a Windows path to its distro spelling when the session runs
+    /// inside WSL.
     wsl_translate: Option<bool>,
+    /// Highlight the target a drag is over.
     highlight: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawUiPaste {
+    /// Paste files held on the clipboard as their paths.
     files: Option<bool>,
+    /// Paste an image held on the clipboard by writing it to a file and
+    /// pasting that path.
     image: Option<bool>,
+    /// Where pasted images are written.  Unset uses a cache directory.
     image_dir: Option<String>,
+    /// How many pasted images to keep before the oldest are removed.
     image_keep: Option<usize>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawUi {
+    /// Sidebar background.  Unset derives it from the terminal palette.
     sidebar_background: Option<RgbStr>,
+    /// Sidebar text color.  Unset derives it from the terminal palette.
     sidebar_foreground: Option<RgbStr>,
+    /// Color of the line between a sidebar and the terminal.
     sidebar_border: Option<RgbStr>,
+    /// Accent for selected rows and focus outlines.  Unset uses the palette's
+    /// `normal.blue`.
     sidebar_accent: Option<RgbStr>,
+    /// Badge color for a session asking to be looked at.  Unset uses the
+    /// palette's `normal.yellow`.
     sidebar_attention: Option<RgbStr>,
+    /// Post a desktop notification when a hidden session rings the bell;
+    /// clicking it focuses that session.
     notifications: Option<bool>,
     /// Grace window in milliseconds before an attention trigger pings; a
     /// session that resumes work inside it swallows the ping.  Default 0.
     attention_grace_ms: Option<u64>,
     /// When the sidebar × on a session row asks before killing the PTY:
     /// "never" (default) | "busy" | "always".
+    #[schemars(extend("enum" = ["never", "busy", "always"]))]
     confirm_session_close: Option<String>,
     /// What closing the on-screen workspace's last session does:
     /// "respawn" (default) | "navigate".
+    #[schemars(extend("enum" = ["respawn", "navigate"]))]
     last_session_close: Option<String>,
     /// How far the projects sidebar goes when the cursor's row stops being
     /// rendered: "preserve" (default) | "follow".
+    #[schemars(extend("enum" = ["preserve", "follow"]))]
     sidebar_focus: Option<String>,
     /// Whether a fuzzy query is confined by the panel's active toggle filters:
     /// "filtered" (default) | "all".
+    #[schemars(extend("enum" = ["filtered", "all"]))]
     search_scope: Option<String>,
     /// When a sidebar row spells its full name out on hover:
     /// "elided" (default) | "always" | "off".
+    #[schemars(extend("enum" = ["elided", "always", "off"]))]
     sidebar_tooltips: Option<String>,
     /// Whether a sidebar icon explains itself on hover: `true` (default).
     icon_tooltips: Option<bool>,
+    /// Whether per-session rows and tabs appear before a workspace has two
+    /// sessions.
     session_display: RawSessionDisplay,
+    /// Explicit `delta` program for the diff pane.  Set, it is used verbatim
+    /// in git's `core.pager` and skips WSL delta autodiscovery; unset, native
+    /// diffs run bare `delta` from PATH.
     delta_path: Option<String>,
+    /// Sidebar glyph overrides.
     icons: RawIcons,
     /// Sidebar scrollbar style: "floating" (default) | "solid".
+    #[schemars(extend("enum" = ["floating", "solid"]))]
     scrollbar: Option<String>,
+    /// Poll `gh` for each branch's open pull request, which drives the PR row
+    /// icons, the PR-state filters, and `$pr` in row templates.
     pr_status: Option<bool>,
+    /// Paint a badge on each worktree row for its branch's upstream state.
+    /// Local refs only: nothing fetches, so a branch deleted on the remote
+    /// reads as tracked until something prunes locally.
     upstream_status: Option<bool>,
+    /// Re-check on a 1.5 s tick whether each listed worktree's checkout is
+    /// still on disk, so a `git worktree remove` typed into one of our own
+    /// sessions greys the row without waiting for a manual refresh.  Default
+    /// `true`; the probe is one `stat` per listed row, which an exotic
+    /// filesystem could make expensive.
     worktree_liveness: Option<bool>,
     /// Max `gh` lookups in flight at once.  Defaults to 8; clamped to ≥ 1.
     pr_status_concurrency: Option<usize>,
+    /// The font sidebars, tabs and dialogs are drawn with.
     font: RawUiFont,
+    /// Template for a worktree row's label, e.g. `"$branch $pr"`.
     worktree_name: Option<String>,
+    /// Template for a project row's label.
     project_name: Option<String>,
+    /// Deprecated WSL options, superseded by the top-level `[wsl]` table.
     wsl: RawUiWsl,
+    /// Named shell launch profiles, offered when starting a session.
     profiles: Vec<RawProfile>,
+    /// Name of the profile new sessions use.  Must match a `[[ui.profiles]]`
+    /// entry, or it is ignored with a warning.
     default_profile: Option<String>,
+    /// Outline drawn around whichever pane holds keyboard focus.
     focus_outline: RawFocusOutline,
     /// Clicking a sidebar moves keyboard focus to it.  Default false.
     sidebar_click_focus: Option<bool>,
     /// Wait for the display's refresh before showing a finished frame.
     /// Default true.
     vsync: Option<bool>,
+    /// How paths are abbreviated where the UI writes them.
     path_style: RawPathStyle,
     /// What a file dragged onto the window does.  Default: every target on.
     drop: RawUiDrop,
+    /// What the clipboard's non-text contents paste as.
     paste: RawUiPaste,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawPathStyle {
     /// "full" (default) | "fish" | "zed", per site.
+    ///
+    /// The diff pane's title.
+    #[schemars(extend("enum" = ["full", "fish", "zed"]))]
     diff_title: Option<String>,
+    /// Paths in the git panel's file rows.
+    #[schemars(extend("enum" = ["full", "fish", "zed"]))]
     git_rows: Option<String>,
+    /// The path in the git panel's header.
+    #[schemars(extend("enum" = ["full", "fish", "zed"]))]
     git_header: Option<String>,
+    /// How the last path segment is emphasized.
     filename: RawTextEmphasis,
+    /// How the leading path segments are emphasized.
     parent: RawTextEmphasis,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawTextEmphasis {
+    /// Text color.  Unset inherits the row's foreground.
     color: Option<RgbStr>,
+    /// Draw bold.
     bold: Option<bool>,
+    /// Draw italic.
     italic: Option<bool>,
 }
 
 /// One `[[ui.profiles]]` entry.  Fields are optional so a malformed entry
 /// degrades to a warning instead of failing the whole config parse.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawProfile {
+    /// Name shown in the session picker and matched by `default_profile`.
     name: Option<String>,
+    /// Program the profile launches.
     program: Option<String>,
+    /// Arguments passed to `program`.
     args: Vec<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawWorkspace {
+    /// Where new worktrees are created.  `$project` expands to the
+    /// repository's directory name.
     worktree_dir: Option<String>,
+    /// Per-project overrides of `worktree_dir`.
     overrides: Vec<RawWorktreeOverride>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct RawWorktreeOverride {
+    /// Path to the project this override applies to.
     project: String,
+    /// Where that project's worktrees are created.
     worktree_dir: String,
 }
 
 /// Wrapper that parses `"0xrrggbb"`, `"#rrggbb"`, or `"rrggbb"` into an `Rgb`.
 #[derive(Debug, Clone, Copy)]
 struct RgbStr(Rgb);
+
+/// Hand-written because `RgbStr` deserializes from a string it parses itself,
+/// so nothing about the accepted spellings is visible to a derive.
+impl JsonSchema for RgbStr {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Color".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "pattern": "^(0[xX]|#)?[0-9a-fA-F]{6}$",
+            "description": "An RGB color, written as \"#rrggbb\", \"0xrrggbb\" or \"rrggbb\".",
+            "examples": ["#1c1c1c", "0x6a9fb5"],
+        })
+    }
+}
 
 impl<'de> Deserialize<'de> for RgbStr {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {

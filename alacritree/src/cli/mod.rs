@@ -14,6 +14,7 @@ mod doctor;
 mod install;
 mod offline;
 mod render;
+mod schema;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -113,6 +114,14 @@ enum Command {
     /// Write a shell completion script to stdout.
     Completions { shell: Shell },
 
+    /// Print the JSON Schema for the config files to stdout.  Editors that
+    /// speak the TOML language server use it for completion, hover docs and
+    /// validation; see `docs/alacritree.md`.
+    Schema {
+        #[command(subcommand)]
+        command: Option<SchemaCommand>,
+    },
+
     /// Take the crash recorder lock and panic, to prove the hook does not
     /// deadlock against itself.  Debug builds only.
     #[cfg(debug_assertions)]
@@ -192,6 +201,17 @@ enum WorkspaceCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum SchemaCommand {
+    /// Point a config at the published schema, creating a starter one when it
+    /// does not exist.  A file that already names a schema is left alone.
+    Init {
+        /// The config to point at the schema.  Defaults to the `alacritree.toml`
+        /// already in use, or the one the search path would pick up next.
+        path: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum WorktreeCommand {
     /// Create a worktree on a new branch, off the project's default branch.
     Create { project_root: PathBuf, branch: String },
@@ -225,6 +245,9 @@ pub fn run(cli: Cli) -> Option<i32> {
         // nothing is running — which is exactly when a crash is being chased.
         Command::Crashes { all } => return Some(crashes::run(cli.json, all)),
         Command::Install { dest } => return Some(install::run(dest, cli.json)),
+        // Generated from the config types in this binary, so it answers with
+        // no instance running and no config on disk.
+        Command::Schema { command } => return Some(run_schema(command)),
         #[cfg(debug_assertions)]
         Command::ProvokeLockPanic => {
             crate::crash_log::provoke_lock_panic();
@@ -234,6 +257,25 @@ pub fn run(cli: Cli) -> Option<i32> {
     };
 
     Some(execute(&request, cli.socket.as_deref(), cli.json))
+}
+
+fn run_schema(command: Option<SchemaCommand>) -> i32 {
+    match command {
+        None => {
+            schema::print();
+            0
+        },
+        Some(SchemaCommand::Init { path }) => {
+            let path = path.unwrap_or_else(schema::default_config_path);
+            match schema::init(&path) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("{e}");
+                    1
+                },
+            }
+        },
+    }
 }
 
 fn execute(request: &IpcRequest, socket: Option<&Path>, as_json: bool) -> i32 {
@@ -319,6 +361,7 @@ fn to_request(command: Command) -> IpcRequest {
         },
         // None of these reach an alacritree, so none has a request to build.
         Command::Completions { .. }
+        | Command::Schema { .. }
         | Command::Mcp
         | Command::Doctor
         | Command::Crashes { .. }

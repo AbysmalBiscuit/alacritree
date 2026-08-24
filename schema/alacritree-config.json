@@ -1,0 +1,1333 @@
+{
+  "$defs": {
+    "BindingCommand": {
+      "anyOf": [
+        {
+          "description": "Just the program.",
+          "type": "string"
+        },
+        {
+          "description": "Program and its arguments.",
+          "properties": {
+            "args": {
+              "default": [],
+              "description": "Arguments passed to the program.  Optional.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "program": {
+              "description": "Path to the program.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "program"
+          ],
+          "type": "object"
+        }
+      ],
+      "description": "An external program to run, as either a bare path or a table with\narguments."
+    },
+    "Color": {
+      "description": "An RGB color, written as \"#rrggbb\", \"0xrrggbb\" or \"rrggbb\".",
+      "examples": [
+        "#1c1c1c",
+        "0x6a9fb5"
+      ],
+      "pattern": "^(0[xX]|#)?[0-9a-fA-F]{6}$",
+      "type": "string"
+    },
+    "RawBinding": {
+      "description": "One `[[keyboard.bindings]]` entry.  A binding needs `key`, plus exactly one\nof `chars`, `action` or `command` to say what pressing it does.",
+      "properties": {
+        "action": {
+          "description": "Named action to run, e.g. `\"Paste\"`, `\"ToggleLeftSidebar\"`.  Not\nenumerated here: the shared `alacritty.toml` legitimately carries\nactions only the real alacritty implements, and alacritree ignores\nthose rather than rejecting them.  `docs/keyboard-shortcuts.md` lists\nwhat alacritree acts on.",
+          "type": "string"
+        },
+        "chars": {
+          "description": "Bytes to write to the PTY, with the usual escapes (`\\x1b`, `\\u001b`).",
+          "type": "string"
+        },
+        "command": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BindingCommand"
+            }
+          ],
+          "description": "External program to run.  alacritree parses it so the binding still\ndisplaces alacritty's default for that key, but never runs it."
+        },
+        "key": {
+          "description": "The key, as alacritty spells it: a character (`\"A\"`), a named key\n(`\"F5\"`, `\"PageUp\"`), or a scancode.  A key alacritree cannot map is\ndropped with a warning.",
+          "type": "string"
+        },
+        "mode": {
+          "description": "Terminal mode the binding applies in, e.g. `\"Vi\"` or `\"~Search\"`.\nalacritree tracks neither mode, so a binding with a `mode` is read and\nignored.",
+          "type": "string"
+        },
+        "mods": {
+          "description": "Modifiers held with the key, joined by `|`: `\"Control\"`, `\"Shift\"`,\n`\"Alt\"`, `\"Super\"`.  Unset means no modifiers.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "type": "object"
+    },
+    "RawColors": {
+      "properties": {
+        "bright": {
+          "$ref": "#/$defs/RawSet",
+          "description": "The eight bright ANSI colors (8–15)."
+        },
+        "cursor": {
+          "$ref": "#/$defs/RawInverted",
+          "description": "Colors the cursor is drawn with."
+        },
+        "dim": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawSet"
+            }
+          ],
+          "description": "The eight dim ANSI colors.  Unset derives them from `normal`."
+        },
+        "draw_bold_text_with_bright_colors": {
+          "default": false,
+          "description": "Draw bold text with the bright color variants.  Default `false`.",
+          "type": "boolean"
+        },
+        "indexed_colors": {
+          "description": "Overrides within the 16–255 range of the 256-color palette.  Unlisted\nindices keep their standard values.",
+          "items": {
+            "$ref": "#/$defs/RawIndexed"
+          },
+          "type": "array"
+        },
+        "normal": {
+          "$ref": "#/$defs/RawSet",
+          "description": "The eight normal ANSI colors (0–7)."
+        },
+        "primary": {
+          "$ref": "#/$defs/RawPrimary",
+          "description": "Default foreground and background, plus the bright and dim foreground\nvariants."
+        },
+        "selection": {
+          "$ref": "#/$defs/RawInverted",
+          "description": "Colors a selection is drawn with."
+        }
+      },
+      "type": "object"
+    },
+    "RawCursor": {
+      "properties": {
+        "blink_interval": {
+          "description": "Blink interval in milliseconds.  Default `750`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "blink_timeout": {
+          "description": "Seconds after which the cursor stops blinking; `0` never stops.\nDefault `5`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "style": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawCursorStyle"
+            }
+          ],
+          "description": "Cursor shape and blinking.  Older alacritty configs write just\n`style = \"Block\"` rather than `style.shape = \"Block\"`; both are\naccepted."
+        },
+        "unfocused_hollow": {
+          "description": "Render the cursor as a hollow box when the window is not focused.\nDefault `true`.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "RawCursorStyle": {
+      "anyOf": [
+        {
+          "description": "Just the shape: `\"Block\"`, `\"Underline\"`, `\"Beam\"`, `\"HollowBlock\"` or\n`\"Hidden\"`.  Lowercase spellings are accepted too.",
+          "type": "string"
+        },
+        {
+          "description": "Shape and blinking together.",
+          "properties": {
+            "blinking": {
+              "description": "`\"Never\"`, `\"Off\"`, `\"On\"` or `\"Always\"`.  alacritree has no vi\nmode, so `On` and `Always` both blink and the other two do not.",
+              "type": "string"
+            },
+            "shape": {
+              "description": "`\"Block\"`, `\"Underline\"`, `\"Beam\"`, `\"HollowBlock\"` or `\"Hidden\"`.\nLowercase spellings are accepted too.",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      ]
+    },
+    "RawDebug": {
+      "description": "alacritty's `[debug]` section, plus one alacritree-only key.",
+      "properties": {
+        "crash_log": {
+          "description": "Write an artifact when the process panics.  alacritree-only, so it\nbelongs in `alacritree.toml`.  Default `true`: a crash that leaves no\nrecord is the failure this exists to prevent.",
+          "type": "boolean"
+        },
+        "persistent_logging": {
+          "description": "Keep the log file after quitting.  Upstream's name and upstream's\ndefault (`false`).",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "RawFocusOutline": {
+      "properties": {
+        "color": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "Outline color.  Unset uses the sidebar accent."
+        },
+        "sidebar": {
+          "description": "Outline the sidebar when it holds keyboard focus.",
+          "type": "boolean"
+        },
+        "terminal": {
+          "description": "Outline the terminal when it holds keyboard focus.",
+          "type": "boolean"
+        },
+        "thickness": {
+          "description": "Outline thickness in pixels.",
+          "format": "float",
+          "type": "number"
+        }
+      },
+      "type": "object"
+    },
+    "RawFont": {
+      "properties": {
+        "bold": {
+          "$ref": "#/$defs/RawFontFace",
+          "description": "The bold face.  An unset family falls back to `normal`'s."
+        },
+        "bold_italic": {
+          "$ref": "#/$defs/RawFontFace",
+          "description": "The bold-italic face.  An unset family falls back to `normal`'s."
+        },
+        "builtin_box_drawing": {
+          "description": "Draw box-drawing (U+2500–U+259F), legacy computing (U+1FB00–U+1FB3B)\nand Powerline (U+E0B0–U+E0BF) characters with the built-in renderer\ninstead of the font.  Default `true`.",
+          "type": "boolean"
+        },
+        "color_glyph_cache_mb": {
+          "description": "Budget in megabytes for the rasterized colour-glyph cache.  The cache\nis already bounded by how many codepoints the colour fonts cover, but\nthat ceiling moves with cell size and with the fallback list.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "color_glyphs": {
+          "description": "Draw emoji from their font's colour tables.  Turning this off falls\nthrough to the first fallback face with ordinary outlines, so emoji\nrender monochrome.  Also alacritree-only, so it belongs in\n`alacritree.toml` alongside `fallback`.  Default `true`.",
+          "type": "boolean"
+        },
+        "fallback": {
+          "description": "Ordered list of fallback font families or font file paths, tried in\norder after the four primary faces and before the automatic system\nchain.  Recommended home is `alacritree.toml`: upstream alacritty\nwarns about unknown keys, so putting it in the shared `alacritty.toml`\nwould make the real alacritty noisy.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "glyph_offset": {
+          "$ref": "#/$defs/RawFontDelta",
+          "description": "Where the glyph sits inside its cell, in pixels.  Increasing `x` moves\nit right, increasing `y` moves it up.  Built-in glyphs ignore this,\nmatching alacritty."
+        },
+        "italic": {
+          "$ref": "#/$defs/RawFontFace",
+          "description": "The italic face.  An unset family falls back to `normal`'s."
+        },
+        "normal": {
+          "$ref": "#/$defs/RawFontFace",
+          "description": "The face ordinary text is drawn with."
+        },
+        "offset": {
+          "$ref": "#/$defs/RawFontDelta",
+          "description": "Extra space around each cell in pixels: `y` is line spacing, `x` is\nletter spacing.  Default `{ x = 0, y = 0 }`."
+        },
+        "size": {
+          "description": "Font size in points.  Default `11.25`.",
+          "format": "float",
+          "type": "number"
+        }
+      },
+      "type": "object"
+    },
+    "RawFontDelta": {
+      "properties": {
+        "x": {
+          "description": "Horizontal offset in pixels.",
+          "format": "int8",
+          "maximum": 127,
+          "minimum": -128,
+          "type": "integer"
+        },
+        "y": {
+          "description": "Vertical offset in pixels.",
+          "format": "int8",
+          "maximum": 127,
+          "minimum": -128,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "RawFontFace": {
+      "properties": {
+        "family": {
+          "description": "Family name as the system font database spells it, e.g.\n`\"JetBrainsMono Nerd Font\"`.",
+          "type": "string"
+        },
+        "style": {
+          "description": "Style within the family, e.g. `\"Regular\"`, `\"Bold\"`, `\"Italic\"`.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "RawGeneral": {
+      "description": "Subset of alacritty's `[general]` section that alacritree honors.  It\nlives in the shared `alacritty.toml`, so disabling alacritty's socket\ndisables ours too — the two sockets are separate files, but the intent\n(\"no IPC\") is the same.",
+      "properties": {
+        "ipc_socket": {
+          "description": "Offer the local socket that `alacritree <command>` and the MCP bridge\nconnect to.  Default `true`.",
+          "type": "boolean"
+        },
+        "working_directory": {
+          "description": "Directory sessions on the home tab start in; worktree tabs always start\nin their checkout.  A leading `~` expands to the home directory.  Unset\ninherits the launching process's directory.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "RawIconStyle": {
+      "anyOf": [
+        {
+          "description": "The glyph alone.",
+          "type": "string"
+        },
+        {
+          "description": "The glyph with styling.",
+          "properties": {
+            "bold": {
+              "default": false,
+              "description": "Draw the glyph bold.",
+              "type": "boolean"
+            },
+            "color": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Color"
+                }
+              ],
+              "description": "Glyph color.  Unset inherits the row's foreground."
+            },
+            "glyph": {
+              "description": "The character to draw.  Unset keeps the built-in glyph and applies\nonly the styling.",
+              "type": "string"
+            },
+            "italic": {
+              "default": false,
+              "description": "Draw the glyph italic.",
+              "type": "boolean"
+            },
+            "size": {
+              "description": "Point size, clamped to a minimum of `1.0`.  Unset uses the sidebar\nfont size.",
+              "format": "float",
+              "type": "number"
+            }
+          },
+          "type": "object"
+        }
+      ],
+      "description": "A styled icon override: either a bare glyph string (`worktree = \"◆\"`) or a\ntable (`worktree = { glyph = \"◆\", color = \"#ff5555\", bold = true }`)."
+    },
+    "RawIcons": {
+      "description": "`[ui.icons]`: sidebar glyph overrides.  A bare string sets the glyph\nalone; a table also styles color/weight/slant/size.  Any glyph works, so\nNerd Font users can substitute their own icons.",
+      "properties": {
+        "add_project": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "The \"add project\" button."
+        },
+        "close_session": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "The \"close session\" button."
+        },
+        "delete_worktree": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "The \"delete worktree\" button."
+        },
+        "home": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "The home tab, whose sessions inherit the launch directory."
+        },
+        "new_session": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "The \"new session\" button."
+        },
+        "new_worktree": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "The \"new worktree\" button."
+        },
+        "pr_closed": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "A branch whose pull request was closed unmerged."
+        },
+        "pr_draft": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "A branch whose pull request is a draft."
+        },
+        "pr_merged": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "A branch whose pull request was merged."
+        },
+        "pr_open": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "A branch with an open pull request."
+        },
+        "project_collapsed": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "A collapsed project."
+        },
+        "project_expanded": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "An expanded project."
+        },
+        "refresh": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "The \"refresh\" button."
+        },
+        "remove_project": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "The \"remove project\" button."
+        },
+        "reorder": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "The drag handle a row is reordered by."
+        },
+        "search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "The panel search box."
+        },
+        "session": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "A terminal session row."
+        },
+        "upstream_diverged": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "A branch that has both moved ahead of and fallen behind its upstream."
+        },
+        "upstream_gone": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "A branch whose upstream no longer exists locally."
+        },
+        "upstream_level": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "A branch level with its upstream."
+        },
+        "upstream_untracked": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "A branch that tracks nothing."
+        },
+        "worktree": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "A linked worktree."
+        },
+        "worktree_main": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "A project's main checkout."
+        }
+      },
+      "type": "object"
+    },
+    "RawIndexed": {
+      "properties": {
+        "color": {
+          "$ref": "#/$defs/Color",
+          "description": "The color that slot takes."
+        },
+        "index": {
+          "description": "Palette slot to override, 16–255.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "index",
+        "color"
+      ],
+      "type": "object"
+    },
+    "RawInverted": {
+      "properties": {
+        "background": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "Alias for `cursor`."
+        },
+        "cursor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "Background block color.  Alacritty calls this `cursor`; we accept both."
+        },
+        "foreground": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "Alias for `text`."
+        },
+        "text": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "Foreground glyph color.  Alacritty calls this `text`; we accept both."
+        }
+      },
+      "type": "object"
+    },
+    "RawKeyboard": {
+      "properties": {
+        "bindings": {
+          "description": "Key bindings, as `[[keyboard.bindings]]` entries.  Vi- and search-mode\nbindings are accepted and ignored: alacritree tracks neither mode.",
+          "items": {
+            "$ref": "#/$defs/RawBinding"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "RawPadding": {
+      "properties": {
+        "x": {
+          "description": "Horizontal padding in pixels.",
+          "format": "float",
+          "type": "number"
+        },
+        "y": {
+          "description": "Vertical padding in pixels.",
+          "format": "float",
+          "type": "number"
+        }
+      },
+      "type": "object"
+    },
+    "RawPathStyle": {
+      "properties": {
+        "diff_title": {
+          "description": "\"full\" (default) | \"fish\" | \"zed\", per site.\n\nThe diff pane's title.",
+          "enum": [
+            "full",
+            "fish",
+            "zed"
+          ],
+          "type": "string"
+        },
+        "filename": {
+          "$ref": "#/$defs/RawTextEmphasis",
+          "description": "How the last path segment is emphasized."
+        },
+        "git_header": {
+          "description": "The path in the git panel's header.",
+          "enum": [
+            "full",
+            "fish",
+            "zed"
+          ],
+          "type": "string"
+        },
+        "git_rows": {
+          "description": "Paths in the git panel's file rows.",
+          "enum": [
+            "full",
+            "fish",
+            "zed"
+          ],
+          "type": "string"
+        },
+        "parent": {
+          "$ref": "#/$defs/RawTextEmphasis",
+          "description": "How the leading path segments are emphasized."
+        }
+      },
+      "type": "object"
+    },
+    "RawPrimary": {
+      "properties": {
+        "background": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "Default background color."
+        },
+        "bright_foreground": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "Foreground for bold text, used only when\n`draw_bold_text_with_bright_colors` is `true`.  Unset uses\n`foreground`."
+        },
+        "dim_foreground": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "Foreground for dimmed text.  Unset derives it from `foreground`."
+        },
+        "foreground": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "Default text color."
+        }
+      },
+      "type": "object"
+    },
+    "RawProfile": {
+      "description": "One `[[ui.profiles]]` entry.  Fields are optional so a malformed entry\ndegrades to a warning instead of failing the whole config parse.",
+      "properties": {
+        "args": {
+          "default": [],
+          "description": "Arguments passed to `program`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "name": {
+          "description": "Name shown in the session picker and matched by `default_profile`.",
+          "type": "string"
+        },
+        "program": {
+          "description": "Program the profile launches.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "RawScrolling": {
+      "properties": {
+        "history": {
+          "description": "Maximum number of lines kept in the scrollback buffer.\nDefault `10000`.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "multiplier": {
+          "description": "Lines scrolled per mouse-wheel increment.  Default `3`.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "RawSelection": {
+      "properties": {
+        "save_to_clipboard": {
+          "description": "Copy selected text to the system clipboard as soon as it is selected.\nDefault `false`.",
+          "type": "boolean"
+        },
+        "semantic_escape_chars": {
+          "description": "Characters that separate \"semantic words\" for double-click selection.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "RawSessionDisplay": {
+      "properties": {
+        "sidebar_always": {
+          "description": "Show a workspace's sidebar session row even with a single session.",
+          "type": "boolean"
+        },
+        "tabs_always": {
+          "description": "Draw a tab-strip segment even with a single session.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "RawSet": {
+      "properties": {
+        "black": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "ANSI color 0."
+        },
+        "blue": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "ANSI color 4."
+        },
+        "cyan": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "ANSI color 6."
+        },
+        "green": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "ANSI color 2."
+        },
+        "magenta": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "ANSI color 5."
+        },
+        "red": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "ANSI color 1."
+        },
+        "white": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "ANSI color 7."
+        },
+        "yellow": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "ANSI color 3."
+        }
+      },
+      "type": "object"
+    },
+    "RawShell": {
+      "anyOf": [
+        {
+          "description": "Just the program, e.g. `\"/bin/zsh\"`.",
+          "type": "string"
+        },
+        {
+          "description": "Program and its arguments.",
+          "properties": {
+            "args": {
+              "default": [],
+              "description": "Arguments passed to the program.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "program": {
+              "description": "Path to the program, e.g. `\"/bin/zsh\"`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "program"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "RawTerminal": {
+      "properties": {
+        "shell": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawShell"
+            }
+          ],
+          "description": "The program each session runs, as either a bare path or a table with\narguments.  Unset uses `$SHELL` (the login shell as a fallback) on\nUnix and PowerShell on Windows."
+        }
+      },
+      "type": "object"
+    },
+    "RawTextEmphasis": {
+      "properties": {
+        "bold": {
+          "description": "Draw bold.",
+          "type": "boolean"
+        },
+        "color": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "Text color.  Unset inherits the row's foreground."
+        },
+        "italic": {
+          "description": "Draw italic.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "RawUi": {
+      "properties": {
+        "attention_grace_ms": {
+          "description": "Grace window in milliseconds before an attention trigger pings; a\nsession that resumes work inside it swallows the ping.  Default 0.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "confirm_session_close": {
+          "description": "When the sidebar × on a session row asks before killing the PTY:\n\"never\" (default) | \"busy\" | \"always\".",
+          "enum": [
+            "never",
+            "busy",
+            "always"
+          ],
+          "type": "string"
+        },
+        "default_profile": {
+          "description": "Name of the profile new sessions use.  Must match a `[[ui.profiles]]`\nentry, or it is ignored with a warning.",
+          "type": "string"
+        },
+        "delta_path": {
+          "description": "Explicit `delta` program for the diff pane.  Set, it is used verbatim\nin git's `core.pager` and skips WSL delta autodiscovery; unset, native\ndiffs run bare `delta` from PATH.",
+          "type": "string"
+        },
+        "drop": {
+          "$ref": "#/$defs/RawUiDrop",
+          "description": "What a file dragged onto the window does.  Default: every target on."
+        },
+        "focus_outline": {
+          "$ref": "#/$defs/RawFocusOutline",
+          "description": "Outline drawn around whichever pane holds keyboard focus."
+        },
+        "font": {
+          "$ref": "#/$defs/RawUiFont",
+          "description": "The font sidebars, tabs and dialogs are drawn with."
+        },
+        "icon_tooltips": {
+          "description": "Whether a sidebar icon explains itself on hover: `true` (default).",
+          "type": "boolean"
+        },
+        "icons": {
+          "$ref": "#/$defs/RawIcons",
+          "description": "Sidebar glyph overrides."
+        },
+        "last_session_close": {
+          "description": "What closing the on-screen workspace's last session does:\n\"respawn\" (default) | \"navigate\".",
+          "enum": [
+            "respawn",
+            "navigate"
+          ],
+          "type": "string"
+        },
+        "notifications": {
+          "description": "Post a desktop notification when a hidden session rings the bell;\nclicking it focuses that session.",
+          "type": "boolean"
+        },
+        "paste": {
+          "$ref": "#/$defs/RawUiPaste",
+          "description": "What the clipboard's non-text contents paste as."
+        },
+        "path_style": {
+          "$ref": "#/$defs/RawPathStyle",
+          "description": "How paths are abbreviated where the UI writes them."
+        },
+        "pr_status": {
+          "description": "Poll `gh` for each branch's open pull request, which drives the PR row\nicons, the PR-state filters, and `$pr` in row templates.",
+          "type": "boolean"
+        },
+        "pr_status_concurrency": {
+          "description": "Max `gh` lookups in flight at once.  Defaults to 8; clamped to ≥ 1.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "profiles": {
+          "description": "Named shell launch profiles, offered when starting a session.",
+          "items": {
+            "$ref": "#/$defs/RawProfile"
+          },
+          "type": "array"
+        },
+        "project_name": {
+          "description": "Template for a project row's label.",
+          "type": "string"
+        },
+        "scrollbar": {
+          "description": "Sidebar scrollbar style: \"floating\" (default) | \"solid\".",
+          "enum": [
+            "floating",
+            "solid"
+          ],
+          "type": "string"
+        },
+        "search_scope": {
+          "description": "Whether a fuzzy query is confined by the panel's active toggle filters:\n\"filtered\" (default) | \"all\".",
+          "enum": [
+            "filtered",
+            "all"
+          ],
+          "type": "string"
+        },
+        "session_display": {
+          "$ref": "#/$defs/RawSessionDisplay",
+          "description": "Whether per-session rows and tabs appear before a workspace has two\nsessions."
+        },
+        "sidebar_accent": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "Accent for selected rows and focus outlines.  Unset uses the palette's\n`normal.blue`."
+        },
+        "sidebar_attention": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "Badge color for a session asking to be looked at.  Unset uses the\npalette's `normal.yellow`."
+        },
+        "sidebar_background": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "Sidebar background.  Unset derives it from the terminal palette."
+        },
+        "sidebar_border": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "Color of the line between a sidebar and the terminal."
+        },
+        "sidebar_click_focus": {
+          "description": "Clicking a sidebar moves keyboard focus to it.  Default false.",
+          "type": "boolean"
+        },
+        "sidebar_focus": {
+          "description": "How far the projects sidebar goes when the cursor's row stops being\nrendered: \"preserve\" (default) | \"follow\".",
+          "enum": [
+            "preserve",
+            "follow"
+          ],
+          "type": "string"
+        },
+        "sidebar_foreground": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "Sidebar text color.  Unset derives it from the terminal palette."
+        },
+        "sidebar_tooltips": {
+          "description": "When a sidebar row spells its full name out on hover:\n\"elided\" (default) | \"always\" | \"off\".",
+          "enum": [
+            "elided",
+            "always",
+            "off"
+          ],
+          "type": "string"
+        },
+        "upstream_status": {
+          "description": "Paint a badge on each worktree row for its branch's upstream state.\nLocal refs only: nothing fetches, so a branch deleted on the remote\nreads as tracked until something prunes locally.",
+          "type": "boolean"
+        },
+        "vsync": {
+          "description": "Wait for the display's refresh before showing a finished frame.\nDefault true.",
+          "type": "boolean"
+        },
+        "worktree_liveness": {
+          "description": "Re-check on a 1.5 s tick whether each listed worktree's checkout is\nstill on disk, so a `git worktree remove` typed into one of our own\nsessions greys the row without waiting for a manual refresh.  Default\n`true`; the probe is one `stat` per listed row, which an exotic\nfilesystem could make expensive.",
+          "type": "boolean"
+        },
+        "worktree_name": {
+          "description": "Template for a worktree row's label, e.g. `\"$branch $pr\"`.",
+          "type": "string"
+        },
+        "wsl": {
+          "$ref": "#/$defs/RawUiWsl",
+          "description": "Deprecated WSL options, superseded by the top-level `[wsl]` table."
+        }
+      },
+      "type": "object"
+    },
+    "RawUiDrop": {
+      "properties": {
+        "enabled": {
+          "description": "Accept dropped files at all.  `false` turns every target off.",
+          "type": "boolean"
+        },
+        "highlight": {
+          "description": "Highlight the target a drag is over.",
+          "type": "boolean"
+        },
+        "quote": {
+          "description": "How a path is quoted for the shell that receives it.  The five concrete\nmodes are wezterm's `quote_dropped_files` values.",
+          "enum": [
+            "auto",
+            "none",
+            "spaces_only",
+            "posix",
+            "windows",
+            "windows_always_quoted"
+          ],
+          "type": "string"
+        },
+        "scratchpad": {
+          "description": "Write a dropped file's path into the workspace scratchpad.",
+          "type": "boolean"
+        },
+        "sidebar": {
+          "description": "Let a file dropped on the projects sidebar add its repository.",
+          "type": "boolean"
+        },
+        "terminal": {
+          "description": "Write a dropped file's path into the terminal.",
+          "type": "boolean"
+        },
+        "wsl_translate": {
+          "description": "Rewrite a Windows path to its distro spelling when the session runs\ninside WSL.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "RawUiFont": {
+      "properties": {
+        "bold_family": {
+          "description": "Family used where the sidebar draws bold.  Unset uses `family`.",
+          "type": "string"
+        },
+        "bold_italic_family": {
+          "description": "Family used where the sidebar draws bold italic.  Unset uses `family`.",
+          "type": "string"
+        },
+        "builtin_symbols": {
+          "description": "Draw the sidebar's own symbols from the bundled subset rather than from\nthe configured family, so a font missing them still renders.",
+          "type": "boolean"
+        },
+        "family": {
+          "description": "Family for sidebars, tabs and dialogs.  Unset uses the terminal font.",
+          "type": "string"
+        },
+        "italic_family": {
+          "description": "Family used where the sidebar draws italic.  Unset uses `family`.",
+          "type": "string"
+        },
+        "size": {
+          "description": "Point size for the sidebar font.",
+          "format": "float",
+          "type": "number"
+        }
+      },
+      "type": "object"
+    },
+    "RawUiPaste": {
+      "properties": {
+        "files": {
+          "description": "Paste files held on the clipboard as their paths.",
+          "type": "boolean"
+        },
+        "image": {
+          "description": "Paste an image held on the clipboard by writing it to a file and\npasting that path.",
+          "type": "boolean"
+        },
+        "image_dir": {
+          "description": "Where pasted images are written.  Unset uses a cache directory.",
+          "type": "string"
+        },
+        "image_keep": {
+          "description": "How many pasted images to keep before the oldest are removed.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "RawUiWsl": {
+      "properties": {
+        "automount_root": {
+          "description": "Deprecated location: `[wsl] automount_root` supersedes this and wins\nwhen both are set; kept so existing configs keep working.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "RawWindow": {
+      "properties": {
+        "opacity": {
+          "description": "Background opacity from `0.0` (transparent) to `1.0` (opaque).\nChanging it requires a restart: transparency is a window flag set\nbefore the window exists.  Default `1.0`.",
+          "format": "float",
+          "type": "number"
+        },
+        "padding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawPadding"
+            }
+          ],
+          "description": "Blank space around the terminal grid, in pixels, added at both\nopposing sides."
+        }
+      },
+      "type": "object"
+    },
+    "RawWorkspace": {
+      "properties": {
+        "overrides": {
+          "description": "Per-project overrides of `worktree_dir`.",
+          "items": {
+            "$ref": "#/$defs/RawWorktreeOverride"
+          },
+          "type": "array"
+        },
+        "worktree_dir": {
+          "description": "Where new worktrees are created.  `$project` expands to the\nrepository's directory name.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "RawWorktreeOverride": {
+      "properties": {
+        "project": {
+          "description": "Path to the project this override applies to.",
+          "type": "string"
+        },
+        "worktree_dir": {
+          "description": "Where that project's worktrees are created.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project",
+        "worktree_dir"
+      ],
+      "type": "object"
+    },
+    "RawWsl": {
+      "description": "Top-level `[wsl]`: platform-integration options.  Lives outside `[ui]`\nbecause nothing here is presentation — it governs how the app talks to\ndistros.",
+      "properties": {
+        "automount_root": {
+          "description": "Distro-side mount point for Windows drives, mirroring wsl.conf's\n`[automount] root`.  Only used for paths *we* translate (git output\nfrom inside a distro); `wsl.exe --cd` translates with the distro's\nreal mount table regardless of this value.",
+          "type": "string"
+        },
+        "resident_helper": {
+          "description": "Keep a resident helper process per distro for foreground probes,\nbatched git queries, and tool discovery.  `false` restores one-shot\nwsl.exe spawns everywhere; WSL sessions then always report \"no\nTUI\", so FocusLeft/FocusRight always move panel focus.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/mathix420/alacritree/releases/latest/download/alacritree-config.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Everything alacritree reads out of alacritty.toml and alacritree.toml. Unknown keys are allowed: the two files are layers, and alacritty.toml legitimately carries keys only the real alacritty acts on.",
+  "properties": {
+    "colors": {
+      "$ref": "#/$defs/RawColors",
+      "description": "Terminal palette: the sixteen ANSI colors plus the primary, cursor and\nselection pairs."
+    },
+    "cursor": {
+      "$ref": "#/$defs/RawCursor",
+      "description": "Cursor shape, blinking, and how it renders when unfocused."
+    },
+    "debug": {
+      "$ref": "#/$defs/RawDebug",
+      "description": "Diagnostics written to disk."
+    },
+    "env": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "default": {},
+      "description": "Environment variables added to every process alacritree spawns,\nincluding the shell.  Entries here may override variables alacritree\nsets itself.",
+      "type": "object"
+    },
+    "font": {
+      "$ref": "#/$defs/RawFont",
+      "description": "The terminal grid's font: the four faces, size, cell offsets, and\nalacritree's fallback chain."
+    },
+    "general": {
+      "$ref": "#/$defs/RawGeneral",
+      "description": "Options that fit no other table."
+    },
+    "keyboard": {
+      "$ref": "#/$defs/RawKeyboard",
+      "description": "Key bindings.  Arrays concatenate across the two files, so bindings\nwritten in `alacritree.toml` add to the shared ones rather than\nreplacing them."
+    },
+    "scrolling": {
+      "$ref": "#/$defs/RawScrolling",
+      "description": "Scrollback depth and mouse-wheel step."
+    },
+    "selection": {
+      "$ref": "#/$defs/RawSelection",
+      "description": "What counts as a word when double-clicking, and whether a selection\nreaches the clipboard on its own."
+    },
+    "terminal": {
+      "$ref": "#/$defs/RawTerminal",
+      "description": "The program each session runs."
+    },
+    "ui": {
+      "$ref": "#/$defs/RawUi",
+      "description": "alacritree's own presentation: sidebar colors, icons, tooltips, shell\nprofiles, and everything else the terminal grid does not own.  Belongs\nin `alacritree.toml` — upstream alacritty warns about it."
+    },
+    "window": {
+      "$ref": "#/$defs/RawWindow",
+      "description": "Window padding and background opacity."
+    },
+    "workspace": {
+      "$ref": "#/$defs/RawWorkspace",
+      "description": "Where alacritree creates git worktrees.  `alacritree.toml` only."
+    },
+    "wsl": {
+      "$ref": "#/$defs/RawWsl",
+      "description": "How alacritree talks to WSL distros.  `alacritree.toml` only."
+    }
+  },
+  "title": "alacritree configuration",
+  "type": "object"
+}
