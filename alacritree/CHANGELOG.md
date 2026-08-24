@@ -1,5 +1,60 @@
 # Changelog
 
+## [0.10.0](https://github.com/mathix420/alacritree/compare/v0.9.0...v0.10.0) (2026-08-24)
+
+
+### Features
+
+* **config:** publish a JSON Schema for taplo ([cadd663](https://github.com/mathix420/alacritree/commit/cadd6632e2794ed4b809a2afef3c8aff0f44875c))
+* **config:** publish a JSON Schema for taplo [0] ([929b773](https://github.com/mathix420/alacritree/commit/929b7734019fb652bcc3ed3c155095a9fe26257e))
+* **crash-log:** name the windows session end that closed us ([77535a2](https://github.com/mathix420/alacritree/commit/77535a2a4831c18d34aaaee13dc58c9e20703b92))
+* **crash-log:** record why the process is exiting ([1e0a572](https://github.com/mathix420/alacritree/commit/1e0a572ef39352b628b0d3145f3899ba6383207b))
+* **crash-log:** record why the process is exiting [4] ([b559b72](https://github.com/mathix420/alacritree/commit/b559b725a315fa4a31cc531259f32637a4c9f53d))
+* **doctor:** report what each WSL distro can do ([db3bd8f](https://github.com/mathix420/alacritree/commit/db3bd8f770a038e3f864261bb1fa1b3de84397db))
+* **doctor:** report what each WSL distro can do [1] ([00b6890](https://github.com/mathix420/alacritree/commit/00b6890d1d628a73e998a100f85b6e125b46c973))
+* **font:** grow over-wide glyphs into blanks ([9eca4a7](https://github.com/mathix420/alacritree/commit/9eca4a708f464924839c3aa9910c3cd94659264a))
+* **font:** grow over-wide icons into trailing blanks [5] ([6320bf9](https://github.com/mathix420/alacritree/commit/6320bf9a2c48ea6da793edd253461a2ed602317c))
+* **input:** report associated text in kitty sequences ([9260fca](https://github.com/mathix420/alacritree/commit/9260fca76f6e2e36ab3bbd2a59aca93f9765d1d2))
+* **palette:** list shell profiles as command palette rows ([fc0de1b](https://github.com/mathix420/alacritree/commit/fc0de1baaab2a973c7831225cb1fa696eb062813))
+* **profiles:** open shell profiles from the palette and sidebar [3] ([4b10b96](https://github.com/mathix420/alacritree/commit/4b10b96ade56f17a3edac30bbb00acbb8bf31a45))
+* **sidebar:** add shell profiles to worktree row context menu ([30f0afc](https://github.com/mathix420/alacritree/commit/30f0afcecfc0c9fecbffc56b090eeb3f88b0c3c0))
+* **sidebar:** grey a worktree whose checkout went away ([2bc7459](https://github.com/mathix420/alacritree/commit/2bc745968a3087df49ed7139bd42dfdee8c13e79))
+
+
+### Bug Fixes
+
+* **app:** make a failed spawn dismissible ([ff442ee](https://github.com/mathix420/alacritree/commit/ff442ee0640b8f0f7c66e59d9b1b0173c0a1b7f5))
+* **color_glyph:** borrow mapped font bytes ([6ac1b79](https://github.com/mathix420/alacritree/commit/6ac1b7931b67fb2fdc0409890ae5dfbbec02b57f))
+* **color_glyph:** memoize the chain lookup ([3f75d54](https://github.com/mathix420/alacritree/commit/3f75d5487df8fa6d29e6ffe2a1ed350579157633))
+* **font:** let a blank join the run beside it ([df65943](https://github.com/mathix420/alacritree/commit/df65943900443d62fcd21a5be72d05cd7a2dafd0))
+* **fonts:** keep bundled fallbacks in UI variants ([35b2803](https://github.com/mathix420/alacritree/commit/35b28038e8cf1037c7a33bc09e6f8d3e0140d939))
+* **fonts:** rank egui's bundled faces last ([36c7c28](https://github.com/mathix420/alacritree/commit/36c7c288688dcabcbfb27aeb41acc11e340cd2aa))
+* **fonts:** rank egui's bundled faces last [3] ([5024bc4](https://github.com/mathix420/alacritree/commit/5024bc44109eb9edcb10e1a16d4c0a52a68f8224))
+* **input:** report the shifted key in kitty sequences ([477cf8c](https://github.com/mathix420/alacritree/commit/477cf8ca615bd6eed7e22c7e38b49c0302a8064b))
+* **input:** report the shifted key in kitty sequences [5] ([7fccad3](https://github.com/mathix420/alacritree/commit/7fccad337f1ea34e4ea687dade7dfc2da373dcaa))
+* **powerline:** fit separators to any cell aspect ([dbfed16](https://github.com/mathix420/alacritree/commit/dbfed166a9965707e13056dd824db49309f493b2))
+* **powerline:** fit separators to any cell aspect [4] ([1c271b9](https://github.com/mathix420/alacritree/commit/1c271b960a4f3c06b516a54eb38df4c0ea511a48))
+* **profiles:** dedupe command string and fix sidebar spawn recovery ([de3ef36](https://github.com/mathix420/alacritree/commit/de3ef36dd11b7e3768dd030caf9e870ad4815932))
+* **pty:** stop large writes freezing the grid on Windows [6] ([5c0601b](https://github.com/mathix420/alacritree/commit/5c0601bc5d2bd40250b6e28a0dc9e495fa9d090c))
+* **render:** paint backgrounds before glyphs ([12f4e3b](https://github.com/mathix420/alacritree/commit/12f4e3bbabbc50c9aaa9ab054a36b5093c23129a))
+* **render:** paint backgrounds before glyphs [2] ([247a38b](https://github.com/mathix420/alacritree/commit/247a38bc77dd8adb6802faf2ee82538c0ee586ac))
+* **sidebar:** judge a worktree by its .git, not its directory ([f1e32d2](https://github.com/mathix420/alacritree/commit/f1e32d2a9512f037b37b85af166741643b8b9705))
+* **sidebar:** keep a dead worktree reachable while it holds shells ([302f063](https://github.com/mathix420/alacritree/commit/302f0639f86d81233683ced98c39d98602025236))
+* **sidebar:** paint the liveness answer that just arrived ([3e5e07b](https://github.com/mathix420/alacritree/commit/3e5e07b4857e1d990a231a6a7edbdcf16af9bf9c))
+* **sidebar:** scope profile menu width bound to actual profiles ([49fd3ba](https://github.com/mathix420/alacritree/commit/49fd3ba795205f4767e02d896270addbf0f77771))
+* **sidebar:** skip vanished worktrees when cycling ([147cddf](https://github.com/mathix420/alacritree/commit/147cddf2b91abbc70ac7f622e873d8b13221363c))
+* **sidebar:** stop the liveness tick repainting every frame ([72e2f96](https://github.com/mathix420/alacritree/commit/72e2f96cb81d3f5577a241b224f4db83b81834d9))
+* **sidebar:** tell the truth about a worktree whose checkout is gone [2] ([14b3a74](https://github.com/mathix420/alacritree/commit/14b3a74ec90ff1cd71140c16078ba6139bbe5101))
+* **worktree:** ask one question about a vanished checkout ([875e234](https://github.com/mathix420/alacritree/commit/875e2347ece952236540d4d49ae59f95ef53d735))
+
+
+### Performance Improvements
+
+* **fonts:** share mapped font bytes across caches [1] ([4ac210a](https://github.com/mathix420/alacritree/commit/4ac210ac186428fdf08a0c80a3074d8a146258ca))
+* **fonts:** stop re-reading the fallback seed ([059d411](https://github.com/mathix420/alacritree/commit/059d411551a13db0ea0f24bd1ffbea930eb58d5c))
+* **pty:** drain the console pipe ahead of parse ([d420abf](https://github.com/mathix420/alacritree/commit/d420abfd8a838de7923ce685f97970b7210f8fc1))
+* **view:** read terminal state once per frame ([3746381](https://github.com/mathix420/alacritree/commit/37463819899c845f9fd4692810afdf8872a5ae76))
+
 ## [0.9.0](https://github.com/mathix420/alacritree/compare/v0.8.1...v0.9.0) (2026-08-07)
 
 
