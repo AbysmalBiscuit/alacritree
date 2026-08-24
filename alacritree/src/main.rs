@@ -20,6 +20,8 @@ mod frame_log;
 mod git_nav;
 mod git_status;
 mod glyph_cache;
+mod grid_gl;
+mod grid_instances;
 mod ime;
 mod input;
 mod ipc;
