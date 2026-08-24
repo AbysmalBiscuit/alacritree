@@ -18,7 +18,7 @@ use crate::colors::{background, foreground, resolve, rgb_to_color32};
 use crate::config::Config;
 use crate::fonts::{BOLD_FAMILY, BOLD_ITALIC_FAMILY, ITALIC_FAMILY};
 use crate::glyph_cache::{Face, GlyphCache, MAX_EXTRA_CELLS, growth_offset, may_grow};
-use crate::input::event_to_bytes;
+use crate::input::{associated_text, event_to_bytes};
 use crate::links::{self, Link};
 use crate::mouse;
 use crate::paste;
@@ -190,18 +190,7 @@ fn dispatch_input(
     mode: TermMode,
 ) {
     if allow_focus && response.has_focus() {
-        let consumed: Vec<ConsumedEvent> = ui.input(|i| {
-            i.events
-                .iter()
-                .filter_map(|e| match e {
-                    Event::Ime(ev) => Some(ConsumedEvent::Ime(ev.clone())),
-                    // `Event::Paste` is dropped (see `consumed_event`): keyboard
-                    // paste runs through the binding table's `Paste` action, not
-                    // the synthetic event egui-winit raises on every command+V.
-                    _ => consumed_event(e, mode),
-                })
-                .collect()
-        });
+        let consumed = ui.input(|i| consume_events(&i.events, mode));
         for event in consumed {
             match event {
                 ConsumedEvent::Ime(ev) => {
@@ -742,6 +731,22 @@ enum ConsumedEvent {
     Ime(ImeEvent),
 }
 
+/// Classify a frame's input events for the focused terminal.
+///
+/// Each event is classified with its successor in hand: egui-winit splits one
+/// winit key press into an `Event::Key` followed by an `Event::Text`, and the
+/// kitty protocol's associated-text field needs the two back together.
+fn consume_events(events: &[Event], mode: TermMode) -> Vec<ConsumedEvent> {
+    events
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, event)| match event {
+            Event::Ime(ev) => Some(ConsumedEvent::Ime(ev.clone())),
+            _ => consumed_event(event, events.get(idx + 1), mode),
+        })
+        .collect()
+}
+
 /// Classify an input event for the focused terminal.
 ///
 /// `Event::Paste` is dropped rather than pasted: egui-winit synthesizes it for
@@ -750,10 +755,10 @@ enum ConsumedEvent {
 /// rebind or unbind.  Keyboard paste runs through `NamedAction::Paste`, which
 /// reads the clipboard itself.  Text widgets outside the terminal still consume
 /// the event normally.  `Event::Ime` is handled separately by the caller.
-fn consumed_event(event: &Event, mode: TermMode) -> Option<ConsumedEvent> {
+fn consumed_event(event: &Event, next: Option<&Event>, mode: TermMode) -> Option<ConsumedEvent> {
     match event {
         Event::Paste(_) => None,
-        _ => event_to_bytes(event, mode).map(ConsumedEvent::Bytes),
+        _ => event_to_bytes(event, associated_text(next), mode).map(ConsumedEvent::Bytes),
     }
 }
 
@@ -2687,7 +2692,7 @@ mod tests {
     /// binding table says — and leave the shortcut impossible to rebind.
     #[test]
     fn paste_event_does_not_reach_the_terminal() {
-        assert!(consumed_event(&Event::Paste("hi".into()), TermMode::empty()).is_none());
+        assert!(consumed_event(&Event::Paste("hi".into()), None, TermMode::empty()).is_none());
     }
 
     /// Alacritty sends SYN on Ctrl+V; paste is a Ctrl+Shift+V binding.
@@ -2701,7 +2706,7 @@ mod tests {
             modifiers: Modifiers::CTRL,
         };
         assert!(
-            matches!(consumed_event(&press, TermMode::empty()), Some(ConsumedEvent::Bytes(ref b)) if b == &vec![0x16]),
+            matches!(consumed_event(&press, None, TermMode::empty()), Some(ConsumedEvent::Bytes(ref b)) if b == &vec![0x16]),
             "Ctrl+V must reach the PTY as 0x16"
         );
     }

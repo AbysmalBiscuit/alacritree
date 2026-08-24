@@ -1,7 +1,7 @@
 use alacritty_terminal::term::TermMode;
 use egui::{Event, Key, Modifiers};
 
-pub fn event_to_bytes(event: &Event, mode: TermMode) -> Option<Vec<u8>> {
+pub fn event_to_bytes(event: &Event, key_text: Option<&str>, mode: TermMode) -> Option<Vec<u8>> {
     match event {
         // OS-composed text — already accounts for Shift and dead-key composition.
         // When the app asked for every key as an escape sequence, the Key event
@@ -14,7 +14,7 @@ pub fn event_to_bytes(event: &Event, mode: TermMode) -> Option<Vec<u8>> {
             }
         },
         Event::Key { key, pressed: true, modifiers, repeat: _, .. } => {
-            key_to_bytes(*key, *modifiers, mode)
+            key_to_bytes(*key, *modifiers, key_text, mode)
         },
         // `Event::Paste` is handled by the caller via `paste::paste` so it
         // gets bracketed-paste wrapping and newline normalization.  `Copy` and
@@ -24,9 +24,27 @@ pub fn event_to_bytes(event: &Event, mode: TermMode) -> Option<Vec<u8>> {
     }
 }
 
-pub fn key_to_bytes(key: Key, mods: Modifiers, mode: TermMode) -> Option<Vec<u8>> {
+/// The characters a key press produced, which egui-winit raises as its own
+/// `Event::Text` directly after the `Event::Key`.  winit carries both on one
+/// event; the split is egui's, so the pair is rejoined here for the kitty
+/// protocol's associated-text field.  Control characters and private-use
+/// codepoints never reach this point — egui-winit drops them before raising
+/// the event, which is the same rule the protocol states.
+pub fn associated_text(next_event: Option<&Event>) -> Option<&str> {
+    match next_event? {
+        Event::Text(text) if !text.is_empty() => Some(text),
+        _ => None,
+    }
+}
+
+pub fn key_to_bytes(
+    key: Key,
+    mods: Modifiers,
+    key_text: Option<&str>,
+    mode: TermMode,
+) -> Option<Vec<u8>> {
     if should_build_kitty(key, mods, mode)
-        && let Some(bytes) = kitty_sequence(key, mods)
+        && let Some(bytes) = kitty_sequence(key, mods, key_text, mode)
     {
         return Some(bytes);
     }
@@ -103,12 +121,18 @@ fn should_build_kitty(key: Key, mods: Modifiers, mode: TermMode) -> bool {
 /// control keys plus modified printables.  Arrows, F-keys and the editing
 /// block keep their legacy CSI encodings even under the kitty protocol, so
 /// they fall through to `named_key_bytes`.
-fn kitty_sequence(key: Key, mods: Modifiers) -> Option<Vec<u8>> {
-    let code: u32 = match key {
-        Key::Tab => 9,
-        Key::Enter => 13,
-        Key::Escape => 27,
-        Key::Backspace => 127,
+fn kitty_sequence(
+    key: Key,
+    mods: Modifiers,
+    key_text: Option<&str>,
+    mode: TermMode,
+) -> Option<Vec<u8>> {
+    // Keys with a fixed code have no shifted form to report beside it.
+    let (code, alternate): (u32, Option<u32>) = match key {
+        Key::Tab => (9, None),
+        Key::Enter => (13, None),
+        Key::Escape => (27, None),
+        Key::Backspace => (127, None),
         _ => {
             // winit reports AltGr as Ctrl+Alt; the composed character arrives
             // via Event::Text, same as on the legacy path.
@@ -119,12 +143,46 @@ fn kitty_sequence(key: Key, mods: Modifiers) -> Option<Vec<u8>> {
             // modifier field.  Shifted punctuation arrives as its own logical
             // key in egui and carries no layout info, so it is used as-is —
             // upstream resolves it via winit's key_without_modifiers.
-            u32::from(key_char(key, false)?)
+            let code = u32::from(key_char(key, false)?);
+            (code, shifted_alternate(key, mods, mode).filter(|alternate| *alternate != code))
         },
     };
+    let mut seq = match alternate {
+        Some(alternate) => format!("\x1b[{code}:{alternate}"),
+        None => format!("\x1b[{code}"),
+    };
+    let text = key_text.filter(|_| mode.contains(TermMode::REPORT_ASSOCIATED_TEXT));
+    // The text is the third field, so the modifier field ahead of it cannot be
+    // left out the way an unmodified press otherwise would.
     let m = kitty_mods(mods);
-    let seq = if m == 0 { format!("\x1b[{code}u") } else { format!("\x1b[{code};{}u", m + 1) };
+    if m != 0 || text.is_some() {
+        seq.push_str(&format!(";{}", m + 1));
+    }
+    if let Some(text) = text {
+        let mut codepoints = text.chars().map(u32::from);
+        if let Some(first) = codepoints.next() {
+            seq.push_str(&format!(";{first}"));
+        }
+        for codepoint in codepoints {
+            seq.push_str(&format!(":{codepoint}"));
+        }
+    }
+    seq.push('u');
     Some(seq.into_bytes())
+}
+
+/// The shifted character an app recovers `D` from, given a key code that is
+/// always the unshifted `d`.  The protocol allows this field only while Shift
+/// is held, and only apps setting `REPORT_ALTERNATE_KEYS` ask for it; without
+/// it a shifted letter reaches the app as `d` plus a shift bit, which matches
+/// neither `d` nor `D` in a keymap.  Layout-shifted punctuation stays out of
+/// reach — egui reports it as its own logical key, with no unshifted base to
+/// pair it with.
+fn shifted_alternate(key: Key, mods: Modifiers, mode: TermMode) -> Option<u32> {
+    if !mods.shift || !mode.contains(TermMode::REPORT_ALTERNATE_KEYS) {
+        return None;
+    }
+    Some(u32::from(key_char(key, true)?))
 }
 
 /// Encoding for keys that never produce composed text.  Because no
@@ -297,10 +355,24 @@ mod tests {
         Modifiers { ctrl: true, shift: true, ..M::NONE }
     }
 
-    /// Legacy-mode shorthand; kitty-protocol tests call `super::key_to_bytes`
-    /// with an explicit mode instead.
+    /// Legacy-mode shorthand; kitty-protocol tests call `kitty_bytes` with an
+    /// explicit mode instead.
     fn key_to_bytes(key: Key, mods: Modifiers) -> Option<Vec<u8>> {
-        super::key_to_bytes(key, mods, TermMode::empty())
+        kitty_bytes(key, mods, TermMode::empty())
+    }
+
+    /// A key press carrying no associated text, which is every press until an
+    /// app asks for `REPORT_ASSOCIATED_TEXT`.
+    fn kitty_bytes(key: Key, mods: Modifiers, mode: TermMode) -> Option<Vec<u8>> {
+        super::key_to_bytes(key, mods, None, mode)
+    }
+
+    /// The `Event::Key` + `Event::Text` pair egui-winit raises for one press.
+    fn press(key: Key, mods: Modifiers, text: &str) -> Vec<Event> {
+        vec![
+            Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: mods },
+            Event::Text(text.to_string()),
+        ]
     }
 
     const DISAMBIGUATE: TermMode = TermMode::DISAMBIGUATE_ESC_CODES;
@@ -308,94 +380,61 @@ mod tests {
 
     #[test]
     fn kitty_disambiguate_encodes_modified_enter() {
-        assert_eq!(
-            super::key_to_bytes(Key::Enter, M::SHIFT, DISAMBIGUATE),
-            Some(b"\x1b[13;2u".to_vec())
-        );
-        assert_eq!(
-            super::key_to_bytes(Key::Enter, M::ALT, DISAMBIGUATE),
-            Some(b"\x1b[13;3u".to_vec())
-        );
-        assert_eq!(
-            super::key_to_bytes(Key::Enter, M::CTRL, DISAMBIGUATE),
-            Some(b"\x1b[13;5u".to_vec())
-        );
+        assert_eq!(kitty_bytes(Key::Enter, M::SHIFT, DISAMBIGUATE), Some(b"\x1b[13;2u".to_vec()));
+        assert_eq!(kitty_bytes(Key::Enter, M::ALT, DISAMBIGUATE), Some(b"\x1b[13;3u".to_vec()));
+        assert_eq!(kitty_bytes(Key::Enter, M::CTRL, DISAMBIGUATE), Some(b"\x1b[13;5u".to_vec()));
     }
 
     #[test]
     fn kitty_disambiguate_encodes_shifted_tab_and_backspace() {
+        assert_eq!(kitty_bytes(Key::Tab, M::SHIFT, DISAMBIGUATE), Some(b"\x1b[9;2u".to_vec()));
         assert_eq!(
-            super::key_to_bytes(Key::Tab, M::SHIFT, DISAMBIGUATE),
-            Some(b"\x1b[9;2u".to_vec())
-        );
-        assert_eq!(
-            super::key_to_bytes(Key::Backspace, M::SHIFT, DISAMBIGUATE),
+            kitty_bytes(Key::Backspace, M::SHIFT, DISAMBIGUATE),
             Some(b"\x1b[127;2u".to_vec())
         );
     }
 
     #[test]
     fn kitty_disambiguate_keeps_plain_keys_legacy() {
-        assert_eq!(super::key_to_bytes(Key::Enter, M::NONE, DISAMBIGUATE), Some(b"\r".to_vec()));
-        assert_eq!(super::key_to_bytes(Key::Tab, M::NONE, DISAMBIGUATE), Some(b"\t".to_vec()));
-        assert_eq!(
-            super::key_to_bytes(Key::Backspace, M::NONE, DISAMBIGUATE),
-            Some(b"\x7f".to_vec())
-        );
+        assert_eq!(kitty_bytes(Key::Enter, M::NONE, DISAMBIGUATE), Some(b"\r".to_vec()));
+        assert_eq!(kitty_bytes(Key::Tab, M::NONE, DISAMBIGUATE), Some(b"\t".to_vec()));
+        assert_eq!(kitty_bytes(Key::Backspace, M::NONE, DISAMBIGUATE), Some(b"\x7f".to_vec()));
     }
 
     #[test]
     fn kitty_disambiguate_always_escapes_escape() {
-        assert_eq!(
-            super::key_to_bytes(Key::Escape, M::NONE, DISAMBIGUATE),
-            Some(b"\x1b[27u".to_vec())
-        );
+        assert_eq!(kitty_bytes(Key::Escape, M::NONE, DISAMBIGUATE), Some(b"\x1b[27u".to_vec()));
     }
 
     #[test]
     fn kitty_disambiguate_encodes_ctrl_printables_unshifted() {
-        assert_eq!(
-            super::key_to_bytes(Key::A, M::CTRL, DISAMBIGUATE),
-            Some(b"\x1b[97;5u".to_vec())
-        );
-        assert_eq!(
-            super::key_to_bytes(Key::Space, M::CTRL, DISAMBIGUATE),
-            Some(b"\x1b[32;5u".to_vec())
-        );
+        assert_eq!(kitty_bytes(Key::A, M::CTRL, DISAMBIGUATE), Some(b"\x1b[97;5u".to_vec()));
+        assert_eq!(kitty_bytes(Key::Space, M::CTRL, DISAMBIGUATE), Some(b"\x1b[32;5u".to_vec()));
         // Shift is reported in the modifier field, not in the key code.
-        assert_eq!(
-            super::key_to_bytes(Key::C, ctrl_shift(), DISAMBIGUATE),
-            Some(b"\x1b[99;6u".to_vec())
-        );
+        assert_eq!(kitty_bytes(Key::C, ctrl_shift(), DISAMBIGUATE), Some(b"\x1b[99;6u".to_vec()));
     }
 
     #[test]
     fn kitty_disambiguate_leaves_shift_only_printables_to_text() {
-        assert_eq!(super::key_to_bytes(Key::A, M::SHIFT, DISAMBIGUATE), None);
+        assert_eq!(kitty_bytes(Key::A, M::SHIFT, DISAMBIGUATE), None);
     }
 
     #[test]
     fn kitty_disambiguate_keeps_legacy_csi_for_modified_arrows() {
-        assert_eq!(
-            super::key_to_bytes(Key::ArrowUp, M::CTRL, DISAMBIGUATE),
-            Some(b"\x1b[1;5A".to_vec())
-        );
+        assert_eq!(kitty_bytes(Key::ArrowUp, M::CTRL, DISAMBIGUATE), Some(b"\x1b[1;5A".to_vec()));
     }
 
     #[test]
     fn kitty_disambiguate_altgr_printables_stay_silent() {
         let ctrl_alt = Modifiers { ctrl: true, alt: true, ..Modifiers::NONE };
-        assert_eq!(super::key_to_bytes(Key::Q, ctrl_alt, DISAMBIGUATE), None);
+        assert_eq!(kitty_bytes(Key::Q, ctrl_alt, DISAMBIGUATE), None);
     }
 
     #[test]
     fn kitty_report_all_encodes_plain_keys_and_mutes_text() {
-        assert_eq!(
-            super::key_to_bytes(Key::Enter, M::NONE, REPORT_ALL),
-            Some(b"\x1b[13u".to_vec())
-        );
-        assert_eq!(super::key_to_bytes(Key::A, M::NONE, REPORT_ALL), Some(b"\x1b[97u".to_vec()));
-        assert_eq!(event_to_bytes(&Event::Text("a".to_string()), REPORT_ALL), None);
+        assert_eq!(kitty_bytes(Key::Enter, M::NONE, REPORT_ALL), Some(b"\x1b[13u".to_vec()));
+        assert_eq!(kitty_bytes(Key::A, M::NONE, REPORT_ALL), Some(b"\x1b[97u".to_vec()));
+        assert_eq!(event_to_bytes(&Event::Text("a".to_string()), None, REPORT_ALL), None);
     }
 
     #[test]
@@ -442,7 +481,7 @@ mod tests {
     #[test]
     fn text_event_passes_through() {
         let ev = Event::Text("é".to_string());
-        assert_eq!(event_to_bytes(&ev, TermMode::empty()), Some("é".as_bytes().to_vec()));
+        assert_eq!(event_to_bytes(&ev, None, TermMode::empty()), Some("é".as_bytes().to_vec()));
     }
 
     #[test]
@@ -521,8 +560,8 @@ mod tests {
     /// and is what the binding table and the encoder act on.
     #[test]
     fn synthetic_clipboard_events_send_nothing() {
-        assert_eq!(event_to_bytes(&Event::Copy, TermMode::empty()), None);
-        assert_eq!(event_to_bytes(&Event::Cut, TermMode::empty()), None);
+        assert_eq!(event_to_bytes(&Event::Copy, None, TermMode::empty()), None);
+        assert_eq!(event_to_bytes(&Event::Cut, None, TermMode::empty()), None);
     }
 
     /// The interrupt still has to reach the PTY off the Key event.
@@ -536,7 +575,7 @@ mod tests {
             repeat: false,
             modifiers: ctrl,
         };
-        assert_eq!(event_to_bytes(&event, TermMode::empty()), Some(vec![0x03]));
+        assert_eq!(event_to_bytes(&event, None, TermMode::empty()), Some(vec![0x03]));
     }
 
     /// The kitty encodings above only ever run if the terminal negotiates the
@@ -566,6 +605,132 @@ mod tests {
             mode.contains(TermMode::DISAMBIGUATE_ESC_CODES),
             "terminal ignored the kitty enable sequence; mode is {mode:?}"
         );
-        assert_eq!(super::key_to_bytes(Key::Enter, M::SHIFT, mode), Some(b"\x1b[13;2u".to_vec()));
+        assert_eq!(kitty_bytes(Key::Enter, M::SHIFT, mode), Some(b"\x1b[13;2u".to_vec()));
+    }
+
+    /// The flag set yazi pushes on startup (`CSI > 29 u`), minus the
+    /// associated-text bit, which alacritree does not report.
+    const REPORT_ALL_ALTERNATES: TermMode =
+        REPORT_ALL.union(DISAMBIGUATE).union(TermMode::REPORT_ALTERNATE_KEYS);
+
+    #[test]
+    fn kitty_alternate_keys_reports_the_shifted_letter() {
+        assert_eq!(
+            kitty_bytes(Key::D, M::SHIFT, REPORT_ALL_ALTERNATES),
+            Some(b"\x1b[100:68;2u".to_vec())
+        );
+        assert_eq!(
+            kitty_bytes(Key::C, ctrl_shift(), REPORT_ALL_ALTERNATES),
+            Some(b"\x1b[99:67;6u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_alternate_keys_are_omitted_without_the_flag() {
+        assert_eq!(kitty_bytes(Key::D, M::SHIFT, REPORT_ALL), Some(b"\x1b[100;2u".to_vec()));
+    }
+
+    /// The kitty spec allows the alternate field only while Shift is held, and
+    /// a key with no distinct shifted form has nothing to report either way.
+    #[test]
+    fn kitty_alternate_keys_need_shift_and_a_different_character() {
+        assert_eq!(
+            kitty_bytes(Key::D, M::CTRL, REPORT_ALL_ALTERNATES),
+            Some(b"\x1b[100;5u".to_vec())
+        );
+        assert_eq!(
+            kitty_bytes(Key::Comma, M::SHIFT, REPORT_ALL_ALTERNATES),
+            Some(b"\x1b[44;2u".to_vec())
+        );
+    }
+
+    /// Yazi keys `D` off the shifted codepoint and has no config syntax for the
+    /// unshifted-`d`-plus-shift state alacritree used to leave it in, so the
+    /// press did nothing at all.  Drives yazi's own enable sequence through the
+    /// terminal so the negotiation and the encoding are covered as one path.
+    #[test]
+    fn shifted_letter_carries_its_alternate_once_an_app_asks_for_them() {
+        use alacritty_terminal::Term;
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+
+        use crate::config::Config;
+        use crate::session::{TermSize, term_config};
+
+        let size = TermSize::new(80, 24);
+        let mut term = Term::new(term_config(&Config::default()), &size, VoidListener);
+
+        // `CSI > 29 u`: disambiguate | alternate keys | all keys as escapes |
+        // associated text, exactly what yazi pushes on startup.
+        Processor::<StdSyncHandler>::new().advance(&mut term, b"\x1b[>29u");
+
+        let mode = *term.mode();
+        assert!(
+            mode.contains(TermMode::REPORT_ALTERNATE_KEYS),
+            "terminal ignored the alternate-keys request; mode is {mode:?}"
+        );
+        assert_eq!(kitty_bytes(Key::D, M::SHIFT, mode), Some(b"\x1b[100:68;2u".to_vec()));
+    }
+
+    /// yazi's full startup set (`CSI > 29 u`): the alternate-key flags plus
+    /// the associated text.
+    const REPORT_ALL_ALTERNATES_TEXT: TermMode =
+        REPORT_ALL_ALTERNATES.union(TermMode::REPORT_ASSOCIATED_TEXT);
+
+    #[test]
+    fn kitty_associated_text_follows_the_modifier_field() {
+        // The text is the third field, so the modifier field it follows cannot
+        // be skipped even with nothing held.
+        assert_eq!(
+            super::key_to_bytes(Key::A, M::NONE, Some("a"), REPORT_ALL_ALTERNATES_TEXT),
+            Some(b"\x1b[97;1;97u".to_vec())
+        );
+        assert_eq!(
+            super::key_to_bytes(Key::D, M::SHIFT, Some("D"), REPORT_ALL_ALTERNATES_TEXT),
+            Some(b"\x1b[100:68;2;68u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_associated_text_is_omitted_without_the_flag() {
+        assert_eq!(
+            super::key_to_bytes(Key::A, M::NONE, Some("a"), REPORT_ALL_ALTERNATES),
+            Some(b"\x1b[97u".to_vec())
+        );
+    }
+
+    /// A composition that commits more than one character reports them all,
+    /// colon-separated after the first.
+    #[test]
+    fn kitty_associated_text_joins_further_codepoints_with_colons() {
+        assert_eq!(
+            super::key_to_bytes(Key::A, M::NONE, Some("ab"), REPORT_ALL_ALTERNATES_TEXT),
+            Some(b"\x1b[97;1;97:98u".to_vec())
+        );
+    }
+
+    #[test]
+    fn associated_text_reads_the_event_after_the_key() {
+        let events = press(Key::D, M::SHIFT, "D");
+        assert_eq!(super::associated_text(events.get(1)), Some("D"));
+        assert_eq!(super::associated_text(events.first()), None);
+        assert_eq!(super::associated_text(None), None);
+        assert_eq!(super::associated_text(Some(&Event::Text(String::new()))), None);
+    }
+
+    /// The pair egui-winit raises for one press must reach the PTY as a single
+    /// sequence carrying the text, not as a sequence plus a loose `D`.
+    #[test]
+    fn a_press_and_its_text_encode_as_one_sequence() {
+        let events = press(Key::D, M::SHIFT, "D");
+        let bytes: Vec<Vec<u8>> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, event)| {
+                let text = super::associated_text(events.get(idx + 1));
+                super::event_to_bytes(event, text, REPORT_ALL_ALTERNATES_TEXT)
+            })
+            .collect();
+        assert_eq!(bytes, vec![b"\x1b[100:68;2;68u".to_vec()]);
     }
 }
