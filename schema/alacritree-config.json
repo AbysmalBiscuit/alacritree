@@ -941,6 +941,10 @@
           "$ref": "#/$defs/RawUiFont",
           "description": "The font sidebars, tabs and dialogs are drawn with."
         },
+        "gpu_grid": {
+          "description": "Draw the terminal grid through an OpenGL paint callback instead of\nhanding epaint a mesh: `false` (default).  Needs a GL 3 context; one\ntoo old for instanced arrays logs once and falls back on its own.",
+          "type": "boolean"
+        },
         "icon_tooltips": {
           "description": "Whether a sidebar icon explains itself on hover: `true` (default).",
           "type": "boolean"

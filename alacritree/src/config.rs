@@ -223,7 +223,7 @@ pub fn profile_command(p: &Profile) -> String {
         .join(" ")
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Palette {
     pub fg: Rgb,
     pub bg: Rgb,
@@ -902,6 +902,13 @@ pub struct UiTheme {
     /// projects' worktrees).  Off by default so an unmodified config spawns
     /// no `gh` processes; when enabled it is best-effort like the diff-base
     /// lookup: no `gh`, no auth, or no PR silently paints nothing.
+    /// Draw the terminal grid through an OpenGL paint callback instead of
+    /// handing epaint a mesh: one twelve-byte record per cell, and the vertex
+    /// shader derives the quads.  Off by default — it needs a GL 3 context and
+    /// bypasses the renderer every other panel goes through, so an unmodified
+    /// config keeps the path that has always drawn the grid.  A context too
+    /// old for instanced arrays logs once and falls back on its own.
+    pub gpu_grid: bool,
     pub pr_status: bool,
     /// Paint a badge showing each worktree branch's upstream state.  Off by
     /// default so an unmodified config does no extra ref work.  The state comes
@@ -968,6 +975,7 @@ impl Default for UiTheme {
             sidebar_tooltips: SidebarTooltips::default(),
             icon_tooltips: true,
             session_display: SessionDisplay::default(),
+            gpu_grid: false,
             pr_status: false,
             upstream_status: false,
             worktree_liveness: true,
@@ -1977,6 +1985,10 @@ struct RawUi {
     /// Sidebar scrollbar style: "floating" (default) | "solid".
     #[schemars(extend("enum" = ["floating", "solid"]))]
     scrollbar: Option<String>,
+    /// Draw the terminal grid through an OpenGL paint callback instead of
+    /// handing epaint a mesh: `false` (default).  Needs a GL 3 context; one
+    /// too old for instanced arrays logs once and falls back on its own.
+    gpu_grid: Option<bool>,
     /// Poll `gh` for each branch's open pull request, which drives the PR row
     /// icons, the PR-state filters, and `$pr` in row templates.
     pr_status: Option<bool>,
@@ -2210,6 +2222,7 @@ impl RawConfig {
                 sidebar_always: self.ui.session_display.sidebar_always.unwrap_or(false),
                 tabs_always: self.ui.session_display.tabs_always.unwrap_or(false),
             },
+            gpu_grid: self.ui.gpu_grid.unwrap_or(false),
             pr_status: self.ui.pr_status.unwrap_or(false),
             upstream_status: self.ui.upstream_status.unwrap_or(false),
             worktree_liveness: self.ui.worktree_liveness.unwrap_or(true),
