@@ -1889,7 +1889,9 @@ impl AlacritreeApp {
                 // The binding consumed the key press before the terminal view
                 // saw it, so the Ctrl+Arrow the inner TUI listens for is
                 // re-synthesized with the terminal's own encoding.
-                if let Some(bytes) = crate::input::key_to_bytes(key, egui::Modifiers::CTRL, mode) {
+                if let Some(bytes) =
+                    crate::input::key_to_bytes(key, egui::Modifiers::CTRL, None, mode)
+                {
                     self.sessions[i].write(bytes);
                 }
             },
