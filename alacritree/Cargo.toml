@@ -96,6 +96,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }
+# The HWND to subclass for session-end messages (`win_session`).  Same version
+# eframe links, so no duplicate build.
+raw-window-handle = "0.6"
 # Foreground-agent detection: walks the shell's descendant process tree.
 # Linux reads /proc directly, so the dependency is Windows-only.
 sysinfo = { version = "0.36", default-features = false, features = ["system"] }

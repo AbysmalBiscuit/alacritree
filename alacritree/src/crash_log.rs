@@ -28,6 +28,10 @@ static ENABLED: AtomicBool = AtomicBool::new(true);
 static BROKEN: AtomicBool = AtomicBool::new(false);
 /// Panics the hook could not write because another thread held the lock.
 static SKIPPED: AtomicUsize = AtomicUsize::new(0);
+/// Latched by the first `record_reason` call so a later, less specific reason
+/// (`window-closed` following an already-recorded `os-close-app`) cannot
+/// overwrite it.
+static REASON_RECORDED: AtomicBool = AtomicBool::new(false);
 
 static STATE: Mutex<State> = Mutex::new(State::new());
 
@@ -123,6 +127,26 @@ pub fn record_exit(result: &Result<(), eframe::Error>) {
     write_event(&mut guard, &event);
 }
 
+/// Record why the process is on its way out, the moment it becomes known —
+/// not deferred to `record_exit` — so a process killed before `run_native`
+/// returns still leaves the reason behind. First writer wins: the latch keeps
+/// a later, less specific close (`window-closed` after an OS session end has
+/// already recorded `os-close-app`) from overwriting the real reason.
+pub fn record_reason(reason: ExitReason) {
+    if !writable() {
+        return;
+    }
+    if REASON_RECORDED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_err()
+    {
+        return;
+    }
+
+    let event = line(&format!("{EXIT_REASON_MARKER} {}", reason.as_str()));
+    let mut guard = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+    flush_repeats(&mut guard);
+    write_event(&mut guard, &event);
+}
+
 fn writable() -> bool {
     ENABLED.load(Ordering::Relaxed)
         && !BROKEN.load(Ordering::Relaxed)
@@ -153,6 +177,34 @@ pub const PANIC_MARKER: &str = "PANIC thread=";
 pub const SKIPPED_MARKER: &str = "panic records skipped:";
 pub const EXIT_OK_MARKER: &str = "exit ok";
 pub const EXIT_ERROR_MARKER: &str = "exit error:";
+pub const EXIT_REASON_MARKER: &str = "exit reason:";
+
+/// Why the process is on its way out, as far as alacritree could tell.
+// The three OS reasons are only ever constructed by the Windows session-end
+// hook, which does not compile elsewhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitReason {
+    UserQuit,
+    WindowClosed,
+    OsCloseApp,
+    OsLogoff,
+    OsShutdown,
+}
+
+impl ExitReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExitReason::UserQuit => "user-quit",
+            ExitReason::WindowClosed => "window-closed",
+            // Windows Restart Manager: an installer wants a file this process
+            // holds and is asking it to close before forcing the issue.
+            ExitReason::OsCloseApp => "os-close-app",
+            ExitReason::OsLogoff => "os-logoff",
+            ExitReason::OsShutdown => "os-shutdown",
+        }
+    }
+}
 
 /// The single initializer.  The header has three possible authors — a panic
 /// during config load, `session_begin`, and any write after the file has been
@@ -450,6 +502,7 @@ pub fn reset_for_tests(dir: &Path) {
     ENABLED.store(true, Ordering::Relaxed);
     BROKEN.store(false, Ordering::Relaxed);
     SKIPPED.store(0, Ordering::Relaxed);
+    REASON_RECORDED.store(false, Ordering::Relaxed);
     logdir::reset_identity_for_tests();
 }
 
@@ -875,6 +928,83 @@ mod tests {
 
             let path = artifact_path_for_tests().expect("an artifact was created");
             assert_eq!(classify(&path, std::process::id()), Verdict::Clean);
+        });
+    }
+
+    #[test]
+    fn a_recorded_reason_lands_before_the_exit_line() {
+        with_recorder(|_| {
+            session_begin();
+            record_reason(ExitReason::UserQuit);
+            record_exit(&Ok(()));
+
+            let text = artifact_text();
+            let reason_pos = text.find("exit reason: user-quit").expect("reason line missing");
+            let exit_pos = text.find(EXIT_OK_MARKER).expect("exit line missing");
+            assert!(reason_pos < exit_pos, "reason did not precede exit:\n{text}");
+        });
+    }
+
+    /// First writer wins: a `WM_CLOSE` following a session end must not
+    /// overwrite `os-close-app` with `window-closed`.
+    #[test]
+    fn a_second_reason_is_dropped_by_the_latch() {
+        with_recorder(|_| {
+            session_begin();
+            record_reason(ExitReason::OsCloseApp);
+            record_reason(ExitReason::WindowClosed);
+
+            let text = artifact_text();
+            assert!(text.contains("exit reason: os-close-app"), "first reason lost:\n{text}");
+            assert!(!text.contains("window-closed"), "second reason overwrote the first:\n{text}");
+            assert_eq!(
+                text.matches("exit reason:").count(),
+                1,
+                "more than one reason line:\n{text}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_reason_with_no_exit_line_classifies_as_crashed_for_a_dead_pid() {
+        with_recorder(|_| {
+            session_begin();
+            record_reason(ExitReason::OsShutdown);
+
+            let path = artifact_path_for_tests().expect("an artifact was created");
+            let text = artifact_text();
+            assert!(text.contains("exit reason: os-shutdown"), "reason missing:\n{text}");
+            assert_eq!(classify(&path, 0), Verdict::Crashed);
+        });
+    }
+
+    #[test]
+    fn a_reason_line_does_not_disturb_a_live_pids_running_verdict() {
+        with_recorder(|_| {
+            session_begin();
+            record_reason(ExitReason::OsLogoff);
+
+            let path = artifact_path_for_tests().expect("an artifact was created");
+            assert_eq!(classify(&path, std::process::id()), Verdict::Running);
+        });
+    }
+
+    #[test]
+    fn a_disabled_call_writes_nothing_and_does_not_burn_the_latch() {
+        with_recorder(|dir| {
+            set_enabled(false);
+
+            record_reason(ExitReason::UserQuit);
+
+            let entries: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().collect();
+            assert!(entries.is_empty(), "wrote {} files while disabled", entries.len());
+
+            set_enabled(true);
+            session_begin();
+            record_reason(ExitReason::UserQuit);
+
+            let text = artifact_text();
+            assert!(text.contains("exit reason: user-quit"), "reason missing:\n{text}");
         });
     }
 
