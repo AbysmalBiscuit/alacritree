@@ -213,6 +213,16 @@ impl Config {
     }
 }
 
+/// The command a profile runs, as shown to the user: `program` followed by
+/// `args`, joined by single spaces. A profile with no args shows just the
+/// program.
+pub fn profile_command(p: &Profile) -> String {
+    std::iter::once(p.program.as_str())
+        .chain(p.args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[derive(Debug, Clone)]
 pub struct Palette {
     pub fg: Rgb,
@@ -3060,6 +3070,19 @@ program = "second"
         let config = raw.into_config();
         assert!(config.profiles.is_empty());
         assert_eq!(config.default_profile, None);
+    }
+
+    #[test]
+    fn profile_command_joins_program_and_args() {
+        let no_args = Profile { name: "cmd".into(), program: "cmd.exe".into(), args: vec![] };
+        assert_eq!(profile_command(&no_args), "cmd.exe");
+
+        let with_args = Profile {
+            name: "ubuntu".into(),
+            program: "wsl.exe".into(),
+            args: vec!["-d".into(), "ubuntu".into()],
+        };
+        assert_eq!(profile_command(&with_args), "wsl.exe -d ubuntu");
     }
 
     #[test]

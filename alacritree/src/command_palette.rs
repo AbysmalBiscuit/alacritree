@@ -32,6 +32,8 @@ pub enum PaletteAction {
     SwitchWorkspace(WorkspaceKey),
     /// Open the new-worktree prompt for a project, keyed by its root.
     CreateWorktree(PathBuf),
+    /// Spawn a `[[ui.profiles]]` entry by name into the current workspace.
+    SpawnProfile(String),
 }
 
 /// The heading a row files under. Grouping keeps the list readable now that a
@@ -45,6 +47,7 @@ pub enum PaletteSection {
     Sidebar,
     Filters,
     Window,
+    Profiles,
     OpenSessions,
     SwitchWorkspace,
     NewWorktree,
@@ -60,6 +63,7 @@ impl PaletteSection {
             Self::Sidebar => "Sidebar & focus",
             Self::Filters => "Filters",
             Self::Window => "Window & application",
+            Self::Profiles => "Shell profiles",
             Self::OpenSessions => "Open sessions",
             Self::SwitchWorkspace => "Switch workspace",
             Self::NewWorktree => "New worktree",
@@ -155,6 +159,25 @@ impl PaletteItem {
             secondary,
         )
     }
+
+    /// A `[[ui.profiles]]` entry. `config_name` (the `SpawnProfileN` string
+    /// bound-key parsers accept, empty past index 9) is folded into the
+    /// search haystack so typing it still finds the row, without painting a
+    /// name the profile itself never carries.
+    pub fn profile(name: String, command: String, keys: String, config_name: &str) -> Self {
+        let mut item = Self::new(
+            PaletteAction::SpawnProfile(name.clone()),
+            PaletteSection::Profiles,
+            keys,
+            name,
+            command,
+        );
+        if !config_name.is_empty() {
+            item.search.push(' ');
+            item.search.push_str(config_name);
+        }
+        item
+    }
 }
 
 /// Rows the palette must not offer to run: unbinds, the pass-through marker,
@@ -163,8 +186,13 @@ impl PaletteItem {
 /// "scroll the palette" row could never do anything. Their keys are advertised
 /// in the palette's footer hint instead.
 fn is_hidden(a: NamedAction) -> bool {
-    matches!(a, NamedAction::NoOp | NamedAction::ReceiveChar | NamedAction::TogglePalette)
-        || a.is_palette_scoped()
+    matches!(
+        a,
+        NamedAction::NoOp
+            | NamedAction::ReceiveChar
+            | NamedAction::TogglePalette
+            | NamedAction::SpawnProfile(_)
+    ) || a.is_palette_scoped()
 }
 
 /// Every runnable keyboard action as one row, listing every key bound to it.
@@ -195,6 +223,11 @@ fn keys_for(bindings: &[KeyBinding], action: NamedAction) -> String {
         .map(|b| format_shortcut(b.key, b.mods))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Every trigger bound to `SpawnProfile(index)`, for a profile's palette row.
+pub fn profile_keys(bindings: &[KeyBinding], index: u8) -> String {
+    keys_for(bindings, NamedAction::SpawnProfile(index))
 }
 
 /// The first key bound to `action`, for the footer hint.
@@ -421,10 +454,23 @@ const PAGE: usize = 10;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bindings::parse_bindings;
+    use crate::bindings::{RawBinding, parse_bindings};
 
     fn find<'a>(items: &'a [PaletteItem], config_name: &str) -> Option<&'a PaletteItem> {
         items.iter().find(|i| i.secondary == config_name)
+    }
+
+    /// A binding of `SpawnProfile{index}` to an arbitrary key, for exercising
+    /// the profile palette rows.
+    fn bind_spawn_profile(index: u8) -> RawBinding {
+        RawBinding {
+            key: "1".into(),
+            mods: Some("Control|Shift".into()),
+            mode: None,
+            chars: None,
+            action: Some(format!("SpawnProfile{index}")),
+            command: None,
+        }
     }
 
     #[test]
@@ -600,5 +646,50 @@ mod tests {
         let items = action_items(&parse_bindings(vec![]));
         assert_eq!(find(&items, "TogglePrOpenFilter").unwrap().keys, "");
         assert_eq!(find(&items, "ToggleSessionsFilter").unwrap().keys, "S");
+    }
+
+    #[test]
+    fn profile_row_carries_the_key_bound_to_its_index() {
+        let bindings = parse_bindings(vec![bind_spawn_profile(2)]);
+        let keys = profile_keys(&bindings, 2);
+        assert_eq!(keys, keys_for(&bindings, NamedAction::SpawnProfile(2)));
+        assert!(!keys.is_empty());
+
+        let item =
+            PaletteItem::profile("nushell".into(), "nu.exe".into(), keys.clone(), "SpawnProfile2");
+        assert_eq!(item.keys, keys);
+    }
+
+    #[test]
+    fn profile_row_without_a_binding_has_empty_keys() {
+        let bindings = parse_bindings(vec![]);
+        let keys = profile_keys(&bindings, 3);
+        assert!(keys.is_empty());
+
+        let item = PaletteItem::profile("cmd".into(), "cmd.exe".into(), keys, "SpawnProfile3");
+        assert!(item.keys.is_empty());
+    }
+
+    #[test]
+    fn bound_spawn_profile_produces_no_generic_action_row() {
+        let bindings = parse_bindings(vec![bind_spawn_profile(2)]);
+        let items = action_items(&bindings);
+        assert!(
+            !items.iter().any(|i| i.action == PaletteAction::Run(NamedAction::SpawnProfile(2))),
+            "the Profiles section owns this row now"
+        );
+    }
+
+    #[test]
+    fn searching_the_config_name_ranks_the_profile_row_without_painting_it() {
+        let item =
+            PaletteItem::profile("nushell".into(), "nu.exe".into(), String::new(), "SpawnProfile2");
+        assert!(!item.primary.contains("SpawnProfile2"));
+        assert!(!item.secondary.contains("SpawnProfile2"));
+
+        let items = vec![item];
+        let mut palette = CommandPalette::new();
+        palette.query_mut().push_str("SpawnProfile2");
+        assert_eq!(palette.rank(&items), vec![0]);
     }
 }
