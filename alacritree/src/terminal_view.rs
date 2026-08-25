@@ -23,6 +23,7 @@ use crate::grid_instances::RunView;
 use crate::input::{associated_text, event_to_bytes};
 use crate::links::{self, Link};
 use crate::mouse;
+use crate::paint_phases::phase;
 use crate::paste;
 use crate::session::{EventProxy, Session, SessionId, SessionKind, TermSize};
 
@@ -1052,57 +1053,60 @@ impl GridSnapshot {
             link_bounds.is_some_and(|b| b.contains(&Point::new(line, column)))
         };
 
-        for &row in &self.damaged {
-            let line = Line(row as i32 - display_offset);
-            let cells = &grid[line];
-            let dest = &mut self.rows[row];
-            dest.text.clear();
-            dest.runs.clear();
-            dest.decorated = false;
+        phase!(Capture, {
+            for &row in &self.damaged {
+                let line = Line(row as i32 - display_offset);
+                let cells = &grid[line];
+                let dest = &mut self.rows[row];
+                dest.text.clear();
+                dest.runs.clear();
+                dest.decorated = false;
 
-            let mut col = 0;
-            while col < cols {
-                let start = col;
-                let style = Style::from_cell(&cells[Column(col)], in_link(line, Column(col)));
-                let selected = is_selected(selection_range.as_ref(), line, Column(col));
-                let text_start = dest.text.len();
+                let mut col = 0;
                 while col < cols {
-                    let cell = &cells[Column(col)];
-                    let cell_style = Style::from_cell(cell, in_link(line, Column(col)));
-                    let blank = matches!(cell.c, ' ' | '\0');
-                    if (cell_style != style && !style.absorbs(&cell_style, blank))
-                        || is_selected(selection_range.as_ref(), line, Column(col)) != selected
-                    {
-                        break;
-                    }
-                    if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    let start = col;
+                    let style = Style::from_cell(&cells[Column(col)], in_link(line, Column(col)));
+                    let selected = is_selected(selection_range.as_ref(), line, Column(col));
+                    let text_start = dest.text.len();
+                    while col < cols {
+                        let cell = &cells[Column(col)];
+                        let cell_style = Style::from_cell(cell, in_link(line, Column(col)));
+                        let blank = matches!(cell.c, ' ' | '\0');
+                        if (cell_style != style && !style.absorbs(&cell_style, blank))
+                            || is_selected(selection_range.as_ref(), line, Column(col)) != selected
+                        {
+                            break;
+                        }
+                        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                            col += 1;
+                            continue;
+                        }
+                        let ch = if cell.c == '\0' || cell.flags.contains(Flags::HIDDEN) {
+                            ' '
+                        } else {
+                            cell.c
+                        };
+                        dest.text.push(ch);
                         col += 1;
+                    }
+                    if dest.text.len() == text_start {
                         continue;
                     }
-                    let ch = if cell.c == '\0' || cell.flags.contains(Flags::HIDDEN) {
-                        ' '
-                    } else {
-                        cell.c
-                    };
-                    dest.text.push(ch);
-                    col += 1;
+                    let (fg, bg) = run_colors(style, selected, runtime_palette, config);
+                    dest.decorated |=
+                        style.flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT);
+                    dest.runs.push(Run {
+                        text: text_start..dest.text.len(),
+                        start_col: start,
+                        row: row as i32,
+                        flags: style.flags,
+                        fg,
+                        bg,
+                        selected,
+                    });
                 }
-                if dest.text.len() == text_start {
-                    continue;
-                }
-                let (fg, bg) = run_colors(style, selected, runtime_palette, config);
-                dest.decorated |= style.flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT);
-                dest.runs.push(Run {
-                    text: text_start..dest.text.len(),
-                    start_col: start,
-                    row: row as i32,
-                    flags: style.flags,
-                    fg,
-                    bg,
-                    selected,
-                });
             }
-        }
+        });
 
         let cursor_point: Point = grid.cursor.point;
         let cursor_row = cursor_point.line.0 + display_offset;
@@ -1237,7 +1241,7 @@ fn paint_grid_gpu(
     // Only the rows this frame's capture rewrote need new records; the rest of
     // the buffer still holds what the GPU already has.
     let dirty = snapshot.dirty_rows();
-    let runs: Vec<RunView<'_>> = snapshot
+    let runs = snapshot
         .runs_in(dirty.clone())
         .filter(|(_, run)| !run.flags.contains(Flags::HIDDEN))
         .map(|(text, run)| RunView {
@@ -1248,8 +1252,7 @@ fn paint_grid_gpu(
             flags: 0,
             fg: run.fg,
             bg: run.bg,
-        })
-        .collect();
+        });
 
     {
         let mut state = gpu.state.lock().expect("grid state");
@@ -1265,8 +1268,14 @@ fn paint_grid_gpu(
             default_bg: default_bg.to_array().map(|c| c as f32 / 255.0),
         };
         let (instances, table) = state.buffers();
-        instances.write_rows(dirty.clone(), &runs, default_bg, |ch, face| {
-            table.slot(ch, face, size, || glyphs.get(ctx, ch, face, size))
+        table.begin_frame(ctx);
+        phase!(WriteRows, {
+            instances.write_rows(dirty.clone(), runs, default_bg, |ch, face| {
+                table.slot(ch, face, size, || {
+                    crate::paint_phases::record_glyph_miss();
+                    glyphs.get(ctx, ch, face, size)
+                })
+            })
         });
         state.mark_rows_dirty(dirty);
     }
@@ -1274,24 +1283,26 @@ fn paint_grid_gpu(
 
     // Underlines are egui shapes, and egui retains nothing between frames, so
     // these are re-emitted for every row whether or not it changed.
-    for (text, run) in snapshot.decorated_runs() {
-        let cells = run_rect(rect, text, run, cell_w, cell_h);
-        let (x, y, width) = (cells.min.x, cells.min.y, cells.width());
-        if run.flags.intersects(Flags::ALL_UNDERLINES) {
-            let uy = y + cell_h - 1.5;
-            painter.line_segment(
-                [Pos2::new(x, uy), Pos2::new(x + width, uy)],
-                Stroke::new(1.0_f32, run.fg),
-            );
+    phase!(Decorations, {
+        for (text, run) in snapshot.decorated_runs() {
+            let cells = run_rect(rect, text, run, cell_w, cell_h);
+            let (x, y, width) = (cells.min.x, cells.min.y, cells.width());
+            if run.flags.intersects(Flags::ALL_UNDERLINES) {
+                let uy = y + cell_h - 1.5;
+                painter.line_segment(
+                    [Pos2::new(x, uy), Pos2::new(x + width, uy)],
+                    Stroke::new(1.0_f32, run.fg),
+                );
+            }
+            if run.flags.contains(Flags::STRIKEOUT) {
+                let sy = y + cell_h * 0.5;
+                painter.line_segment(
+                    [Pos2::new(x, sy), Pos2::new(x + width, sy)],
+                    Stroke::new(1.0_f32, run.fg),
+                );
+            }
         }
-        if run.flags.contains(Flags::STRIKEOUT) {
-            let sy = y + cell_h * 0.5;
-            painter.line_segment(
-                [Pos2::new(x, sy), Pos2::new(x + width, sy)],
-                Stroke::new(1.0_f32, run.fg),
-            );
-        }
-    }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2795,6 +2806,11 @@ mod tests {
     /// Dense output that fills every visible cell, with a colour change every
     /// few columns so the run-splitting in `paint_grid` behaves like it does
     /// under real program output rather than collapsing to one run per line.
+    ///
+    /// Written once, this screen never changes again, so every frame after the
+    /// first finds the terminal undamaged.  That is the wrong shape for
+    /// anything measuring a renderer that skips clean rows — use
+    /// `termbench_frame` there, which moves every cell every frame.
     fn dense_screen(cols: usize, rows: usize) -> Vec<u8> {
         let mut out = Vec::new();
         for row in 0..rows {
@@ -2807,6 +2823,256 @@ mod tests {
             }
         }
         out
+    }
+
+    /// One frame of termbench's `FGPerChar` (`backgrounds` false) or
+    /// `FGBGPerChar` (true), transcribed from `termbench.cpp`: a truecolour
+    /// SGR on every cell, colours derived from the frame index, background
+    /// written before foreground.
+    ///
+    /// The frame index is the part that matters.  Every colour on screen moves
+    /// between frames, so the terminal reports full damage each time — the
+    /// same thing a real run of termbench does, and the reason a harness that
+    /// paints one fixed screen repeatedly measures nothing useful for a
+    /// renderer that skips clean rows.
+    ///
+    /// `stride` is the one thing here termbench has no equivalent of: it holds
+    /// each colour for that many columns, so a row splits into `cols / stride`
+    /// runs while the cell count stays put.  At 1 this is the transcription.
+    /// Above 1 it is the only way to tell per-cell cost from per-run cost,
+    /// which every previous reading of these numbers had to guess at.
+    fn colored_frame(
+        cols: usize,
+        rows: usize,
+        frame: usize,
+        backgrounds: bool,
+        stride: usize,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        for y in 0..rows {
+            out.extend_from_slice(format!("\x1b[{};1H", y + 1).as_bytes());
+            for x in 0..cols {
+                let c = x - x % stride;
+                if x % stride == 0 {
+                    if backgrounds {
+                        let (r, g, b) = (frame + y + c, frame + y, frame);
+                        let sgr = format!("\x1b[48;2;{};{};{}m", r & 0xff, g & 0xff, b & 0xff);
+                        out.extend_from_slice(sgr.as_bytes());
+                    }
+                    let (r, g, b) = (frame, frame + y, frame + y + c);
+                    let sgr = format!("\x1b[38;2;{};{};{}m", r & 0xff, g & 0xff, b & 0xff);
+                    out.extend_from_slice(sgr.as_bytes());
+                }
+                out.push(b'a' + ((frame + x + y) % 25) as u8);
+            }
+        }
+        out
+    }
+
+    /// Not a gate — run it by hand:
+    /// `cargo test -p alacritree --release -- --ignored --nocapture --test-threads=1
+    /// report_colored_frame`
+    ///
+    /// Frame cost under termbench's two colour tests, mesh path against GL
+    /// path, with a third workload that keeps the cell count and cuts the run
+    /// count to an eighth.  Every other harness here runs `dense_screen`, which
+    /// holds the default background, changes colour every seventh column, and
+    /// never changes between frames: the one shape where neither run count nor
+    /// damage tracking costs anything.
+    ///
+    /// Both paths are stepped through the same frames in lockstep and sampled
+    /// in the same round, so a thermal drift or a background process hits both
+    /// or neither.  Reading them one after the other, as this used to, let a
+    /// quiet minute and a busy one land on different paths and read as a
+    /// difference between the paths.
+    ///
+    /// Parsing happens outside the timed region, so what is reported is paint
+    /// alone; both paths see byte-identical frames.
+    ///
+    /// There is no GL context here, so the GL path's callback is emitted and
+    /// never invoked.  Both rows are therefore the CPU half only, which is the
+    /// half that runs on the UI thread ahead of the next keystroke.
+    #[test]
+    #[ignore = "timing harness, not an assertion"]
+    fn report_colored_frame() {
+        #[cfg(windows)]
+        crate::harden_dll_search_path();
+
+        let grid = crate::grid_gl::GpuGrid::new();
+
+        for screen in [Vec2::new(1280.0, 720.0), Vec2::new(2560.0, 1440.0)] {
+            let mut printed_header = false;
+            for (label, backgrounds, stride) in
+                [("FGPerChar", false, 1), ("FGBGPerChar", true, 1), ("FGBG stride 8", true, 8)]
+            {
+                let mut cases: Vec<Case<'_>> = ["mesh", "gl"]
+                    .into_iter()
+                    .map(|path| Case::new(path, (path == "gl").then_some(&grid)))
+                    .collect();
+
+                for case in &mut cases {
+                    case.paint(screen);
+                }
+                let (cols, rows) =
+                    (cases[0].session.size.columns, cases[0].session.size.screen_lines);
+                for case in &mut cases {
+                    case.session.term.lock().resize(TermSize::new(cols, rows));
+                }
+
+                // Generating the escapes is the benchmark's cost, not the
+                // painter's, so the ring is built up front.  Reusing it wraps
+                // round every RING frames, and only consecutive frames have to
+                // differ for damage to stay full.
+                let ring: Vec<Vec<u8>> = (0..RING)
+                    .map(|frame| colored_frame(cols, rows, frame, backgrounds, stride))
+                    .collect();
+
+                for i in 0..WARMUP {
+                    for case in &mut cases {
+                        case.advance(&ring[i % RING]);
+                        case.paint(screen);
+                    }
+                }
+
+                for round in 0..ROUNDS {
+                    for case in &mut cases {
+                        case.round = Sample::default();
+                    }
+                    for f in 0..BATCH {
+                        let bytes = &ring[(WARMUP + round * BATCH + f) % RING];
+                        for case in &mut cases {
+                            case.advance(bytes);
+                            case.measure(screen);
+                        }
+                    }
+                    for case in &mut cases {
+                        case.rounds.push(case.round);
+                    }
+                }
+
+                if !printed_header {
+                    println!("{}x{} logical px = {cols}x{rows} cells", screen.x, screen.y);
+                    printed_header = true;
+                }
+                for case in &mut cases {
+                    case.report(label);
+                }
+            }
+        }
+    }
+
+    const ROUNDS: usize = 11;
+    const BATCH: usize = 20;
+    const RING: usize = 32;
+    const WARMUP: usize = 10;
+
+    /// One round's worth of frames, summed.  Divided by `BATCH` at print time.
+    #[derive(Clone, Copy, Default)]
+    struct Sample {
+        frame: std::time::Duration,
+        build: std::time::Duration,
+        tessellate: std::time::Duration,
+        allocs: usize,
+        bytes: usize,
+        vertices: usize,
+        phases: crate::paint_phases::Totals,
+    }
+
+    /// One painter under test: its own terminal, its own caches, its own egui
+    /// context, fed the same bytes as every other case in the sweep.
+    struct Case<'a> {
+        path: &'static str,
+        gpu: Option<&'a crate::grid_gl::GpuGrid>,
+        config: Config,
+        ctx: egui::Context,
+        session: Session,
+        _dir: tempfile::TempDir,
+        caches: Caches,
+        parser: Processor<StdSyncHandler>,
+        round: Sample,
+        rounds: Vec<Sample>,
+    }
+
+    impl<'a> Case<'a> {
+        fn new(path: &'static str, gpu: Option<&'a crate::grid_gl::GpuGrid>) -> Self {
+            let mut config = Config::default();
+            config.ui.gpu_grid = gpu.is_some();
+            let ctx = egui::Context::default();
+            let (session, dir) = headless_session(&ctx, &config);
+            Self {
+                path,
+                gpu,
+                config,
+                ctx,
+                session,
+                _dir: dir,
+                caches: Caches::new(),
+                parser: Processor::new(),
+                round: Sample::default(),
+                rounds: Vec::new(),
+            }
+        }
+
+        fn advance(&mut self, bytes: &[u8]) {
+            let mut term = self.session.term.lock();
+            self.parser.advance(&mut *term, bytes);
+        }
+
+        fn paint(&mut self, screen: Vec2) -> FrameCost {
+            paint_one_frame_on(
+                &self.ctx,
+                &mut self.session,
+                &self.config,
+                &mut self.caches,
+                screen,
+                self.gpu,
+            )
+        }
+
+        fn measure(&mut self, screen: Vec2) {
+            crate::paint_phases::reset();
+            let started = std::time::Instant::now();
+            let (cost, counts) =
+                crate::steady_state::measure(|| std::hint::black_box(self.paint(screen)));
+            self.round.frame += started.elapsed();
+            self.round.build += cost.build;
+            self.round.tessellate += cost.tessellate;
+            self.round.vertices = cost.vertices;
+            self.round.allocs += counts.allocs;
+            self.round.bytes += counts.bytes;
+            self.round.phases += crate::paint_phases::totals();
+        }
+
+        /// The median round, with the spread across rounds beside it.  A tight
+        /// spread is the only thing that makes a difference between two of
+        /// these lines worth reading.
+        fn report(&mut self, label: &str) {
+            self.rounds.sort_by_key(|s| s.frame);
+            let mid = self.rounds[self.rounds.len() / 2];
+            let (lo, hi) = (self.rounds[0].frame, self.rounds[self.rounds.len() - 1].frame);
+            let spread = (hi.as_secs_f64() / lo.as_secs_f64() - 1.0) * 100.0;
+            let n = BATCH as u32;
+            println!(
+                "  {label:<14} {:<4} {:>11?}/frame  spread {spread:>4.0}%  build {:?} tess {:?}  \
+                 verts {}  alloc {}/{}",
+                self.path,
+                mid.frame / n,
+                mid.build / n,
+                mid.tessellate / n,
+                mid.vertices,
+                mid.allocs / BATCH,
+                bytes_human(mid.bytes / BATCH),
+            );
+            println!("       {}", mid.phases.per_frame(n).summary());
+        }
+    }
+
+    fn bytes_human(bytes: usize) -> String {
+        match bytes {
+            b if b >= 1 << 20 => format!("{:.2}MB", b as f64 / (1 << 20) as f64),
+            b if b >= 1 << 10 => format!("{:.1}kB", b as f64 / (1 << 10) as f64),
+            b => format!("{b}B"),
+        }
     }
 
     /// Not a gate — run it by hand:
@@ -2955,7 +3221,7 @@ mod tests {
         // Warm the glyph table so the timed loop measures writing records, not
         // laying characters out for the first time.
         let all = views(&snapshot, &|_| true);
-        grid.write_rows(0..rows, &all, default_bg, |ch, face| {
+        grid.write_rows(0..rows, all, default_bg, |ch, face| {
             table.slot(ch, face, size, || caches.glyphs.get(&ctx, ch, face, size))
         });
         let slots = table.slots().len();
@@ -2969,7 +3235,7 @@ mod tests {
         for damaged in [rows, rows / 2, 8, 3, 1] {
             let touched = views(&snapshot, &|row| row < damaged);
             let build = time(iterations, || {
-                grid.write_rows(0..damaged, &touched, default_bg, |ch, face| {
+                grid.write_rows(0..damaged, touched.iter().copied(), default_bg, |ch, face| {
                     table.slot(ch, face, size, || caches.glyphs.get(&ctx, ch, face, size))
                 });
                 std::hint::black_box(grid.glyphs.len());
