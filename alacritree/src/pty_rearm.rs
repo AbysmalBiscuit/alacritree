@@ -25,24 +25,23 @@
 //! the child keeps running.  The chain ends where `piper` takes the waker back,
 //! which is the read that comes up empty — see `DRAIN_AHEAD`.
 //!
-//! One case still posts more than it consumes: a visit that cannot reach the
-//! terminal lock reads again without parsing, and each of those reads
-//! announces.  Nothing inside a reader can see a visit boundary, so that is
-//! bounded only by how long the UI thread holds the lock.  It is survivable
-//! because the queue drains: the depth it adds goes away with the burst.
+//! A visit that cannot reach the terminal lock reads again without parsing.
+//! Those reads consume no packet, so announcing on each of them posts a parse
+//! buffer's worth of hand-backs for the one packet the visit took.  Painting
+//! the grid is what holds that lock, so under load this is the ordinary case
+//! rather than a rare one.  The loop offers its whole parse buffer at the top
+//! of a visit and what is left of it on every read after — see `VisitBudget`.
 
 use std::io::{self, Read};
 use std::sync::Arc;
 
 use alacritty_terminal::event::{OnResize, WindowSize};
+use alacritty_terminal::event_loop::{MAX_LOCKED_READ, READ_BUFFER_SIZE};
 use alacritty_terminal::tty::{
     ChildEvent, EventedPty, EventedReadWrite, PTY_READ_WRITE_TOKEN, Pty,
 };
 use polling::os::iocp::{CompletionPacket, PollerIocpExt};
 use polling::{Event, PollMode, Poller};
-
-/// Mirrors `alacritty_terminal::event_loop::MAX_LOCKED_READ`, which is private.
-const MAX_LOCKED_READ: usize = u16::MAX as usize;
 
 /// How much one read may hand back.
 ///
@@ -60,11 +59,16 @@ const MAX_LOCKED_READ: usize = u16::MAX as usize;
 /// stale packets.  The loop drains the channel carrying keystrokes once per
 /// wait, and the writable packet that finally carries a Ctrl-C to the child
 /// goes on the tail of that queue, so it waits behind the whole backlog.
+///
+/// Taken from the read loop's own cap rather than copied, because falling
+/// below it is what breaks `VisitBudget`: a hand-back short of the cap lets
+/// the loop parse, reset `unprocessed`, and offer the whole buffer again, and
+/// an offer that wide reads as a fresh visit with a fresh announcement.
 const HANDBACK: usize = MAX_LOCKED_READ;
 
-/// Mirrors `alacritty_terminal::tty::windows::conpty::PIPE_CAPACITY`, the ring
-/// between the console and the read loop.  Private upstream.
-const PIPE_CAPACITY: usize = 0x10_0000;
+/// The ring between the console and the read loop, which `conpty` sizes from
+/// the same constant.
+const PIPE_CAPACITY: usize = READ_BUFFER_SIZE;
 
 /// A backstop on one refill, not a target.
 ///
@@ -84,11 +88,22 @@ const PIPE_CAPACITY: usize = 0x10_0000;
 /// from growing the staging without bound.
 const DRAIN_AHEAD: usize = 2 * PIPE_CAPACITY;
 
+const _: () = assert!(
+    DRAIN_AHEAD > PIPE_CAPACITY,
+    "a refill that cannot outrun the ring never reaches the read that hands \
+     the waker back, so the announcements never stop",
+);
+
 /// Bytes taken out of the console pipe ahead of the read loop, and how far the
 /// loop has got through them.
 #[derive(Default)]
 struct Staging {
+    /// Kept at the high-water mark of what a refill has needed rather than
+    /// resized per read, because a lock the renderer holds turns the read loop
+    /// into a spin and every turn of it would otherwise zero a hand-back.
+    /// Bytes past `filled` are whatever the last refill left.
     buf: Vec<u8>,
+    filled: usize,
     taken: usize,
     /// Whether the last refill ended on a read that returned nothing, which is
     /// what `UnblockedReader` reports once `piper` has taken the waker.  A
@@ -96,10 +111,13 @@ struct Staging {
     /// `piper` could not supply, so no waker was installed and nothing but this
     /// side can announce what is left in the ring.
     ///
-    /// The converse does not quite hold: `piper` yields on a non-empty ring
-    /// about once in a hundred drains, and that also reads as nothing.  It
-    /// wakes the reader on its way out, so the announcement comes through the
-    /// waker rather than from here.
+    /// The converse does not quite hold.  `piper` drops the waker on a
+    /// non-empty ring and then, about once in a hundred drains, wakes it and
+    /// reports nothing anyway so a fast reader cannot starve the writer.  That
+    /// is indistinguishable from an empty ring here, and it has already queued
+    /// a packet — so a refill it interrupts mid-staging leaves this side
+    /// announcing on top of it, one extra packet in the queue until some visit
+    /// finds the staging empty.
     rearmed: bool,
 }
 
@@ -109,33 +127,37 @@ impl Staging {
     /// How far this got decides who announces next, so it records whether it
     /// reached the read that returned nothing.
     fn refill(&mut self, source: &mut impl Read) -> io::Result<()> {
-        self.buf.clear();
+        self.filled = 0;
         self.taken = 0;
         self.rearmed = false;
 
-        while self.buf.len() < DRAIN_AHEAD {
-            let base = self.buf.len();
-            self.buf.resize(base + HANDBACK, 0);
-            match source.read(&mut self.buf[base..]) {
+        while self.filled < DRAIN_AHEAD {
+            let room = self.filled + HANDBACK;
+            if self.buf.len() < room {
+                self.buf.resize(room, 0);
+            }
+            match source.read(&mut self.buf[self.filled..room]) {
                 Ok(0) => {
-                    self.buf.truncate(base);
                     self.rearmed = true;
                     break;
                 },
-                Ok(read) => self.buf.truncate(base + read),
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => self.buf.truncate(base),
+                Ok(read) => self.filled += read,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {},
                 // `UnblockedReader` never reports this, and a source that did
                 // would not have armed a waker on the way out, so leave the
                 // announcement to this side.
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                    self.buf.truncate(base);
-                    break;
-                },
-                Err(err) => {
-                    self.buf.truncate(base);
-                    return Err(err);
-                },
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) => return Err(err),
             }
+        }
+
+        // A burst leaves the high-water mark at `DRAIN_AHEAD`, which every
+        // session that ever saw one would otherwise hold for its whole life.
+        // A drained pipe with a hand-back or less behind it is the burst
+        // ending, so give the room back and pay one growth if it resumes.
+        if self.rearmed && self.filled <= HANDBACK && self.buf.len() > HANDBACK {
+            self.buf.truncate(HANDBACK);
+            self.buf.shrink_to_fit();
         }
         Ok(())
     }
@@ -151,21 +173,56 @@ impl Staging {
         let mut read = 0;
 
         while read < want {
-            if self.taken == self.buf.len() {
+            if self.taken == self.filled {
                 self.refill(source)?;
-                if self.buf.is_empty() {
+                if self.filled == 0 {
                     break;
                 }
             }
 
-            let end = (self.taken + want - read).min(self.buf.len());
+            let end = (self.taken + want - read).min(self.filled);
             let staged = &self.buf[self.taken..end];
             out[read..read + staged.len()].copy_from_slice(staged);
             read += staged.len();
             self.taken = end;
         }
 
-        Ok((read, self.taken < self.buf.len() || !self.rearmed))
+        Ok((read, self.taken < self.filled || !self.rearmed))
+    }
+}
+
+/// Holds a visit to one announcement, however many times it reads.
+///
+/// A visit starts with the whole parse buffer and reads `buf[unprocessed..]`
+/// after that, so an offer narrower than the widest yet seen is the loop going
+/// round again on a lock it could not take.  Calibrating on the widest offer
+/// rather than on a constant keeps this from mirroring a buffer size the read
+/// loop owns.
+///
+/// The count is per visit rather than per opening read because the read that
+/// has something to announce need not be the first.  An opening read that
+/// finds the pipe nearly empty leaves the waker with `piper` and says nothing;
+/// a burst landing before the next read fills the staging to `DRAIN_AHEAD`,
+/// where `piper` holds no waker and this side is all that can speak.
+#[derive(Default)]
+struct VisitBudget {
+    widest: usize,
+    spent: bool,
+}
+
+impl VisitBudget {
+    /// Whether a read offered this much room still has its visit's
+    /// announcement to give.  A read that says nothing keeps it for the next.
+    fn may_announce(&mut self, offered: usize) -> bool {
+        if offered >= self.widest {
+            self.widest = offered;
+            self.spent = false;
+        }
+        !self.spent
+    }
+
+    fn spend(&mut self) {
+        self.spent = true;
     }
 }
 
@@ -175,15 +232,26 @@ pub struct RearmingReader {
     pty: Pty,
     poller: Option<Arc<Poller>>,
     staged: Staging,
+    visit: VisitBudget,
 }
 
 impl Read for RearmingReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let Self { pty, staged, poller } = self;
+        let Self { pty, staged, poller, visit } = self;
+        let may_announce = visit.may_announce(buf.len());
         let (read, staged_behind) = staged.take(buf, pty.reader())?;
 
-        if staged_behind && let Some(poller) = poller {
-            let _ = poller.post(CompletionPacket::new(Event::readable(PTY_READ_WRITE_TOKEN)));
+        if staged_behind
+            && may_announce
+            && let Some(poller) = poller
+        {
+            // A post that failed announced nothing, and after a refill that hit
+            // the cap there is no waker either, so keep the budget for the next
+            // read of this visit rather than leaving the staging unspoken for.
+            let packet = CompletionPacket::new(Event::readable(PTY_READ_WRITE_TOKEN));
+            if poller.post(packet).is_ok() {
+                visit.spend();
+            }
         }
         Ok(read)
     }
@@ -195,7 +263,14 @@ pub struct RearmingPty {
 
 impl RearmingPty {
     pub fn new(pty: Pty) -> Self {
-        Self { reader: RearmingReader { pty, poller: None, staged: Staging::default() } }
+        Self {
+            reader: RearmingReader {
+                pty,
+                poller: None,
+                staged: Staging::default(),
+                visit: VisitBudget::default(),
+            },
+        }
     }
 }
 
@@ -292,6 +367,47 @@ mod tests {
         }
     }
 
+    /// A visit that cannot take the terminal lock reads again without parsing,
+    /// and reads its way down `buf[unprocessed..]` until the buffer is full.
+    /// Those reads consume no packet, so announcing on each of them hands the
+    /// poller a buffer's worth for the one the visit took — sixteen for one at
+    /// a megabyte buffer and a sixty-four kilobyte hand-back.
+    #[test]
+    fn a_visit_announces_once_however_often_it_reads() {
+        let mut visit = VisitBudget::default();
+        let buffer = 16 * HANDBACK;
+
+        assert!(visit.may_announce(buffer), "a visit opens with its announcement to give");
+        visit.spend();
+        for unprocessed in (HANDBACK..buffer).step_by(HANDBACK) {
+            let offered = buffer - unprocessed;
+            assert!(
+                !visit.may_announce(offered),
+                "{offered} of {buffer} is the loop going round on a lock it could not take",
+            );
+        }
+        assert!(visit.may_announce(buffer), "the next visit opens with one to give again");
+    }
+
+    /// The read with something to announce need not be the one that opened the
+    /// visit.  An opening read that finds the pipe nearly empty leaves the
+    /// waker with `piper` and says nothing; a burst landing before the next
+    /// read fills the staging to `DRAIN_AHEAD`, where `piper` holds no waker
+    /// and this side is all that can speak for what is staged.
+    #[test]
+    fn a_visit_that_opened_quiet_can_still_announce() {
+        let mut visit = VisitBudget::default();
+        let buffer = 16 * HANDBACK;
+
+        assert!(visit.may_announce(buffer), "the opening read is offered its announcement");
+        assert!(
+            visit.may_announce(buffer - HANDBACK),
+            "an opening read that said nothing leaves the announcement for the next",
+        );
+        visit.spend();
+        assert!(!visit.may_announce(buffer - 2 * HANDBACK), "the visit has now spent it");
+    }
+
     /// The read loop parses what a read returned before re-checking its own
     /// `MAX_LOCKED_READ` cap, so a take carrying the cap ends the visit by
     /// itself.  A shorter one costs the visit a second take, and every take
@@ -322,6 +438,22 @@ mod tests {
         staging.refill(&mut source).unwrap();
 
         assert!(staging.rearmed, "the refill stopped short of the pipe, so nobody holds the waker");
+    }
+
+    /// The staging grows to whatever the heaviest burst needed and the read
+    /// loop never asks for it back, so a pane that once printed a large file
+    /// would hold megabytes for the rest of its life — once per pane.
+    #[test]
+    fn a_burst_gives_its_room_back_when_the_pipe_drains() {
+        let mut staging = Staging::default();
+
+        staging.refill(&mut io::Cursor::new(vec![b'x'; PIPE_CAPACITY])).unwrap();
+        assert!(staging.buf.capacity() >= PIPE_CAPACITY, "the burst should have grown the staging");
+
+        staging.refill(&mut io::Cursor::new(Vec::new())).unwrap();
+
+        let held = staging.buf.capacity();
+        assert!(held <= 2 * HANDBACK, "a drained pipe left {held} bytes of staging behind");
     }
 
     /// Emptying the pipe leaves `piper` holding the waker, and that is what
