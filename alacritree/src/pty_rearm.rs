@@ -14,10 +14,10 @@
 //!
 //! Wrapping the reader posts that packet, one per visit of the read loop.  One
 //! is enough: the visit it wakes hands back everything the loop will take
-//! before it stops, and announces again only if bytes are still staged behind
-//! it.  One is also the ceiling — see `HANDBACK`.  A drain that emptied the
-//! pipe announces nothing at all, because reaching that empty read is what
-//! makes `piper` install its waker, and the waker announces the next byte.
+//! before it stops, and announces again if anything is left behind it.  One is
+//! also the ceiling — see `HANDBACK`.  A visit that emptied the pipe announces
+//! nothing at all, because reaching that empty read is what makes `piper`
+//! install its waker, and the waker announces the next byte.
 
 use std::io::{self, Read};
 use std::sync::Arc;
@@ -51,19 +51,18 @@ const HANDBACK: usize = MAX_LOCKED_READ;
 
 /// How much one visit may pull out of the console pipe ahead of the read loop.
 ///
-/// The pipe between the console and the read loop is a ring of exactly this
-/// size, filled by a thread that parks when it runs out of room.  The loop
-/// stops taking bytes after `MAX_LOCKED_READ`, so left to itself it empties
-/// sixty-four kilobytes per visit and goes back to the poller.  The ring stays
-/// full, the filling thread stays parked, and the console blocks on its own
-/// writes.  Draining the whole ring into a staging buffer first decouples the
-/// two: the filler keeps running at the console's pace while the loop takes
-/// what it can hold.
-const DRAIN_AHEAD: usize = PIPE_CAPACITY;
-
-/// Mirrors `alacritty_terminal::tty::windows::conpty::PIPE_CAPACITY`, which is
-/// private.
-const PIPE_CAPACITY: usize = 0x10_0000;
+/// The pipe between the console and the read loop is a ring, filled by a
+/// thread that parks when it runs out of room.  Taking straight from the ring
+/// couples the two: the loop stops after `MAX_LOCKED_READ` and goes back to
+/// the poller, and the ring sits where the loop left it until it returns.
+/// Staging a visit ahead lets the filler keep running at the console's pace
+/// while the loop parses what it already holds.
+///
+/// One visit ahead is the whole benefit.  Anything staged past that is output
+/// already committed to the screen, so it is what a Ctrl-C waits through
+/// before the prompt comes back, and at the megabytes per second a terminal
+/// actually retires, every megabyte held here is most of a second of it.
+const DRAIN_AHEAD: usize = 2 * HANDBACK;
 
 /// Bytes taken out of the console pipe ahead of the read loop, and how far the
 /// loop has got through them.
@@ -71,16 +70,23 @@ const PIPE_CAPACITY: usize = 0x10_0000;
 struct Staging {
     buf: Vec<u8>,
     taken: usize,
+    /// Whether the last refill reached the read that came up empty.  When it
+    /// stopped at `DRAIN_AHEAD` instead, `piper` was never asked for a byte it
+    /// could not supply and holds no waker, so nothing but this side can
+    /// announce what is left in the ring.
+    drained: bool,
 }
 
 impl Staging {
-    /// Empty `source` into the buffer.
+    /// Empty `source` into the buffer, up to `DRAIN_AHEAD`.
     ///
-    /// Stops on the read that comes up empty, which is what lets `piper`
-    /// install the waker that announces the next byte.
+    /// Reaching the read that comes up empty is what lets `piper` install the
+    /// waker that announces the next byte, so how far this got decides who
+    /// announces next.
     fn refill(&mut self, source: &mut impl Read) -> io::Result<()> {
         self.buf.clear();
         self.taken = 0;
+        self.drained = false;
 
         while self.buf.len() < DRAIN_AHEAD {
             let base = self.buf.len();
@@ -88,12 +94,14 @@ impl Staging {
             match source.read(&mut self.buf[base..]) {
                 Ok(0) => {
                     self.buf.truncate(base);
+                    self.drained = true;
                     break;
                 },
                 Ok(read) => self.buf.truncate(base + read),
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => self.buf.truncate(base),
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                     self.buf.truncate(base);
+                    self.drained = true;
                     break;
                 },
                 Err(err) => {
@@ -108,8 +116,8 @@ impl Staging {
     /// Hand the read loop one visit's worth, refilling first when the buffer
     /// has run out.
     ///
-    /// Returns how much was handed back and whether bytes are still staged,
-    /// which is what the caller has to announce.
+    /// Returns how much was handed back and whether anything is left for the
+    /// caller to announce, either here or behind an undrained ring.
     fn take(&mut self, out: &mut [u8], source: &mut impl Read) -> io::Result<(usize, bool)> {
         if self.taken == self.buf.len() {
             self.refill(source)?;
@@ -121,7 +129,7 @@ impl Staging {
         out[..read].copy_from_slice(staged);
         self.taken = end;
 
-        Ok((read, self.taken < self.buf.len()))
+        Ok((read, self.taken < self.buf.len() || !self.drained))
     }
 }
 
@@ -209,10 +217,10 @@ impl OnResize for RearmingPty {
 mod tests {
     use super::*;
 
-    /// What the read loop hands a read: its whole parse buffer, minus whatever
-    /// earlier reads in the same visit already filled.
+    /// What the read loop hands a read: its parse buffer, always room for more
+    /// than one hand-back.
     fn parse_buffer() -> Vec<u8> {
-        vec![0; PIPE_CAPACITY]
+        vec![0; 4 * HANDBACK]
     }
 
     /// The read loop parses what a read returned before re-checking its own
@@ -243,11 +251,30 @@ mod tests {
         assert_eq!(staging.take(&mut parse_buffer(), &mut source).unwrap(), (0, false));
     }
 
+    /// A refill that stopped at `DRAIN_AHEAD` never asked `piper` for a byte it
+    /// could not supply, so `piper` holds no waker and the ring may still be
+    /// full.  Handing back the last staged byte has to announce anyway: being
+    /// wrong costs one wakeup that finds nothing, and staying quiet costs a
+    /// pane that stops until the user types.
+    #[test]
+    fn a_refill_that_hit_the_cap_announces_its_last_byte() {
+        let mut source = io::Cursor::new(vec![b'x'; 4 * DRAIN_AHEAD]);
+        let mut staging = Staging::default();
+        let mut buf = parse_buffer();
+
+        let mut taken = 0;
+        while taken < DRAIN_AHEAD {
+            let (read, staged_behind) = staging.take(&mut buf, &mut source).unwrap();
+            taken += read;
+            assert!(staged_behind, "the ring was never drained, so only this side can announce");
+        }
+    }
+
     /// Every visit takes its cap and announces the remainder once, until the
     /// drain runs out.  Anything above one packet per visit compounds.
     #[test]
     fn a_drain_announces_once_per_visit() {
-        let staged = 4 * MAX_LOCKED_READ;
+        let staged = 4 * MAX_LOCKED_READ + 100;
         let mut source = io::Cursor::new(vec![b'x'; staged]);
         let mut staging = Staging::default();
         let mut buf = parse_buffer();
