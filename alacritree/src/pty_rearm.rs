@@ -12,18 +12,24 @@
 //! exiting — which is why a pane streaming megabytes only advances while the
 //! user types.
 //!
-//! Wrapping the reader posts that packet.  What has to hold is that the
-//! packets a visit posts never outnumber the visits they buy, or the backlog
-//! doubles every round until a wait returns nothing but stale packets.  A visit
-//! that emptied the pipe announces nothing at all, because reaching that empty
-//! read is what makes `piper` install its waker, and the waker announces the
-//! next byte.  Every other visit announces once — see `HANDBACK`.
+//! Wrapping the reader posts that packet.  Two things have to hold, and the
+//! second is the one that bites.
+//!
+//! A visit must not post more packets than it consumes, or the queue doubles
+//! every round until a wait returns nothing but stale packets — see `HANDBACK`.
+//!
+//! And a burst must end with a visit that posts nothing, or the queue never
+//! returns to empty.  Posting one for one holds the depth steady rather than
+//! draining it, so whatever depth a burst once reached it keeps, and the
+//! writable packet carrying a Ctrl-C sits on the tail behind all of it while
+//! the child keeps running.  The chain ends where `piper` takes the waker back,
+//! which is the read that comes up empty — see `DRAIN_AHEAD`.
 //!
 //! One case still posts more than it consumes: a visit that cannot reach the
 //! terminal lock reads again without parsing, and each of those reads
-//! announces.  Nothing inside a reader can see a visit boundary, so this is
-//! bounded only by how long the UI thread holds the lock.  It is worth knowing
-//! about; it is not what stalls a pane.
+//! announces.  Nothing inside a reader can see a visit boundary, so that is
+//! bounded only by how long the UI thread holds the lock.  It is survivable
+//! because the queue drains: the depth it adds goes away with the burst.
 
 use std::io::{self, Read};
 use std::sync::Arc;
@@ -56,22 +62,27 @@ const MAX_LOCKED_READ: usize = u16::MAX as usize;
 /// goes on the tail of that queue, so it waits behind the whole backlog.
 const HANDBACK: usize = MAX_LOCKED_READ;
 
-/// How much one refill may pull out of the console pipe ahead of the read loop.
+/// Mirrors `alacritty_terminal::tty::windows::conpty::PIPE_CAPACITY`, the ring
+/// between the console and the read loop.  Private upstream.
+const PIPE_CAPACITY: usize = 0x10_0000;
+
+/// A backstop on one refill, not a target.
 ///
-/// The pipe between the console and the read loop is a ring, filled by a thread
-/// that parks when it runs out of room.  Staging ahead of the parse lets that
-/// thread keep running at the console's pace while the loop works through what
-/// it already holds.  It does not take much: `piper` wakes the filler after
-/// every chunk it copies out, so the ring does not have to be emptied to unpark
-/// it, and one visit in hand is enough to keep the loop from waiting on a
-/// refill.
+/// This has to sit above the ring.  A refill that stops before the ring runs
+/// dry never asked `piper` for a byte it could not supply, so `piper` takes no
+/// waker and only this side can announce what is left.  Every visit then
+/// announces: one packet in, one packet out, and whatever depth the poller's
+/// queue once reached it holds forever.  The writable packet carrying a Ctrl-C
+/// is posted on the tail of that queue, so it waits behind all of it while the
+/// child keeps running.
 ///
-/// What is staged past that is output already committed to the screen, so it is
-/// what a Ctrl-C waits through before the prompt comes back.  The 1 MiB ring
-/// underneath is in that path too and dominates it; this is the half this side
-/// owns.  The value is reasoned, not measured — compare TermMarkV2 before
-/// changing it.
-const DRAIN_AHEAD: usize = 2 * HANDBACK;
+/// Reaching the empty read is what ends the chain.  The visit that empties the
+/// staging goes quiet, the queue drains to nothing, and `piper` announces the
+/// next byte.  Set below the ring, that never happens under load.
+///
+/// So the cap is only here to stop a filler thread that somehow outran a memcpy
+/// from growing the staging without bound.
+const DRAIN_AHEAD: usize = 2 * PIPE_CAPACITY;
 
 /// Bytes taken out of the console pipe ahead of the read loop, and how far the
 /// loop has got through them.
@@ -295,6 +306,22 @@ mod tests {
 
         assert!(read >= MAX_LOCKED_READ, "a visit stops after {MAX_LOCKED_READ}, got {read}");
         assert!(staged_behind, "the rest of the drain still has to be announced");
+    }
+
+    /// The whole ring arriving at once is the ordinary case under load, not an
+    /// extreme.  A refill has to get through it and reach the read that comes
+    /// up empty, because that is where `piper` takes the waker back and the
+    /// chain of announcements ends.  A cap at or below the ring stops the
+    /// refill first, every visit announces, and the poller's queue never
+    /// returns to empty — which is what leaves a Ctrl-C waiting behind it.
+    #[test]
+    fn a_ring_sized_burst_hands_the_waker_back() {
+        let mut source = io::Cursor::new(vec![b'x'; PIPE_CAPACITY]);
+        let mut staging = Staging::default();
+
+        staging.refill(&mut source).unwrap();
+
+        assert!(staging.rearmed, "the refill stopped short of the pipe, so nobody holds the waker");
     }
 
     /// Emptying the pipe leaves `piper` holding the waker, and that is what
