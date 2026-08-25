@@ -21,10 +21,10 @@ use crate::{thread, tty};
 use vte::ansi;
 
 /// Max bytes to read from the PTY before forced terminal synchronization.
-pub(crate) const READ_BUFFER_SIZE: usize = 0x10_0000;
+pub const READ_BUFFER_SIZE: usize = 0x10_0000;
 
 /// Max bytes to read from the PTY while the terminal is locked.
-const MAX_LOCKED_READ: usize = u16::MAX as usize;
+pub const MAX_LOCKED_READ: usize = u16::MAX as usize;
 
 /// Messages that may be sent to the `EventLoop`.
 #[derive(Debug)]
