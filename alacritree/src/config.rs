@@ -70,11 +70,17 @@ pub struct DebugConfig {
     pub crash_log: bool,
     /// Upstream's name and upstream's default.
     pub persistent_logging: bool,
+    /// alacritree-only, set in `alacritree.toml`.  Log what the GPU grid's
+    /// paint callback costs: the wall time of issuing a frame, and the GPU's
+    /// own time for the upload and each of the three draws.  Off by default;
+    /// timer queries are cheap but not free, and the line is only meaningful
+    /// to someone reading it.  Needs `[ui] gpu_grid` and a GL 3.3 context.
+    pub gpu_timing: bool,
 }
 
 impl Default for DebugConfig {
     fn default() -> Self {
-        Self { crash_log: true, persistent_logging: false }
+        Self { crash_log: true, persistent_logging: false, gpu_timing: false }
     }
 }
 
@@ -223,7 +229,7 @@ pub fn profile_command(p: &Profile) -> String {
         .join(" ")
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Palette {
     pub fg: Rgb,
     pub bg: Rgb,
@@ -898,6 +904,14 @@ pub struct UiTheme {
     pub icon_tooltips: bool,
     /// Show single-session sidebar rows / tab segments ([`SessionDisplay`]).
     pub session_display: SessionDisplay,
+    /// Draw the terminal grid through an OpenGL paint callback instead of
+    /// handing epaint a mesh: one twelve-byte record per cell, and the vertex
+    /// shader derives the quads.  Off by default — it needs a GL 3 context and
+    /// bypasses the renderer every other panel goes through, so an unmodified
+    /// config keeps the path that has always drawn the grid.  A context too
+    /// old for instanced arrays logs once, costs the frame it was found on,
+    /// and paints the mesh from the next one.
+    pub gpu_grid: bool,
     /// Paint PR-status badges on worktree rows (and poll `gh` for expanded
     /// projects' worktrees).  Off by default so an unmodified config spawns
     /// no `gh` processes; when enabled it is best-effort like the diff-base
@@ -968,6 +982,7 @@ impl Default for UiTheme {
             sidebar_tooltips: SidebarTooltips::default(),
             icon_tooltips: true,
             session_display: SessionDisplay::default(),
+            gpu_grid: false,
             pr_status: false,
             upstream_status: false,
             worktree_liveness: true,
@@ -1424,6 +1439,13 @@ struct RawDebug {
     /// Keep the log file after quitting.  Upstream's name and upstream's
     /// default (`false`).
     persistent_logging: Option<bool>,
+    /// Log what the GPU grid's paint callback costs: the wall time of
+    /// issuing a frame, and the GPU's own time for the upload and each of
+    /// the three draws.  alacritree-only, so it belongs in
+    /// `alacritree.toml`.  Default `false`; timer queries are cheap but not
+    /// free, and the line is only meaningful to someone reading it.  Needs
+    /// `[ui] gpu_grid` and a GL 3.3 context.
+    gpu_timing: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -1977,6 +1999,13 @@ struct RawUi {
     /// Sidebar scrollbar style: "floating" (default) | "solid".
     #[schemars(extend("enum" = ["floating", "solid"]))]
     scrollbar: Option<String>,
+    /// Draw the terminal grid through an OpenGL paint callback instead of
+    /// handing epaint a mesh.  Default `false`: it needs a GL 3 context and
+    /// bypasses the renderer every other panel goes through, so an
+    /// unmodified config keeps the path that has always drawn the grid.  A
+    /// context too old for instanced arrays logs once and paints the mesh
+    /// from the next frame on.
+    gpu_grid: Option<bool>,
     /// Poll `gh` for each branch's open pull request, which drives the PR row
     /// icons, the PR-state filters, and `$pr` in row templates.
     pr_status: Option<bool>,
@@ -2210,6 +2239,7 @@ impl RawConfig {
                 sidebar_always: self.ui.session_display.sidebar_always.unwrap_or(false),
                 tabs_always: self.ui.session_display.tabs_always.unwrap_or(false),
             },
+            gpu_grid: self.ui.gpu_grid.unwrap_or(false),
             pr_status: self.ui.pr_status.unwrap_or(false),
             upstream_status: self.ui.upstream_status.unwrap_or(false),
             worktree_liveness: self.ui.worktree_liveness.unwrap_or(true),
@@ -2421,6 +2451,7 @@ impl RawConfig {
             debug: DebugConfig {
                 crash_log: self.debug.crash_log.unwrap_or(true),
                 persistent_logging: self.debug.persistent_logging.unwrap_or(false),
+                gpu_timing: self.debug.gpu_timing.unwrap_or(false),
             },
             working_directory: self
                 .general
@@ -3590,6 +3621,15 @@ program = "second"
         let raw: RawConfig = toml::from_str("[debug]\npersistent_logging = true").unwrap();
 
         assert!(raw.into_config().debug.persistent_logging);
+    }
+
+    #[test]
+    fn gpu_timing_is_off_unless_asked_for() {
+        let off: RawConfig = toml::from_str("").unwrap();
+        let on: RawConfig = toml::from_str("[debug]\ngpu_timing = true").unwrap();
+
+        assert!(!off.into_config().debug.gpu_timing);
+        assert!(on.into_config().debug.gpu_timing);
     }
 
     /// `[debug]` in both files merges key by key rather than the later table
