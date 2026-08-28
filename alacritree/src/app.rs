@@ -1107,8 +1107,12 @@ impl AlacritreeApp {
         ctx: &Context,
         working_directory: WorkspaceKey,
     ) -> std::io::Result<SessionId> {
+        let started = Instant::now();
         let (shell, wsl_probe) = self.resolve_shell(&working_directory);
-        self.spawn_session_with_shell(ctx, working_directory, shell, wsl_probe)
+        crate::frame_log::spawn_phase(None, "resolve", started.elapsed());
+        let id = self.spawn_session_with_shell(ctx, working_directory, shell, wsl_probe);
+        crate::frame_log::spawn_phase(id.as_ref().ok().copied(), "open", started.elapsed());
+        id
     }
 
     /// The one path every shell reaches, which is why the checkout guard and

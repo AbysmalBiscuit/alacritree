@@ -2,6 +2,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -29,12 +30,32 @@ pub struct EventProxy {
     /// Whether this session's grid is the one on screen.  Read from the PTY
     /// thread on every event, written by the UI thread once per frame.
     visible: Arc<AtomicBool>,
+    /// Set once the PTY exists, so the first thing the child writes closes the
+    /// spawn measurement.  Empty unless `ALACRITREE_FRAME_LOG` asked for it.
+    first_output: Arc<OnceLock<crate::frame_log::FirstOutput>>,
 }
 
 impl EventProxy {
     pub fn new(ctx: egui::Context) -> (Self, mpsc::Receiver<TermEvent>) {
         let (sender, receiver) = mpsc::channel();
-        (Self { ctx, sender, visible: Arc::new(AtomicBool::new(true)) }, receiver)
+        let proxy = Self {
+            ctx,
+            sender,
+            visible: Arc::new(AtomicBool::new(true)),
+            first_output: Arc::new(OnceLock::new()),
+        };
+        (proxy, receiver)
+    }
+
+    /// Start the clock the child's first output closes.
+    ///
+    /// Called after the proxy has been cloned into the terminal and the event
+    /// loop, which is why the clock lives behind a shared cell rather than
+    /// arriving as a constructor argument.
+    fn watch_first_output(&self, session: u64, started: Instant) {
+        if let Some(clock) = crate::frame_log::FirstOutput::since(session, started) {
+            let _ = self.first_output.set(clock);
+        }
     }
 
     pub fn set_visible(&self, visible: bool) {
@@ -66,6 +87,9 @@ const SPINNER_COALESCE: Duration = Duration::from_millis(120);
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: TermEvent) {
+        if let Some(clock) = self.first_output.get() {
+            clock.note();
+        }
         // A hidden session's grid is not on screen, so a repaint for it would
         // redraw the *visible* session to the same pixels.  Nothing then
         // drains the channel either, which is why the payload-free events must
@@ -1157,6 +1181,7 @@ impl Session {
         escape_args: bool,
         wsl_probe: Option<WslProbe>,
     ) -> std::io::Result<Self> {
+        let started = Instant::now();
         let pty_cwd = pty_working_directory(working_directory.clone(), config);
         ensure_working_directory(pty_cwd.as_deref())?;
         let window_size = window_size(size, cell_size);
@@ -1195,9 +1220,13 @@ impl Session {
         #[cfg(windows)]
         let pty = crate::pty_rearm::RearmingPty::new(pty);
 
+        // Installed before anything reads the PTY, so a child that answers
+        // immediately cannot beat the clock into place.
+        proxy.watch_first_output(id, started);
         let event_loop = EventLoop::new(term.clone(), proxy.clone(), pty, false, false)?;
         let sender = event_loop.channel();
         event_loop.spawn();
+        crate::frame_log::spawn_phase(Some(id), "pty", started.elapsed());
 
         if let Some(probe) = &wsl_probe {
             wsl_helper::register_probe(&probe.distro, &probe.key);

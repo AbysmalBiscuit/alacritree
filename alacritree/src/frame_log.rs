@@ -16,7 +16,7 @@
 //! wakeup, and never allocates.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// How often the accumulated frames are summarized.
@@ -310,6 +310,56 @@ impl std::fmt::Debug for Reading {
         match self.0 {
             Some(value) => write!(f, "{value:?}"),
             None => f.write_str("-"),
+        }
+    }
+}
+
+/// Report one phase of opening a tab.
+///
+/// A tab that appears instantly and then sits blank splits into two halves
+/// that fail for unrelated reasons: everything before the PTY exists blocks
+/// the UI thread (an `is_dir` over 9p for a WSL path, the shell argv, the
+/// Doppler scope write), while everything after it is the child's own startup
+/// and nothing in this process can shorten it.  Naming the phase tells the
+/// two apart.
+///
+/// The session is named where it is already known, because the phase that
+/// waits on the child closes whenever the child gets around to answering —
+/// possibly after the next tab has already opened.
+pub fn spawn_phase(session: Option<u64>, phase: &str, elapsed: Duration) {
+    if !enabled() {
+        return;
+    }
+    let millis = elapsed.as_secs_f64() * 1000.0;
+    match session {
+        Some(id) => log::info!("spawn {phase} [{id}]: {millis:.1}ms"),
+        None => log::info!("spawn {phase}: {millis:.1}ms"),
+    }
+}
+
+/// A session's wait for its child to say anything.
+///
+/// Held by the session's `EventProxy`, so the PTY thread can close it without
+/// a handle on the session itself.
+pub struct FirstOutput {
+    session: u64,
+    started: Instant,
+    seen: AtomicBool,
+}
+
+impl FirstOutput {
+    /// A clock counting from `started`, or nothing when measurement is off.
+    pub fn since(session: u64, started: Instant) -> Option<Self> {
+        enabled().then(|| Self { session, started, seen: AtomicBool::new(false) })
+    }
+
+    /// Close the clock on the first event the session produces.
+    ///
+    /// Every later event costs one relaxed swap: the PTY thread calls this for
+    /// all of them, and only the first has anything to report.
+    pub fn note(&self) {
+        if !self.seen.swap(true, Ordering::Relaxed) {
+            spawn_phase(Some(self.session), "first-output", self.started.elapsed());
         }
     }
 }
