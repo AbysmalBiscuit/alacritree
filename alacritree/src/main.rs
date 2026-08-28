@@ -13,6 +13,7 @@ mod command_palette;
 mod config;
 mod crash_log;
 mod decoration_sprites;
+mod diag;
 mod digest;
 mod doppler;
 mod file_drop;

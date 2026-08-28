@@ -133,7 +133,7 @@ impl PrCache {
             entry.pending.is_some(),
         );
 
-        if spawn && may_spawn(self.concurrency, self.in_flight) {
+        if spawn && may_spawn(self.concurrency, self.in_flight) && !crate::diag::pause_jobs() {
             let rx = spawn_lookup(path.to_path_buf(), branch.to_string(), ctx.clone());
             self.bank_pending(path.to_path_buf(), branch, rx);
         }

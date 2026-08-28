@@ -557,6 +557,8 @@ pub struct AlacritreeApp {
     gpu_grid: crate::grid_gl::GpuGrid,
     /// Present only under `ALACRITREE_FRAME_LOG`; `None` is the normal run.
     frame_log: Option<crate::frame_log::FrameLog>,
+    /// Present only under `ALACRITREE_SYNTH_KEYS`; `None` is the normal run.
+    synth_keys: Option<crate::diag::SynthKeys>,
     phases: crate::frame_log::Phases,
     /// How much of the frame in progress went to painting the terminal grid,
     /// as opposed to the sidebars and everything else sharing it.
@@ -893,6 +895,7 @@ impl AlacritreeApp {
             grid_snapshot: crate::terminal_view::GridSnapshot::new(),
             gpu_grid: crate::grid_gl::GpuGrid::new(),
             frame_log: crate::frame_log::FrameLog::from_env(),
+            synth_keys: crate::diag::SynthKeys::from_env(),
             phases: crate::frame_log::Phases::new(),
             grid_paint: std::time::Duration::ZERO,
             project_refreshes: Default::default(),
@@ -987,7 +990,7 @@ impl AlacritreeApp {
     /// milliseconds on a project with many worktrees.
     fn refresh_project(&mut self, ctx: &Context, idx: usize) {
         let root = self.projects[idx].root.clone();
-        if self.project_refreshes.is_running(&root) {
+        if self.project_refreshes.is_running(&root) || crate::diag::pause_jobs() {
             return;
         }
         let (tx, rx) = mpsc::channel();
@@ -1040,7 +1043,7 @@ impl AlacritreeApp {
             None => {},
         }
 
-        if probing {
+        if probing && !crate::diag::pause_jobs() {
             let batch = self.liveness.batch(drawn);
             if batch.is_empty() {
                 // No worker will land to close the interval, so close it here.
@@ -4492,7 +4495,7 @@ impl AlacritreeApp {
             return Some(path.clone());
         }
 
-        if !self.pending_delta.contains_key(distro) {
+        if !self.pending_delta.contains_key(distro) && !crate::diag::pause_jobs() {
             let (tx, rx) = mpsc::channel();
             let distro_owned = distro.to_string();
             let ctx = ctx.clone();
@@ -8349,6 +8352,14 @@ fn session_json(session: &Session, is_active_tab: bool) -> Value {
 }
 
 impl eframe::App for AlacritreeApp {
+    /// Where the synthetic typist puts its characters, so they queue behind
+    /// the same frame wait a real keystroke does.
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if let Some(keys) = self.synth_keys.as_mut() {
+            keys.inject(ctx, raw_input);
+        }
+    }
+
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         // This clear is the only thing painting a cell the grid leaves alone,
         // so it has to carry the terminal's own background rather than the
@@ -8430,8 +8441,10 @@ impl eframe::App for AlacritreeApp {
 
         let panel_frame = Frame::default().fill(sidebar_fill).inner_margin(Margin::same(8));
 
+        let sidebars = !crate::diag::skip_sidebars();
+
         let mut sidebar_rect = None;
-        if self.show_left_sidebar {
+        if self.show_left_sidebar && sidebars {
             let r = self.show_project_sidebar(ctx, panel_frame.clone());
             paint_panel_border(ctx, r.right(), r.y_range(), theme.sidebar_border);
             if theme.focus_outline.sidebar
@@ -8445,7 +8458,7 @@ impl eframe::App for AlacritreeApp {
 
         self.phases.mark("projects-sidebar");
 
-        if self.show_right_sidebar {
+        if self.show_right_sidebar && sidebars {
             let r = self.show_git_sidebar(ctx, panel_frame);
             paint_panel_border(ctx, r.left(), r.y_range(), theme.sidebar_border);
             if theme.focus_outline.sidebar && !modal_open && self.focus == PaneFocus::GitSidebar {

@@ -74,7 +74,7 @@ impl EventListener for EventProxy {
         if !carries_payload(&event) {
             if self.visible.load(Ordering::Relaxed) {
                 crate::frame_log::output_arrived();
-                self.ctx.request_repaint();
+                crate::diag::request_output_repaint(&self.ctx);
             }
             return;
         }
@@ -87,7 +87,7 @@ impl EventListener for EventProxy {
         if spinner_frame {
             self.ctx.request_repaint_after(SPINNER_COALESCE);
         } else {
-            self.ctx.request_repaint();
+            crate::diag::request_output_repaint(&self.ctx);
         }
     }
 }

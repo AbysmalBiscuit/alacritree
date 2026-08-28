@@ -1282,6 +1282,11 @@ fn paint_grid_gpu(
     glyphs: &mut GlyphCache,
     ctx: &egui::Context,
 ) {
+    // Ablation: the cells stay unpainted, so the frame keeps its structure
+    // and loses only the grid.
+    if crate::diag::skip_grid() {
+        return;
+    }
     let default_bg = snapshot.default_bg(&config.palette);
     let size = config.font.egui_size();
     // Collected under the lock and drawn after it: painting needs the glyph
@@ -1414,6 +1419,9 @@ fn paint_grid(
     glyphs: &mut GlyphCache,
     ctx: &egui::Context,
 ) {
+    if crate::diag::skip_grid() {
+        return;
+    }
     let bg_color = snapshot.default_bg(&config.palette);
     // Every background goes down before any glyph does.  A background is an
     // opaque fill over the whole run, so painting one run at a time cuts off

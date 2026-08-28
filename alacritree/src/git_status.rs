@@ -209,7 +209,7 @@ impl StatusCache {
         let stale = self.last_refreshed.map_or(true, |when| when.elapsed() > REFRESH_INTERVAL);
         let needs_refresh = self.last_refreshed.is_none() || hint_changed || stale;
 
-        if needs_refresh && self.pending.is_none() {
+        if needs_refresh && self.pending.is_none() && !crate::diag::pause_git_poll() {
             self.pending = Some(spawn_compute(
                 self.path.clone(),
                 default_branch_hint.map(str::to_string),
