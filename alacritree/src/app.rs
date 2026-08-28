@@ -8593,7 +8593,6 @@ impl eframe::App for AlacritreeApp {
                 cpu: frame.info().cpu_usage.map(std::time::Duration::from_secs_f32),
                 waited,
                 echo: crate::frame_log::echo(),
-                pending: ctx.has_requested_repaint(),
             });
         }
     }

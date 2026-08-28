@@ -63,6 +63,7 @@ for arm in "$@"; do
 
   ALACRITREE_FRAME_LOG=1 \
   ALACRITREE_SYNTH_KEYS="$keys_every" \
+  ALACRITREE_SYNTH_DELAY="${SYNTH_DELAY:-30}" \
   ALACRITREE_ABLATE="$([ "$arm" = none ] && echo "" || echo "$arm")" \
     "$exe" &
   app="$!"

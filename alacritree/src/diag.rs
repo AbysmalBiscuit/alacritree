@@ -156,6 +156,7 @@ impl SynthKeys {
         let now = Instant::now();
         if now >= self.next {
             raw.events.push(egui::Event::Text("a".into()));
+            crate::frame_log::typist_late(now - self.next);
             self.next = now + self.interval;
         }
         ctx.request_repaint_after(self.next.saturating_duration_since(now));

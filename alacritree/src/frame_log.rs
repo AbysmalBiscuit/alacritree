@@ -220,16 +220,11 @@ pub struct Timings {
     pub cpu: Option<Duration>,
     pub waited: Option<Duration>,
     pub echo: Option<Duration>,
-    /// Whether a repaint was already asked for when `update` returned.  A gap
-    /// before the next frame only means starvation when this was true.
-    pub pending: bool,
 }
 
 pub struct FrameLog {
     samples: Samples,
     started_previous: Option<Instant>,
-    /// When the last frame returned, and whether it left a repaint pending.
-    ended_previous: Option<(Instant, bool)>,
     reported_at: Instant,
 }
 
@@ -240,31 +235,22 @@ impl FrameLog {
         enabled().then(|| Self {
             samples: Samples::default(),
             started_previous: None,
-            ended_previous: None,
+
             reported_at: Instant::now(),
         })
     }
 
     pub fn record(&mut self, frame: Timings) {
-        let Timings { started, grid, cpu, waited, echo, pending } = frame;
+        let Timings { started, grid, cpu, waited, echo } = frame;
         self.samples.totals.push(started.elapsed());
         self.samples.grids.push(grid);
         self.samples.cpus.extend(cpu);
         self.samples.waits.extend(waited);
         self.samples.echoes.extend(echo);
-        // A gap between two frames is only a symptom when the loop had already
-        // been asked to run: the wait then belongs to the scheduler or to
-        // present, since `update` had nothing left to do.
-        if let Some((ended, asked)) = self.ended_previous
-            && asked
-        {
-            self.samples.wakes.push(started.saturating_duration_since(ended));
-        }
+        self.samples.wakes.extend(take_typist_late());
         if let Some(previous) = self.started_previous.replace(started) {
             self.samples.periods.push(started.saturating_duration_since(previous));
         }
-
-        self.ended_previous = Some((Instant::now(), pending));
 
         if self.reported_at.elapsed() >= REPORT_EVERY {
             self.report();
@@ -300,7 +286,7 @@ impl FrameLog {
             "frames: {} in {:.1}s ({:.0}/s, {:.0}% of the thread) | total p50 {:?} p95 {:?} p99 \
              {:?} max {:?} | grid p50 {:?} p95 {:?} | period p50 {:?} p95 {:?} | render+update \
              p50 {:?} p95 {:?} | output waited p50 {:?} p95 {:?} max {:?} | echo n={} p50 {:?} \
-             p95 {:?} p99 {:?} | woke n={} p50 {:?} p95 {:?} max {:?}",
+             p95 {:?} p99 {:?} | typist late n={} p50 {:?} p95 {:?} max {:?}",
             totals.len(),
             elapsed.as_secs_f64(),
             totals.len() as f64 / elapsed.as_secs_f64(),
@@ -340,6 +326,29 @@ impl std::fmt::Debug for Reading {
             Some(value) => write!(f, "{value:?}"),
             None => f.write_str("-"),
         }
+    }
+}
+
+/// How late the frame carrying a synthetic keystroke ran.
+///
+/// The typist names the instant it wants its next frame, so the overshoot is
+/// the loop's own lateness with no ambiguity about what was asked for.
+/// `has_requested_repaint` cannot serve here: it is true for a repaint
+/// scheduled a second and a half away as much as for one wanted immediately.
+static TYPIST_LATE: AtomicU64 = AtomicU64::new(0);
+
+/// Note that a keystroke went out `late` after the frame that should have
+/// carried it was due.
+pub fn typist_late(late: Duration) {
+    if enabled() {
+        TYPIST_LATE.store(late.as_nanos().max(1) as u64, Ordering::Relaxed);
+    }
+}
+
+fn take_typist_late() -> Option<Duration> {
+    match TYPIST_LATE.swap(0, Ordering::Relaxed) {
+        0 => None,
+        nanos => Some(Duration::from_nanos(nanos)),
     }
 }
 
@@ -406,7 +415,7 @@ mod tests {
         FrameLog {
             samples: Samples::default(),
             started_previous: None,
-            ended_previous: None,
+
             reported_at: Instant::now(),
         }
     }
