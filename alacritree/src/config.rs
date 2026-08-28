@@ -963,6 +963,11 @@ pub struct UiTheme {
     /// it (so filter typing works without the focus shortcut).  Off by default
     /// so unmodified configs keep click-through-to-terminal behavior.
     pub sidebar_click_focus: bool,
+    /// `[ui] shell_priority_boost`: start each shell one scheduling class
+    /// above normal, so a build saturating the machine cannot starve the
+    /// prompt.  Off by default: everything the shell then starts inherits the
+    /// class.  Windows only.
+    pub shell_priority_boost: bool,
     /// `[ui] vsync`: block each present until the display's next refresh.  On
     /// by default, as upstream eframe has it.  Turning it off presents a
     /// finished frame immediately, trading tearing for the queueing delay
@@ -1012,6 +1017,7 @@ impl Default for UiTheme {
             focus_outline: FocusOutline::default(),
             scrollbar: ScrollbarStyle::Floating,
             sidebar_click_focus: false,
+            shell_priority_boost: false,
             vsync: true,
             worktree_name: None,
             project_name: None,
@@ -2074,6 +2080,10 @@ struct RawUi {
     focus_outline: RawFocusOutline,
     /// Clicking a sidebar moves keyboard focus to it.  Default false.
     sidebar_click_focus: Option<bool>,
+    /// Start each shell one scheduling class above normal so a busy machine
+    /// cannot starve the prompt.  Everything the shell starts inherits the
+    /// class.  Windows only.  Default false.
+    shell_priority_boost: Option<bool>,
     /// Wait for the display's refresh before showing a finished frame.
     /// Default true.
     vsync: Option<bool>,
@@ -2293,6 +2303,7 @@ impl RawConfig {
             },
             scrollbar: parse_scrollbar(self.ui.scrollbar.as_deref()),
             sidebar_click_focus: self.ui.sidebar_click_focus.unwrap_or(false),
+            shell_priority_boost: self.ui.shell_priority_boost.unwrap_or(false),
             vsync: self.ui.vsync.unwrap_or(true),
             worktree_name: self.ui.worktree_name.clone().filter(|t| !t.trim().is_empty()),
             project_name: self.ui.project_name.clone().filter(|t| !t.trim().is_empty()),
@@ -3373,6 +3384,18 @@ program = "second"
     #[test]
     fn sidebar_click_focus_defaults_off() {
         assert!(!ui_from_toml("").sidebar_click_focus);
+    }
+
+    /// A boosted shell outranks whatever else is running, and everything it
+    /// starts inherits that, so an unmodified config must never get it.
+    #[test]
+    fn shell_priority_boost_defaults_off() {
+        assert!(!ui_from_toml("").shell_priority_boost);
+    }
+
+    #[test]
+    fn shell_priority_boost_parses() {
+        assert!(ui_from_toml("[ui]\nshell_priority_boost = true").shell_priority_boost);
     }
 
     #[test]

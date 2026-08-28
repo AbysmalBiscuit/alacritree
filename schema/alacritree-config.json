@@ -1061,6 +1061,10 @@
           "$ref": "#/$defs/RawSessionDisplay",
           "description": "Whether per-session rows and tabs appear before a workspace has two\nsessions."
         },
+        "shell_priority_boost": {
+          "description": "Start each shell one scheduling class above normal so a busy machine\ncannot starve the prompt.  Everything the shell starts inherits the\nclass.  Windows only.  Default false.",
+          "type": "boolean"
+        },
         "sidebar_accent": {
           "anyOf": [
             {

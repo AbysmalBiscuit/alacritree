@@ -1218,6 +1218,11 @@ impl Session {
         let shell_pid = pty_shell_pid(&pty);
 
         #[cfg(windows)]
+        if config.ui.shell_priority_boost {
+            crate::shell_priority::boost(pty.child_watcher().raw_handle());
+        }
+
+        #[cfg(windows)]
         let pty = crate::pty_rearm::RearmingPty::new(pty);
 
         // Installed before anything reads the PTY, so a child that answers

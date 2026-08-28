@@ -47,6 +47,8 @@ mod pty_rearm;
 mod row_label;
 mod scratchpad;
 mod session;
+#[cfg(windows)]
+mod shell_priority;
 mod sidebar_focus;
 mod sidebar_nav;
 mod stale_exe;

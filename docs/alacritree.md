@@ -383,6 +383,16 @@ vsync              = true   # restart required — wait for the display's refres
                             # before showing a finished frame (default true).
                             # false presents each frame as soon as it is drawn,
                             # trading tearing for lower keystroke-to-screen delay
+shell_priority_boost = false  # Windows only — start each shell one scheduling
+                              # class above normal (default false). A shell
+                              # that redraws its prompt line as you type needs
+                              # CPU for every keystroke, and at normal priority
+                              # a build saturating every core starves it:
+                              # nushell echoed in 10 ms boosted, where it took
+                              # up to 1.9 s unboosted. Everything the shell
+                              # then starts inherits the class, so a build
+                              # launched from a boosted session outranks the
+                              # rest of the desktop for its whole life
 search_scope       = "filtered"  # whether a sidebar search is confined by the
                                  # active toggle filters
                                  # "filtered" (default): a query narrows what
