@@ -156,7 +156,7 @@ fn main() -> eframe::Result<()> {
 
     wsl::set_automount_root(config.wsl_automount_root.clone());
     wsl_helper::set_enabled(config.wsl_resident_helper);
-    let translucent = config.window.opacity < 1.0;
+    let translucent = config.window.opacity < 1.0 && !diag::skip_translucency();
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1280.0, 800.0])
@@ -167,8 +167,11 @@ fn main() -> eframe::Result<()> {
         viewport = viewport.with_icon(icon);
     }
 
-    let native_options =
-        eframe::NativeOptions { viewport, vsync: config.ui.vsync, ..Default::default() };
+    let native_options = eframe::NativeOptions {
+        viewport,
+        vsync: config.ui.vsync && !diag::skip_vsync(),
+        ..Default::default()
+    };
 
     let result = eframe::run_native(
         "Alacritree",

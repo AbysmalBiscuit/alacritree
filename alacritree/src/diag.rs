@@ -14,6 +14,7 @@
 //! ```text
 //! ALACRITREE_ABLATE=sidebars,gitpoll   drop both from the frame
 //! ALACRITREE_ABLATE=repaint=8          coalesce output-driven repaints to 8ms
+//! ALACRITREE_ABLATE=vsync,translucency swap unsynchronised, window opaque
 //! ALACRITREE_SYNTH_KEYS=50             type one character every 50ms
 //! ```
 
@@ -27,6 +28,8 @@ struct Switches {
     sidebars: bool,
     jobs: bool,
     git_poll: bool,
+    vsync: bool,
+    translucency: bool,
     /// Shortest gap between two repaints asked for by arriving output.
     repaint: Option<Duration>,
 }
@@ -51,6 +54,8 @@ fn switches() -> &'static Switches {
                     switches.git_poll = true;
                 },
                 "gitpoll" => switches.git_poll = true,
+                "vsync" => switches.vsync = true,
+                "translucency" => switches.translucency = true,
                 "repaint" => {
                     switches.repaint = value.parse().ok().map(Duration::from_millis);
                 },
@@ -80,6 +85,25 @@ pub fn pause_jobs() -> bool {
 /// Whether the git status poller should stay unspawned.
 pub fn pause_git_poll() -> bool {
     switches().git_poll
+}
+
+/// Whether the swap should be left unsynchronised.
+///
+/// A painted frame is only handed to the compositor by the swap, and on
+/// Windows that hand-off blocks.  Taking it away separates a loop waiting for
+/// the screen from one waiting to be woken, which timings taken inside the
+/// process cannot: eframe stops its own clock across the swap.
+pub fn skip_vsync() -> bool {
+    switches().vsync
+}
+
+/// Whether the window should open opaque whatever opacity was configured.
+///
+/// A translucent window reaches the screen by a different path through DWM, so
+/// it has to be removable on its own before a slow swap can be blamed on the
+/// swap rather than on the alpha.
+pub fn skip_translucency() -> bool {
+    switches().translucency
 }
 
 /// When the last output-driven repaint was asked for, as nanoseconds since
