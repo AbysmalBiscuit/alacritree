@@ -354,6 +354,7 @@ fn main() {
     let mut keys = 40usize;
     let mut spawn_rounds = 3usize;
     let mut dump = false;
+    let mut hold: Option<u64> = None;
     let mut it = argv.iter();
     while let Some(arg) = it.next() {
         let mut value = || it.next().cloned().unwrap_or_default();
@@ -373,6 +374,11 @@ fn main() {
             "--keys" => keys = value().parse().unwrap_or(40),
             "--spawns" => spawn_rounds = value().parse().unwrap_or(3),
             "--dump" => dump = true,
+            // Load for someone else's measurement: hold the burners for this
+            // many seconds and measure nothing.  The burners have to be this
+            // process's children, or the pipe they watch is one nobody holds
+            // and they exit the moment they start.
+            "--hold" => hold = value().parse().ok(),
             "--quiet" => {
                 let ms = value().parse().unwrap_or(150);
                 QUIET.store(ms, std::sync::atomic::Ordering::Relaxed);
@@ -408,6 +414,11 @@ fn main() {
         .collect();
 
     let _burners = burners(load);
+    if let Some(seconds) = hold {
+        eprintln!("holding {load} burners for {seconds}s");
+        std::thread::sleep(Duration::from_secs(seconds));
+        return;
+    }
     if load > 0 {
         eprintln!("warming {load} burners");
         std::thread::sleep(Duration::from_secs(2));

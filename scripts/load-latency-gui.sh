@@ -44,11 +44,12 @@ trap cleanup EXIT INT TERM
 for arm in "$@"; do
   echo "=== ablate=$arm load=$load ==="
 
+  # One holder owns every burner.  Spawning them from here instead would give
+  # each an inherited stdin that is already at EOF, and the watchdog that
+  # stops them outliving a hard kill would then stop them immediately.
   burners=()
-  for _ in $(seq "$load"); do
-    "$probe" --burn &
-    burners+=("$!")
-  done
+  "$probe" --load "$load" --hold "$((seconds + 30))" &
+  burners+=("$!")
   # The report covers five-second windows, so the first one has to land after
   # the load is already steady or it averages the ramp in.
   sleep 3
