@@ -208,6 +208,7 @@ struct Samples {
     cpus: Vec<Duration>,
     waits: Vec<Duration>,
     echoes: Vec<Duration>,
+    wakes: Vec<Duration>,
 }
 
 /// One frame's readings, gathered across `update` and handed over at the end.
@@ -219,11 +220,16 @@ pub struct Timings {
     pub cpu: Option<Duration>,
     pub waited: Option<Duration>,
     pub echo: Option<Duration>,
+    /// Whether a repaint was already asked for when `update` returned.  A gap
+    /// before the next frame only means starvation when this was true.
+    pub pending: bool,
 }
 
 pub struct FrameLog {
     samples: Samples,
     started_previous: Option<Instant>,
+    /// When the last frame returned, and whether it left a repaint pending.
+    ended_previous: Option<(Instant, bool)>,
     reported_at: Instant,
 }
 
@@ -234,20 +240,31 @@ impl FrameLog {
         enabled().then(|| Self {
             samples: Samples::default(),
             started_previous: None,
+            ended_previous: None,
             reported_at: Instant::now(),
         })
     }
 
     pub fn record(&mut self, frame: Timings) {
-        let Timings { started, grid, cpu, waited, echo } = frame;
+        let Timings { started, grid, cpu, waited, echo, pending } = frame;
         self.samples.totals.push(started.elapsed());
         self.samples.grids.push(grid);
         self.samples.cpus.extend(cpu);
         self.samples.waits.extend(waited);
         self.samples.echoes.extend(echo);
+        // A gap between two frames is only a symptom when the loop had already
+        // been asked to run: the wait then belongs to the scheduler or to
+        // present, since `update` had nothing left to do.
+        if let Some((ended, asked)) = self.ended_previous
+            && asked
+        {
+            self.samples.wakes.push(started.saturating_duration_since(ended));
+        }
         if let Some(previous) = self.started_previous.replace(started) {
             self.samples.periods.push(started.saturating_duration_since(previous));
         }
+
+        self.ended_previous = Some((Instant::now(), pending));
 
         if self.reported_at.elapsed() >= REPORT_EVERY {
             self.report();
@@ -257,8 +274,15 @@ impl FrameLog {
     fn report(&mut self) {
         let elapsed = self.reported_at.elapsed();
         self.reported_at = Instant::now();
-        let Samples { mut totals, mut grids, mut periods, mut cpus, mut waits, mut echoes } =
-            std::mem::take(&mut self.samples);
+        let Samples {
+            mut totals,
+            mut grids,
+            mut periods,
+            mut cpus,
+            mut waits,
+            mut echoes,
+            mut wakes,
+        } = std::mem::take(&mut self.samples);
         if totals.is_empty() {
             return;
         }
@@ -269,13 +293,14 @@ impl FrameLog {
         cpus.sort_unstable();
         waits.sort_unstable();
         echoes.sort_unstable();
+        wakes.sort_unstable();
         let spent: Duration = totals.iter().sum();
 
         log::info!(
             "frames: {} in {:.1}s ({:.0}/s, {:.0}% of the thread) | total p50 {:?} p95 {:?} p99 \
              {:?} max {:?} | grid p50 {:?} p95 {:?} | period p50 {:?} p95 {:?} | render+update \
              p50 {:?} p95 {:?} | output waited p50 {:?} p95 {:?} max {:?} | echo n={} p50 {:?} \
-             p95 {:?} p99 {:?}",
+             p95 {:?} p99 {:?} | woke n={} p50 {:?} p95 {:?} max {:?}",
             totals.len(),
             elapsed.as_secs_f64(),
             totals.len() as f64 / elapsed.as_secs_f64(),
@@ -297,6 +322,10 @@ impl FrameLog {
             Reading(quantile(&echoes, 0.50)),
             Reading(quantile(&echoes, 0.95)),
             Reading(quantile(&echoes, 0.99)),
+            wakes.len(),
+            Reading(quantile(&wakes, 0.50)),
+            Reading(quantile(&wakes, 0.95)),
+            Reading(wakes.last().copied()),
         );
     }
 }
@@ -377,6 +406,7 @@ mod tests {
         FrameLog {
             samples: Samples::default(),
             started_previous: None,
+            ended_previous: None,
             reported_at: Instant::now(),
         }
     }

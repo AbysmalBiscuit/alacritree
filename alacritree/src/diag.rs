@@ -128,13 +128,22 @@ pub struct SynthKeys {
 
 impl SynthKeys {
     /// A typist if `ALACRITREE_SYNTH_KEYS` names an interval in milliseconds,
-    /// otherwise nothing.
+    /// otherwise nothing.  `ALACRITREE_SYNTH_DELAY` holds it back for that many
+    /// seconds first.
+    ///
+    /// The delay is what separates typing from typing-at-a-shell-that-is-still-
+    /// starting.  Under load the second takes seconds, and a typist that begins
+    /// with the window measures it as though it were the round trip.
     pub fn from_env() -> Option<Self> {
         let raw = std::env::var("ALACRITREE_SYNTH_KEYS").ok()?;
         let millis: u64 = raw.trim().parse().ok()?;
         let interval = Duration::from_millis(millis.max(1));
-        log::info!("synthesizing a keystroke every {interval:?}");
-        Some(Self { interval, next: Instant::now() + interval })
+        let delay = std::env::var("ALACRITREE_SYNTH_DELAY")
+            .ok()
+            .and_then(|raw| raw.trim().parse().ok())
+            .map_or(interval, Duration::from_secs);
+        log::info!("synthesizing a keystroke every {interval:?}, starting in {delay:?}");
+        Some(Self { interval, next: Instant::now() + delay })
     }
 
     /// Add this frame's keystroke, if one is due.
