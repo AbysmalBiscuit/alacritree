@@ -15,7 +15,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::process::{Child, Command};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -33,7 +33,15 @@ use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
 mod pty_rearm;
 
 /// Output stops arriving for this long once the child has finished answering.
-const QUIET: Duration = Duration::from_millis(150);
+///
+/// Raise it for a loaded run: a starved child can pause mid-answer for longer
+/// than an idle one takes to finish, and a window too narrow then closes the
+/// settle early and bills the leftovers to the next keystroke.
+static QUIET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(150);
+
+fn quiet() -> Duration {
+    Duration::from_millis(QUIET.load(std::sync::atomic::Ordering::Relaxed))
+}
 
 /// A shell's own startup pauses for longer than a keystroke's answer does —
 /// nushell's config shells out to `mise` — so declaring the prompt ready needs
@@ -91,6 +99,8 @@ struct Arm {
     label: String,
     program: String,
     args: Vec<String>,
+    /// A line run once at the settled prompt, before the sample opens.
+    setup: Option<String>,
     firsts: Vec<Duration>,
     readys: Vec<Duration>,
     echoes: Vec<Duration>,
@@ -161,7 +171,7 @@ fn spawn(program: &str, args: &[String]) -> std::io::Result<(Live, Spawned)> {
 /// Drain until the child stops producing, so the next keystroke is measured
 /// against a settled prompt rather than against the tail of the last one.
 fn settle(live: &Live) {
-    while live.events.recv_timeout(QUIET).is_ok() {}
+    while live.events.recv_timeout(quiet()).is_ok() {}
 }
 
 /// The non-blank lines of the grid, so a run can be checked against a real
@@ -204,9 +214,52 @@ fn echo(live: &Live) -> Option<Duration> {
     }
 }
 
+/// A round trip with no child process in it.
+///
+/// One thread answers on a channel the way a PTY thread does, so this pays
+/// the same two context switches and none of the shell.  Under load it is the
+/// control that decides whether the probe is measuring starved children or
+/// its own starved threads: if this degrades as much as the shells do, the
+/// shell numbers say nothing about shells.
+struct Control {
+    ask: Sender<Instant>,
+    answer: Receiver<Instant>,
+}
+
+impl Control {
+    fn new() -> Self {
+        let (ask, asked) = mpsc::channel::<Instant>();
+        let (answered, answer) = mpsc::channel();
+        std::thread::spawn(move || {
+            while asked.recv().is_ok() {
+                if answered.send(Instant::now()).is_err() {
+                    return;
+                }
+            }
+        });
+        Self { ask, answer }
+    }
+
+    fn round_trip(&self) -> Option<Duration> {
+        let at = Instant::now();
+        self.ask.send(at).ok()?;
+        self.answer.recv_timeout(PATIENCE).ok().map(|back| back - at)
+    }
+}
+
 /// Busy loop in a child process, so the load sits outside the process under
 /// test the way a build inside a terminal does.
 fn burn() -> ! {
+    // The parent holds the write end of this pipe.  Killing the parent hard
+    // skips every destructor it owns, including the one that reaps these, so
+    // a burner that does not notice on its own outlives the run and quietly
+    // eats a core until someone spots it in the task list.
+    std::thread::spawn(|| {
+        let mut byte = [0u8; 1];
+        let _ = std::io::stdin().read(&mut byte);
+        std::process::exit(0);
+    });
+
     let mut state: u64 = 1;
     loop {
         for _ in 0..4096 {
@@ -231,7 +284,7 @@ fn burners(count: usize) -> Burners {
     let exe = std::env::current_exe().expect("current exe");
     let mut children = Vec::new();
     for _ in 0..count {
-        match Command::new(&exe).arg("--burn").spawn() {
+        match Command::new(&exe).arg("--burn").stdin(std::process::Stdio::piped()).spawn() {
             Ok(child) => children.push(child),
             Err(err) => eprintln!("burner failed to start: {err}"),
         }
@@ -253,7 +306,7 @@ fn ms(d: Duration) -> f64 {
 fn report(arms: &[Arm], load: usize) {
     println!("\nload={load} burners");
     println!(
-        "{:<22} {:>4} {:>9} {:>9} {:>9} {:>4} {:>10} {:>10} {:>10} {:>10}",
+        "{:<34} {:>4} {:>9} {:>9} {:>9} {:>4} {:>10} {:>10} {:>10} {:>10}",
         "arm",
         "n",
         "echo p50",
@@ -273,7 +326,7 @@ fn report(arms: &[Arm], load: usize) {
         firsts.sort_unstable();
         readys.sort_unstable();
         println!(
-            "{:<22} {:>4} {:>8.1}ms {:>8.1}ms {:>8.1}ms {:>4} {:>9.1}ms {:>9.1}ms {:>9.1}ms \
+            "{:<34} {:>4} {:>8.1}ms {:>8.1}ms {:>8.1}ms {:>4} {:>9.1}ms {:>9.1}ms {:>9.1}ms \
              {:>9.1}ms{}",
             arm.label,
             echoes.len(),
@@ -296,7 +349,7 @@ fn main() {
         burn();
     }
 
-    let mut shells: Vec<String> = Vec::new();
+    let mut shells: Vec<(String, Option<String>)> = Vec::new();
     let mut load = 0usize;
     let mut keys = 40usize;
     let mut spawn_rounds = 3usize;
@@ -305,28 +358,47 @@ fn main() {
     while let Some(arg) = it.next() {
         let mut value = || it.next().cloned().unwrap_or_default();
         match arg.as_str() {
-            "--shell" => shells.push(value()),
+            "--shell" => shells.push((value(), None)),
+            // Changing one setting in a shell that is already running beats
+            // running two configs: the arms then differ in that setting and
+            // in nothing else, not even startup.
+            "--setup" => {
+                let line = value();
+                match shells.last_mut() {
+                    Some(shell) => shell.1 = Some(line),
+                    None => eprintln!("--setup before any --shell"),
+                }
+            },
             "--load" => load = value().parse().unwrap_or(0),
             "--keys" => keys = value().parse().unwrap_or(40),
             "--spawns" => spawn_rounds = value().parse().unwrap_or(3),
             "--dump" => dump = true,
+            "--quiet" => {
+                let ms = value().parse().unwrap_or(150);
+                QUIET.store(ms, std::sync::atomic::Ordering::Relaxed);
+            },
             other => eprintln!("ignoring {other}"),
         }
     }
     if shells.is_empty() {
-        shells.push("cmd.exe".into());
+        shells.push(("cmd.exe".into(), None));
     }
 
     let mut arms: Vec<Arm> = shells
         .iter()
-        .map(|spec| {
+        .map(|(spec, setup)| {
             let mut parts = spec.split_whitespace().map(str::to_string);
             let program = parts.next().unwrap_or_default();
             let args: Vec<String> = parts.collect();
+            let label = match setup {
+                Some(line) => format!("{spec} | {line}"),
+                None => spec.clone(),
+            };
             Arm {
-                label: spec.clone(),
+                label,
                 program,
                 args,
+                setup: setup.clone(),
                 firsts: Vec::new(),
                 readys: Vec::new(),
                 echoes: Vec::new(),
@@ -363,6 +435,10 @@ fn main() {
         match spawn(&arm.program, &arm.args) {
             Ok((session, _)) => {
                 settle(&session);
+                if let Some(line) = &arm.setup {
+                    session.notifier.notify(format!("{line}\r").into_bytes());
+                    settle(&session);
+                }
                 if dump {
                     eprintln!("--- {} grid ---\n{}", arm.label, screen(&session));
                 }
@@ -375,7 +451,28 @@ fn main() {
         }
     }
 
+    let control = Control::new();
+    let mut control_arm = Arm {
+        label: "(no child, threads only)".into(),
+        program: String::new(),
+        args: Vec::new(),
+        setup: None,
+        firsts: Vec::new(),
+        readys: Vec::new(),
+        echoes: Vec::new(),
+        timeouts: 0,
+    };
+
     for key in 0..keys + WARMUP_KEYS {
+        // Sampled alongside the shells rather than before them, so it sees the
+        // same load at the same moment.
+        let control_took = control.round_trip();
+        if key >= WARMUP_KEYS {
+            match control_took {
+                Some(took) => control_arm.echoes.push(took),
+                None => control_arm.timeouts += 1,
+            }
+        }
         for (arm, session) in arms.iter_mut().zip(&live) {
             let Some(session) = session else { continue };
             let took = echo(session);
@@ -400,5 +497,6 @@ fn main() {
         }
     }
 
+    arms.insert(0, control_arm);
     report(&arms, load);
 }
