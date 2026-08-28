@@ -355,6 +355,7 @@ fn main() {
     let mut spawn_rounds = 3usize;
     let mut dump = false;
     let mut hold: Option<u64> = None;
+    let mut priority: Option<u32> = None;
     let mut it = argv.iter();
     while let Some(arg) = it.next() {
         let mut value = || it.next().cloned().unwrap_or_default();
@@ -374,6 +375,20 @@ fn main() {
             "--keys" => keys = value().parse().unwrap_or(40),
             "--spawns" => spawn_rounds = value().parse().unwrap_or(3),
             "--dump" => dump = true,
+            // Children inherit the priority class in force when they are
+            // created, so raising it here, after the burners already exist, is
+            // what the app would do to the shell it spawns and to nothing else.
+            "--priority" => {
+                priority = match value().as_str() {
+                    "above" => Some(0x0000_8000),
+                    "high" => Some(0x0000_0080),
+                    "below" => Some(0x0000_4000),
+                    other => {
+                        eprintln!("unknown priority {other}");
+                        None
+                    },
+                }
+            },
             // Load for someone else's measurement: hold the burners for this
             // many seconds and measure nothing.  The burners have to be this
             // process's children, or the pipe they watch is one nobody holds
@@ -418,6 +433,16 @@ fn main() {
         eprintln!("holding {load} burners for {seconds}s");
         std::thread::sleep(Duration::from_secs(seconds));
         return;
+    }
+    if let Some(class) = priority {
+        #[cfg(windows)]
+        unsafe {
+            use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetPriorityClass};
+            if SetPriorityClass(GetCurrentProcess(), class) == 0 {
+                eprintln!("SetPriorityClass refused {class:#x}");
+            }
+        }
+        eprintln!("shells spawn at priority class {class:#x}");
     }
     if load > 0 {
         eprintln!("warming {load} burners");

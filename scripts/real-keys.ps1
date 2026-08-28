@@ -26,7 +26,7 @@ Add-Type -Namespace Win -Name Input -MemberDefinition @'
 }
 // Size is stated rather than inferred: only the keyboard arm of the union is
 // declared here, and without it the struct measures 32 bytes where the real
-// INPUT is 40 — the mouse arm is the larger one.  SendInput checks the size it
+// INPUT is 40 - the mouse arm is the larger one.  SendInput checks the size it
 // is handed against its own and refuses every call that disagrees.
 [StructLayout(LayoutKind.Explicit, Size = 40)] public struct INPUT {
   [FieldOffset(0)] public uint type;
