@@ -331,17 +331,14 @@ impl GlResources {
         let mut timers = self.timers.take();
         if let Some(timers) = &mut timers {
             timers.begin_frame(gl);
-            // Opened before the clear, which belongs to the frame but to no
-            // stage, and so has never been counted anywhere.
             timers.begin_whole(gl);
         }
         unsafe {
-            // egui scissors the callback to its clip rect before handing over,
-            // so this reaches the grid and nothing around it.
-            let [r, g, b, a] = state.frame.default_bg;
-            gl.clear_color(r, g, b, a);
-            gl.clear(glow::COLOR_BUFFER_BIT);
-
+            // Nothing clears the grid's rect here.  eframe clears the whole
+            // framebuffer to the terminal's background before the callback
+            // runs, which is the colour a collapsed cell is supposed to show,
+            // and a second `glClear` under egui's scissor cost 100us and
+            // overwrote the alpha a translucent window needs.
             if let Some(timers) = &mut timers {
                 timers.begin(gl, gpu_timing::UPLOAD);
             }
@@ -505,10 +502,10 @@ impl GlResources {
     }
 
     /// The cell backgrounds, one instance per cell.  A cell still carrying
-    /// `default_bg` collapses in the vertex shader, because the clear already
-    /// painted the whole grid rect that colour; alacritty reaches the same end
-    /// by giving such a cell zero alpha and discarding it in the fragment
-    /// shader (`compute_bg_alpha`, `text.f.glsl`).
+    /// `default_bg` collapses in the vertex shader, because eframe's clear
+    /// already painted the whole framebuffer that colour; alacritty reaches the
+    /// same end by giving such a cell zero alpha and discarding it in the
+    /// fragment shader (`compute_bg_alpha`, `text.f.glsl`).
     unsafe fn draw_backgrounds(
         &self,
         gl: &glow::Context,
