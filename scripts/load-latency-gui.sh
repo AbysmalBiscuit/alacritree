@@ -13,6 +13,13 @@
 # keystrokes to reach the session, so nothing else may take it while a run is
 # in flight.
 #
+# The window opens before the load rather than underneath it.  The complaint is
+# about typing into a terminal that was already sitting there when a build
+# started; a window that has to create its GL context and start its shell under
+# saturation is a cold start, which is a different failure with a different
+# cause.  `SETTLE_SECONDS` is how long it gets to itself, and the typist is
+# held back for that plus the load's ramp.
+#
 # Every arm opens on GlazeWM workspace 1, tiled beside what is already there.
 # Grid size decides how much there is to paint, so a window that lands on
 # whatever workspace happened to be focused is a different measurement each
@@ -24,6 +31,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 exe="$here/../target/release/alacritree.exe"
 probe="$here/../target/release/examples/echo_probe.exe"
 seconds="${SECONDS_PER_ARM:-40}"
+settle="${SETTLE_SECONDS:-20}"
 keys_every="${KEYS_EVERY_MS:-60}"
 workspace="${GLAZE_WORKSPACE:-1}"
 logs="${LOCALAPPDATA:-$APPDATA}/alacritree"
@@ -41,19 +49,14 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# Anything the typist sends before the load is up lands on an idle machine, so
+# it waits out the settle and the ramp together.
+quiet_for=$((settle + 3))
+
 for arm in "$@"; do
   echo "=== ablate=$arm load=$load ==="
 
-  # One holder owns every burner.  Spawning them from here instead would give
-  # each an inherited stdin that is already at EOF, and the watchdog that
-  # stops them outliving a hard kill would then stop them immediately.
   burners=()
-  "$probe" --load "$load" --hold "$((seconds + 30))" &
-  burners+=("$!")
-  # The report covers five-second windows, so the first one has to land after
-  # the load is already steady or it averages the ramp in.
-  sleep 3
-
   before="$(ls -t "$logs"/alacritree-*.log 2>/dev/null | head -1 || true)"
 
   # A new window opens on whatever workspace has focus, so the focus moves
@@ -63,10 +66,23 @@ for arm in "$@"; do
 
   ALACRITREE_FRAME_LOG=1 \
   ALACRITREE_SYNTH_KEYS="$keys_every" \
-  ALACRITREE_SYNTH_DELAY="${SYNTH_DELAY:-30}" \
+  ALACRITREE_SYNTH_DELAY="$quiet_for" \
   ALACRITREE_ABLATE="$([ "$arm" = none ] && echo "" || echo "$arm")" \
     "$exe" &
   app="$!"
+
+  # Window up, GL context built, shell at its prompt, all on an idle machine —
+  # the state the terminal is in when a build starts.
+  sleep "$settle"
+
+  # One holder owns every burner.  Spawning them from here instead would give
+  # each an inherited stdin that is already at EOF, and the watchdog that
+  # stops them outliving a hard kill would then stop them immediately.
+  "$probe" --load "$load" --hold "$((seconds + 30))" &
+  burners+=("$!")
+  # The report covers five-second windows, so the first one has to land after
+  # the load is already steady or it averages the ramp in.
+  sleep 3
 
   sleep "$seconds"
   kill "$app" 2>/dev/null || true
@@ -79,6 +95,7 @@ for arm in "$@"; do
     echo "  no new session log — is [debug] gpu_timing or persistent_logging on?"
     continue
   fi
-  # The first window still carries startup, so it is dropped.
-  rg -N "frames:" "$after" | tail -n +2 || echo "  no frame reports"
+  # Everything before the load is a different measurement, so the windows
+  # covering the settle go with the one carrying startup.
+  rg -N "frames:" "$after" | tail -n "+$((quiet_for / 5 + 1))" || echo "  no frame reports"
 done
