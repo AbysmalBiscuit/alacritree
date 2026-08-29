@@ -17,7 +17,6 @@ mod diag;
 mod digest;
 mod doppler;
 mod file_drop;
-#[cfg(windows)]
 mod focus_priority;
 mod fonts;
 mod frame_log;

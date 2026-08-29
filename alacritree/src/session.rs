@@ -198,8 +198,8 @@ pub struct Session {
     wsl_probe: Option<WslProbe>,
     /// Holds the shell and, as they are created, everything it starts, so
     /// focus can raise the whole tree in one call.  `None` unless
-    /// `[ui] focus_priority_boost` is on, or when the shell refused the job.
-    #[cfg(windows)]
+    /// `[ui] focus_priority_boost` is on, when the shell refused the job, and
+    /// always on platforms that have no boost.
     priority_job: Option<crate::focus_priority::PriorityJob>,
     notifier: Option<Notifier>,
     sender: Option<EventLoopSender>,
@@ -1145,7 +1145,6 @@ impl Session {
             shell_pid: None,
             agent_cache: Cell::new(AgentCache::default()),
             wsl_probe: None,
-            #[cfg(windows)]
             priority_job: None,
             notifier: None,
             sender: None,
@@ -1233,7 +1232,6 @@ impl Session {
         // Jobbed here rather than on focus: a process joins a job when it is
         // created, so anything the shell starts before the job exists escapes
         // it for its whole life.
-        #[cfg(windows)]
         let priority_job = shell_pid
             .filter(|_| config.ui.focus_priority_boost)
             .and_then(crate::focus_priority::PriorityJob::adopt);
@@ -1269,7 +1267,6 @@ impl Session {
             shell_pid,
             agent_cache: Cell::new(AgentCache::default()),
             wsl_probe,
-            #[cfg(windows)]
             priority_job,
             notifier: Some(Notifier(sender.clone())),
             sender: Some(sender),
@@ -1290,7 +1287,6 @@ impl Session {
     /// boost.  A session with no job holds nothing and always answers false.
     /// Only the session the user is typing into may be raised; see
     /// `app::process_session_events`.
-    #[cfg(windows)]
     pub fn set_priority_boost(&self, boosted: bool) -> bool {
         let Some(job) = &self.priority_job else {
             return false;

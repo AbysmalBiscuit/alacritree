@@ -1,13 +1,9 @@
-//! Raise the session in front of the user above the load competing with it.
+//! The boost on Windows: a job object per session, the class following focus.
 //!
-//! A keystroke's round trip is mostly the program redrawing its own line, and
-//! a line editor that highlights and completes as you type spends milliseconds
-//! of CPU doing it.  At the same scheduling priority as a build saturating
-//! every core, that work waits: against 64 spinning threads a nushell prompt
+//! The measurement behind it: against 64 spinning threads a nushell prompt
 //! echoed a character in 128 ms at the median and 1.9 s at the 95th
 //! percentile, while the same PTY stack hosting `cmd.exe` — which answers from
-//! its own read loop and needs no CPU — stayed at 0.2 ms.  One class above the
-//! load restores the idle figure.
+//! its own read loop and needs no CPU — stayed at 0.2 ms.
 //!
 //! Windows does not spread the class on its own: `CreateProcess` gives a new
 //! process the normal class unless its creator is at *idle* or *below* normal,
@@ -19,10 +15,10 @@
 //! member joins the job and is *born* at the job's class.
 //!
 //! So a session owns a [`PriorityJob`] and focus moves the class between them.
-//! [`set_boosted`] is the single-process form, used on alacritree itself: the
-//! job covers every depth, so a focused tab running `cargo build -j16` raises
-//! all sixteen compilers, and a GUI left at normal would lose to the tree it
-//! is drawing.
+//! [`set_self_boosted`] covers alacritree's own process, which needs raising
+//! for the same reason: the job reaches every depth, so a focused tab running
+//! `cargo build -j16` raises all sixteen compilers, and a GUI left at normal
+//! would lose to the tree it is drawing.
 
 use std::cell::Cell;
 use std::io;
@@ -57,7 +53,7 @@ fn class(boosted: bool) -> u32 {
 /// Best effort by design.  A process that exits between being listed and being
 /// opened, or one this user may not touch, is skipped: the cost of missing it
 /// is the latency that was there anyway.
-pub fn set_boosted(pid: u32, boosted: bool) {
+fn set_boosted(pid: u32, boosted: bool) {
     let handle = unsafe { OpenProcess(PROCESS_SET_INFORMATION, 0, pid) };
     if handle.is_null() || handle == INVALID_HANDLE_VALUE {
         log::debug!("could not open {pid} to set its priority: {}", io::Error::last_os_error());
