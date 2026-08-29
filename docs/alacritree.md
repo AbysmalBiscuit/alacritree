@@ -383,16 +383,18 @@ vsync              = true   # restart required — wait for the display's refres
                             # before showing a finished frame (default true).
                             # false presents each frame as soon as it is drawn,
                             # trading tearing for lower keystroke-to-screen delay
-shell_priority_boost = false  # Windows only — start each shell one scheduling
-                              # class above normal (default false). A shell
-                              # that redraws its prompt line as you type needs
-                              # CPU for every keystroke, and at normal priority
-                              # a build saturating every core starves it:
-                              # nushell echoed in 10 ms boosted, where it took
-                              # up to 1.9 s unboosted. Everything the shell
-                              # then starts inherits the class, so a build
-                              # launched from a boosted session outranks the
-                              # rest of the desktop for its whole life
+shell_priority_boost = false  # Windows only — put the session on screen one
+                              # scheduling class above normal (default false).
+                              # A program that redraws its line as you type
+                              # needs CPU for every keystroke, and at normal
+                              # priority a build saturating every core starves
+                              # it: nushell echoed in 10 ms boosted, against up
+                              # to 1.9 s unboosted. Covers the shell and
+                              # whatever it started directly, so an agent
+                              # running in the session is raised too but that
+                              # agent's own helpers are not. Follows focus, and
+                              # covers nothing while the window is in the
+                              # background
 search_scope       = "filtered"  # whether a sidebar search is confined by the
                                  # active toggle filters
                                  # "filtered" (default): a query narrows what

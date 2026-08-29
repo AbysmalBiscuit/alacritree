@@ -1062,7 +1062,7 @@
           "description": "Whether per-session rows and tabs appear before a workspace has two\nsessions."
         },
         "shell_priority_boost": {
-          "description": "Start each shell one scheduling class above normal so a busy machine\ncannot starve the prompt.  Everything the shell starts inherits the\nclass.  Windows only.  Default false.",
+          "description": "Put the session on screen one scheduling class above normal — its\nshell, and whatever the shell started directly — so a busy machine\ncannot starve what the user is typing into.  Follows focus.  Windows\nonly.  Default false.",
           "type": "boolean"
         },
         "sidebar_accent": {

@@ -963,10 +963,11 @@ pub struct UiTheme {
     /// it (so filter typing works without the focus shortcut).  Off by default
     /// so unmodified configs keep click-through-to-terminal behavior.
     pub sidebar_click_focus: bool,
-    /// `[ui] shell_priority_boost`: start each shell one scheduling class
-    /// above normal, so a build saturating the machine cannot starve the
-    /// prompt.  Off by default: everything the shell then starts inherits the
-    /// class.  Windows only.
+    /// `[ui] shell_priority_boost`: put the session on screen one scheduling
+    /// class above normal — its shell, and whatever the shell started
+    /// directly — so a build saturating the machine cannot starve what the
+    /// user is typing into.  Follows focus, and covers nothing while the
+    /// window is in the background.  Off by default.  Windows only.
     pub shell_priority_boost: bool,
     /// `[ui] vsync`: block each present until the display's next refresh.  On
     /// by default, as upstream eframe has it.  Turning it off presents a
@@ -2080,9 +2081,10 @@ struct RawUi {
     focus_outline: RawFocusOutline,
     /// Clicking a sidebar moves keyboard focus to it.  Default false.
     sidebar_click_focus: Option<bool>,
-    /// Start each shell one scheduling class above normal so a busy machine
-    /// cannot starve the prompt.  Everything the shell starts inherits the
-    /// class.  Windows only.  Default false.
+    /// Put the session on screen one scheduling class above normal — its
+    /// shell, and whatever the shell started directly — so a busy machine
+    /// cannot starve what the user is typing into.  Follows focus.  Windows
+    /// only.  Default false.
     shell_priority_boost: Option<bool>,
     /// Wait for the display's refresh before showing a finished frame.
     /// Default true.
@@ -3386,8 +3388,8 @@ program = "second"
         assert!(!ui_from_toml("").sidebar_click_focus);
     }
 
-    /// A boosted shell outranks whatever else is running, and everything it
-    /// starts inherits that, so an unmodified config must never get it.
+    /// A boosted session outranks everything else the machine is doing, so an
+    /// unmodified config must never get it.
     #[test]
     fn shell_priority_boost_defaults_off() {
         assert!(!ui_from_toml("").shell_priority_boost);

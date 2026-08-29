@@ -6936,6 +6936,15 @@ impl AlacritreeApp {
         // treat unknown as "focused" so we don't pile up stale attention dots.
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
 
+        // Only the session on screen, and only while the window has focus:
+        // typing somewhere else is the one moment a terminal has no claim on
+        // the machine.
+        #[cfg(windows)]
+        if self.config.ui.shell_priority_boost {
+            let on_screen = visible_idx.filter(|_| focused).and_then(|i| self.sessions.get(i));
+            crate::session::set_boost_target(on_screen.and_then(Session::shell_pid));
+        }
+
         let grace = self.config.ui.attention_grace;
         for idx in 0..self.sessions.len() {
             // Window focus is deliberately not part of this: an unfocused
