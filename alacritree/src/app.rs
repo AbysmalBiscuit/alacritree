@@ -6938,11 +6938,20 @@ impl AlacritreeApp {
 
         // Only the session on screen, and only while the window has focus:
         // typing somewhere else is the one moment a terminal has no claim on
-        // the machine.
+        // the machine.  Both calls are no-ops unless they change something, so
+        // a frame where focus has not moved costs nothing.  Sessions with the
+        // feature off hold no job and ignore this entirely.
         #[cfg(windows)]
-        if self.config.ui.shell_priority_boost {
-            let on_screen = visible_idx.filter(|_| focused).and_then(|i| self.sessions.get(i));
-            crate::session::set_boost_target(on_screen.and_then(Session::shell_pid));
+        {
+            let target = visible_idx.filter(|_| focused);
+            let mut anything_raised = false;
+            for (idx, session) in self.sessions.iter().enumerate() {
+                anything_raised |= session.set_priority_boost(Some(idx) == target);
+            }
+            // A job covers every depth, so a focused tab running
+            // `cargo build -j16` raises all sixteen compilers.  The GUI left at
+            // normal would then lose to the tree it is drawing.
+            crate::focus_priority::set_self_boosted(anything_raised);
         }
 
         let grace = self.config.ui.attention_grace;

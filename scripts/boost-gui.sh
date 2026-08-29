@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Does `[ui] shell_priority_boost` fix typing latency in the real app?
+# Does `[ui] focus_priority_boost` fix typing latency in the real app?
 #
 # The headless probe already showed a boosted shell echoing in 10 ms where an
 # unboosted one took seconds, and the wiring check showed the option reaching
@@ -44,15 +44,22 @@ pipes() {
 }
 
 for arm in "$@"; do
-  echo "=== shell_priority_boost = $arm, $load burners ==="
+  echo "=== focus_priority_boost = $arm, $load burners ==="
   bench="$(mktemp -d)"
   cp -r "$APPDATA/alacritty" "$bench/"
   cfg="$bench/alacritty/alacritree.toml"
   # Inside the existing [ui] table rather than appended: a second [ui] header
   # is a duplicate key and the whole file fails to parse.
   if [ "$arm" = on ]; then
-    awk 'BEGIN{d=0} {print} /^\[ui\]/ && !d {print "shell_priority_boost = true"; d=1}' "$cfg" > "$cfg.new"
+    awk 'BEGIN{d=0} {print} /^\[ui\]/ && !d {print "focus_priority_boost = true"; d=1}' "$cfg" > "$cfg.new"
     mv "$cfg.new" "$cfg"
+    # With no [ui] header to insert after, the key never lands, and an unknown
+    # or misplaced key is dropped without a warning — the arm would measure the
+    # defaults against themselves and report that the boost changes nothing.
+    grep -q '^focus_priority_boost = true' "$cfg" || {
+      echo "  no [ui] table in $cfg; the on arm would test defaults" >&2
+      exit 1
+    }
   fi
 
   before="$(pipes)"

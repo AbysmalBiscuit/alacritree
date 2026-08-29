@@ -17,6 +17,8 @@ mod diag;
 mod digest;
 mod doppler;
 mod file_drop;
+#[cfg(windows)]
+mod focus_priority;
 mod fonts;
 mod frame_log;
 mod git_nav;
@@ -47,8 +49,6 @@ mod pty_rearm;
 mod row_label;
 mod scratchpad;
 mod session;
-#[cfg(windows)]
-mod shell_priority;
 mod sidebar_focus;
 mod sidebar_nav;
 mod stale_exe;

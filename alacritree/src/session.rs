@@ -196,6 +196,11 @@ pub struct Session {
     /// shim published, unregistered again on drop.  The Windows process
     /// table ends at wsl.exe, so this is the only live view inside.
     wsl_probe: Option<WslProbe>,
+    /// Holds the shell and, as they are created, everything it starts, so
+    /// focus can raise the whole tree in one call.  `None` unless
+    /// `[ui] focus_priority_boost` is on, or when the shell refused the job.
+    #[cfg(windows)]
+    priority_job: Option<crate::focus_priority::PriorityJob>,
     notifier: Option<Notifier>,
     sender: Option<EventLoopSender>,
     /// Shares this session's on-screen flag with the `EventProxy` its PTY
@@ -906,37 +911,17 @@ mod windows_process_probe {
         wanted: BTreeSet<u32>,
         published: BTreeMap<u32, Signals>,
         refresher_running: bool,
-        /// Shell of the session in front of the user, or `None` when nothing
-        /// should outrank the rest of the machine.
-        boost_target: Option<u32>,
     }
 
     static SHARED: Mutex<Shared> = Mutex::new(Shared {
         wanted: BTreeSet::new(),
         published: BTreeMap::new(),
         refresher_running: false,
-        boost_target: None,
     });
     /// Wakes the refresher when it is idling with nothing to scan.
     static WANTED: Condvar = Condvar::new();
 
-    /// Name the shell whose session is on screen and focused, so the next pass
-    /// raises it and its direct children and lowers whatever it raised before.
-    ///
-    /// Handled here rather than at spawn because a raise does not spread: an
-    /// agent started inside the shell is a separate process at the default
-    /// class, and only a pass over the process table can find it.
-    pub(super) fn set_boost_target(shell_pid: Option<u32>) {
-        let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
-        start_refresher(&mut shared);
-        if shared.boost_target != shell_pid {
-            shared.boost_target = shell_pid;
-            WANTED.notify_one();
-        }
-    }
-
-    /// The refresher is started by whoever needs it first — a sidebar asking
-    /// about a shell, or a focus change naming one to raise.
+    /// Started by the first sidebar to ask about a shell.
     fn start_refresher(shared: &mut Shared) {
         if shared.refresher_running {
             return;
@@ -974,20 +959,13 @@ mod windows_process_probe {
     fn refresh_loop() {
         let mut sys = System::new();
         let mut scanned = ScannedTrees::new();
-        let mut boosted: BTreeSet<u32> = BTreeSet::new();
         loop {
-            let (wanted, boost_target) = {
+            let wanted = {
                 let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
-                // A raised set has to be lowered again even once the sidebar
-                // stops asking, so an idle pass still runs while anything is
-                // boosted or a target is named.
-                while shared.wanted.is_empty()
-                    && shared.boost_target.is_none()
-                    && boosted.is_empty()
-                {
+                while shared.wanted.is_empty() {
                     shared = WANTED.wait(shared).unwrap_or_else(PoisonError::into_inner);
                 }
-                (std::mem::take(&mut shared.wanted), shared.boost_target)
+                std::mem::take(&mut shared.wanted)
             };
 
             // Everything below runs with no lock held: the UI thread must
@@ -1003,7 +981,6 @@ mod windows_process_probe {
                 .map(|(pid, p)| (pid.as_u32(), p.parent().map(|pp| pp.as_u32())))
                 .collect();
             let alive: BTreeSet<u32> = table.iter().map(|(pid, _)| *pid).collect();
-            apply_boost(&table, &alive, boost_target, &mut boosted);
             let published: BTreeMap<u32, Signals> = wanted
                 .iter()
                 .filter(|pid| alive.contains(pid))
@@ -1021,43 +998,6 @@ mod windows_process_probe {
             }
             std::thread::sleep(REFRESH_INTERVAL);
         }
-    }
-
-    /// The processes a boost covers: the shell, and whatever it started
-    /// directly.
-    ///
-    /// Depth one, deliberately.  The shell is what echoes a keystroke at a
-    /// prompt, and an agent running inside it is what echoes one at its own —
-    /// between them they are everything the user types into.  A build's
-    /// compilers sit a level further down and go on competing with the rest of
-    /// the machine on equal terms.
-    pub(super) fn boost_set(table: &[(u32, Option<u32>)], target: Option<u32>) -> BTreeSet<u32> {
-        let Some(shell) = target else {
-            return BTreeSet::new();
-        };
-        std::iter::once(shell)
-            .chain(table.iter().filter(|(_, ppid)| *ppid == Some(shell)).map(|(pid, _)| *pid))
-            .collect()
-    }
-
-    /// Move the boost onto `target`, lowering whatever it used to cover.
-    ///
-    /// A pid that has gone is skipped rather than lowered: its priority went
-    /// with it, and the number may belong to something else by now.
-    fn apply_boost(
-        table: &[(u32, Option<u32>)],
-        alive: &BTreeSet<u32>,
-        target: Option<u32>,
-        boosted: &mut BTreeSet<u32>,
-    ) {
-        let wanted = boost_set(table, target);
-        for pid in boosted.difference(&wanted).filter(|pid| alive.contains(pid)) {
-            crate::shell_priority::set_boosted(*pid, false);
-        }
-        for pid in wanted.difference(boosted) {
-            crate::shell_priority::set_boosted(*pid, true);
-        }
-        *boosted = wanted;
     }
 
     fn scan(
@@ -1113,17 +1053,6 @@ mod windows_process_probe {
     ) -> Option<Option<char>> {
         cache.get(&shell_pid).filter(|(scanned, _)| scanned == tree).map(|(_, glyph)| *glyph)
     }
-}
-
-/// Name the shell of the session the user is looking at, so it and the
-/// programs it started directly outrank the load; `None` lowers everything.
-///
-/// Applied on the process-probe thread, which already walks the process table
-/// on its own clock — the boost costs one pass over a table that was being
-/// built anyway.
-#[cfg(windows)]
-pub fn set_boost_target(shell_pid: Option<u32>) {
-    windows_process_probe::set_boost_target(shell_pid);
 }
 
 /// How a process inside a session names itself to `alacritree session move`
@@ -1216,6 +1145,8 @@ impl Session {
             shell_pid: None,
             agent_cache: Cell::new(AgentCache::default()),
             wsl_probe: None,
+            #[cfg(windows)]
+            priority_job: None,
             notifier: None,
             sender: None,
             proxy,
@@ -1299,6 +1230,14 @@ impl Session {
         let pty = tty::new(&pty_options, window_size, window_id)?;
         let shell_pid = pty_shell_pid(&pty);
 
+        // Jobbed here rather than on focus: a process joins a job when it is
+        // created, so anything the shell starts before the job exists escapes
+        // it for its whole life.
+        #[cfg(windows)]
+        let priority_job = shell_pid
+            .filter(|_| config.ui.focus_priority_boost)
+            .and_then(crate::focus_priority::PriorityJob::adopt);
+
         #[cfg(windows)]
         let pty = crate::pty_rearm::RearmingPty::new(pty);
 
@@ -1330,6 +1269,8 @@ impl Session {
             shell_pid,
             agent_cache: Cell::new(AgentCache::default()),
             wsl_probe,
+            #[cfg(windows)]
+            priority_job,
             notifier: Some(Notifier(sender.clone())),
             sender: Some(sender),
             proxy,
@@ -1342,6 +1283,20 @@ impl Session {
     /// background tab no longer costs a full repaint per chunk of output.
     pub fn set_visible(&self, visible: bool) {
         self.proxy.set_visible(visible);
+    }
+
+    /// Put this session's whole process tree one scheduling class above the
+    /// load, or return it to normal, and answer whether it now holds the
+    /// boost.  A session with no job holds nothing and always answers false.
+    /// Only the session the user is typing into may be raised; see
+    /// `app::process_session_events`.
+    #[cfg(windows)]
+    pub fn set_priority_boost(&self, boosted: bool) -> bool {
+        let Some(job) = &self.priority_job else {
+            return false;
+        };
+        job.set_boosted(boosted);
+        boosted
     }
 
     pub fn write(&self, bytes: Vec<u8>) {
@@ -1424,12 +1379,6 @@ impl Session {
     /// decide whether a `C:\` path has to be rewritten before a shell sees it.
     pub fn wsl_distro(&self) -> Option<&str> {
         self.wsl_probe.as_ref().map(|probe| probe.distro.as_str())
-    }
-
-    /// The PTY's own child.  Under ConPTY that is the shell, and everything the
-    /// user runs is somewhere beneath it.
-    pub fn shell_pid(&self) -> Option<u32> {
-        self.shell_pid
     }
 
     /// Sidebar glyph for the agent running here.  Identity comes from the
@@ -2607,37 +2556,5 @@ mod tests {
         user.insert("ALACRITREE_SESSION_ID".to_string(), "999".to_string());
         let env = session_env(&user, &SessionKind::Shell, 7);
         assert_eq!(env.get("ALACRITREE_SESSION_ID").map(String::as_str), Some("7"));
-    }
-}
-
-#[cfg(all(test, windows))]
-mod boost_tests {
-    use std::collections::BTreeSet;
-
-    use super::windows_process_probe::boost_set;
-
-    /// Depth one, and no further.  The shell answers a keystroke at a prompt
-    /// and the agent inside it answers one at its own; a compiler two levels
-    /// down is work the user is waiting on, not typing at, and it goes on
-    /// competing with the rest of the machine on equal terms.
-    #[test]
-    fn a_boost_reaches_the_shell_and_what_it_started() {
-        let table = vec![
-            (100, None),      // the shell
-            (200, Some(100)), // an agent running in it
-            (300, Some(200)), // that agent's own helper
-            (400, Some(999)), // another session entirely
-        ];
-
-        assert_eq!(boost_set(&table, Some(100)), BTreeSet::from([100, 200]));
-    }
-
-    /// An unfocused window names no target, and every process it had raised is
-    /// lowered on the next pass.
-    #[test]
-    fn no_target_reaches_nothing() {
-        let table = vec![(100, None), (200, Some(100))];
-
-        assert!(boost_set(&table, None).is_empty());
     }
 }
