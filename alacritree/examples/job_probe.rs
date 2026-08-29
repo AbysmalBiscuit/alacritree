@@ -8,51 +8,53 @@
 //! member join the job automatically — but only if ConPTY has not already
 //! claimed the child for a job of its own, which is what this asks.
 //!
+//! Job objects are a Windows facility and CI builds every target on Linux, so
+//! everything below is gated and the example is a message elsewhere.
+//!
 //! ```text
 //! cargo run -p alacritree --release --example job_probe
 //! ```
 
+#[cfg(windows)]
 use std::io::Write as _;
+#[cfg(windows)]
 use std::process::{Command, Stdio};
 
+#[cfg(windows)]
 use alacritty_terminal::event::WindowSize;
-use alacritty_terminal::grid::Dimensions;
+#[cfg(windows)]
 use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+#[cfg(windows)]
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_PRIORITY_CLASS,
     JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_BASIC_PROCESS_ID_LIST,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicProcessIdList,
     JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
 };
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
     ABOVE_NORMAL_PRIORITY_CLASS, GetPriorityClass, NORMAL_PRIORITY_CLASS, OpenProcess,
     PROCESS_QUERY_INFORMATION,
 };
 
+#[cfg(windows)]
 const COLS: u16 = 120;
+#[cfg(windows)]
 const LINES: u16 = 40;
 
-struct Size;
-
-impl Dimensions for Size {
-    fn total_lines(&self) -> usize {
-        LINES as usize
-    }
-
-    fn screen_lines(&self) -> usize {
-        LINES as usize
-    }
-
-    fn columns(&self) -> usize {
-        COLS as usize
-    }
+#[cfg(not(windows))]
+fn main() {
+    eprintln!("job_probe asks a question only Windows has an answer to");
 }
 
+#[cfg(windows)]
 fn last_error() -> String {
     std::io::Error::last_os_error().to_string()
 }
 
+#[cfg(windows)]
 fn class_of(pid: u32) -> String {
     let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid) };
     if handle.is_null() {
@@ -69,12 +71,15 @@ fn class_of(pid: u32) -> String {
 
 /// The pids the job currently holds.  A grandchild appearing here is the whole
 /// point: it means coverage costs no scanning.
+#[cfg(windows)]
 fn job_members(job: HANDLE) -> Vec<u32> {
     // The struct carries one pid inline; the rest are read past its end, so
     // the query gets a buffer sized for a plausible tree rather than the
-    // struct alone.
+    // struct alone.  A pid here is a `ULONG_PTR`, so the buffer is typed as
+    // one: it gives the header the alignment it wants, and the count of ids
+    // that fit is then just its length less the two-`u32` header.
     const ROOM: usize = 256;
-    let mut buffer = vec![0u32; ROOM];
+    let mut buffer = vec![0usize; ROOM];
     let bytes = std::mem::size_of_val(buffer.as_slice()) as u32;
     let ok = unsafe {
         QueryInformationJobObject(
@@ -93,11 +98,12 @@ fn job_members(job: HANDLE) -> Vec<u32> {
     let returned = header.NumberOfProcessIdsInList as usize;
     // `ProcessIdList` is declared as one element and continues past it.
     let list = unsafe {
-        std::slice::from_raw_parts(header.ProcessIdList.as_ptr(), returned.min(ROOM / 2))
+        std::slice::from_raw_parts(header.ProcessIdList.as_ptr(), returned.min(ROOM - 1))
     };
     list.iter().map(|&pid| pid as u32).collect()
 }
 
+#[cfg(windows)]
 fn main() {
     let shell = std::env::args().nth(1).unwrap_or_else(|| "cmd.exe".to_string());
 
