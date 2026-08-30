@@ -1522,6 +1522,8 @@ fn next_session_id() -> SessionId {
 }
 
 #[cfg(test)]
+// Fixtures drive real processes and wait on them; no frame is pending.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use std::sync::Mutex;
 
