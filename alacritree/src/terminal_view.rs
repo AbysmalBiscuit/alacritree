@@ -19,6 +19,7 @@ use crate::config::Config;
 use crate::fonts::{BOLD_FAMILY, BOLD_ITALIC_FAMILY, ITALIC_FAMILY};
 use crate::glyph_cache::{Face, GlyphCache, MAX_EXTRA_CELLS, growth_offset, may_grow};
 use crate::input::{associated_text, event_to_bytes};
+use crate::jobs;
 use crate::links::{self, Link};
 use crate::mouse;
 use crate::paste;
@@ -35,6 +36,7 @@ pub fn show(
     color_glyphs: &mut ColorGlyphCache,
     glyphs: &mut GlyphCache,
     snapshot: &mut GridSnapshot,
+    detached_jobs: &mut Vec<jobs::Job<()>>,
 ) -> Response {
     let font_id = FontId::monospace(config.font.egui_size());
     let (cell_w_pt, cell_h_pt) = ui.ctx().fonts(|f| {
@@ -109,6 +111,7 @@ pub fn show(
             cols,
             rows,
             peek.link.as_ref(),
+            detached_jobs,
         );
     }
     handle_wheel_scroll(ui, &response, session, config, rect, cell_w, cell_h, cols, rows, &peek);
@@ -322,6 +325,7 @@ fn handle_selection(
     cols: usize,
     rows: usize,
     hovered_link: Option<&Link>,
+    detached_jobs: &mut Vec<jobs::Job<()>>,
 ) {
     let primary = PointerButton::Primary;
     let secondary = PointerButton::Secondary;
@@ -423,7 +427,7 @@ fn handle_selection(
         // selection.  That matches alacritty's default URL hint, which fires
         // on release without any modifier.
         if let Some(link) = hovered_link {
-            links::open(&link.uri);
+            detached_jobs.push(links::open(&link.uri));
             return;
         }
         // Bare click outside an existing drag clears the selection, matching alacritty.
@@ -1421,6 +1425,7 @@ mod tests {
         glyphs: GlyphCache,
         ime: crate::ime::Ime,
         snapshot: GridSnapshot,
+        detached_jobs: Vec<jobs::Job<()>>,
     }
 
     impl Caches {
@@ -1431,6 +1436,7 @@ mod tests {
                 glyphs: GlyphCache::new(),
                 ime: crate::ime::Ime::default(),
                 snapshot: GridSnapshot::new(),
+                detached_jobs: Vec::new(),
             }
         }
     }
@@ -1461,6 +1467,7 @@ mod tests {
                     &mut caches.colors,
                     &mut caches.glyphs,
                     &mut caches.snapshot,
+                    &mut caches.detached_jobs,
                 );
             });
         });
@@ -1508,6 +1515,7 @@ mod tests {
                     &mut caches.colors,
                     &mut caches.glyphs,
                     &mut caches.snapshot,
+                    &mut caches.detached_jobs,
                 );
             });
         });
@@ -1580,6 +1588,7 @@ mod tests {
                     &mut caches.colors,
                     &mut caches.glyphs,
                     &mut caches.snapshot,
+                    &mut caches.detached_jobs,
                 );
             });
         });
@@ -1699,6 +1708,7 @@ mod tests {
                     &mut caches.colors,
                     &mut caches.glyphs,
                     &mut caches.snapshot,
+                    &mut caches.detached_jobs,
                 );
             });
         });
@@ -1868,6 +1878,7 @@ mod tests {
                     &mut caches.colors,
                     &mut caches.glyphs,
                     &mut caches.snapshot,
+                    &mut caches.detached_jobs,
                 );
             });
         });
