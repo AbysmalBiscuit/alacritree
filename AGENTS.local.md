@@ -8,9 +8,14 @@ Every feature and bugfix gets its own worktree and branch, created by `devkit
 issue setup` and living at `../alacritree-worktrees/<branch>`, a sibling of this
 checkout.
 
-**Branches stack: branch off the newest open PR, never off `master`.** Resolve
-the tip at branch time — the stack grows while specs sit unimplemented, and a
-stale base silently forks the chain.
+**Branches stack: branch off the newest open PR, never off `master`.** Two
+branches cut from `master` collide when the second one merges, and that
+collision lands after review, on whoever merges last. Stacking front-loads it
+into your own worktree, where you resolve it once. Read the tip fresh each time,
+since the stack grows while specs sit unimplemented.
+
+Stack branches that look independent, too. A clean merge between them today says
+nothing about what `master` moving under both does to them later.
 
 ```sh
 gh pr list --repo mathix420/alacritree --state open --json number,title,headRefName
@@ -37,6 +42,12 @@ git -C ../alacritree-worktrees/feat/decoration-metrics reset --hard origin/<base
 
 `devkit issue status` lists what exists, `devkit issue end` removes a finished
 worktree.
+
+## Running tests
+
+`cargo nextest run -p alacritree` is the test command in this checkout, in
+place of the `cargo test` line in `AGENTS.md`. That file keeps naming `cargo
+test` because Arnaud's CI runs it and nextest is installed only here.
 
 ## devkit
 
