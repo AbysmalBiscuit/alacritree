@@ -1,18 +1,13 @@
 # Specs and plans
 
-Design specs and implementation plans for alacritree, kept on the
-`docs/specs-and-plans` branch so they survive worktree deletion and can be
-shared between machines.
+Design specs and implementation plans for alacritree. `specs/` holds designs
+from the brainstorming skill, `plans/` holds implementation plans and their
+progress files, both named `YYYY-MM-DD-<topic>[-design].md`.
 
-`docs/superpowers/` is listed in `.git/info/exclude`, which keeps these files
-untracked on every feature branch. That is deliberate: they are working
-documents and are never upstreamed. This branch is the one place they are
-tracked, so adding a file here needs `git add -f`.
+They are working documents and are never upstreamed, so `.git/info/exclude`
+keeps `docs/superpowers/` untracked on every other branch. This branch is the
+one place they are tracked, which is what lets them outlive a worktree and reach
+another machine. It carries no code.
 
-- `specs/` — designs produced by the brainstorming skill, named
-  `YYYY-MM-DD-<topic>-design.md`.
-- `plans/` — implementation plans produced by the writing-plans skill, named
-  `YYYY-MM-DD-<topic>.md`, plus their progress files.
-
-The branch carries no code changes. Never merge it into a feature branch;
-pull from it, or copy files out of it.
+`AGENTS.local.md` in this repo root, under "Specs and plans", is the procedure
+for adding to the branch and pulling from it.
