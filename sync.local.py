@@ -51,6 +51,13 @@ PAYLOAD = (
 TO_BRANCH = "to-branch"
 TO_MAIN = "to-main"
 
+#: Which checkout the running copy of this script sits in.  A third value is
+#: possible: the script is itself part of the payload, so every worktree cut
+#: after a sync carries a copy of it, and one of those can be the copy that
+#: runs.
+SIDE_MAIN = "main"
+SIDE_BRANCH = "branch"
+
 
 @dataclass(frozen=True)
 class Move:
@@ -90,20 +97,29 @@ def worktrees(start: Path) -> list[tuple[Path, str | None]]:
     return entries
 
 
-def locate(start: Path) -> tuple[Path, Path]:
-    """The main checkout and the branch's worktree, from either of them."""
+def locate(start: Path) -> tuple[Path, Path, str | None]:
+    """The main checkout, the branch's worktree, and which of them `start` is.
+
+    Direction is decided per file, so the side a run starts from changes
+    nothing about what moves.  It is worth naming anyway: a copy of this
+    script sits in both checkouts, and a run that reports only the two paths
+    reads the same from either, which is exactly when a surprising result is
+    hardest to account for.  `None` means neither, which is what running a
+    copy carried into some other worktree looks like.
+    """
     entries = worktrees(start)
     if not entries:
         sys.exit(f"{start} is not inside a git worktree")
     # `git worktree list` names the main checkout first, run from wherever.
-    main = entries[0][0]
-    for path, branch in entries:
-        if branch == BRANCH:
-            return main.resolve(), path.resolve()
-    sys.exit(
-        f"no worktree is checked out on {BRANCH}. Create one with:\n"
-        f"  git worktree add ../alacritree-worktrees/{BRANCH} {BRANCH}"
-    )
+    main = entries[0][0].resolve()
+    branch_path = next((path.resolve() for path, name in entries if name == BRANCH), None)
+    if branch_path is None:
+        sys.exit(
+            f"no worktree is checked out on {BRANCH}. Create one with:\n"
+            f"  git worktree add ../alacritree-worktrees/{BRANCH} {BRANCH}"
+        )
+    side = SIDE_MAIN if start == main else SIDE_BRANCH if start == branch_path else None
+    return main, branch_path, side
 
 
 def tracked_files(main: Path, branch: Path) -> list[str]:
@@ -244,8 +260,14 @@ def main() -> int:
     args = parser.parse_args()
 
     forced = TO_BRANCH if args.to_branch else TO_MAIN if args.to_main else None
-    main_checkout, branch = locate(Path(__file__).resolve().parent)
-    print(f"main   {main_checkout}\nbranch {branch}\n")
+    here = Path(__file__).resolve().parent
+    main_checkout, branch, side = locate(here)
+    running = "  <- running here"
+    print(f"main   {main_checkout}{running if side == SIDE_MAIN else ''}")
+    print(f"branch {branch}{running if side == SIDE_BRANCH else ''}")
+    if side is None:
+        print(f"\nrunning from {here}, which is neither; it syncs the two above")
+    print()
 
     moves = [
         move
