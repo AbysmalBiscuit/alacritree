@@ -1,0 +1,36 @@
+#:schema https://raw.githubusercontent.com/hlmtre/devkit/main/schema/devkit-config.json
+
+# alacritree is a personal fork with no dev servers and no Linear project, so
+# this file carries only what `issue` needs: where worktrees go, what they are
+# cut from, and which local files follow them in.
+
+[defaults]
+# Worktrees are siblings of this checkout, one directory per branch. A slug
+# carrying a slash (`feat/decoration-metrics`) nests exactly like the branch.
+worktree_root = "../alacritree-worktrees"
+
+# Branch type is chosen per change (feat/, fix/, perf/, docs/), so it belongs
+# in the slug rather than in a fixed prefix.
+branch_prefix = ""
+
+# `issue setup` cuts every branch from this ref. Stacked work is re-pointed at
+# its real base afterwards; see "Specs and plans" and the stacking rule in
+# AGENTS.local.md.
+baseline_ref = "origin/master"
+
+# PRs go to Arnaud's repo, whose default branch is master, not devkit's staging.
+pr_base = "master"
+
+# No baseline server exists here. The path names one that is never created.
+baseline_path = "../alacritree-baseline"
+
+# Untracked instructions copied into each new worktree, so an agent working
+# there reads the same rules as one working in the main checkout.
+worktree_include = ["AGENTS.local.md", "CLAUDE.local.md"]
+
+[github]
+issues_repo = "AbysmalBiscuit/alacritree"
+pr_repo = "mathix420/alacritree"
+
+[tracker]
+kind = "github"

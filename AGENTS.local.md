@@ -4,8 +4,9 @@ So new UX/UI features need to provide config options that are used to enable the
 
 ## Working on features/bugfixes
 
-Always use worktrees + branches to work on features and bugfixes. Worktrees live
-at `../alacritree-worktrees/<branch>`, a sibling of this checkout.
+Every feature and bugfix gets its own worktree and branch, created by `issue
+setup` and living at `../alacritree-worktrees/<branch>`, a sibling of this
+checkout.
 
 **Branches stack: branch off the newest open PR, never off `master`.** Resolve
 the tip at branch time — the stack grows while specs sit unimplemented, and a
@@ -16,13 +17,44 @@ gh pr list --repo mathix420/alacritree --state open --json number,title,headRefN
 ```
 
 Take the entry whose title carries the highest `[n]` marker; its `headRefName` is
-your base and `n + 1` is your marker. Then:
+your base and `n + 1` is your marker. PR titles carry that marker:
+`feat(logging): record why alacritree died [8]`.
+
+The slug is the whole branch name, type prefix included, and the GitHub issue
+number comes first:
 
 ```sh
-git worktree add ../alacritree-worktrees/<branch> -b <branch> origin/<base>
+issue setup 41 --slug feat/decoration-metrics
 ```
 
-PR titles carry that marker: `feat(logging): record why alacritree died [8]`.
+`issue setup` cuts every branch from `origin/master` and takes no base flag, so
+a stacked branch is re-pointed once, before it has any commits of its own:
+
+```sh
+git -C ../alacritree-worktrees/feat/decoration-metrics reset --hard origin/<base>
+```
+
+`issue status` lists what exists, `issue end` removes a finished worktree.
+
+## devkit
+
+This checkout is a devkit project. `devkit.local.toml` configures it and is
+untracked, so it rides on the `docs/specs-and-plans` branch with the other local
+files.
+
+`worktree_include` names the untracked instructions copied into each new
+worktree, so an agent working there reads the same rules as one working here.
+After editing `AGENTS.local.md` or `CLAUDE.local.md`, push the change into
+worktrees that already exist:
+
+```sh
+issue sync-includes --overwrite
+```
+
+Several agents share this checkout, so claim a file with `lockm acquire` before
+editing it. `docm` resolves alacritty, kitty, ghostty, wezterm and zed at the
+versions this project pins; read those checkouts rather than recalling how they
+behave.
 
 ## Specs and plans
 
@@ -44,6 +76,19 @@ cp docs/superpowers/specs/<file>.md $W/docs/superpowers/specs/
 git -C $W add -f docs/superpowers
 git -C $W commit -m "docs: add <topic> spec" && git -C $W push
 ```
+
+The branch also carries the untracked local files this repository needs and git
+ignores: `AGENTS.local.md`, `CLAUDE.local.md`, `devkit.local.toml`,
+`install.local.ps1` and `setup.local.ps1`. On a fresh machine, or after pulling
+a change to one of them, `setup.local.ps1` copies them into the main checkout:
+
+```sh
+pwsh -File $W/setup.local.ps1
+```
+
+It leaves a file whose main-checkout copy differs alone until `-Force` says
+otherwise, and `-WhatIf` reports without writing. Editing one of them means
+copying it back and committing, the same way a spec goes.
 
 Pull from that branch or copy files out of it. Merging it into a feature branch
 puts working documents into a PR.
