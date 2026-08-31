@@ -35,7 +35,10 @@ UNIX_PAYLOAD = ("alacritree",)
 
 def git(repo: Path, *args: str) -> str:
     result = subprocess.run(
-        ["git", "-C", str(repo), *args], capture_output=True, text=True, encoding="utf-8"
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
     )
     if result.returncode != 0:
         sys.exit(f"git {' '.join(args)} failed:\n{result.stderr.strip()}")
@@ -52,16 +55,28 @@ def worktree_for(start: Path, branch: str) -> Path:
     sys.exit(f"no worktree is checked out on {branch} (git worktree add one first)")
 
 
+def ocargo() -> Path | None:
+    """Locate `ocargo`, the cargo wrapper that turns on the optimized profile.
+
+    It is a Python script, so callers run it through this interpreter rather
+    than through PATH: a bare `ocargo.py` is only executable where PATHEXT
+    says so.
+    """
+    installed = Path.home() / ".local" / "bin" / "ocargo.py"
+    if installed.is_file():
+        return installed
+    found = shutil.which("ocargo.py")
+    return Path(found) if found else None
+
+
 def build_command(worktree: Path, cargo: str | None) -> list[str]:
     manifest = str(worktree / "Cargo.toml")
     arguments = ["build", "-p", "alacritree", "--release", "--manifest-path", manifest]
     if cargo:
         return [*cargo.split(), *arguments]
-    # `ocargo` turns on the optimized profile and exists only as PowerShell.
-    wrapper = shutil.which("ocargo.ps1")
-    shell = shutil.which("pwsh") or shutil.which("powershell")
-    if os.name == "nt" and wrapper and shell:
-        return [shell, "-NoProfile", "-File", wrapper, *arguments]
+    wrapper = ocargo()
+    if wrapper:
+        return [sys.executable, str(wrapper), *arguments]
     return ["cargo", *arguments]
 
 
@@ -111,13 +126,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--branch", default=DEFAULT_BRANCH, help="worktree to build from")
     parser.add_argument(
-        "--destination", type=Path, default=Path.home() / ".local" / "bin", help="install directory"
+        "--branch", default=DEFAULT_BRANCH, help="worktree to build from"
     )
-    parser.add_argument("--skip-build", action="store_true", help="install what is already built")
     parser.add_argument(
-        "--cargo", help="build command to use instead of ocargo or cargo, e.g. \"cargo +nightly\""
+        "--destination",
+        type=Path,
+        default=Path.home() / ".local" / "bin",
+        help="install directory",
+    )
+    parser.add_argument(
+        "--skip-build", action="store_true", help="install what is already built"
+    )
+    parser.add_argument(
+        "--cargo",
+        help='build command to use instead of ocargo or cargo, e.g. "cargo +nightly"',
     )
     args = parser.parse_args()
 
