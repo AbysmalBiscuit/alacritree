@@ -4,8 +4,8 @@ So new UX/UI features need to provide config options that are used to enable the
 
 ## Working on features/bugfixes
 
-Every feature and bugfix gets its own worktree and branch, created by `issue
-setup` and living at `../alacritree-worktrees/<branch>`, a sibling of this
+Every feature and bugfix gets its own worktree and branch, created by `devkit
+issue setup` and living at `../alacritree-worktrees/<branch>`, a sibling of this
 checkout.
 
 **Branches stack: branch off the newest open PR, never off `master`.** Resolve
@@ -24,17 +24,19 @@ The slug is the whole branch name, type prefix included, and the GitHub issue
 number comes first:
 
 ```sh
-issue setup 41 --slug feat/decoration-metrics
+devkit issue setup 41 --slug feat/decoration-metrics
 ```
 
-`issue setup` cuts every branch from `origin/master` and takes no base flag, so
-a stacked branch is re-pointed once, before it has any commits of its own:
+`devkit issue setup` cuts every branch from `origin/master` and takes no base
+flag, so a stacked branch is re-pointed once, before it has any commits of its
+own:
 
 ```sh
 git -C ../alacritree-worktrees/feat/decoration-metrics reset --hard origin/<base>
 ```
 
-`issue status` lists what exists, `issue end` removes a finished worktree.
+`devkit issue status` lists what exists, `devkit issue end` removes a finished
+worktree.
 
 ## devkit
 
@@ -48,7 +50,7 @@ After editing `AGENTS.local.md` or `CLAUDE.local.md`, push the change into
 worktrees that already exist:
 
 ```sh
-issue sync-includes --overwrite
+devkit issue sync-includes --overwrite
 ```
 
 Several agents share this checkout, so claim a file with `lockm acquire` before
