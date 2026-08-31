@@ -11,30 +11,31 @@
 ## Global constraints
 
 - Work in the worktree `C:\Users\Lev\Git\github\alacritree-worktrees\feat\decoration-metrics`, on branch `feat/decoration-metrics`. It is based on `perf/instanced-grid`, not `master`, because `decoration_sprites.rs` exists only there.
-- Design doc: `docs/superpowers/specs/2026-08-31-decoration-metrics-design.md` in the main checkout. It is not present in the worktree.
+- Design doc: `docs/superpowers/specs/2026-08-31-decoration-metrics-design.md` in the main checkout at `C:\Users\Lev\Git\github\alacritree`. It is not present in the worktree.
 - Workspace MSRV 1.85, edition 2024.
 - `cargo fmt` is enforced. Run it before every commit.
+- **Line numbers in this plan were taken before any task ran.** An insertion earlier in a file shifts every number below it, including numbers in a later step of the same task. Each citation carries a grep anchor; when the two disagree, the anchor wins.
 - Scope is the GL path only. Do not touch `paint_grid`'s own underline and strikeout drawing in `terminal_view.rs`. The mesh path keeps its constants deliberately.
 - Comments explain a non-obvious *why*, never restate the *what*. No issue numbers, no "previously", no change narration. Match the voice already in `decoration_sprites.rs` and `config.rs`.
 - Conventional Commits, imperative subject under 72 characters, and every commit carries the trailer `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`.
-- Only `alacritree/` may be edited. The vendored alacritty crates are read-only.
+- Only `alacritree/` and `schema/` may be edited. The vendored alacritty crates are read-only.
 
 ---
 
 ### Task 1: Read decoration metrics from the primary face
 
 **Files:**
-- Modify: `alacritree/src/fonts.rs` (add `FaceMetrics` near `face_height_ratio` at line 618; change `install_terminal_fonts` at line 859)
-- Modify: `alacritree/src/app.rs:726-727` (call site), `alacritree/src/app.rs:889` (struct literal), `alacritree/src/app.rs:547-553` (field declarations)
+- Modify: `alacritree/src/fonts.rs` (insert after `face_height_ratio`; rewrite `install_terminal_fonts`; fix one existing test)
+- Modify: `alacritree/src/app.rs` (the `install_terminal_fonts` call, the struct literal, the field declarations)
 - Test: `alacritree/src/fonts.rs`, in the existing `#[cfg(test)] mod tests`
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
-- Produces: `pub struct FaceMetrics` with public `f32` fields `ascender`, `descender`, `underline_position`, `underline_thickness`, `strikeout_position`, `strikeout_thickness`; `impl Default for FaceMetrics`; `pub fn FaceMetrics::from_face(data: &[u8], index: u32) -> FaceMetrics`. `install_terminal_fonts` changes return type from `Vec<ChainFace>` to `(Vec<ChainFace>, FaceMetrics)`. `AlacritreeApp` gains a `face_metrics: crate::fonts::FaceMetrics` field.
+- Produces: `pub struct FaceMetrics` with public `f32` fields `ascender`, `descender`, `underline_position`, `underline_thickness`, `strikeout_position`, `strikeout_thickness`, deriving `Debug, Clone, Copy, PartialEq`; `impl Default for FaceMetrics`; `pub fn FaceMetrics::from_face(data: &[u8], index: u32) -> FaceMetrics`. `install_terminal_fonts` changes return type from `Vec<ChainFace>` to `(Vec<ChainFace>, FaceMetrics)`. `AlacritreeApp` gains a `face_metrics: crate::fonts::FaceMetrics` field.
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to the `mod tests` block in `alacritree/src/fonts.rs`:
+Append to the `mod tests` block in `alacritree/src/fonts.rs` (grep `mod tests`, near line 1567). It opens with `use super::*`, so private items are in scope.
 
 ```rust
 /// Raw font units are in the hundreds; em fractions are not.  A face read
@@ -113,7 +114,7 @@ Expected: FAIL to compile, with `cannot find type FaceMetrics in this scope` and
 
 - [ ] **Step 3: Add `FaceMetrics` and its fallbacks**
 
-Insert after `face_height_ratio` (currently ending at line 623) in `alacritree/src/fonts.rs`:
+Insert into `alacritree/src/fonts.rs` immediately after `face_height_ratio` (grep `fn face_height_ratio`; near line 618, ending at 623):
 
 ```rust
 /// Em fractions used where a face reports nothing usable.  A zero in a metric
@@ -212,7 +213,7 @@ fn nonzero(value: f32) -> Option<f32> {
 
 - [ ] **Step 4: Return the metrics from `install_terminal_fonts`**
 
-Replace the body of `install_terminal_fonts` (line 859) in `alacritree/src/fonts.rs`:
+Replace `install_terminal_fonts` in `alacritree/src/fonts.rs` (grep `pub fn install_terminal_fonts`; it was at line 859 before Step 3's insertion, so it is now roughly 90 lines lower):
 
 ```rust
 /// Register the terminal faces with egui and return the normal-variant
@@ -255,22 +256,32 @@ fn primary_face_metrics(chain: &[ChainFace]) -> FaceMetrics {
 }
 ```
 
-- [ ] **Step 5: Store the metrics on the app**
+- [ ] **Step 5: Fix the one existing test that binds the old return value**
 
-In `alacritree/src/app.rs`, change lines 726-727 to:
+`an_unresolvable_normal_font_still_binds_every_chrome_family` in the same file (grep it; near line 1826) does `let chain = install_terminal_fonts(...)` and then `chain.is_empty()`. It is `#[cfg(not(unix))]`, so it compiles on this Windows worktree. Change its binding to:
+
+```rust
+        let (chain, _) = install_terminal_fonts(&ctx, &font, &ui);
+```
+
+The other call in that file discards the return value entirely and needs no change.
+
+- [ ] **Step 6: Store the metrics on the app**
+
+In `alacritree/src/app.rs`, change the `install_terminal_fonts` call (grep `install_terminal_fonts`; near line 726):
 
 ```rust
         let (font_chain, face_metrics) =
             crate::fonts::install_terminal_fonts(&cc.egui_ctx, &config.font, &config.ui_font);
 ```
 
-Add the field to the struct literal, immediately after the `color_glyphs:` entry that ends at line 891:
+Add the field to the struct literal, immediately after the `color_glyphs:` entry (grep `color_glyphs: crate::color_glyph::ColorGlyphCache::new(`; the entry closes near line 891):
 
 ```rust
             face_metrics,
 ```
 
-Add the declaration to the `AlacritreeApp` struct, immediately after `glyph_cache` at line 550:
+Add the declaration to the `AlacritreeApp` struct, immediately after the `glyph_cache` field (grep `glyph_cache: crate::glyph_cache::GlyphCache,`; near line 550):
 
 ```rust
     /// The `[font.normal]` face's own decoration metrics, parsed once when the
@@ -278,13 +289,13 @@ Add the declaration to the `AlacritreeApp` struct, immediately after `glyph_cach
     face_metrics: crate::fonts::FaceMetrics,
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [ ] **Step 7: Run the tests to verify they pass**
 
 Run: `cargo test -p alacritree --lib fonts::tests`
 
-Expected: PASS, six new tests included.
+Expected: PASS, six new tests included, and no compile error anywhere in the crate.
 
-- [ ] **Step 7: Format and commit**
+- [ ] **Step 8: Format and commit**
 
 ```bash
 cargo fmt
@@ -299,13 +310,13 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ### Task 2: Parse the four adjustment knobs
 
 **Files:**
-- Modify: `alacritree/src/config.rs` (add `Adjust`/`Decorations` near the other resolved types around line 916; add `RawDecorations` near `RawUiFont` at line 1878; add the field to `RawUi` near `gpu_grid` at line 2011; add the `resolve` arm near line 2245)
-- Modify: `schema/alacritree-config.json` (regenerated, not hand-edited)
+- Modify: `alacritree/src/config.rs` (add `Adjust`/`Decorations` above the `Ui` struct; add `RawDecorations` above `RawUiFont`; add the field to `RawUi`; add the `resolve` arm)
+- Modify: `schema/alacritree-config.json` (regenerated, never hand-edited)
 - Test: `alacritree/src/config.rs`, in the existing `#[cfg(test)] mod tests`
 
 **Interfaces:**
 - Consumes: nothing from Task 1.
-- Produces: `pub enum Adjust { Pixels(f32), Points(f32), Scale(f32) }` with `Adjust::NONE`, `Adjust::parse(&str) -> Option<Adjust>` and `Adjust::apply(self, value: f32, pixels_per_point: f32) -> f32`; `pub struct Decorations` with four `Adjust` fields named `underline_position`, `underline_thickness`, `strikeout_position`, `strikeout_thickness`; `Ui` gains `pub decorations: Decorations`.
+- Produces: `pub enum Adjust { Pixels(f32), Points(f32), Scale(f32) }` deriving `Debug, Clone, Copy, PartialEq`, with `Adjust::NONE`, `Adjust::parse(&str) -> Option<Adjust>` and `Adjust::apply(self, value: f32, pixels_per_point: f32) -> f32`; `pub struct Decorations` deriving `Debug, Clone, Copy, PartialEq` with four `Adjust` fields named `underline_position`, `underline_thickness`, `strikeout_position`, `strikeout_thickness`, and an `impl Default` setting all four to `Adjust::NONE`; `Ui` gains `pub decorations: Decorations`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -368,7 +379,7 @@ Expected: FAIL to compile, with `cannot find type Adjust in this scope`.
 
 - [ ] **Step 3: Add `Adjust` and `Decorations`**
 
-Insert into `alacritree/src/config.rs`, above the `Ui` struct that declares `gpu_grid` at line 916:
+Insert into `alacritree/src/config.rs` above the `Ui` struct's `gpu_grid` field (grep `pub gpu_grid: bool`; near line 916), outside the struct:
 
 ```rust
 /// One correction to a decoration the font placed: a shift in physical pixels,
@@ -450,7 +461,7 @@ fn parse_adjust(field: &str, raw: Option<&str>) -> Adjust {
 }
 ```
 
-Add to the `Ui` struct, immediately after the `pub gpu_grid: bool` field at line 916:
+Add to the `Ui` struct, immediately after `pub gpu_grid: bool`:
 
 ```rust
     /// Corrections applied to the underline and strikeout the font placed
@@ -461,7 +472,7 @@ Add to the `Ui` struct, immediately after the `pub gpu_grid: bool` field at line
 
 - [ ] **Step 4: Add the raw config type**
 
-Insert into `alacritree/src/config.rs`, above `RawUiFont` at line 1876:
+Insert into `alacritree/src/config.rs` above `RawUiFont` (grep `struct RawUiFont`; near line 1878, with its derive attributes two lines above):
 
 ```rust
 /// Corrections applied to what the font reports for its underline and
@@ -487,7 +498,7 @@ struct RawDecorations {
 }
 ```
 
-Add to `RawUi`, immediately after `gpu_grid: Option<bool>,` at line 2011:
+Add to `RawUi`, immediately after its `gpu_grid` field (grep `gpu_grid: Option<bool>,`; near line 2011):
 
 ```rust
     /// Corrections to the underline and strikeout the font placed
@@ -497,7 +508,7 @@ Add to `RawUi`, immediately after `gpu_grid: Option<bool>,` at line 2011:
 
 - [ ] **Step 5: Resolve it**
 
-Add to the `Ui { .. }` literal in `resolve`, immediately after `gpu_grid: self.ui.gpu_grid.unwrap_or(false),` at line 2245:
+Add to the `Ui { .. }` literal in `resolve`, immediately after its `gpu_grid` arm (grep `gpu_grid: self.ui.gpu_grid.unwrap_or(false),`; near line 2245):
 
 ```rust
             decorations: Decorations {
@@ -526,21 +537,16 @@ Run: `cargo test -p alacritree --lib config::tests`
 
 Expected: PASS, five new tests included.
 
-- [ ] **Step 7: Regenerate the schema and check where the pattern landed**
+- [ ] **Step 7: Regenerate the schema and confirm the pattern reached the four properties**
 
 ```bash
 ALACRITREE_UPDATE_SCHEMA=1 cargo test -p alacritree --test config_schema
-```
-
-Then confirm the constraint reached the four properties:
-
-```bash
 grep -n -A 4 '"underline_position"' schema/alacritree-config.json
 ```
 
-Expected: each of the four properties carries both its description and a `"pattern"` key.
+Expected: each of the four property objects holds a `"description"` key and a `"pattern"` key directly, the same shape the `scrollbar` property has with its `"enum"` (grep `"scrollbar"` in the same file to compare).
 
-If `schemars` put the pattern somewhere a validator will not apply it, which can happen when `extend` lands beside an `Option`'s `["string","null"]` type union rather than inside it, replace the four `Option<String>` fields with a newtype carrying a hand-written `JsonSchema`, following `RgbStr` at `alacritree/src/config.rs:2117-2136`. Then rerun the regeneration command above.
+If a property object has no `"pattern"` key at all, the derive routed the field through a `$ref` and the constraint went somewhere else. In that case replace the four `Option<String>` fields with a newtype carrying a hand-written `JsonSchema`, following `RgbStr` (grep `struct RgbStr`; near line 2117), then rerun both commands above.
 
 - [ ] **Step 8: Run the full test suite, format and commit**
 
@@ -555,15 +561,19 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 ---
 
-### Task 3: Reshape `Geometry` and hang the styles off the descent
+### Task 3: Place the decorations from the metrics
+
+Reshaping `Geometry` and wiring it up are one change, not two. `Geometry` is built at exactly one place, inside `paint_grid_gpu`, so removing its `thickness` field breaks that caller in the same instant. Splitting the two would mean committing a state that does not compile, or committing throwaway constants to bridge one commit to the next. Steps 3 through 5 therefore leave the crate broken on purpose, and Step 6 is the first point where anything runs.
 
 **Files:**
-- Modify: `alacritree/src/decoration_sprites.rs:38-45` (the struct), `:82-113` (`rasterize`), `:118-151` (`draw_underline`), `:180-215` (`curl`), `:218-326` (the tests)
+- Modify: `alacritree/src/decoration_sprites.rs` (the `Geometry` struct, `rasterize`, `draw_underline`, `curl`, the test module)
+- Modify: `alacritree/src/terminal_view.rs` (the `show` signature and its cell-size layout, the `paint_grid_gpu` signature and its one call, the `Geometry` construction)
+- Modify: `alacritree/src/app.rs` (the `terminal_view::show` call)
 - Test: `alacritree/src/decoration_sprites.rs`, in the existing `#[cfg(test)] mod tests`
 
 **Interfaces:**
-- Consumes: `crate::fonts::FaceMetrics` from Task 1, `crate::config::Decorations` from Task 2.
-- Produces: `Geometry` loses `thickness` and gains `baseline: f32`, `descent: f32`, `underline_thickness: f32`, `strikeout_thickness: f32`, keeping `cell`, `underline_y` and `strikeout_y`; `pub fn Geometry::resolve(cell: [usize; 2], font_ascent_pt: f32, pixels_per_point: f32, metrics: &FaceMetrics, knobs: &Decorations) -> Geometry`.
+- Consumes: `crate::fonts::FaceMetrics` and `AlacritreeApp::face_metrics` from Task 1; `crate::config::Decorations` and its `Default` impl from Task 2, reachable as `config.ui.decorations`.
+- Produces: nothing later tasks depend on. This is the last task.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -699,11 +709,11 @@ Then append these tests to the same module:
 
 Run: `cargo test -p alacritree --lib decoration_sprites`
 
-Expected: FAIL to compile, with `struct Geometry has no field named baseline` and `no function or associated item named resolve`.
+Expected: FAIL to compile, with `struct Geometry has no field named baseline` and `no function or associated item named resolve found for struct Geometry`.
 
 - [ ] **Step 3: Reshape the struct and add `resolve`**
 
-Replace the `Geometry` declaration at `alacritree/src/decoration_sprites.rs:38-45`:
+Replace the `Geometry` declaration in `alacritree/src/decoration_sprites.rs` (grep `pub struct Geometry`; near lines 38-46):
 
 ```rust
 /// Where the lines sit and how thick they are, in physical pixels.  The `y`
@@ -773,7 +783,7 @@ impl Geometry {
 }
 ```
 
-Add to the imports at the top of the file, beside the existing `use egui::{...}` line:
+Add beside the file's existing `use egui::{...}` line:
 
 ```rust
 use crate::config::Decorations;
@@ -791,7 +801,7 @@ In `rasterize`, replace the strikeout bar inside the style loop:
             }
 ```
 
-and the standalone strikeout tile below the loop:
+and the standalone strikeout tile below the loop, keeping its existing comment:
 
 ```rust
     // A struck cell with no underline is the one tile the loop above cannot
@@ -803,7 +813,7 @@ and the standalone strikeout tile below the loop:
 
 - [ ] **Step 5: Anchor double and curly on the descent area**
 
-In `draw_underline`, change `let t = geometry.thickness;` to `let t = geometry.underline_thickness;` and replace the `DOUBLE` arm:
+In `draw_underline`, change `let t = geometry.thickness;` to `let t = geometry.underline_thickness;` and replace the `DOUBLE` arm together with the two-line comment above it:
 
 ```rust
         // One stem in each half of the descent area.  Deriving the gap from
@@ -821,7 +831,7 @@ In `draw_underline`, change `let t = geometry.thickness;` to `let t = geometry.u
 
 Leave `STRAIGHT`, `DOTTED` and `DASHED` as they are. They keep `underline_y` and the font's stroke weight. Alacritty passes its dotted style the descent, but that is a canvas allocation rather than a dot size: it packs every decoration into one quad and its shader needs a tall one, while `draw_dotted_aliased` in `alacritty/res/rect.f.glsl` gives each dot a radius of `underlineThickness / 2`. Our tiles are already cell-sized, so there is nothing to allocate.
 
-In `curl`, replace the four lines that compute the wave's extent:
+In `curl`, replace `let t = geometry.thickness;`, the comment block that follows it, and the `bottom`, `top`, `amplitude` and `centre` bindings:
 
 ```rust
     let t = geometry.underline_thickness;
@@ -836,56 +846,21 @@ In `curl`, replace the four lines that compute the wave's extent:
     let amplitude = ((bottom - top - t) / 2.0).max(0.5);
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [ ] **Step 6: Thread the metrics and the baseline to the construction site**
 
-Run: `cargo test -p alacritree --lib decoration_sprites`
+`Geometry` is built inside `paint_grid_gpu`, not inside `show`, so both new values have to reach it as parameters.
 
-Expected: PASS. The six pre-existing tests still pass against the new fixture, and six new ones join them.
-
-- [ ] **Step 7: Format and commit**
-
-```bash
-cargo fmt
-git add alacritree/src/decoration_sprites.rs
-git commit -m "feat(grid): place decorations from the face's own metrics
-
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
-```
-
----
-
-### Task 4: Wire the baseline through and verify on screen
-
-**Files:**
-- Modify: `alacritree/src/terminal_view.rs:31-41` (the `show` signature), `:44-48` (the cell-size layout), `:1298-1310` (the `Geometry` construction)
-- Modify: `alacritree/src/app.rs:8496-8506` (the `show` call)
-- Test: manual, plus the whole existing suite
-
-**Interfaces:**
-- Consumes: `FaceMetrics` from Task 1 via `AlacritreeApp::face_metrics`, `Decorations` from Task 2 via `config.ui.decorations`, `Geometry::resolve` from Task 3.
-- Produces: nothing later tasks depend on. This is the last task.
-
-- [ ] **Step 1: Take the metrics as an argument**
-
-In `alacritree/src/terminal_view.rs`, add a parameter to `show` after `config`:
+In `alacritree/src/terminal_view.rs`, add a parameter to `show` after `config` (grep `pub fn show(`; near line 31):
 
 ```rust
     face_metrics: &crate::fonts::FaceMetrics,
 ```
 
-In `alacritree/src/app.rs`, add the matching argument to the call at line 8496, after `&self.config,`:
+Replace the `ui.ctx().fonts(..)` block that computes `cell_w_pt` and `cell_h_pt` at the top of `show`:
 
 ```rust
-                        &self.face_metrics,
-```
-
-- [ ] **Step 2: Read the baseline from a laid-out glyph**
-
-In `show`, replace the `ui.ctx().fonts(..)` block that computes `cell_w_pt` and `cell_h_pt`:
-
-```rust
-    // `Fonts` exposes no ascent, and deriving one from the face would miss
-    // the quantization `FontImpl::new` applies when it stores its own.
+    // `Fonts` exposes no ascent, and deriving one from the face would miss the
+    // quantization `FontImpl::new` applies when it stores its own.
     // `font_ascent` on a laid-out glyph is the number epaint draws at.  egui
     // caches this layout, so it costs one hash after the first frame.
     let (cell_w_pt, cell_h_pt, font_ascent_pt) = ui.ctx().fonts(|f| {
@@ -906,11 +881,36 @@ In `show`, replace the `ui.ctx().fonts(..)` block that computes `cell_w_pt` and 
     });
 ```
 
-- [ ] **Step 3: Build the geometry from the metrics**
-
-Replace the `Geometry` literal at `alacritree/src/terminal_view.rs:1300-1309`:
+Add two parameters to `fn paint_grid_gpu` (grep `fn paint_grid_gpu(`; near line 1271), immediately after `config: &Config,`:
 
 ```rust
+    face_metrics: &crate::fonts::FaceMetrics,
+    font_ascent_pt: f32,
+```
+
+That function already has a parameter named `metrics: &Metrics`. It is `builtin_font::Metrics` and has nothing to do with the face; leave it alone.
+
+Pass the two new values at the single call to `paint_grid_gpu` (grep `paint_grid_gpu(`; near line 144), immediately after `config,`:
+
+```rust
+                face_metrics,
+                font_ascent_pt,
+```
+
+In `alacritree/src/app.rs`, add the matching argument at the single `terminal_view::show(` call (grep it; near line 8496), immediately after `&self.config,`:
+
+```rust
+                        &self.face_metrics,
+```
+
+- [ ] **Step 7: Build the geometry from the metrics**
+
+Replace the `Geometry` literal in `paint_grid_gpu` (grep `decoration_sprites::Geometry`; near line 1300, one match in the file):
+
+```rust
+        // The mesh path still draws a straight rule at a fixed offset, so the
+        // two paths deliberately disagree; it is on its way out rather than
+        // waiting to be brought along.
         let geometry = decoration_sprites::Geometry::resolve(
             [(cell_w * ppp) as usize, (cell_h * ppp) as usize],
             font_ascent_pt,
@@ -920,27 +920,24 @@ Replace the `Geometry` literal at `alacritree/src/terminal_view.rs:1300-1309`:
         );
 ```
 
-The comment above it, which says the constants match where `paint_grid` puts the same two lines "so a decorated run comes out in the same place whichever path drew it", goes away with the constants. Put this above the call in its place:
+The three comments that annotated the old constants go with them, including the one claiming the two paths put the same lines in the same place.
 
-```rust
-        // The mesh path still draws a straight rule at a fixed offset, so the
-        // two paths deliberately disagree; it is on its way out rather than
-        // waiting to be brought along.
-```
-
-- [ ] **Step 4: Build and run the whole suite**
+- [ ] **Step 8: Run everything**
 
 ```bash
+cargo test -p alacritree --lib decoration_sprites
 cargo fmt --check
 cargo clippy -p alacritree --all-targets -- -D warnings
 cargo test -p alacritree
 ```
 
-Expected: no warnings, and every test passing.
+Expected: the nine pre-existing tests in `decoration_sprites` still pass against the new fixture, the six new ones pass, no clippy warnings, and the whole suite green.
 
-- [ ] **Step 5: Look at it**
+- [ ] **Step 9: Look at it**
 
-The demo sheet is untracked and lives only in the main checkout, at `C:\Users\Lev\Git\github\alacritree\terminal-decorations-demo.local.nu`. Build from the worktree, enable the GPU grid, and run the sheet by absolute path at two font sizes:
+The demo sheet is untracked and lives only in the main checkout, at `C:\Users\Lev\Git\github\alacritree\terminal-decorations-demo.local.nu`. Build from the worktree and run the sheet by absolute path at two font sizes.
+
+This step edits the live `alacritty.toml` / `alacritree.toml` the user actually runs. Note their contents before touching them and restore them afterwards.
 
 ```toml
 [ui]
@@ -951,13 +948,14 @@ gpu_grid = true
 cargo run -p alacritree --release
 ```
 
-Check that each of the five underline styles still reads as itself, that the double underline keeps a visible gap, that the curl keeps its shape, and that underlines and strikeouts sit where the glyphs suggest they should rather than where the cell edge is. Then set `[ui.decorations] underline_position = "2px"` and confirm the underline moves down by two pixels and nothing else does.
+Check that each of the five underline styles still reads as itself, that the double underline keeps a visible gap, that the curl keeps its shape, and that underlines and strikeouts sit where the glyphs suggest rather than where the cell edge is. Then set `[ui.decorations] underline_position = "2px"`, confirm the underline moves down by two pixels and nothing else moves, and restore the config.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 10: Format and commit**
 
 ```bash
-git add alacritree/src/terminal_view.rs alacritree/src/app.rs
-git commit -m "feat(grid): draw decorations at the laid-out baseline
+cargo fmt
+git add alacritree/src/decoration_sprites.rs alacritree/src/terminal_view.rs alacritree/src/app.rs
+git commit -m "feat(grid): place decorations from the face's own metrics
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
@@ -968,4 +966,5 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 - The mesh path is untouched on purpose. An unmodified config sees nothing from this work until `[ui] gpu_grid` is on.
 - `Geometry` derives `PartialEq` and `DecorationAtlas` compares it to decide whether to re-rasterize. Adding fields keeps that correct: a change in any of them is a change worth redrawing for.
-- SGR 58 underline colour, blink and overline stay out. They are tracked separately and the one-tile-one-colour problem in the sprite strip has to be solved before the first of them can land.
+- `the_curl_stays_inside_the_descent_area` passes with about 0.1px of headroom once the slope correction inside `curl` is accounted for. Any future change to the amplitude should expect to revisit it.
+- SGR 58 underline colour, blink and overline stay out. They are tracked separately, and the one-tile-one-colour problem in the sprite strip has to be solved before the first of them can land.
