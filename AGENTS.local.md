@@ -68,32 +68,27 @@ off feature branches and out of PRs; PR descriptions carry the context instead.
 The one branch that tracks them is `docs/specs-and-plans`, which holds no code
 and exists so they survive worktree deletion and reach another machine.
 
-After writing a spec or plan, copy it onto that branch and push. The file is
-still excluded there, so it needs `git add -f`:
-
-```sh
-W=../alacritree-worktrees/docs/specs-and-plans
-git worktree add $W docs/specs-and-plans   # once per machine
-cp docs/superpowers/specs/<file>.md $W/docs/superpowers/specs/
-git -C $W add -f docs/superpowers
-git -C $W commit -m "docs: add <topic> spec" && git -C $W push
-```
-
 The branch also carries the untracked local files this repository needs and git
 ignores: `AGENTS.local.md`, `CLAUDE.local.md`, `devkit.local.toml`,
-`install.local.ps1` and `setup.local.ps1`. On a fresh machine, or after pulling
-a change to one of them, `setup.local.ps1` copies them into the main checkout:
+`install.local.py` and `sync.local.py`.
+
+`sync.local.py` moves both kinds of file between the main checkout and that
+branch, and works from either one. It needs the worktree to exist first:
 
 ```sh
-pwsh -File $W/setup.local.ps1
+git worktree add ../alacritree-worktrees/docs/specs-and-plans docs/specs-and-plans
+python3 sync.local.py --dry-run
+python3 sync.local.py --push
 ```
 
-It leaves a file whose main-checkout copy differs alone until `-Force` says
-otherwise, and `-WhatIf` reports without writing. Editing one of them means
-copying it back and committing, the same way a spec goes.
+Direction is decided per file. One side missing it gets a copy; both sides
+holding different content sends the newer one, so writing a spec here pushes it
+onto the branch and pulling the branch on a new machine seeds this checkout.
+After a clone stamps every file at once, `--to-branch` or `--to-main` overrides
+that. Anything reaching the branch is committed there, one commit per logical
+change, and `--trailer` adds a `Co-Authored-By` line for an agent's commits.
 
-Pull from that branch or copy files out of it. Merging it into a feature branch
-puts working documents into a PR.
+Merging the branch into a feature branch puts working documents into a PR.
 
 ## Git Commits
 
@@ -110,7 +105,7 @@ The GitHub base is always `master`, even though the branch descends from the
 previous PR in the stack rather than from `master`.
 
 
-After opening PR, merge in the features into the `all-features` branch. Then run the `install.local.ps1` script.
+After opening PR, merge in the features into the `all-features` branch. Then run the `install.local.py` script.
 
 ## Tracking features
 
