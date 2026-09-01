@@ -115,6 +115,36 @@ Whenever I ask to open a PR, or push open PR, etc. You need to push the branch t
 The GitHub base is always `master`, even though the branch descends from the
 previous PR in the stack rather than from `master`.
 
+Open the PR with `devkit issue review request`, not `gh pr create`. Its
+`pr_body` template in `devkit.local.toml` renders the body shape every PR here
+uses: a human TL;DR, the `Closes` lines, then the Claude summary under a rule,
+ending in the model attribution. Writing the body by hand reproduces that shape
+by memory and drifts from it.
+
+```sh
+devkit issue review request --no-notify \
+  --pr-title 'feat(render): draw the grid on the GPU [3]' \
+  --pr-body "$(cat summary.md)" \
+  --arg tldr="$(cat tldr.md)" \
+  --arg closes="12 41" \
+  --arg stacked_on=203
+```
+
+Always pass `--no-notify`, and never pass `--to`. Together they mean the command
+adds no reviewer and sends no Slack: it opens the PR and stops. Requesting a
+review is my call, not yours.
+
+`--pr-body` is the Claude summary and `--arg tldr` the human half; pass both
+through files rather than inline, since either can run long. The first `Closes`
+line comes from the worktree's own issue, so `--arg closes` carries only the
+extra ones, whitespace separated. `--arg stacked_on` takes the PR number this
+branch sits on and emits the review-order note; leave it off for a branch that
+really does descend from `master`. `--arg model` overrides the attribution when
+a different model did the work.
+
+The template renders only when the command creates a PR. Editing an open one is
+still `gh pr edit`, and the shape has to be preserved by hand there.
+
 
 After opening PR, merge in the features into the `all-features` branch. Then run the `install.local.py` script.
 
