@@ -34,3 +34,61 @@ pr_repo = "mathix420/alacritree"
 
 [tracker]
 kind = "github"
+
+[templates]
+# Every PR here has the same shape: a human TL;DR, the issues it closes, then a
+# Claude-written section under a rule. The `Closes` lines have to sit inside the
+# TL;DR rather than at the end, because GitHub only reads them from the body and
+# a reader skimming the top should see what the PR resolves without scrolling
+# past the summary.
+#
+# `{{ input }}` is `--pr-body`, so the Claude summary goes there; the human half
+# and the issue numbers come in as `--arg`. For prose too long to type inline,
+# `--arg tldr="$(cat notes.md)"`.
+pr_body = '''
+## TL;DR (human written)
+
+{{ tldr }}
+{%- set ids = (((issue if issue is defined else "") ~ " " ~ closes) | split) -%}
+{%- if ids %}
+{% for id in ids %}
+Closes {{ issues_repo }}#{{ id }}
+{%- endfor %}
+{%- endif %}
+
+Claude summary below:
+
+---
+{% if stacked_on %}
+> Stacked on #{{ stacked_on }}. The base is `master`, so the diff below also
+> contains that PR's commits. Review #{{ stacked_on }} first.
+{% endif %}
+{{ input }}
+
+---
+
+Written by {{ model }} in Claude Code.
+'''
+
+[templates.variables]
+# The worktree's own issue is already in the render context as `issue`; this is
+# for the extra ones a PR closes, whitespace separated: `--arg closes="12 41"`.
+closes = ""
+
+# Human half of the body. Empty by default so a PR opened without it still gets
+# the heading and the Closes lines.
+tldr = ""
+
+# PR number this branch is stacked on. Every branch here is cut from the newest
+# open PR rather than master, so the diff carries its parent's commits and a
+# reviewer needs telling. Empty for a branch that really does sit on master.
+stacked_on = ""
+
+# Issues live on the fork, PRs go to Arnaud's repo, so a bare `#41` in the body
+# would resolve against the wrong one. Spelled out again here because the
+# template context does not carry `[github] issues_repo`; keep the two in sync.
+issues_repo = "AbysmalBiscuit/alacritree"
+
+# Attribution line. Override per PR when a different model did the work:
+# `--arg model="Claude Opus 5 (1M Context)"`.
+model = "Claude Opus 5"
