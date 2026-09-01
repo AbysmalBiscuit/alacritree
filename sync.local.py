@@ -136,6 +136,19 @@ def tracked_files(main: Path, branch: Path) -> list[str]:
     return names
 
 
+def content(path: Path) -> bytes:
+    """A file's bytes with line endings normalized.
+
+    The two checkouts can disagree about line endings without disagreeing
+    about anything that matters: `core.autocrlf` decides them per checkout, so
+    a file freshly checked out on the branch differs from a Windows main
+    checkout on every line.  Comparing raw bytes would read that as an edit
+    and copy the file back and forth on alternate runs, each copy looking like
+    a change to commit.
+    """
+    return path.read_bytes().replace(b"\r\n", b"\n")
+
+
 def compare(main: Path, branch: Path, relative: str, forced: str | None) -> Move | None:
     """How `relative` differs across the two checkouts, if it does."""
     here, there = main / relative, branch / relative
@@ -145,7 +158,7 @@ def compare(main: Path, branch: Path, relative: str, forced: str | None) -> Move
         return Move(relative, TO_BRANCH, True)
     if not here.exists():
         return Move(relative, TO_MAIN, True)
-    if here.read_bytes() == there.read_bytes():
+    if content(here) == content(there):
         return None
     if forced:
         return Move(relative, forced, False)
