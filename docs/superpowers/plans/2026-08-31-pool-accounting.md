@@ -1955,15 +1955,19 @@ never reports stamps `queried_at` on every member, so the next attempt waits a
 full TTL rather than re-spawning on the next frame. Task 8 Step 5 keeps that
 behaviour under the new shape, in `back_off`. Do not add a second backoff.
 
-## One spec test deliberately not written
+## The hanging-origin test this plan wrongly ruled out
 
-The spec lists "`create` cancelled during the fetch returns `Err` and leaves no
-worktree on disk", and says to drop it rather than build a fragile harness if it
-needs a fake `git` on `PATH`. It does: it needs a repository with an origin that
-hangs. Task 2's `dropping_a_running_job_kills_its_child_and_frees_the_worker` is
-the pool-level cancel test the spec names as the substitute, and Task 3's
-between-steps test covers the rest of `create`. Do not add the fetch test unless
-a clean way to hang an origin appears.
+This plan claimed the spec's "`create` cancelled during the fetch returns `Err`
+and leaves no worktree on disk" needed a fragile harness and told implementers
+to skip it. That was wrong, and Task 3's fix round proved it: a `TcpListener` on
+`127.0.0.1:0` whose thread accepts and drains without ever replying, reached
+through a `git://127.0.0.1:<port>/repo.git` origin, hangs a real `git` client on
+a read with no fake binary on `PATH` and no external network.
+`create_stops_while_resolving_the_base_branch` uses it.
+
+One environmental assumption comes with it, which the rest of this test module
+does not carry: an environment that disables the `git://` transport by policy
+makes that test fail outright rather than pass for the wrong reason.
 
 ## Known flake
 
