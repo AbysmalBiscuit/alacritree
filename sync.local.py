@@ -19,7 +19,10 @@ stamped every file at once.
 
 Anything that reaches the branch is committed there, grouped so one run that
 touches an instruction file and two specs produces three commits rather than
-one describing all of it.
+one describing all of it.  A file can also arrive on the branch's disk without
+this script moving it, in which case both sides agree and only the commit is
+missing; that is committed too, so the order the tools run in does not decide
+whether the branch ends up carrying the change.
 """
 
 from __future__ import annotations
@@ -149,6 +152,21 @@ def compare(main: Path, branch: Path, relative: str, forced: str | None) -> Move
     return Move(relative, TO_BRANCH if here.stat().st_mtime > there.stat().st_mtime else TO_MAIN, False)
 
 
+def uncommitted(branch: Path, names: list[str]) -> list[Move]:
+    """Payload the branch's worktree holds on disk but has not committed.
+
+    `devkit issue sync-includes` copies the instruction files into every
+    worktree, this branch's included, so a file can reach the branch without
+    passing through here.  Both sides then agree and `compare` reports nothing,
+    which would leave the change sitting uncommitted where the next run cannot
+    see it either.
+    """
+    if not names:
+        return []
+    changed = set(git(branch, "diff", "--name-only", "HEAD", "--", *names).split())
+    return [Move(name, TO_BRANCH, False) for name in names if name in changed]
+
+
 def apply(move: Move, main: Path, branch: Path) -> None:
     source, destination = (main, branch) if move.direction == TO_BRANCH else (branch, main)
     target = destination / move.relative
@@ -269,21 +287,23 @@ def main() -> int:
         print(f"\nrunning from {here}, which is neither; it syncs the two above")
     print()
 
+    names = tracked_files(main_checkout, branch)
     moves = [
         move
-        for move in (
-            compare(main_checkout, branch, relative, forced)
-            for relative in tracked_files(main_checkout, branch)
-        )
+        for move in (compare(main_checkout, branch, relative, forced) for relative in names)
         if move is not None
     ]
-    if not moves:
+    moved = {move.relative for move in moves}
+    pending = [move for move in uncommitted(branch, names) if move.relative not in moved]
+    if not moves and not pending:
         print("nothing to sync")
         return 0
 
     for move in moves:
         arrow = "->" if move.direction == TO_BRANCH else "<-"
         print(f"  {'add ' if move.created else 'edit'} {arrow} {move.relative}")
+    for move in pending:
+        print(f"  keep -> {move.relative}  (already on the branch, uncommitted)")
 
     if args.dry_run:
         print("\ndry run, nothing written")
@@ -296,7 +316,7 @@ def main() -> int:
         print("\ncopied; the branch is left uncommitted")
         return 0
 
-    grouped = commits(moves)
+    grouped = commits(moves + pending)
     if grouped:
         print()
     for subject, group in grouped:
