@@ -4883,6 +4883,21 @@ fn dirty_warning(counts: Option<&DirtyCounts>, force: bool, checking: bool) -> O
     }
 }
 
+/// Fold a failure into the single-slot error dialog rather than replacing
+/// what it holds.  One frame can finish several background deletes, and the
+/// dialog shows one message: replacing it would leave only the last
+/// failure, with the earlier explanations gone before the user ever read
+/// them.
+fn push_error(slot: &mut Option<String>, message: String) {
+    match slot {
+        Some(shown) => {
+            shown.push_str("\n\n");
+            shown.push_str(&message);
+        },
+        None => *slot = Some(message),
+    }
+}
+
 /// The modal frame's horizontal inner margin.  Any width budgeted against the
 /// window has to leave room for it, so it lives apart from the frame itself.
 fn modal_pad_x(scale: f32) -> f32 {
@@ -7852,12 +7867,12 @@ impl AlacritreeApp {
                             force: true,
                         });
                     } else {
-                        self.error_dialog = Some(format!("Delete failed.\n\n{e}"));
+                        push_error(&mut self.error_dialog, format!("Delete failed.\n\n{e}"));
                     }
                 },
                 Err(e) => {
                     let action = if f.prunable { "Prune" } else { "Delete" };
-                    self.error_dialog = Some(format!("{action} failed.\n\n{e}"));
+                    push_error(&mut self.error_dialog, format!("{action} failed.\n\n{e}"));
                 },
             }
             self.refresh_project(ctx, f.project_idx);
@@ -9040,6 +9055,16 @@ mod tests {
         assert!(checking.to_lowercase().contains("checking"));
         let unavailable = dirty_warning(None, false, false).expect("probe failed or was skipped");
         assert!(!unavailable.to_lowercase().contains("checking"));
+    }
+
+    #[test]
+    fn every_delete_failure_in_a_batch_stays_readable() {
+        let mut slot = None;
+        push_error(&mut slot, "Delete failed.\n\nwt1 is locked".to_string());
+        push_error(&mut slot, "Delete failed.\n\nwt2 is a main working tree".to_string());
+        let shown = slot.expect("both failures");
+        assert!(shown.contains("wt1 is locked"));
+        assert!(shown.contains("wt2 is a main working tree"));
     }
 
     #[test]
