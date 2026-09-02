@@ -31,6 +31,7 @@ use crate::file_drop;
 use crate::git_nav::{self, GitSection, SectionCount};
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, GitStatus, StatusCache};
 use crate::ipc;
+use crate::modal_gate::{ModalGate, ModalKind};
 use crate::panel_filter::{self, PanelFilter};
 use crate::paste;
 use crate::path_style;
@@ -523,6 +524,9 @@ pub struct AlacritreeApp {
     /// painted over the terminal would not.
     error_dialog: Option<String>,
     quit_dialog_open: bool,
+    /// Whether the modal on screen was already in front of the user when
+    /// the keys arriving now were pressed.
+    modal_gate: ModalGate,
     pending_delete: Option<DeleteRequest>,
     /// Confirmed deletes whose git removal is running off-thread; polled and
     /// adopted in `poll_pending_deletes`.
@@ -875,6 +879,7 @@ impl AlacritreeApp {
             theme,
             error_dialog: None,
             quit_dialog_open: false,
+            modal_gate: ModalGate::default(),
             pending_delete: None,
             pending_deletes: Vec::new(),
             pending_create: None,
@@ -4811,12 +4816,18 @@ fn palette_hint(bindings: &[KeyBinding]) -> String {
     parts.join(" · ")
 }
 
-fn consume_modal_keys(ctx: &Context) -> (bool, bool) {
+/// Take Escape and Enter for the modal now painting.
+///
+/// The keys leave the queue whether or not the modal may act on them: they
+/// were aimed at a screen that is no longer in front of the user, and letting
+/// one fall through would type it into a shell they can no longer see.  The
+/// gate decides only whether the modal answers them.
+fn consume_modal_keys(ctx: &Context, gate: &ModalGate, modal: ModalKind) -> (bool, bool) {
+    let accepts = gate.accepts(modal);
     ctx.input_mut(|i| {
-        (
-            i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
-            i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
-        )
+        let escape = i.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
+        let enter = i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+        (accepts && escape, accepts && enter)
     })
 }
 
@@ -7151,7 +7162,8 @@ impl AlacritreeApp {
         };
         let warning = dirty_warning(&req.dirty);
 
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modal_gate, ModalKind::Delete);
 
         let frame = modal_frame(&theme);
         let mut confirmed = false;
@@ -7222,7 +7234,8 @@ impl AlacritreeApp {
         let title = format!("Close session `{}`?", session.title);
         let busy = session.is_busy();
 
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modal_gate, ModalKind::CloseSession);
         let frame = modal_frame(&theme);
         let mut confirmed = false;
         let mut cancelled = false;
@@ -7277,7 +7290,8 @@ impl AlacritreeApp {
         };
         let title = format!("Remove `{}` from the sidebar?", state.name);
 
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modal_gate, ModalKind::RemoveProject);
         let frame = modal_frame(&theme);
         let mut confirmed = false;
         let mut cancelled = false;
@@ -7343,7 +7357,8 @@ impl AlacritreeApp {
         };
 
         // Enter and Esc both just dismiss — there's nothing to confirm.
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modal_gate, ModalKind::Error);
         let frame = modal_frame(&theme);
         let mut dismissed = false;
 
@@ -7390,7 +7405,7 @@ impl AlacritreeApp {
         // never steals Enter (run), Esc (clear then close), the arrows, or the
         // bound cursor jumps.  Ctrl+K shuts the palette with the same key that
         // opened it.
-        let (cancel, confirm) = consume_modal_keys(ctx);
+        let (cancel, confirm) = consume_modal_keys(ctx, &self.modal_gate, ModalKind::Palette);
         let (up, down) = ctx.input_mut(|i| {
             (
                 i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
@@ -7725,7 +7740,8 @@ impl AlacritreeApp {
             return;
         };
         let theme = self.theme;
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modal_gate, ModalKind::Rename);
         let frame = modal_frame(&theme);
         let mut rename_clicked = false;
         let mut cancelled = false;
@@ -7787,7 +7803,8 @@ impl AlacritreeApp {
         };
         let theme = self.theme;
         let danger = rgb_to_color32(self.config.palette.normal[1]);
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modal_gate, ModalKind::BaseBranchPicker);
         let (up, down) = ctx.input_mut(|i| {
             (
                 i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
@@ -7958,7 +7975,8 @@ impl AlacritreeApp {
         let default_branch = self.projects[project_idx].default_branch.clone();
         let project_root = self.projects[project_idx].root.clone();
 
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modal_gate, ModalKind::CreatePrompt);
         let frame = modal_frame(&theme);
         let mut create_clicked = false;
         let mut cancelled = false;
@@ -8053,7 +8071,8 @@ impl AlacritreeApp {
         let project_name = self.projects[project_idx].display_name().to_string();
         let frame = modal_frame(&theme);
         let s = theme.ui_scale;
-        let (minimize_via_esc, minimize_via_enter) = consume_modal_keys(ctx);
+        let (minimize_via_esc, minimize_via_enter) =
+            consume_modal_keys(ctx, &self.modal_gate, ModalKind::CreateRunning);
         let modal = egui::Modal::new(egui::Id::new("alacritree_create_dialog")).frame(frame).show(
             ctx,
             |ui| {
@@ -8101,7 +8120,8 @@ impl AlacritreeApp {
         let project_name = self.projects[project_idx].display_name().to_string();
         let frame = modal_frame(&theme);
         let mut close = false;
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modal_gate, ModalKind::CreateDone);
 
         let s = theme.ui_scale;
         let modal = egui::Modal::new(egui::Id::new("alacritree_create_dialog")).frame(frame).show(
@@ -8151,7 +8171,8 @@ impl AlacritreeApp {
         let danger = rgb_to_color32(self.config.palette.normal[1]);
         let n = self.sessions.len();
 
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modal_gate, ModalKind::Quit);
         let frame = modal_frame(&theme);
         let mut quit_clicked = false;
         let mut cancel_clicked = false;
@@ -8635,6 +8656,7 @@ impl eframe::App for AlacritreeApp {
         if self.palette.is_open() && !modal_open {
             self.show_command_palette(ctx);
         }
+        self.modal_gate.end_frame();
         self.phases.mark("dialogs");
 
         self.reap_exited_sessions(ctx);
@@ -8807,6 +8829,38 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         }
+    }
+
+    /// egui hands a frame the keys pressed while the previous frame was on
+    /// screen.  A modal opening now is answering an Enter aimed at whatever
+    /// the user was looking at, so it must not act on it -- and must still
+    /// take it off the queue, or it would be typed into the shell the modal
+    /// just covered.
+    #[test]
+    fn a_modal_ignores_the_enter_pressed_before_it_opened() {
+        let ctx = egui::Context::default();
+        let gate = ModalGate::default();
+        let press = || egui::RawInput {
+            events: vec![key_ev(egui::Key::Enter, true)],
+            ..Default::default()
+        };
+
+        let mut opening = (true, true);
+        let mut left_on_queue = 1;
+        let _ = ctx.run(press(), |ctx| {
+            opening = consume_modal_keys(ctx, &gate, ModalKind::Delete);
+            left_on_queue = ctx.input(|i| i.events.len());
+        });
+        gate.end_frame();
+
+        let mut settled = (false, false);
+        let _ = ctx.run(press(), |ctx| {
+            settled = consume_modal_keys(ctx, &gate, ModalKind::Delete);
+        });
+
+        assert_eq!(opening, (false, false));
+        assert_eq!(left_on_queue, 0);
+        assert_eq!(settled, (false, true));
     }
 
     #[test]
