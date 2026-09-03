@@ -39,8 +39,8 @@ fn main() {
         escape_args: false,
     };
     let size = alacritty_terminal::event::WindowSize {
-        num_lines: 40,
-        num_cols: 140,
+        num_lines: 30,
+        num_cols: 117,
         cell_width: 8,
         cell_height: 16,
     };

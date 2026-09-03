@@ -29,7 +29,8 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config as TermConfig, Term};
-use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
+use alacritty_terminal::event::OnResize;
+use alacritty_terminal::tty::{self, EventedPty, Options as PtyOptions, Shell};
 
 #[cfg(windows)]
 #[path = "../src/pty_rearm.rs"]
@@ -51,6 +52,7 @@ struct Options {
     columns: usize,
     screen_lines: usize,
     max: Duration,
+    no_rearm: bool,
     program: String,
     args: Vec<String>,
 }
@@ -96,7 +98,7 @@ fn main() -> std::io::Result<()> {
     let Some(opts) = parse_args() else {
         eprintln!(
             "usage: grid_probe [--log PATH] [--match TEXT] [--interval-us N] [--cols N] [--rows \
-             N] [--max-secs N] <program> [args…]"
+             N] [--max-secs N] [--no-rearm] <program> [args…]"
         );
         std::process::exit(2);
     };
@@ -125,9 +127,46 @@ fn main() -> std::io::Result<()> {
     };
 
     let pty = tty::new(&pty_options, window_size, 0)?;
-    #[cfg(windows)]
-    let pty = pty_rearm::RearmingPty::new(pty);
 
+    // The wrapper is what ships, so it is the default.  Running without it
+    // measures whether its packet accounting is what holds the reader up.
+    #[cfg(windows)]
+    let samples = if opts.no_rearm {
+        drive(pty, &term, &proxy, &opts)?
+    } else {
+        drive(pty_rearm::RearmingPty::new(pty), &term, &proxy, &opts)?
+    };
+    #[cfg(not(windows))]
+    let samples = drive(pty, &term, &proxy, &opts)?;
+
+    if let Some(path) = &opts.log {
+        let mut out = String::with_capacity(samples.len() * 24);
+        for sample in &samples {
+            out.push_str(&format!(
+                "{:.6}\t{}\t{}\n",
+                sample.at.as_secs_f64(),
+                u8::from(sample.present),
+                sample.cursor_column
+            ));
+        }
+        std::fs::write(path, out)?;
+    }
+
+    report(&opts, &samples, proxy.events.load(Ordering::Relaxed));
+    Ok(())
+}
+
+/// Run the child and sample the grid until it exits or the cap is reached.
+/// Generic so the same loop can drive a wrapped and an unwrapped pty.
+fn drive<P>(
+    pty: P,
+    term: &Arc<FairMutex<Term<Proxy>>>,
+    proxy: &Proxy,
+    opts: &Options,
+) -> std::io::Result<Vec<Sample>>
+where
+    P: EventedPty + OnResize + Send + 'static,
+{
     let event_loop = EventLoop::new(term.clone(), proxy.clone(), pty, false, false)?;
     let channel = event_loop.channel();
     let loop_handle = event_loop.spawn();
@@ -157,22 +196,7 @@ fn main() -> std::io::Result<()> {
 
     let _ = channel.send(Msg::Shutdown);
     let _ = loop_handle.join();
-
-    if let Some(path) = &opts.log {
-        let mut out = String::with_capacity(samples.len() * 24);
-        for sample in &samples {
-            out.push_str(&format!(
-                "{:.6}\t{}\t{}\n",
-                sample.at.as_secs_f64(),
-                u8::from(sample.present),
-                sample.cursor_column
-            ));
-        }
-        std::fs::write(path, out)?;
-    }
-
-    report(&opts, &samples, proxy.events.load(Ordering::Relaxed));
-    Ok(())
+    Ok(samples)
 }
 
 /// One frame at 60 Hz.  A gap shorter than this cannot have had a frame of its
@@ -266,6 +290,7 @@ fn parse_args() -> Option<Options> {
     let mut columns = 117usize;
     let mut screen_lines = 30usize;
     let mut max_secs = 600u64;
+    let mut no_rearm = false;
     let mut args = std::env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -276,6 +301,7 @@ fn parse_args() -> Option<Options> {
             "--cols" => columns = value(&mut args)?,
             "--rows" => screen_lines = value(&mut args)?,
             "--max-secs" => max_secs = value(&mut args)?,
+            "--no-rearm" => no_rearm = true,
             // Everything from the first non-option on is the command to run,
             // options of its own included.
             _ => {
@@ -286,6 +312,7 @@ fn parse_args() -> Option<Options> {
                     columns,
                     screen_lines,
                     max: Duration::from_secs(max_secs),
+                    no_rearm,
                     program: arg,
                     args: args.collect(),
                 });
