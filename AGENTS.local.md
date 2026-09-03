@@ -101,6 +101,10 @@ change, and `--trailer` adds a `Co-Authored-By` line for an agent's commits.
 
 Merging the branch into a feature branch puts working documents into a PR.
 
+## Soft-wrapped prose
+
+Issue bodies, PR bodies, review comments and Markdown docs are soft-wrapped: one line per paragraph, one line per bullet, and the renderer wraps them. Hard wrapping at a column renders as ragged text on GitHub and makes every later edit a rewrap. Commit messages are the exception and stay wrapped at 72.
+
 ## Git Commits
 
 Git commits you and/or your subagents make must have a commit trailer like: `Co-Authored-By: MODEL <EMAIL>`
