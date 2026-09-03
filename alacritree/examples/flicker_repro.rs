@@ -18,6 +18,12 @@
 //!   is preceded by a write that genuinely blanks the bottom row.
 //! * Ticks are throttled to one per 100 ms after an initial 500 ms, and a tick
 //!   whose rendered line is unchanged writes nothing at all.
+//! * The throttle does not govern the redraw after a status line.  Cargo's
+//!   `tick_progress` calls `Progress::tick_now`, which skips `Throttle`
+//!   entirely, so the bar returns on the next pass of the drain loop rather
+//!   than at the next allowed tick.  The row is blank for the length of a
+//!   syscall, not for a throttle window, which is why `--throttled-redraw` is
+//!   an opt-in: as a default it invents a blank row cargo never leaves.
 //!
 //! `--erase el` forces the Unix sequence on Windows.  If that alone settles the
 //! flicker, the trigger is the full-width blank write, not the tick rate.
@@ -59,12 +65,25 @@ struct Options {
     buffered: bool,
     /// Ask the console for its width once per tick, the way cargo does.
     query_width: bool,
+    /// Hold the redraw after a status line back until the throttle allows it.
+    /// Cargo does not: `tick_now` bypasses the throttle on that path.
+    throttled_redraw: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
         let erase = if cfg!(windows) { Erase::Spaces } else { Erase::El };
-        Self { width: 120, tick_ms: 100, scroll: 3.0, load: 0, secs: 30, erase, buffered: false, query_width: false }
+        Self {
+            width: 120,
+            tick_ms: 100,
+            scroll: 3.0,
+            load: 0,
+            secs: 30,
+            erase,
+            buffered: false,
+            query_width: false,
+            throttled_redraw: false,
+        }
     }
 }
 
@@ -72,7 +91,7 @@ fn main() {
     let Some(opts) = parse_args() else {
         eprintln!(
             "usage: flicker_repro [--width N] [--tick-ms N] [--scroll N] [--load N] [--secs N] \
-             [--erase el|spaces] [--buffered] [--query-width]"
+             [--erase el|spaces] [--buffered] [--query-width] [--throttled-redraw]"
         );
         std::process::exit(2);
     };
@@ -114,7 +133,12 @@ fn main() {
             finished += 1;
         }
 
-        if Instant::now() >= next_tick {
+        // `needs_clear` is false exactly when a status line has just been
+        // printed over the bar, which is the pass on which cargo's drain loop
+        // reaches `tick_progress` and redraws unthrottled.
+        let redraw_after_status = !opts.throttled_redraw && !needs_clear;
+
+        if Instant::now() >= next_tick || redraw_after_status {
             next_tick = Instant::now() + Duration::from_millis(opts.tick_ms);
             // Cargo re-reads the width every tick, and on Windows that is a
             // console API call rather than a VT write.  Whether conpty can stay
@@ -238,6 +262,10 @@ fn parse_args() -> Option<Options> {
             "--secs" => opts.secs = value(&mut args)?,
             "--buffered" => opts.buffered = true,
             "--query-width" => opts.query_width = true,
+            "--throttled-redraw" => opts.throttled_redraw = true,
+            // Accepted so a command line written for the redraw cargo actually
+            // does keeps working; it is the default.
+            "--tick-now" => opts.throttled_redraw = false,
             "--erase" => {
                 opts.erase = match args.next()?.as_str() {
                     "el" => Erase::El,
