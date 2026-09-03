@@ -52,6 +52,7 @@ struct Options {
     columns: usize,
     screen_lines: usize,
     max: Duration,
+    #[cfg_attr(not(windows), allow(dead_code))]
     no_rearm: bool,
     program: String,
     args: Vec<String>,
@@ -131,13 +132,13 @@ fn main() -> std::io::Result<()> {
     // The wrapper is what ships, so it is the default.  Running without it
     // measures whether its packet accounting is what holds the reader up.
     #[cfg(windows)]
-    let samples = if opts.no_rearm {
+    let (samples, child_exited) = if opts.no_rearm {
         drive(pty, &term, &proxy, &opts)?
     } else {
         drive(pty_rearm::RearmingPty::new(pty), &term, &proxy, &opts)?
     };
     #[cfg(not(windows))]
-    let samples = drive(pty, &term, &proxy, &opts)?;
+    let (samples, child_exited) = drive(pty, &term, &proxy, &opts)?;
 
     if let Some(path) = &opts.log {
         let mut out = String::with_capacity(samples.len() * 24);
@@ -152,7 +153,7 @@ fn main() -> std::io::Result<()> {
         std::fs::write(path, out)?;
     }
 
-    report(&opts, &samples, proxy.events.load(Ordering::Relaxed));
+    report(&opts, &samples, proxy.events.load(Ordering::Relaxed), child_exited);
     Ok(())
 }
 
@@ -163,7 +164,7 @@ fn drive<P>(
     term: &Arc<FairMutex<Term<Proxy>>>,
     proxy: &Proxy,
     opts: &Options,
-) -> std::io::Result<Vec<Sample>>
+) -> std::io::Result<(Vec<Sample>, bool)>
 where
     P: EventedPty + OnResize + Send + 'static,
 {
@@ -194,9 +195,10 @@ where
         std::thread::sleep(opts.interval);
     }
 
+    let child_exited = proxy.exited.load(Ordering::Relaxed);
     let _ = channel.send(Msg::Shutdown);
     let _ = loop_handle.join();
-    Ok(samples)
+    Ok((samples, child_exited))
 }
 
 /// One frame at 60 Hz.  A gap shorter than this cannot have had a frame of its
@@ -205,7 +207,7 @@ const FRAME: Duration = Duration::from_micros(16_667);
 
 /// The summary is what the probe is for: whoever runs it on another platform
 /// should get the number without a second tool to post-process the log.
-fn report(opts: &Options, samples: &[Sample], events: usize) {
+fn report(opts: &Options, samples: &[Sample], events: usize, child_exited: bool) {
     let Some(last) = samples.last() else {
         eprintln!("no samples");
         return;
@@ -238,23 +240,27 @@ fn report(opts: &Options, samples: &[Sample], events: usize) {
         }
         let dt = next.at.saturating_sub(sample.at).as_secs_f64();
         if sample.present {
+            // A run counts only once it has closed.  One still open when
+            // sampling stops has no measured length, and it is usually the
+            // program clearing the row as it exits rather than a stall, so
+            // folding it in here would report the end of the build as flicker.
             if run > FRAME.as_secs_f64() {
                 gaps_over_a_frame += 1;
             }
+            longest_absent = longest_absent.max(run);
             run = 0.0;
         } else {
             absent += dt;
             run += dt;
-            longest_absent = longest_absent.max(run);
         }
         // A completed redraw ends in a carriage return, so a cursor anywhere
         // but column 0 is a write the reader caught half applied.
         if sample.cursor_column == 0 {
+            longest_off = longest_off.max(off_run);
             off_run = 0.0;
         } else {
             off_column += dt;
             off_run += dt;
-            longest_off = longest_off.max(off_run);
         }
     }
 
@@ -277,6 +283,15 @@ fn report(opts: &Options, samples: &[Sample], events: usize) {
         percent(off_column),
         longest_off * 1000.0
     );
+    // Reported rather than folded into the figures above, because whether it
+    // is a stall or the program exiting is not something the probe can tell.
+    if run > 0.0 {
+        let ending = if child_exited { "the child had exited" } else { "the cap was reached" };
+        eprintln!("sampling ended inside a gap of {:.1} ms, {ending}", run * 1000.0);
+    }
+    if off_run > 0.0 {
+        eprintln!("sampling ended with the cursor off column 0 for {:.1} ms", off_run * 1000.0);
+    }
 }
 
 fn parse_args() -> Option<Options> {
