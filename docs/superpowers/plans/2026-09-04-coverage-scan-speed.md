@@ -243,13 +243,13 @@ fn cmap_coverage_matches_the_sorting_implementation_on_every_system_face() {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 2: Run the test to verify it passes**
 
 Run: `cargo nextest run -p alacritree -E 'test(cmap_coverage_matches)'`
 
-Expected: FAIL to compile, with `cannot find function `cmap_coverage_by_sorting``, because the oracle is written but `cmap_coverage` still holds the old body and there is nothing to compare. After Step 3 both exist and the assertion becomes meaningful.
+Expected: PASS. Both functions exist after Step 1 and both still hold the collect-and-sort body, so they agree trivially.
 
-Note this test cannot go red against a bug, because the change it guards has not been made. It is a characterization test: it must pass before and after Step 3, and it fails loudly if Step 3 changes coverage. Run it once now so a later pass is evidence rather than assumption.
+This is the one test in the plan that does not go red first, and that is deliberate. The behaviour it guards is "unchanged", so it cannot fail against a bug that has not been introduced yet. It is a characterization test: passing here establishes the baseline, and a failure after Step 3 means the fold changed coverage. Do not treat the green in Step 4 as evidence the rewrite happened; check the diff for that.
 
 - [ ] **Step 3: Rewrite `cmap_coverage`**
 
@@ -331,13 +331,13 @@ rayon = "1"
 
 Run: `cargo check -p alacritree`
 
-Expected: succeeds. `Cargo.lock` gains `rayon`, `rayon-core`, `either`, `crossbeam-deque`, `crossbeam-epoch`, `crossbeam-utils`.
+Expected: succeeds. `Cargo.lock` gains five packages — `rayon`, `rayon-core`, `either`, `crossbeam-deque`, `crossbeam-epoch`. `crossbeam-utils` is already in the lock at 0.8.21 and every new dependent accepts it, so it does not move.
 
 - [ ] **Step 3: Confirm the Unix build does not pull it**
 
 Run: `cargo tree -p alacritree --target x86_64-unknown-linux-gnu -i rayon`
 
-Expected: `error: package ID specification `rayon` did not match any packages`, or an empty result. If rayon appears, the target gate is wrong.
+Expected: `warning: nothing to print.` If rayon appears in a tree instead, the target gate is wrong.
 
 - [ ] **Step 4: Commit**
 
@@ -358,7 +358,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 Split the single loop into a serial stat pass, a rayon parallel phase, and a serial accumulation. The accumulation stays serial on purpose.
 
 **Files:**
-- Modify: `alacritree/src/fonts.rs:182-275` (`scan_coverage`)
+- Modify: `alacritree/src/fonts.rs:176-275` (`scan_coverage` and its doc comment)
 - Test: `alacritree/src/fonts.rs` (the `#[cfg(not(unix))]` test region, near `coverage_cache_round_trips_across_scans` at :2141)
 
 **Interfaces:**
@@ -417,7 +417,31 @@ fn every_face_of_a_collection_file_is_a_cache_hit_on_the_second_scan() {
     let (warm, warm_hits) = scan_coverage_with_workers(warm_fonts.db(), Some(&cache_path), 4);
 
     assert_eq!(cold, warm);
-    assert_eq!(warm_hits, warm.len(), "every scanned face should come from the cache");
+
+    // Two faces of one path is the hazard this test exists for, so fail
+    // loudly on a machine that has no collection file rather than pass
+    // without exercising it.
+    let mut faces_per_path: HashMap<&PathBuf, usize> = HashMap::new();
+    for (candidate, _) in &warm {
+        *faces_per_path.entry(&candidate.path).or_default() += 1;
+    }
+    assert!(
+        faces_per_path.values().any(|&n| n > 1),
+        "no multi-face font file was scanned, so this proved nothing"
+    );
+
+    // Not every face can be cached: one whose file cannot be stat'd never
+    // reaches `fresh_files`, and one whose cmap emits a codepoint above
+    // U+10FFFF is rejected on the way back out of the cache.  Both are
+    // properties of the font set, not of the accumulation.
+    let cacheable = cold
+        .iter()
+        .filter(|(candidate, cov)| {
+            candidate.bytes > 0
+                && coverage::Coverage::from_stored_ranges(cov.ranges().to_vec()).is_some()
+        })
+        .count();
+    assert_eq!(warm_hits, cacheable, "every cacheable face should come from the cache");
 
     std::fs::remove_file(&cache_path).ok();
 }
@@ -431,7 +455,7 @@ Expected: FAIL to compile, with `cannot find function `worker_count`` and `canno
 
 - [ ] **Step 3: Rewrite `scan_coverage`**
 
-Replace the whole function at `fonts.rs:181-275`. Add `use rayon::prelude::*;` inside the function rather than at module scope, so the import is also `cfg`-gated by its enclosing item.
+Replace `fonts.rs:176-275`, which is the function and the doc comment above it. The replacement below carries its own copy of that doc comment, so starting at 181 would leave the old five lines stranded above the new `worker_count` and rustdoc would attach them to it. Add `use rayon::prelude::*;` inside the function rather than at module scope, so the import is also `cfg`-gated by its enclosing item.
 
 ```rust
 /// How many faces to scan at once.  Four is where the measured curve
@@ -602,7 +626,7 @@ Run: `cargo nextest run -p alacritree -E 'test(worker_count) or test(a_parallel_
 
 Expected: PASS, 3 tests.
 
-If `every_face_of_a_collection_file_is_a_cache_hit_on_the_second_scan` fails with `warm_hits` less than `warm.len()`, the accumulation was parallelised or the `fresh_files` entry does not merge per file. That is the bug this test exists for.
+If `every_face_of_a_collection_file_is_a_cache_hit_on_the_second_scan` fails with `warm_hits` less than `cacheable`, the accumulation was parallelised or the `fresh_files` entry does not merge per file. That is the bug this test exists for.
 
 - [ ] **Step 5: Run the whole suite**
 
@@ -624,6 +648,10 @@ reads a finished map, and the cache accumulation stays serial: one
 CachedFile holds every face of a collection file, and per-worker
 fragments would have to merge those maps or silently drop faces.
 
+Coverage is unchanged face for face.  The one behavioural difference
+is that an unparseable face no longer marks the cache dirty, so a
+launch where every other face hits skips a rewrite it used to do.
+
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
 
@@ -632,6 +660,8 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ### Task 5: Record the resulting scan time on the issue
 
 #55's last acceptance criterion, and the input #27 is waiting on. This is the deliverable, not a formality: #27's entire design is priced against a 2860 ms scan.
+
+Be careful which number you compare against. 2860 ms comes from #27 and its conditions are not recorded. The spec's own before-number is 1393 ms, serial, warm filesystem cache, best of 5, on the 16-CPU machine with 928 faces. Post the comparison against 1393 ms with those conditions named, and mention 2860 ms only as the figure #27 was written against.
 
 **Files:** none.
 
@@ -653,13 +683,23 @@ Run it a second time without deleting the cache. Record the same line; hits shou
 - [ ] **Step 3: Post both numbers to the issue**
 
 ```bash
-gh issue comment 55 -R AbysmalBiscuit/alacritree --body "Cold scan after the change: <M> ms for <N> faces, against 2860 ms before. Warm scan: <M2> ms, all from cache. Measured on <machine, core count>."
+gh issue comment 55 -R AbysmalBiscuit/alacritree --body "Cold scan after the change: <M> ms for <N> faces on <machine, core count>, warm filesystem cache. The serial before-number under the same conditions was 1393 ms. Warm scan: <M2> ms, all from cache."
 ```
 
-- [ ] **Step 4: Note the consequence for #27**
+- [ ] **Step 4: Correct #55's second acceptance criterion**
+
+It reads "produces the same candidate set as a serial run, compared order-independently". `par_iter().collect()` preserves input order by construction, and the test in Task 4 asserts element-for-element equality, which is strictly stronger. Edit the issue body so the criterion matches what is actually guaranteed:
 
 ```bash
-gh issue comment 27 -R AbysmalBiscuit/alacritree --body "#55 has landed and the cold scan is now <M> ms, not 2860. The design in this issue is priced against the old number and should be re-scoped before implementation."
+gh issue view 55 -R AbysmalBiscuit/alacritree --json body -q .body > /tmp/55.md
+sed -i 's/compared order-independently/compared element for element, since rayon preserves input order/' /tmp/55.md
+gh issue edit 55 -R AbysmalBiscuit/alacritree --body-file /tmp/55.md
+```
+
+- [ ] **Step 5: Note the consequence for #27**
+
+```bash
+gh issue comment 27 -R AbysmalBiscuit/alacritree --body "#55 has landed and the cold scan is now <M> ms. The design in this issue is priced against 2860 ms and should be re-scoped before implementation."
 ```
 
 ---
@@ -668,7 +708,7 @@ gh issue comment 27 -R AbysmalBiscuit/alacritree --body "#55 has landed and the 
 
 **Spec coverage.** Section 1 of the spec is Tasks 1 and 2: the constructor, the three-way fold with `<=`, `checked_sub` for the overflow, the re-walk fallback, `Coverage::default()` for a cmap with no unicode subtable, and reuse of the existing `merge`. Section 2 is Tasks 3 and 4: the target-gated dependency, the hoisted stat pass, `par_iter` with order preserved by construction, the local pool, `worker_count`, and the serial accumulation with its per-file merge. The spec's testing section maps onto the tests in Tasks 1, 2 and 4. The spec's "why not DirectWrite" and "why not a single subtable" sections are rejected alternatives with no task. The last acceptance criterion on #55 is Task 5.
 
-**Not covered by a task, deliberately.** The spec's unresolved questions 1 and 2 are measurements Task 5 partly answers for the scan as a whole; the stat pass is not separately instrumented, because doing so means adding a timer to production code for a one-off question. Question 3 is Task 5's second comment.
+**Not covered by a task, deliberately.** The spec's unresolved questions 1 and 2 are measurements Task 5 partly answers for the scan as a whole; the stat pass is not separately instrumented, because doing so means adding a timer to production code for a one-off question. Question 3 is Task 5 Step 4, which edits #55's second criterion to say element-for-element.
 
 **Type consistency.** `Coverage::from_ascending_walk` takes `impl Fn(&mut dyn FnMut(u32))` in Task 1 and is called that way in Task 2. `worker_count` and `scan_coverage_with_workers` are declared in Task 4's interface block and used with those exact signatures in its tests. `scan_coverage` keeps `-> Vec<(coverage::Candidate, coverage::Coverage)>` so the four existing call sites compile untouched, while `scan_coverage_with_workers` returns the tuple with `hits` that Task 4's third test needs.
 
