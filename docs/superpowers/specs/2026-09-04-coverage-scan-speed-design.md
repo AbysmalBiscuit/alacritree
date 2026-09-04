@@ -69,6 +69,12 @@ Malformed is the right word: the ordering is required, not merely conventional. 
 
 `Coverage::from_codepoints` stays. After this change it has two callers: the non-ascending fallback, and the tests.
 
+### Why not ask DirectWrite for the ranges
+
+`IDWriteFontFace1::GetUnicodeRanges` returns `DWRITE_UNICODE_RANGE { first, last }`, the exact shape `Coverage` holds, so Windows will answer "what does this face cover" without a cmap parse. Over the full system font set it takes 2600 to 2900 ms across three runs, against 1393 ms for today's scan and about 120 ms for the one below. DirectWrite is not serving those ranges from its font cache; it is opening and parsing each font, more slowly than `ttf-parser` does. It also failed to produce a face for 229 of the 1385 entries in the system font set, so the index would be incomplete as well as slow.
+
+zed calls the same API, for the user's configured fallback families only, then appends `GetSystemFontFallback()` so the OS answers everything else per glyph at paint time (`crates/gpui_windows/src/direct_write.rs:398-441`). At roughly 2.4 ms per face that is fine for a handful of families and hopeless for a thousand. zed builds no index either. The per-glyph query is the route every Windows terminal takes, and egui's `FontDefinitions`, fixed before layout with no per-glyph hook, is what puts it out of reach here.
+
 ### Why not select a single subtable
 
 Walking only the widest unicode subtable per face is faster still, and it is wrong. Six of 928 faces here lose 304 codepoints under that rule, all Nerd Fonts whose format-4 subtable carries codepoints their format-12 subtable lacks: U+01F7, U+02CA, U+037B and others. Restricting to formats 12 and 13 loses the same 304. The union across subtables has to be preserved. Only the way it is accumulated changes.
@@ -98,7 +104,16 @@ Rayon is 8 to 15% slower, which is under 10 ms on a path that runs once per proc
 
 What it buys is that two whole classes of concurrency bug stop being possible rather than being fixed. Order preservation is free instead of argued. The accumulation stays serial instead of becoming a fragment fold with a per-file merge to get right. Neither is machinery the implementer has to hold in their head.
 
-The cost is six crates: `rayon`, `rayon-core`, `either`, and three `crossbeam` ones.
+The cost is six crates: `rayon`, `rayon-core`, `either`, and three `crossbeam` ones, and they are scoped to the platform that calls them:
+
+```toml
+[target.'cfg(not(unix))'.dependencies]
+rayon = "1"
+```
+
+`alacritree/Cargo.toml` already carries a `[target.'cfg(windows)'.dependencies]` block, so the shape is established. This one uses `cfg(not(unix))` to match the gate on the code that calls it, rather than `cfg(windows)`, so the two cannot drift apart on a target that is neither. A Linux or macOS build compiles none of the six.
+
+Scoping it this way is not a judgement that rayon has no other use here. If later work in #22 wants it on a path that runs everywhere, widening the target is a one-line change.
 
 This reverses the note in the #27 design, which rejected rayon. That call was made on time alone, against the pre-change code where per-face work was four times larger. On time the two are still a wash; the decision here is made on what the spec no longer has to specify.
 
@@ -164,5 +179,4 @@ Touch the Unix path. There is no coverage scan there.
 
 1. The cold scan time after the change, on the machine that reported 2860 ms. Everything above is a warm-filesystem measurement of the parse and range building; the first launch after a reboot also pays page faults on every font file, which no measurement here covers.
 2. Whether the 14 ms stat pass is still 14 ms cold. It is unmeasured after a reboot, and once the scan is around 120 ms it is a tenth of the total rather than a hundredth.
-3. Whether rayon should be an optional dependency behind a feature, given the whole scan is `#[cfg(not(unix))]` and a Linux or macOS build would pull six crates it never calls into.
-4. #55's acceptance criteria say the parallel and serial scans are "compared order-independently". This spec asserts the stronger element-for-element equality, which rayon supports for free. Update the issue rather than weakening the test.
+3. #55's acceptance criteria say the parallel and serial scans are "compared order-independently". This spec asserts the stronger element-for-element equality, which rayon supports for free. Update the issue rather than weakening the test.
