@@ -4,7 +4,9 @@
 
 **Issue:** [#27](https://github.com/AbysmalBiscuit/alacritree/issues/27), a sub-issue of [#22](https://github.com/AbysmalBiscuit/alacritree/issues/22).
 
-**Branch:** `perf/font-scan-background`, cut from `fix-selecting-text-near-the-left-side-of-the` (PR 206), marker `[5]`. The scan runs on its own thread rather than through `jobs.rs`, so this branch needs neither `perf/nonblocking-ui` nor `perf/pool-accounting` underneath it and stacks on the live stack tip like every other branch.
+**Branch:** `perf/font-scan-background`, cut from `perf/pool-accounting`. The scan is submitted to the `jobs.rs` pool, so it sits above `perf/nonblocking-ui` (which introduced the pool) and `perf/pool-accounting` (which reworked its ceilings). See the unresolved questions: neither has an open PR today.
+
+**Initiative:** this is one component of [#22](https://github.com/AbysmalBiscuit/alacritree/issues/22), which moves work that does not need to be synchronous off the UI thread. That framing decides two things below. The scan goes through the shared pool rather than a thread of its own, because a bespoke thread per moved component is what the pool exists to prevent. And replacing the fallback subsystem outright is out of scope, however attractive: the job here is to move this work, not to delete it.
 
 **Platform:** Windows only. Every part of the coverage scan is `#[cfg(not(unix))]`. Linux and macOS get their fallback chain from fontconfig's `FcFontSort`, backed by the system's own `fc-cache`, so there is nothing for alacritree to scan or persist there.
 
@@ -37,7 +39,7 @@ Rayon is not worth a dependency. It ties the dependency-free atomic queue on tim
 
 ### Two corrections to the issue
 
-The issue says the background side "needs its own `fontdb::Database` rather than a borrow of the one startup used". `fontdb::Database` is `Send + Sync`, verified by compile check, because its sources are `Arc<dyn AsRef<[u8]> + Sync + Send>`. What is not `Send` is `SystemFonts`, which holds `OnceCell` and `RefCell`. That type is constructed inside the scan thread and never crosses a thread, so an `Arc<Database>` is shared instead of rebuilt, saving a second enumeration and a duplicate copy.
+The issue says the background side "needs its own `fontdb::Database` rather than a borrow of the one startup used". `fontdb::Database` is `Send + Sync`, verified by compile check, because its sources are `Arc<dyn AsRef<[u8]> + Sync + Send>`. What is not `Send` is `SystemFonts`, which holds `OnceCell` and `RefCell`. That type is constructed inside the job and never crosses a thread, so an `Arc<Database>` is shared instead of rebuilt, saving a second enumeration and a duplicate copy.
 
 The issue says "the cache answers startup". It cannot answer it alone. The cache stores only `path -> {size, mtime, face_index -> ranges}`, while a `coverage::Candidate` also needs family, weight, italic, monospaced and file size, all of which come from `db.faces()`. The cache supplies the coverage; fontdb supplies the identity.
 
@@ -63,7 +65,7 @@ Windows Terminal calls `IDWriteFontFallback::MapCharacters` per text run at pain
 
 zed builds a fallback object once, reading `GetUnicodeRanges` for the user's configured fallback families only, then appends `GetSystemFontFallback()` so the OS answers everything else (`crates/gpui_windows/src/direct_write.rs:388-444`). ghostty's Windows discovery is a lazy directory walk that returns the first family match and stops, and its `discoverFallback` ignores the codepoint entirely (`src/font/discovery.zig:993-1001`). kitty's `all_fonts_map` is an `lru_cache` computed on first use with no disk cache and no thread (`kitty/fonts/fontconfig.py:53-54`), with fallback through `fc_match` (`fontconfig.py:92-94`).
 
-Two things follow. The fan-out gets a dedicated thread rather than a pool priority class, which is what wezterm does and costs nothing to copy. And the coverage scan itself is the outlier, which is the subject of "Alternative considered" below.
+Two things follow. The scan needs no priority machinery beyond the queue it already sits in, which is what section 2 settles. And the coverage scan itself is the outlier among these projects, which is what "What this does not do" records and defers.
 
 ## 1. Startup builds the chain from the cache
 
@@ -84,21 +86,29 @@ Startup's blocking cost becomes the 26 ms enumeration, the 14 ms stat pass, and 
 
 ## 2. The background scan
 
-`AlacritreeApp::new` spawns one named thread, `font-scan`, carrying the `Arc<Database>`, the font config, the cache path, and the chain startup installed. The result returns on an `mpsc::Sender` paired with `ctx.request_repaint()`, the pattern `EventProxy` already uses for PTY events, so the swap wakes the egui loop instead of waiting for the next input event.
+`AlacritreeApp::new` submits **one** job to the `jobs.rs` pool at `Priority::Background`, carrying the `Arc<Database>`, the font config, the cache path, and the chain startup installed. One job, not four: the fan-out happens inside it, so the scan occupies a single pool slot and cannot crowd out git status however many cores it uses.
 
-The thread does four things in order. It runs `scan_coverage` across four scoped threads pulling indices from a shared `AtomicUsize` over `db.faces()`. It writes the refreshed cache. It constructs `SystemFonts::from_scan` and calls `build_font_definitions`. It compares the resulting chain against the one it was handed.
+The job does four things in order. It runs `scan_coverage` across four scoped threads pulling indices from a shared `AtomicUsize` over `db.faces()`. It writes the refreshed cache. It constructs `SystemFonts::from_scan` and calls `build_font_definitions`. It compares the resulting chain against the one it was handed.
 
-It sends `Option<(FontDefinitions, Vec<ChainFace>)>`, `None` when the chains are equal. `ChainFace` already derives `PartialEq`, so the comparison is direct. A warm launch on a machine whose fonts have not changed does no swap at all.
+The job returns `Option<(FontDefinitions, Vec<ChainFace>)>`, `None` when the chains are equal. `ChainFace` already derives `PartialEq`, so the comparison is direct. A warm launch on a machine whose fonts have not changed does no swap at all.
 
-Building the `FontDefinitions` on the scan thread is what keeps the UI thread's share to a single `set_fonts` call. `trim_by_coverage` and `order_candidates` run over the whole candidate pool four times, once per variant, and `map_font_file` maps every chain face. None of that belongs on the UI thread. `FontDefinitions` is `Send`, since `FontData` holds a `Cow<'static, [u8]>`.
+Building the `FontDefinitions` inside the job is what keeps the UI thread's share to a single `set_fonts` call. `trim_by_coverage` and `order_candidates` run over the whole candidate pool four times, once per variant, and `map_font_file` maps every chain face. None of that belongs on the UI thread. `FontDefinitions` is `Send`, since `FontData` holds a `Cow<'static, [u8]>`.
 
-**No priority is set, on any platform.** An earlier draft added a `Priority::Cpu` class to `jobs.rs` with a `THREAD_PRIORITY_BELOW_NORMAL` nudge on Windows. The prior art does not support it: of the six projects surveyed, only ghostty lowers a thread at all, and it does so per long-lived thread on macOS, not per job. The scan is one bounded burst that ends on its own, competing mostly with an idle UI thread waiting for PTY output. Dropping the class also removes the Unix parity question the earlier draft could not answer, since there is now nothing to be at parity about.
+`scan_coverage` takes a `&Blocking`, so the token that already makes blocking helpers uncallable from `update` covers the scan too. That is what stops a later change from quietly putting it back on the UI thread.
 
-**Not the `jobs.rs` pool.** The pool is documented as sized for IO-bound work that spends its time waiting rather than saturating a core, and four CPU-bound shards would take every background slot on a four-worker pool, stalling git status on exactly the low-core machine where the scan is slowest. Sizing around that meant a new priority class, a new ceiling, and a dependency on two branches with no open PR. A dedicated thread for a one-shot, once-per-process job is what wezterm does for the same work, and it costs one `spawn`.
+**No new priority class, and no OS priority call.** A dedicated CPU class with its own ceiling and a `THREAD_PRIORITY_BELOW_NORMAL` nudge on Windows was considered and rejected. The ceiling would guard against four shards taking four pool slots, which submitting a single job makes impossible. The OS nudge has no support in the prior art: of the six projects surveyed, only ghostty lowers a thread at all, and it does so per long-lived thread on macOS rather than per job. Leaving it out also means no Unix parity gap to answer for, since there is nothing to be at parity about.
+
+### What this takes from zed, and what it leaves
+
+zed is the reference for the threading work in #22, and the part worth copying is its priority model, not its plumbing.
+
+Worth copying: priority is queue ordering and nothing else, with no OS call anywhere except raising a realtime audio thread; and selection is a weighted draw rather than strict precedence, 60/30/10 across High/Medium/Low, which is how zed keeps low-priority work from starving without needing a per-class ceiling at all (`crates/gpui/src/queue.rs:255-282`). That is about fifteen lines of plain Rust and it would let `jobs.rs` drop its ceilings. It belongs in `perf/pool-accounting`, which owns pool admission, not here; this design only needs the pool to be fair, not to be fair by any particular means.
+
+Left alone: the executor underneath it. zed runs `async_task::Runnable` over `futures`, with `Task<T>` handles, `dispatch_after` timers and a per-platform `PlatformDispatcher`, because it schedules thousands of small futures across a large app. alacritree submits a handful of long, self-contained closures per session and reads their results in `update`. `Job<T>` and a worker pool cover that. Adding an async runtime would buy nothing this app can spend.
 
 ## 3. The swap
 
-`update` drains the channel. On `Some((defs, chain))` the UI thread calls `ctx.set_fonts(defs)`, replaces `self.glyph_cache` with a fresh `GlyphCache`, replaces `self.color_glyphs` with `ColorGlyphCache::new(chain, budget)`, and requests a repaint.
+`update` polls the job. On `Some((defs, chain))` the UI thread calls `ctx.set_fonts(defs)`, replaces `self.glyph_cache` with a fresh `GlyphCache`, replaces `self.color_glyphs` with `ColorGlyphCache::new(chain, budget)`, and requests a repaint.
 
 The glyph cache is cleared explicitly rather than left to `AtlasState::outlived_by`. That heuristic notices a rebuilt atlas by its fill ratio dropping, which normally catches a `set_fonts`, but it is evaluated once per frame in `begin_frame`. A swap landing after `begin_frame` in the same frame would leave galleys addressing repacked atlas slots, painting the wrong characters for one frame.
 
@@ -112,7 +122,7 @@ An `egui::Area` anchored `Align2::LEFT_TOP` inside the terminal panel, at `Order
 
 An overlay rather than a sidebar row because either sidebar can be collapsed, and rather than a status strip because a new persistent region would have to be subtracted from the grid's cell fitting for a message that appears rarely.
 
-It appears only if the scan is still running 500 ms after the thread starts, and fades over roughly 200 ms when the swap lands or the thread dies. A scan that finishes inside the threshold shows nothing at all, which on the measurements above is the common case; the overlay exists for the machine where the scan takes seconds, so the tofu has an explanation.
+It appears only if the job is still running 500 ms after submission, and fades over roughly 200 ms when the swap lands or the job fails. A scan that finishes inside the threshold shows nothing at all, which on the measurements above is the common case; the overlay exists for the machine where the scan takes seconds, so the tofu has an explanation.
 
 ## 5. Configuration
 
@@ -130,9 +140,9 @@ A cache that is absent, truncated, corrupt, or version-mismatched already makes 
 
 A cache write that fails is already swallowed after a debug log. The next launch rescans.
 
-A scan thread that panics closes its sender. The UI thread sees the channel disconnect, clears the overlay, and keeps the chain startup installed. A cold launch that hits this keeps a primary-only chain for the session. The panic reaches `crash_log` through the existing hook.
+A scan job that panics is reported by `Job::failed`. The overlay clears, the chain stays as startup installed it, and the pool logs the payload. A cold launch that hits this keeps a primary-only chain for the session.
 
-A primary face that cannot be resolved at all is unchanged: `unresolvable_font_definitions` still runs on the UI thread at startup, and the scan result is discarded, because a chain built against a font that does not exist has nothing to install.
+A primary face that cannot be resolved at all is unchanged: `unresolvable_font_definitions` still runs on the UI thread at startup, and the job's result is discarded, because a chain built against a font that does not exist has nothing to install.
 
 ## Testing
 
@@ -148,25 +158,15 @@ Correctness of the parallel scan:
 
 Correctness of the swap:
 
-- A scan whose chain equals the cache-built chain sends `None` and triggers no `set_fonts`.
+- A scan whose chain equals the cache-built chain returns `None` and triggers no `set_fonts`.
 - The swap path clears the glyph cache, tested by observing that a galley cached before the swap is not returned after it.
-- A disconnected channel leaves the startup chain in place and clears the overlay.
+- A failed job leaves the startup chain in place and clears the overlay.
 
 The overlay's not-shown path is checked against the allocation-free unchanged-frame assertion in `steady_state.rs`.
 
-## Alternative considered: ask DirectWrite instead of scanning
-
-Windows answers "which font covers this codepoint" itself, through `IDWriteFontFallback::MapCharacters`. wezterm reaches it from Rust with the `dwrote` crate in about a hundred lines (`wezterm-font/src/locator/gdi.rs:260-360`). Every terminal surveyed above uses that API or its platform equivalent, and none of them pays a scan.
-
-alacritree does not, because of egui. `FontDefinitions` fixes the family list before layout and offers no per-glyph hook to consult on a miss, so the chain has to be complete up front, and completeness is what costs 2860 ms. The other terminals own their shaper and can ask at the moment of the miss.
-
-That is a smaller obstacle than it looks. `ctx.set_fonts` can be called at any point, and the grid painter already knows when it draws a cell with no glyph. A wezterm-shaped loop is available: collect missed codepoints during paint, resolve them off-thread with `MapCharacters`, append the faces, call `set_fonts`. That deletes the scan, the 928-face parse, the coverage cache, its binary format and version, and this design's indicator, and replaces them with a query the OS answers while shaping a single run.
-
-Against it: it deletes issue #27 rather than implementing it, replaces the fallback subsystem instead of moving it off the UI thread, adds a dependency, and leaves Unix on the fontconfig path so the two platforms stop sharing a shape. `MapCharacters` is unmeasured here, and Windows Terminal's own comment warns that it is slow per call.
-
-Recommendation: file it as its own issue, measure `MapCharacters` against the 2860 ms scan before committing to it, and ship this design meanwhile. This design is a strict improvement either way, and its cache-first startup path survives into that one unchanged.
-
 ## What this does not do
+
+Replace the coverage scan with DirectWrite. Windows answers "which font covers this codepoint" itself through `IDWriteFontFallback::MapCharacters`, reachable from Rust via `dwrote`, and it is what wezterm, zed and Windows Terminal all use instead of an index. alacritree cannot ask on demand today because egui fixes `FontDefinitions` before layout with no per-glyph hook, though a paint-time miss could be collected and resolved the way wezterm does. That is a different piece of work: it replaces the fallback subsystem rather than moving it off the UI thread, so it is a separate issue and not part of #22. Worth filing; not worth blocking this on.
 
 Mid-session font installation. The chain is built once per process. A font installed while alacritree is running is picked up on the next launch. The issue scopes this out and notes the answer may well be no.
 
@@ -176,8 +176,9 @@ Removing the last of the UI thread's font work. The 26 ms fontdb enumeration and
 
 ## Unresolved questions
 
-1. The DirectWrite alternative. Confirm that it is filed as its own issue and this design ships meanwhile, or stop here and measure `MapCharacters` first.
-2. Benchmark noise. Every number above was taken while another session ran mutation tests. Re-run on an idle machine before the plan cites 567 ms as the expected scan span.
-3. The option name `font_scan_notice`.
-4. The 500 ms appearance threshold and the 200 ms fade are chosen by argument, not measurement. They can only be judged against a real slow launch.
-5. Whether four scan threads is right on a four-core machine, where four shards plus the UI thread plus a shell spawn oversubscribe. A fixed four may want to become `min(4, available)`.
+1. Base branch. This depends on `jobs.rs`, so it must sit above `perf/nonblocking-ui` and `perf/pool-accounting`. Neither has an open PR, while the open stack (202 through 206) descends from `master` without them. Either those two open first, or this branch cuts from `perf/pool-accounting` and waits for them.
+2. Whether `perf/pool-accounting` adopts zed's weighted draw in place of per-class ceilings. Not this branch's call, but it is the one part of zed's model that transfers directly, and deciding it there keeps the pool from growing a ceiling per component as #22 proceeds.
+3. Benchmark noise. Every number above was taken while another session ran mutation tests. Re-run on an idle machine before the plan cites 567 ms as the expected scan span.
+4. The option name `font_scan_notice`.
+5. The 500 ms appearance threshold and the 200 ms fade are chosen by argument, not measurement. They can only be judged against a real slow launch.
+6. Whether four scan threads is right on a four-core machine, where four shards plus the UI thread plus a shell spawn oversubscribe. A fixed four may want to become `min(4, available)`.
