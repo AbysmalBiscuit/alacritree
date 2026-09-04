@@ -73,21 +73,40 @@ Malformed is the right word: the ordering is required, not merely conventional. 
 
 Walking only the widest unicode subtable per face is faster still, and it is wrong. Six of 928 faces here lose 304 codepoints under that rule, all Nerd Fonts whose format-4 subtable carries codepoints their format-12 subtable lacks: U+01F7, U+02CA, U+037B and others. Restricting to formats 12 and 13 loses the same 304. The union across subtables has to be preserved. Only the way it is accumulated changes.
 
-## 2. Fan out over faces
+## 2. Fan out over faces with rayon
 
 `scan_coverage` splits into three phases.
 
 **The stat pass runs first, serially, over distinct paths.** It is 14 ms, and hoisting it is what lets the parallel phase read a finished map instead of contending on one. This is also why `stat_memo` exists today: a `.ttc` collection holds several faces behind one path, and each would otherwise stat it again.
 
-**The parallel phase hands out face indices from an `AtomicUsize`**, and each worker collects into its own `Vec<(usize, (Candidate, Coverage))>`, carrying the face's position alongside its result. No worker touches a shared slot. The fold concatenates the fragments and sorts by the carried index.
+**The parallel phase is a `par_iter` over the face list**, producing the per-face `(Candidate, Coverage)` and whatever the cache write needs. It reads `&Database` and the finished stat map, and writes nothing shared.
 
-The obvious alternative, writing into a preallocated `Vec<Option<_>>` at each worker's own index, is not expressible in safe Rust: several scoped threads cannot each hold `&mut` into one `Vec`, and a dynamic atomic queue rules out splitting it with `chunks_mut`. A `Vec<OnceLock<_>>` would work, but carrying the index costs less and needs no shared allocation at all.
+**The accumulation phase runs serially over the ordered result.** It builds `fresh_files`, counts `hits`, and sets `any_fresh` exactly as today's loop does, then writes the cache and logs.
 
-Preserving position matters for determinism, not for tie-breaking. `order_candidates` sorts on family, then path, then face index (`fonts.rs:2590-2596`), a total order over the scan, so input order cannot reach it. What input order does reach is the tests, which compare whole `Vec`s.
+Splitting it this way is the point of using rayon rather than hand-rolled threads. `par_iter().collect()` preserves input order by construction, so the scan's output is deterministic with nothing carried or sorted to make it so. And because the accumulation stays serial over an ordered `Vec`, the `.ttc` hazard never arises: one `CachedFile` accumulates every face of a collection under one path (`fonts.rs:232-240`), and a parallel fold that built per-worker fragments would have to merge those per-file face maps or silently drop faces. Keep the accumulation serial. It is a single pass over a list that is already built, and parallelising it would buy nothing and reintroduce that bug.
 
-**Each worker accumulates its own bookkeeping and the fold merges it.** A worker keeps its own `fresh_files` fragment, its own `hits`, and its own `any_fresh`, so the hot loop touches no shared state beyond the atomic index.
+### Rayon rather than hand-rolled threads
 
-**The `fresh_files` fold merges per-file face maps rather than replacing them.** Today one `CachedFile` accumulates every face of a collection under one path (`fonts.rs:232-240`). Two workers scanning two faces of the same `.ttc` each build their own `CachedFile` for that path, and a `HashMap::extend` in the fold would keep one and discard the other's faces. The fold is therefore `entry(path).or_insert(file).faces.extend(file.faces)`. Getting it wrong fails silently: the dropped faces reparse on every launch, and `coverage_cache_round_trips_across_scans` (`fonts.rs:2141-2155`) still passes, because a cache miss only means a reparse.
+A hand-rolled fan-out was benchmarked against rayon at matched thread counts on 928 faces, four runs each, and the two produce identical output:
+
+| | 4 threads | full width |
+| --- | --- | --- |
+| atomic index queue, scoped threads | ~105 ms | ~62 ms |
+| rayon | ~113 ms | ~72 ms |
+
+Rayon is 8 to 15% slower, which is under 10 ms on a path that runs once per process and is smaller than the spread between runs of either implementation. One hand-rolled run came in at 164 ms against its own 88 ms best.
+
+What it buys is that two whole classes of concurrency bug stop being possible rather than being fixed. Order preservation is free instead of argued. The accumulation stays serial instead of becoming a fragment fold with a per-file merge to get right. Neither is machinery the implementer has to hold in their head.
+
+The cost is six crates: `rayon`, `rayon-core`, `either`, and three `crossbeam` ones.
+
+This reverses the note in the #27 design, which rejected rayon. That call was made on time alone, against the pre-change code where per-face work was four times larger. On time the two are still a wash; the decision here is made on what the spec no longer has to specify.
+
+### A local pool, not the global one
+
+The scan runs inside a `rayon::ThreadPool` built for it and dropped after, rather than on rayon's global pool. The global pool spawns on first use and keeps its threads for the life of the process, which would leave idle threads behind for a scan that runs once. A local pool joins its threads on drop.
+
+The whole lifecycle costs nothing: building a four-thread pool, installing into it and dropping it measures 104 µs, against 131 µs for spawning four scoped threads by hand.
 
 The thread count is:
 
@@ -97,30 +116,24 @@ fn worker_count(reported: usize) -> usize {
 }
 ```
 
-called as `worker_count(std::thread::available_parallelism().map_or(1, |n| n.get()))`. Of those workers, one is the main thread running the loop inline and the rest are spawned, so a machine reporting one CPU spawns nothing and scans serially.
+called as `worker_count(std::thread::available_parallelism().map_or(1, |n| n.get()))` and passed to `ThreadPoolBuilder::num_threads`.
 
-The main thread participates rather than reserving a core for itself. It has nothing else to do: it is inside `AlacritreeApp::new`, and the alternative is to sit blocked in `thread::scope` while a core goes unused. Reserving one would give a four-core machine three workers, which the sweep above prices at 164 ms against 121.
+The ceiling of 4 is the measured knee: a 36-core machine gains nothing measurable from 36 threads on memory-bound work. The floor of 1 keeps a restricted container from building a zero-thread pool. `worker_count` is a free function because that is what makes it testable; `available_parallelism` cannot be mocked.
 
-The ceiling of 4 is the measured knee: a 36-core machine gains nothing measurable from 36 threads on memory-bound work. The floor of 1 keeps a restricted container from spawning zero workers. `worker_count` is a free function because that is what makes it testable; `available_parallelism` cannot be mocked.
+### Not the job pool
 
-### No thread pool
-
-The fan-out spawns threads directly rather than reusing a pool. Windows thread creation is genuinely slower than Linux's, measured here at about 33 µs per thread against single-digit µs, but the scan pays it once: four scoped threads cost 131 µs typically and 409 µs at the worst of 200 runs, against a scan of roughly 120 ms. That is 0.1% to 0.3%, below the scan's own run-to-run variance.
-
-A pool amortises repeated spawns, and there is exactly one fan-out per process here. A reusable pool does already exist, in `jobs.rs` on `perf/nonblocking-ui`, and using it would put this branch behind the pool stack, the same dependency that has #27 waiting. Writing a second pool would duplicate it. Either way the structural cost far exceeds 131 µs.
-
-This changes if the scan ever becomes repeated, per session or on a font-install event. It is not today, and #27's scope note rules mid-session font installation out.
+`jobs.rs` on `perf/nonblocking-ui` is the other pool in reach, and using it would put this branch behind the pool stack, the same dependency that has #27 waiting. That branch independence is most of why this work can land now. When #27 goes ahead, the scan moves into that pool and this fan-out becomes a pooled job.
 
 ## Error handling
 
-Nothing new. An unparseable face is skipped with a debug log, unchanged, now inside a worker. A face whose source is `Source::Binary` is skipped as before, and its position simply produces no entry. A panic in a worker re-panics on the joining thread when `thread::scope` returns, on the UI thread during `AlacritreeApp::new`, which is where a panic in font setup already lands; the crash hook fires once, on the worker. The cache write, its failure path, and the summary log are untouched.
+Nothing new. An unparseable face is skipped with a debug log, unchanged, now inside a rayon task. A face whose source is `Source::Binary` is skipped as before, producing no entry. A panic in a rayon task propagates out of `install` on the calling thread, the UI thread during `AlacritreeApp::new`, which is where a panic in font setup already lands. The cache write, its failure path, and the summary log are untouched.
 
 ## Testing
 
 Equivalence is the load-bearing property, and both tests below need an oracle. Since `cmap_coverage` is the function being replaced, the tests keep a private copy of today's collect-and-sort body to compare against. Without it the implementer compares the new path against itself.
 
 - Coverage for every installed face is identical computed both ways, over the real system font set rather than a fixture. A fixture cannot cover the subtable shapes real fonts carry, and the Nerd Font case above is exactly what a hand-written fixture would miss.
-- A parallel scan returns the same `Vec` as a serial scan, element for element and in order. Both runs pass `cache_path = None`, or distinct scratch paths: the existing pattern at `fonts.rs:2143-2151` writes a cache on the first scan, and a second scan against it takes the `from_stored_ranges` branch and never parses a cmap at all.
+- A parallel scan returns the same `Vec` as a single-threaded scan, element for element and in order. Both runs pass `cache_path = None`, or distinct scratch paths: the existing pattern at `fonts.rs:2143-2151` writes a cache on the first scan, and a second scan against it takes the `from_stored_ranges` branch and never parses a cmap at all.
 
 That second test needs a worker count it can set. `scan_coverage` keeps its current signature (`fonts.rs:182-185`) and delegates to a new `scan_coverage_with_workers(db, cache_path, workers)`, so the four existing call sites (`fonts.rs:2147, 2151, 2165, 2170`) are untouched.
 
@@ -131,9 +144,9 @@ The range builder, tested through `Coverage::from_ascending_walk` against a synt
 
 `Coverage::merge` already has `merge_coalesces_overlapping_and_adjacent_ranges` (`fonts.rs:2719`), so overlap and adjacency need no new test. What needs one is the fold that drives it, which the equivalence test above covers.
 
-The cache fold:
+The cache accumulation:
 
-- A warm scan of a `.ttc` collection reports every one of its faces as a cache hit. This is the regression test for the per-file merge; a fold that replaces rather than merges fails it, where `coverage_cache_round_trips_across_scans` does not. It needs `hits` returned from `scan_coverage_with_workers`, or an assertion that the second scan does not rewrite the cache file.
+- A warm scan of a `.ttc` collection reports every one of its faces as a cache hit. The serial accumulation makes this pass by construction; the test exists so that parallelising it later fails loudly rather than silently reparsing those faces every launch. It needs `hits` returned from `scan_coverage_with_workers`, or an assertion that the second scan does not rewrite the cache file.
 
 The thread count, against `worker_count` directly: 1 from 1, 4 from 4, 4 from 36.
 
@@ -143,10 +156,13 @@ Everything in #27: starting from the cache, moving the scan to a background job,
 
 Change the disk cache format, its keying, or its validity rules. A cache written before this change stays valid after it, because the ranges it holds are unchanged.
 
+Introduce rayon anywhere else. It arrives for this scan; whether other work in #22 should use it is that work's call.
+
 Touch the Unix path. There is no coverage scan there.
 
 ## Unresolved questions
 
 1. The cold scan time after the change, on the machine that reported 2860 ms. Everything above is a warm-filesystem measurement of the parse and range building; the first launch after a reboot also pays page faults on every font file, which no measurement here covers.
 2. Whether the 14 ms stat pass is still 14 ms cold. It is unmeasured after a reboot, and once the scan is around 120 ms it is a tenth of the total rather than a hundredth.
-3. #55's acceptance criteria say the parallel and serial scans are "compared order-independently". This spec asserts the stronger element-for-element equality, which the fan-out design supports. Update the issue rather than weakening the test.
+3. Whether rayon should be an optional dependency behind a feature, given the whole scan is `#[cfg(not(unix))]` and a Linux or macOS build would pull six crates it never calls into.
+4. #55's acceptance criteria say the parallel and serial scans are "compared order-independently". This spec asserts the stronger element-for-element equality, which rayon supports for free. Update the issue rather than weakening the test.
