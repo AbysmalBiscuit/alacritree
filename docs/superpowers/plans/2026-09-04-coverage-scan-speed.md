@@ -665,25 +665,53 @@ Be careful which number you compare against. 2860 ms comes from #27 and its cond
 
 **Files:** none.
 
+Measure through the test harness, not by launching the app. `scan_coverage_with_workers` is callable directly against a scratch cache path, which gives the same numbers plus a worker count the app's log line does not carry.
+
+**Never launch the GUI to take this measurement, and never kill a process by image name.** alacritree is a terminal, so a developer's own session — including the one an agent is running inside — is an `alacritree.exe`. `taskkill /IM alacritree.exe` takes those down with it. App-level verification is a manual step for the repository owner, not part of this task.
+
 - [ ] **Step 1: Measure a cold scan**
 
-Delete the real cache and run the app once, then read the line `scan_coverage` logs:
+Add a temporary timing test in the `#[cfg(not(unix))]` test region of `alacritree/src/fonts.rs`. It points `scan_coverage_with_workers` at a scratch cache path that does not exist yet, so every face takes the fresh-parse branch:
 
-```bash
-rm -f "$LOCALAPPDATA/alacritree/coverage-cache.v1.bin"
-cargo run -p alacritree --release
+```rust
+#[cfg(not(unix))]
+#[test]
+fn measure_cold_and_warm_scan() {
+    let cache_path = scratch_cache_path("measure");
+    std::fs::remove_file(&cache_path).ok();
+    let fonts = SystemFonts::with_cache_dir(None);
+    let workers = worker_count(std::thread::available_parallelism().map_or(1, |n| n.get()));
+
+    let t = std::time::Instant::now();
+    let (cold, cold_hits) = scan_coverage_with_workers(fonts.db(), Some(&cache_path), workers);
+    let cold_ms = t.elapsed().as_millis();
+
+    let t = std::time::Instant::now();
+    let (_, warm_hits) = scan_coverage_with_workers(fonts.db(), Some(&cache_path), workers);
+    let warm_ms = t.elapsed().as_millis();
+
+    std::fs::remove_file(&cache_path).ok();
+    panic!(
+        "faces {} workers {workers} cold {cold_ms} ms ({cold_hits} hits) warm {warm_ms} ms ({warm_hits} hits)",
+        cold.len()
+    );
+}
 ```
 
-Expected: a log line of the form `scanned N font faces for fallback coverage in M ms (0 from cache)`. Record `N` and `M`.
+The `panic!` is how the numbers reach stdout; this test is deleted before the task ends and never committed.
 
-- [ ] **Step 2: Measure a warm scan**
+Run: `cargo nextest run -p alacritree --release -E 'test(measure_cold_and_warm_scan)'`
 
-Run it a second time without deleting the cache. Record the same line; hits should equal the face count.
+Record the face count, the worker count, and both timings.
+
+- [ ] **Step 2: Delete the temporary test**
+
+Remove it and confirm `git -C <worktree> status --porcelain` is empty. This task commits nothing.
 
 - [ ] **Step 3: Post both numbers to the issue**
 
 ```bash
-gh issue comment 55 -R AbysmalBiscuit/alacritree --body "Cold scan after the change: <M> ms for <N> faces on <machine, core count>, warm filesystem cache. The serial before-number under the same conditions was 1393 ms. Warm scan: <M2> ms, all from cache."
+gh issue comment 55 -R AbysmalBiscuit/alacritree --body "Cold scan after the change: <M> ms for <N> faces at <W> workers on <machine, core count>, warm filesystem cache, measured through the test harness rather than app startup. The serial before-number under the same conditions was 1393 ms. Warm scan: <M2> ms, all from cache."
 ```
 
 - [ ] **Step 4: Correct #55's second acceptance criterion**
