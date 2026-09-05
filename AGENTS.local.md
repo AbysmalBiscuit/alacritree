@@ -135,19 +135,22 @@ The GitHub base is always `master`, even though the branch descends from the
 previous PR in the stack rather than from `master`.
 
 Open the PR with `devkit issue pr create`, not `gh pr create`. Its `pr_body`
-template in `devkit.local.toml` renders the body shape every PR here uses: a
-human TL;DR, the `Closes` lines, then the Claude summary under a rule, ending in
-the model attribution. Writing the body by hand reproduces that shape by memory
+template in `devkit.local.toml` renders the body shape every PR here uses: my
+TL;DR, the `Closes` lines, then the Claude summary under a rule, ending in the
+model attribution. Writing the body by hand reproduces that shape by memory
 and drifts from it.
 
 ```sh
 devkit issue pr create --ready \
   --pr-title 'feat(render): draw the grid on the GPU [3]' \
   --pr-body "$(cat summary.md)" \
-  --arg tldr="$(cat tldr.md)" \
   --arg closes="12 41" \
   --arg stacked_on=203
 ```
+
+The TL;DR is mine. I write it into the PR myself once it is open, so leave
+`--arg tldr` off the command and pass only `--pr-body`, `--arg closes` and
+`--arg stacked_on`.
 
 `devkit issue review request` is a different command. It requests review on a PR
 that already exists, and it is mine to run, not yours. Never pass `--to` to `pr
@@ -157,13 +160,13 @@ it opens the PR and stops.
 `--ready` opens a real PR. Without it devkit opens a draft, and drafts get no
 review-bot coverage. Add `--no-push` only when the branch is already pushed.
 
-`--pr-body` is the Claude summary and `--arg tldr` the human half; pass both
-through files rather than inline, since either can run long. The first `Closes`
-line comes from the worktree's own issue, so `--arg closes` carries only the
-extra ones, whitespace separated. `--arg stacked_on` takes the PR number this
-branch sits on and emits the review-order note; leave it off for a branch that
-really does descend from `master`. `--arg model` overrides the attribution when
-a different model did the work.
+`--pr-body` carries the Claude summary; pass it through a file rather than
+inline, since it can run long. The first `Closes` line comes from the
+worktree's own issue, so `--arg closes` carries only the extra ones,
+whitespace separated. `--arg stacked_on` takes the PR number this branch sits
+on and emits the review-order note; leave it off for a branch that really does
+descend from `master`. `--arg model` overrides the attribution when a
+different model did the work.
 
 The template renders only when the command creates a PR. Editing an open one is
 still `gh pr edit`, and the shape has to be preserved by hand there.
