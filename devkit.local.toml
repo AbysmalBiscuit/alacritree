@@ -49,7 +49,6 @@ kind = "github"
 pr_body = '''
 ## TL;DR (human written)
 
-{{ tldr }}
 {%- set ids = (((issue if issue is defined else "") ~ " " ~ closes) | split) -%}
 {%- if ids %}
 {% for id in ids %}
