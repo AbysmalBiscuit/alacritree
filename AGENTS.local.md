@@ -40,6 +40,21 @@ own:
 git -C ../alacritree-worktrees/feat/decoration-metrics reset --hard origin/<base>
 ```
 
+The base moves under you. A branch that sat unimplemented for a few days is
+based on a commit its own PR has since rebased away, and nothing errors: the
+hash is simply gone from the base's history. Check before opening the PR.
+
+```sh
+git -C <worktree> merge-base --is-ancestor <recorded base> origin/<base>
+```
+
+When that fails, the live commit usually carries the same subject at a new hash,
+and replaying onto the base fixes it:
+
+```sh
+git -C <worktree> rebase --onto origin/<base> <recorded base> <branch>
+```
+
 `devkit issue status` lists what exists, `devkit issue end` removes a finished
 worktree.
 
@@ -119,14 +134,14 @@ Whenever I ask to open a PR, or push open PR, etc. You need to push the branch t
 The GitHub base is always `master`, even though the branch descends from the
 previous PR in the stack rather than from `master`.
 
-Open the PR with `devkit issue review request`, not `gh pr create`. Its
-`pr_body` template in `devkit.local.toml` renders the body shape every PR here
-uses: a human TL;DR, the `Closes` lines, then the Claude summary under a rule,
-ending in the model attribution. Writing the body by hand reproduces that shape
-by memory and drifts from it.
+Open the PR with `devkit issue pr create`, not `gh pr create`. Its `pr_body`
+template in `devkit.local.toml` renders the body shape every PR here uses: a
+human TL;DR, the `Closes` lines, then the Claude summary under a rule, ending in
+the model attribution. Writing the body by hand reproduces that shape by memory
+and drifts from it.
 
 ```sh
-devkit issue review request --no-notify \
+devkit issue pr create --ready \
   --pr-title 'feat(render): draw the grid on the GPU [3]' \
   --pr-body "$(cat summary.md)" \
   --arg tldr="$(cat tldr.md)" \
@@ -134,9 +149,13 @@ devkit issue review request --no-notify \
   --arg stacked_on=203
 ```
 
-Always pass `--no-notify`, and never pass `--to`. Together they mean the command
-adds no reviewer and sends no Slack: it opens the PR and stops. Requesting a
-review is my call, not yours.
+`devkit issue review request` is a different command. It requests review on a PR
+that already exists, and it is mine to run, not yours. Never pass `--to` to `pr
+create` either: without it the command adds no reviewer and sends no Slack, so
+it opens the PR and stops.
+
+`--ready` opens a real PR. Without it devkit opens a draft, and drafts get no
+review-bot coverage. Add `--no-push` only when the branch is already pushed.
 
 `--pr-body` is the Claude summary and `--arg tldr` the human half; pass both
 through files rather than inline, since either can run long. The first `Closes`
