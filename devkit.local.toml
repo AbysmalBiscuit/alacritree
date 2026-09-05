@@ -21,8 +21,9 @@ baseline_ref = "origin/master"
 # PRs go to Arnaud's repo, whose default branch is master, not devkit's staging.
 pr_base = "master"
 
-# No baseline server exists here. The path names one that is never created.
-baseline_path = "../alacritree-baseline"
+# No baseline server exists here. The directory names where one would be
+# created, and nothing creates it.
+baseline_dir = "../alacritree-baselines"
 
 # Untracked instructions copied into each new worktree, so an agent working
 # there reads the same rules as one working in the main checkout.
