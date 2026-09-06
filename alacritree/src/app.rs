@@ -8227,8 +8227,12 @@ fn managed_hint(managed: &Managed) -> String {
         hint.push_str(", shared view");
     }
     if let Some(chord) = &managed.detach {
-        hint.push_str(", detach with ");
+        // Backquoted because the chord is a sequence, not one combination:
+        // unquoted, "detach with Ctrl+B q" reads as a sentence whose last
+        // word happens to be `q`.
+        hint.push_str(", detach with `");
         hint.push_str(chord);
+        hint.push('`');
     }
     hint
 }
@@ -11570,13 +11574,13 @@ mod tests {
         row.managed.detach = Some("Ctrl+B q".to_string());
         assert_eq!(
             herdr_row_tooltip(&row),
-            "claude primary, working. herdr, detach with Ctrl+B q."
+            "claude primary, working. herdr, detach with `Ctrl+B q`."
         );
 
         row.managed.shared_view = true;
         assert_eq!(
             herdr_row_tooltip(&row),
-            "claude primary, working. herdr, shared view, detach with Ctrl+B q."
+            "claude primary, working. herdr, shared view, detach with `Ctrl+B q`."
         );
     }
 
