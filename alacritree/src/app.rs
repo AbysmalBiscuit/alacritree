@@ -27,6 +27,7 @@ use crate::config::{
 use crate::crash_log::{self, ExitReason};
 use crate::git_nav::{self, GitSection, SectionCount};
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, GitStatus, StatusCache};
+use crate::modal_gate::{ModalGate, ModalKind};
 use crate::panel_filter::{self, PanelFilter};
 use crate::path_style::PathStyle;
 use crate::pending_spawn::{Finished, PendingSpawns};
@@ -530,6 +531,9 @@ pub struct AlacritreeApp {
     /// painted over the terminal would not.
     error_dialog: Option<String>,
     quit_dialog_open: bool,
+    /// Whether the modal on screen was already in front of the user when
+    /// the keys arriving now were pressed.
+    modal_gate: ModalGate,
     pending_delete: Option<DeleteRequest>,
     /// Confirmed deletes whose git removal is running off-thread; polled and
     /// adopted in `poll_pending_deletes`.
@@ -951,6 +955,7 @@ impl AlacritreeApp {
             theme,
             error_dialog: None,
             quit_dialog_open: false,
+            modal_gate: ModalGate::default(),
             pending_delete: None,
             pending_deletes: Vec::new(),
             pending_create: None,
@@ -5393,6 +5398,33 @@ fn dirty_warning(counts: Option<&DirtyCounts>, force: bool, checking: bool) -> O
     }
 }
 
+/// Whether the delete confirm may execute.
+///
+/// A removal is only safe to run once the dirty count is resolved.  The
+/// sessions living in the worktree are torn down before `git worktree
+/// remove` runs, so an unforced attempt that git refuses as dirty has
+/// already cost the user their shells by the time the refusal arrives.  A
+/// resolved count presets `--force`, which git will not refuse for
+/// dirtiness; a forced retry has already been through that refusal.
+fn delete_confirm_ready(counts: Option<&DirtyCounts>, force: bool) -> bool {
+    force || counts.is_some()
+}
+
+/// Fold a failure into the single-slot error dialog rather than replacing
+/// what it holds.  One frame can finish several background deletes, and the
+/// dialog shows one message: replacing it would leave only the last
+/// failure, with the earlier explanations gone before the user ever read
+/// them.
+fn push_error(slot: &mut Option<String>, message: String) {
+    match slot {
+        Some(shown) => {
+            shown.push_str("\n\n");
+            shown.push_str(&message);
+        },
+        None => *slot = Some(message),
+    }
+}
+
 /// The modal frame's horizontal inner margin.  Any width budgeted against the
 /// window has to leave room for it, so it lives apart from the frame itself.
 fn modal_pad_x(scale: f32) -> f32 {
@@ -5456,12 +5488,18 @@ fn palette_hint(bindings: &[KeyBinding]) -> String {
     parts.join(" · ")
 }
 
-fn consume_modal_keys(ctx: &Context) -> (bool, bool) {
+/// Take Escape and Enter for the modal now painting.
+///
+/// The keys leave the queue whether or not the modal may act on them: they
+/// were aimed at a screen that is no longer in front of the user, and letting
+/// one fall through would type it into a shell they can no longer see.  The
+/// gate decides only whether the modal answers them.
+fn consume_modal_keys(ctx: &Context, gate: &ModalGate, modal: ModalKind) -> (bool, bool) {
+    let accepts = gate.accepts(modal);
     ctx.input_mut(|i| {
-        (
-            i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
-            i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
-        )
+        let escape = i.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
+        let enter = i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+        (accepts && escape, accepts && enter)
     })
 }
 
@@ -7972,17 +8010,24 @@ impl AlacritreeApp {
             return;
         }
 
-        // Consume Enter/Escape, and act on a confirm, before adopting a
+        // Consume Enter/Escape, and judge a confirm, before adopting a
         // dirty count below: adoption can flip `force` from `false` to
         // `true` this same frame, but the keypress was the user's reaction
         // to what was already painted (a previous frame's "checking…", read
-        // as `force: false`). Executing the confirm here, against the
-        // request as it stands before this frame's adoption runs, is what
-        // keeps "the `force` a confirm executes" equal to "the `force` the
-        // user was shown" — held Enter (key repeat) would otherwise hit the
-        // race on the exact frame the probe lands.
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
-        if confirm_via_key {
+        // as `force: false`). Judging the confirm here, against the request
+        // as it stands before this frame's adoption runs, is what keeps
+        // "what a confirm executes" equal to "what the user was shown" —
+        // held Enter (key repeat) would otherwise hit the race on the exact
+        // frame the probe lands. The key is consumed whether or not the
+        // confirm may act on it: it was aimed at this dialog, and letting it
+        // fall through would type it into the shell behind.
+        let confirm_ready = self
+            .pending_delete
+            .as_ref()
+            .is_some_and(|req| delete_confirm_ready(req.dirty.as_ref(), req.force));
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modal_gate, ModalKind::Delete);
+        if confirm_via_key && confirm_ready {
             self.run_pending_delete(ctx);
             return;
         }
@@ -8032,10 +8077,16 @@ impl AlacritreeApp {
             )
         };
         let warning = dirty_warning(req.dirty.as_ref(), req.force, req.dirty_job.is_some());
+        let ready = delete_confirm_ready(req.dirty.as_ref(), req.force);
+        // The probe finished without leaving a count, so waiting longer buys
+        // nothing; offer the check again rather than stranding the dialog
+        // behind a confirm that will never enable.
+        let recheckable = !ready && req.dirty_job.is_none();
 
         let frame = modal_frame(&theme);
         let mut confirmed = false;
         let mut cancelled = false;
+        let mut recheck = false;
 
         let s = theme.ui_scale;
         let modal = egui::Modal::new(egui::Id::new("alacritree_delete_dialog")).frame(frame).show(
@@ -8060,18 +8111,26 @@ impl AlacritreeApp {
                 }
                 ui.add_space(4.0 * s);
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!("Enter to {} · Esc to cancel", verb.to_lowercase()))
-                            .color(theme.text_muted)
-                            .small(),
-                    );
+                    let hint = if ready {
+                        format!("Enter to {} · Esc to cancel", verb.to_lowercase())
+                    } else {
+                        "Esc to cancel".to_string()
+                    };
+                    ui.label(RichText::new(hint).color(theme.text_muted).small());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let delete = modal_button(ui, &theme, verb, danger);
+                        let delete = ui
+                            .add_enabled_ui(ready, |ui| modal_button(ui, &theme, verb, danger))
+                            .inner;
                         if delete.clicked() {
                             confirmed = true;
                         }
                         if modal_button(ui, &theme, "Cancel", theme.text_dim).clicked() {
                             cancelled = true;
+                        }
+                        if recheckable
+                            && modal_button(ui, &theme, "Check again", theme.text).clicked()
+                        {
+                            recheck = true;
                         }
                         focus_default(ui.ctx(), delete.id);
                     });
@@ -8079,6 +8138,16 @@ impl AlacritreeApp {
             },
         );
 
+        if recheck {
+            if let Some(req) = self.pending_delete.as_mut() {
+                let path = req.worktree_path.clone();
+                req.dirty_job =
+                    Some(jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
+                        git_status::dirty_counts(&path, blocking)
+                    }));
+            }
+            return;
+        }
         if confirmed {
             self.run_pending_delete(ctx);
             return;
@@ -8102,7 +8171,8 @@ impl AlacritreeApp {
         let title = format!("Close session `{}`?", session.title);
         let busy = session.is_busy();
 
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modal_gate, ModalKind::CloseSession);
         let frame = modal_frame(&theme);
         let mut confirmed = false;
         let mut cancelled = false;
@@ -8157,7 +8227,8 @@ impl AlacritreeApp {
         };
         let title = format!("Remove `{}` from the sidebar?", state.name);
 
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modal_gate, ModalKind::RemoveProject);
         let frame = modal_frame(&theme);
         let mut confirmed = false;
         let mut cancelled = false;
@@ -8223,7 +8294,8 @@ impl AlacritreeApp {
         };
 
         // Enter and Esc both just dismiss — there's nothing to confirm.
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modal_gate, ModalKind::Error);
         let frame = modal_frame(&theme);
         let mut dismissed = false;
 
@@ -8270,7 +8342,7 @@ impl AlacritreeApp {
         // never steals Enter (run), Esc (clear then close), the arrows, or the
         // bound cursor jumps.  Ctrl+K shuts the palette with the same key that
         // opened it.
-        let (cancel, confirm) = consume_modal_keys(ctx);
+        let (cancel, confirm) = consume_modal_keys(ctx, &self.modal_gate, ModalKind::Palette);
         let (up, down) = ctx.input_mut(|i| {
             (
                 i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
@@ -8660,12 +8732,12 @@ impl AlacritreeApp {
                             force: true,
                         });
                     } else {
-                        self.error_dialog = Some(format!("Delete failed.\n\n{e}"));
+                        push_error(&mut self.error_dialog, format!("Delete failed.\n\n{e}"));
                     }
                 },
                 Err(e) => {
                     let action = if f.prunable { "Prune" } else { "Delete" };
-                    self.error_dialog = Some(format!("{action} failed.\n\n{e}"));
+                    push_error(&mut self.error_dialog, format!("{action} failed.\n\n{e}"));
                 },
             }
             self.refresh_project(ctx, f.project_idx);
@@ -8725,7 +8797,8 @@ impl AlacritreeApp {
             return;
         };
         let theme = self.theme;
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modal_gate, ModalKind::Rename);
         let frame = modal_frame(&theme);
         let mut rename_clicked = false;
         let mut cancelled = false;
@@ -8803,7 +8876,8 @@ impl AlacritreeApp {
         }
         let theme = self.theme;
         let danger = rgb_to_color32(self.config.palette.normal[1]);
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modal_gate, ModalKind::BaseBranchPicker);
         let (up, down) = ctx.input_mut(|i| {
             (
                 i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
@@ -8994,7 +9068,8 @@ impl AlacritreeApp {
         let default_branch = self.projects[project_idx].default_branch.clone();
         let project_root = self.projects[project_idx].root.clone();
 
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modal_gate, ModalKind::CreatePrompt);
         let frame = modal_frame(&theme);
         let mut create_clicked = false;
         let mut cancelled = false;
@@ -9091,7 +9166,8 @@ impl AlacritreeApp {
         let project_name = self.projects[project_idx].display_name().to_string();
         let frame = modal_frame(&theme);
         let s = theme.ui_scale;
-        let (minimize_via_esc, minimize_via_enter) = consume_modal_keys(ctx);
+        let (minimize_via_esc, minimize_via_enter) =
+            consume_modal_keys(ctx, &self.modal_gate, ModalKind::CreateRunning);
         let modal = egui::Modal::new(egui::Id::new("alacritree_create_dialog")).frame(frame).show(
             ctx,
             |ui| {
@@ -9139,7 +9215,8 @@ impl AlacritreeApp {
         let project_name = self.projects[project_idx].display_name().to_string();
         let frame = modal_frame(&theme);
         let mut close = false;
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modal_gate, ModalKind::CreateDone);
 
         let s = theme.ui_scale;
         let modal = egui::Modal::new(egui::Id::new("alacritree_create_dialog")).frame(frame).show(
@@ -9189,7 +9266,8 @@ impl AlacritreeApp {
         let danger = rgb_to_color32(self.config.palette.normal[1]);
         let n = self.sessions.len();
 
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modal_gate, ModalKind::Quit);
         let frame = modal_frame(&theme);
         let mut quit_clicked = false;
         let mut cancel_clicked = false;
@@ -9745,6 +9823,7 @@ impl eframe::App for AlacritreeApp {
         if self.palette.is_open() && !modal_open {
             self.show_command_palette(ctx);
         }
+        self.modal_gate.end_frame();
         self.phases.mark("dialogs");
 
         self.reap_exited_sessions(ctx);
@@ -9899,6 +9978,33 @@ mod tests {
         assert!(checking.to_lowercase().contains("checking"));
         let unavailable = dirty_warning(None, false, false).expect("probe failed or was skipped");
         assert!(!unavailable.to_lowercase().contains("checking"));
+    }
+
+    #[test]
+    fn a_delete_confirm_waits_for_the_dirty_count() {
+        // An unresolved count is the one case where the removal may be
+        // refused, and the sessions are gone before the refusal lands.
+        assert!(!delete_confirm_ready(None, false));
+
+        let clean = DirtyCounts::default();
+        assert!(delete_confirm_ready(Some(&clean), false));
+
+        let dirty = DirtyCounts { staged: 1, modified: 0, untracked: 0 };
+        assert!(delete_confirm_ready(Some(&dirty), false));
+
+        // The retry git's own refusal opened: forced, so nothing left to wait
+        // for even though the probe never landed a count.
+        assert!(delete_confirm_ready(None, true));
+    }
+
+    #[test]
+    fn every_delete_failure_in_a_batch_stays_readable() {
+        let mut slot = None;
+        push_error(&mut slot, "Delete failed.\n\nwt1 is locked".to_string());
+        push_error(&mut slot, "Delete failed.\n\nwt2 is a main working tree".to_string());
+        let shown = slot.expect("both failures");
+        assert!(shown.contains("wt1 is locked"));
+        assert!(shown.contains("wt2 is a main working tree"));
     }
 
     #[test]
@@ -10080,6 +10186,38 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         }
+    }
+
+    /// egui hands a frame the keys pressed while the previous frame was on
+    /// screen.  A modal opening now is answering an Enter aimed at whatever
+    /// the user was looking at, so it must not act on it -- and must still
+    /// take it off the queue, or it would be typed into the shell the modal
+    /// just covered.
+    #[test]
+    fn a_modal_ignores_the_enter_pressed_before_it_opened() {
+        let ctx = egui::Context::default();
+        let gate = ModalGate::default();
+        let press = || egui::RawInput {
+            events: vec![key_ev(egui::Key::Enter, true)],
+            ..Default::default()
+        };
+
+        let mut opening = (true, true);
+        let mut left_on_queue = 1;
+        let _ = ctx.run(press(), |ctx| {
+            opening = consume_modal_keys(ctx, &gate, ModalKind::Delete);
+            left_on_queue = ctx.input(|i| i.events.len());
+        });
+        gate.end_frame();
+
+        let mut settled = (false, false);
+        let _ = ctx.run(press(), |ctx| {
+            settled = consume_modal_keys(ctx, &gate, ModalKind::Delete);
+        });
+
+        assert_eq!(opening, (false, false));
+        assert_eq!(left_on_queue, 0);
+        assert_eq!(settled, (false, true));
     }
 
     #[test]

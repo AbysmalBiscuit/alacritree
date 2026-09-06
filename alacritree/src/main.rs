@@ -33,6 +33,7 @@ mod links;
 mod logdir;
 mod logging;
 mod mcp;
+mod modal_gate;
 mod mouse;
 #[cfg(target_os = "macos")]
 mod notify_macos;
