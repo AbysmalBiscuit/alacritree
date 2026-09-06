@@ -1,6 +1,7 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -19,6 +20,7 @@ use alacritty_terminal::vte::ansi::Rgb;
 use crate::clipboard::Target;
 use crate::colors;
 use crate::config::{Config, Palette};
+use crate::herdr;
 use crate::scratchpad;
 use crate::wsl_helper::{self, WslProbe};
 
@@ -135,19 +137,95 @@ pub enum SessionKind {
     },
 }
 
-/// What the sidebar needs to communicate about a live session.  Agent
-/// identity remains available for hover text, but every agent shares the same
-/// visual language instead of each CLI bringing its own status glyph.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SessionActivity {
+/// What an agent is doing right now.  Mutually exclusive and recomputed from
+/// whatever signal the session has, so nothing here latches — the flag that
+/// does, `Session::needs_attention`, is a separate axis and coexists with all
+/// three.
+///
+/// Ordered by how much a state wants a human, which is what an aggregate row
+/// ranks by when several sessions report at once.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LiveState {
+    /// Present and waiting on you, with nothing in flight.
     #[default]
     Idle,
-    /// A recognized name enriches the tooltip; `None` is an agent inferred
-    /// only from the conventional decorative title prefix.
-    Agent(Option<&'static str>),
     /// A Braille spinner in the title is the cross-agent signal for active
-    /// work. Unknown agents can therefore still report loading.
-    Loading(Option<&'static str>),
+    /// work, so an unrecognized agent can report working too.
+    Working,
+    /// An approval or permission dialog is on screen right now.  Unlike the
+    /// latched attention flag, this clears itself when the dialog does, so an
+    /// agent that auto-approves after you walk away stops claiming to want
+    /// you.  Only a watcher outside the pane can see it, and no native
+    /// alacritree signal reaches inside one yet.
+    Blocked,
+}
+
+impl LiveState {
+    /// The live state a herdr status reports.  `None` is herdr declining to
+    /// say rather than a claim that the agent is idle, so a caller that
+    /// already has a reading of its own keeps it.
+    ///
+    /// `done` collapses to `Idle`: a finished turn is not work in flight.
+    /// The word survives in the row's label, which is where the distinction
+    /// is worth drawing.
+    pub fn from_herdr(status: herdr::Status) -> Option<Self> {
+        match status {
+            herdr::Status::Idle | herdr::Status::Done => Some(Self::Idle),
+            herdr::Status::Working => Some(Self::Working),
+            herdr::Status::Blocked => Some(Self::Blocked),
+            herdr::Status::Unknown => None,
+        }
+    }
+}
+
+/// What the sidebar needs to communicate about a live session.  Presence is a
+/// gate rather than a state: a plain shell has no agent, so there is no agent
+/// state to draw.  Agent identity remains available for hover text, but every
+/// agent shares the same visual language instead of each CLI bringing its own
+/// status glyph.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SessionActivity {
+    /// Nothing agent-shaped in the foreground.
+    #[default]
+    Shell,
+    /// A recognized `name` enriches the tooltip; `None` is an agent inferred
+    /// only from the conventional decorative title prefix, or one herdr
+    /// vouches for that no process probe recognized.
+    Agent { name: Option<&'static str>, live: LiveState },
+}
+
+impl SessionActivity {
+    pub fn agent(name: Option<&'static str>, live: LiveState) -> Self {
+        Self::Agent { name, live }
+    }
+
+    /// Whether an agent holds the foreground at all — the gate the row's
+    /// title cleanup and the workspace aggregate both key on.
+    pub fn is_agent(self) -> bool {
+        matches!(self, Self::Agent { .. })
+    }
+
+    /// The live state, or `None` when no agent is present to have one.
+    pub fn live(self) -> Option<LiveState> {
+        match self {
+            Self::Shell => None,
+            Self::Agent { live, .. } => Some(live),
+        }
+    }
+
+    pub fn name(self) -> Option<&'static str> {
+        match self {
+            Self::Shell => None,
+            Self::Agent { name, .. } => name,
+        }
+    }
+
+    /// The same agent, re-reported as doing something else.  A plain shell
+    /// gains the gate: whoever supplies a live state has already established
+    /// that an agent is there.
+    pub fn with_live(self, live: LiveState) -> Self {
+        Self::Agent { name: self.name(), live }
+    }
 }
 
 /// One tab in a workspace. Shell/diff tabs own a PTY and parsed terminal;
@@ -202,7 +280,11 @@ pub struct Session {
     /// Shares this session's on-screen flag with the `EventProxy` its PTY
     /// thread posts events through.
     proxy: EventProxy,
-    exited: bool,
+    exit_status: Option<ExitStatus>,
+    /// Set when this session is a shell attached to a herdr agent, so the
+    /// sidebar draws one row for that agent rather than two.  Dies with the
+    /// session, which is why it lives here and not in a map.
+    pub herdr_key: Option<herdr::HerdrKey>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -421,11 +503,11 @@ fn title_decorative_glyph(title: &str) -> Option<char> {
 
 fn session_activity(agent_name: Option<&'static str>, title: &str) -> SessionActivity {
     if is_spinner_title(title) {
-        SessionActivity::Loading(agent_name)
+        SessionActivity::agent(agent_name, LiveState::Working)
     } else if agent_name.is_some() || title_decorative_glyph(title).is_some() {
-        SessionActivity::Agent(agent_name)
+        SessionActivity::agent(agent_name, LiveState::Idle)
     } else {
-        SessionActivity::Idle
+        SessionActivity::Shell
     }
 }
 
@@ -1181,7 +1263,8 @@ impl Session {
             sender: None,
             pending_writes: None,
             proxy,
-            exited: false,
+            exit_status: None,
+            herdr_key: None,
         })
     }
 
@@ -1349,7 +1432,8 @@ impl Session {
             sender: None,
             pending_writes: Some(Vec::new()),
             proxy: proxy.clone(),
-            exited: false,
+            exit_status: None,
+            herdr_key: None,
         };
 
         let request = OpenRequest {
@@ -1460,7 +1544,7 @@ impl Session {
                         event,
                         &mut self.title,
                         title_pinned,
-                        &mut self.exited,
+                        &mut self.exit_status,
                         &mut outcome,
                     ) {
                         self.write(bytes);
@@ -1492,7 +1576,23 @@ impl Session {
     }
 
     pub fn is_exited(&self) -> bool {
-        self.exited
+        self.exit_status.is_some()
+    }
+
+    /// Whether an exited child left cleanly.  A herdr agent that refuses to
+    /// attach exits within a frame, and only a non-zero exit distinguishes
+    /// that refusal from an ordinary shell the user closed.
+    pub fn exit_was_clean(&self) -> bool {
+        self.exit_status.is_none_or(|status| status.success())
+    }
+
+    /// Whether `reap_exited_sessions` should close this session.  A refused
+    /// attach — the agent already has a client, or herdr refuses on this
+    /// platform — exits within a frame; reaping it would take herdr's
+    /// message with it and leave only a flash, so a session holding a herdr
+    /// key stays until the user closes it, unless it exited cleanly.
+    pub fn should_reap(&self) -> bool {
+        self.is_exited() && (self.herdr_key.is_none() || self.exit_was_clean())
     }
 
     /// The distro a shimmed WSL session runs in.  Dropped paths need it to
@@ -1506,7 +1606,7 @@ impl Session {
     /// active work even for an agent the process list does not recognize.
     pub fn activity(&self) -> SessionActivity {
         if self.scratchpad.is_some() {
-            return SessionActivity::Idle;
+            return SessionActivity::Shell;
         }
         session_activity(self.process_agent_name(), &self.title)
     }
@@ -1645,7 +1745,7 @@ fn apply_term_event(
     event: TermEvent,
     title: &mut String,
     pinned: bool,
-    exited: &mut bool,
+    exit_status: &mut Option<ExitStatus>,
     outcome: &mut DrainOutcome,
 ) -> Option<Vec<u8>> {
     match event {
@@ -1659,7 +1759,7 @@ fn apply_term_event(
             }
             *title = t;
         },
-        TermEvent::ChildExit(_) => *exited = true,
+        TermEvent::ChildExit(status) => *exit_status = Some(status),
         TermEvent::Bell => outcome.attention = true,
         // OSC 52.  Apps that copy this way (Claude Code, tmux, vim) get no
         // acknowledgement, so dropping it leaves them reporting a successful
@@ -2031,8 +2131,8 @@ mod tests {
         let event = events.try_recv().expect("terminal emitted no event for OSC 52");
         let mut outcome = DrainOutcome::default();
         let mut title = String::new();
-        let mut exited = false;
-        apply_term_event(event, &mut title, false, &mut exited, &mut outcome);
+        let mut exit_status = None;
+        apply_term_event(event, &mut title, false, &mut exit_status, &mut outcome);
 
         assert_eq!(outcome.clipboard, vec![(Target::Clipboard, "hello".to_owned())]);
     }
@@ -2069,7 +2169,8 @@ mod tests {
             sender: None,
             pending_writes: None,
             proxy,
-            exited: false,
+            exit_status: None,
+            herdr_key: None,
         }
     }
 
@@ -2112,32 +2213,94 @@ mod tests {
     #[test]
     fn a_pinned_session_still_reports_bells_and_exit() {
         #[cfg(windows)]
-        let exit_status = {
+        let status = {
             use std::os::windows::process::ExitStatusExt;
             std::process::ExitStatus::from_raw(0)
         };
         #[cfg(not(windows))]
-        let exit_status = {
+        let status = {
             use std::os::unix::process::ExitStatusExt;
             std::process::ExitStatus::from_raw(0)
         };
 
         let mut outcome = DrainOutcome::default();
         let mut title = "diff: src/app.rs".to_string();
-        let mut exited = false;
+        let mut exit_status = None;
 
-        apply_term_event(TermEvent::Bell, &mut title, true, &mut exited, &mut outcome);
+        apply_term_event(TermEvent::Bell, &mut title, true, &mut exit_status, &mut outcome);
         apply_term_event(
-            TermEvent::ChildExit(exit_status),
+            TermEvent::ChildExit(status),
             &mut title,
             true,
-            &mut exited,
+            &mut exit_status,
             &mut outcome,
         );
 
         assert!(outcome.attention);
-        assert!(exited);
+        assert_eq!(exit_status, Some(status));
         assert_eq!(title, "diff: src/app.rs");
+    }
+
+    /// A refused herdr attach exits non-zero; an ordinary shell the user
+    /// closed exits zero.  `reap_exited_sessions` tells them apart by this.
+    #[test]
+    fn exit_was_clean_reflects_the_captured_status() {
+        #[cfg(not(windows))]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+
+        let mut session = pty_less_probe(SessionKind::Shell, "shell");
+        assert!(session.exit_was_clean(), "a session that has not exited counts as clean");
+
+        session.exit_status = Some(std::process::ExitStatus::from_raw(0));
+        assert!(session.exit_was_clean());
+
+        #[cfg(windows)]
+        let failure = std::process::ExitStatus::from_raw(1);
+        #[cfg(not(windows))]
+        let failure = std::process::ExitStatus::from_raw(1 << 8);
+        session.exit_status = Some(failure);
+        assert!(!session.exit_was_clean());
+    }
+
+    /// A refused herdr attach must outlive the flash `reap_exited_sessions`
+    /// would otherwise give it; every other combination reaps normally.
+    #[test]
+    fn should_reap_keeps_only_a_dirty_herdr_exit_on_screen() {
+        #[cfg(not(windows))]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+
+        let clean = std::process::ExitStatus::from_raw(0);
+        #[cfg(windows)]
+        let dirty = std::process::ExitStatus::from_raw(1);
+        #[cfg(not(windows))]
+        let dirty = std::process::ExitStatus::from_raw(1 << 8);
+
+        let key = || herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
+
+        let not_exited = pty_less_probe(SessionKind::Shell, "shell");
+        assert!(!not_exited.should_reap());
+
+        let mut plain_clean = pty_less_probe(SessionKind::Shell, "shell");
+        plain_clean.exit_status = Some(clean);
+        assert!(plain_clean.should_reap());
+
+        let mut plain_dirty = pty_less_probe(SessionKind::Shell, "shell");
+        plain_dirty.exit_status = Some(dirty);
+        assert!(plain_dirty.should_reap(), "an ordinary shell reaps whatever its exit code");
+
+        let mut herdr_clean = pty_less_probe(SessionKind::Shell, "shell");
+        herdr_clean.herdr_key = Some(key());
+        herdr_clean.exit_status = Some(clean);
+        assert!(herdr_clean.should_reap());
+
+        let mut herdr_dirty = pty_less_probe(SessionKind::Shell, "shell");
+        herdr_dirty.herdr_key = Some(key());
+        herdr_dirty.exit_status = Some(dirty);
+        assert!(!herdr_dirty.should_reap(), "a refused attach must stay on screen to be read");
     }
 
     /// Zero grace is the config default and must keep the pre-debounce
@@ -2579,18 +2742,47 @@ mod tests {
     }
 
     #[test]
+    fn a_herdr_status_maps_onto_the_live_axis() {
+        assert_eq!(LiveState::from_herdr(herdr::Status::Idle), Some(LiveState::Idle));
+        assert_eq!(LiveState::from_herdr(herdr::Status::Working), Some(LiveState::Working));
+        assert_eq!(LiveState::from_herdr(herdr::Status::Blocked), Some(LiveState::Blocked));
+        // A finished turn is not work in flight.  The word itself survives in
+        // the row's label, which is where `done` is worth distinguishing.
+        assert_eq!(LiveState::from_herdr(herdr::Status::Done), Some(LiveState::Idle));
+        // herdr declining to say is not a claim that the agent is idle.
+        assert_eq!(LiveState::from_herdr(herdr::Status::Unknown), None);
+    }
+
+    #[test]
+    fn the_live_axis_ranks_by_how_much_a_state_wants_a_human() {
+        assert!(LiveState::Idle < LiveState::Working);
+        assert!(LiveState::Working < LiveState::Blocked);
+    }
+
+    #[test]
     fn session_activity_uses_one_cross_agent_status_set() {
-        assert_eq!(session_activity(None, "zsh"), SessionActivity::Idle);
+        assert_eq!(session_activity(None, "zsh"), SessionActivity::Shell);
         assert_eq!(
             session_activity(Some("claude"), "✳ waiting"),
-            SessionActivity::Agent(Some("claude"))
+            SessionActivity::agent(Some("claude"), LiveState::Idle)
         );
-        assert_eq!(session_activity(None, "✦ waiting"), SessionActivity::Agent(None));
+        assert_eq!(
+            session_activity(None, "✦ waiting"),
+            SessionActivity::agent(None, LiveState::Idle)
+        );
         assert_eq!(
             session_activity(Some("codex"), "⠋ working"),
-            SessionActivity::Loading(Some("codex"))
+            SessionActivity::agent(Some("codex"), LiveState::Working)
         );
-        assert_eq!(session_activity(None, "⠋ working"), SessionActivity::Loading(None));
+        assert_eq!(
+            session_activity(None, "⠋ working"),
+            SessionActivity::agent(None, LiveState::Working)
+        );
+        // No native signal reaches inside a pane, so nothing here reports
+        // blocked; herdr is the only source of that state today.
+        for title in ["zsh", "✳ waiting", "⠋ working", "✦ Allow this edit? (y/n)"] {
+            assert_ne!(session_activity(None, title).live(), Some(LiveState::Blocked));
+        }
     }
 
     #[test]

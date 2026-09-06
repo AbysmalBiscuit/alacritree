@@ -546,6 +546,25 @@ impl PasteConfig {
     }
 }
 
+/// `[ui.herdr]`: whether alacritree lists agents running under a herdr server
+/// in the sidebar. On by default; a probe with no herdr binary or server
+/// present costs nothing, so an unmodified config pays no price for it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HerdrConfig {
+    /// Discover herdr servers and list their agents in the sidebar.
+    pub enabled: bool,
+    /// How often a reachable herdr server is re-polled for agent state.
+    pub poll_interval: Duration,
+    /// List agents whose working directory matches no worktree, under Home.
+    pub show_unmatched: bool,
+}
+
+impl Default for HerdrConfig {
+    fn default() -> Self {
+        Self { enabled: true, poll_interval: Duration::from_millis(2000), show_unmatched: true }
+    }
+}
+
 /// Disposable by nature.  Unix keeps captures in the user's cache rather than
 /// a shared fixed-name tmp directory; Windows' `%TEMP%` is already per-user and
 /// remains reachable from WSL through the usual automount.
@@ -646,6 +665,11 @@ baked_glyphs! {
     DEFAULT_WORKTREE_MAIN_ICON = "●";
     DEFAULT_WORKTREE_ICON = "○";
     DEFAULT_SESSION_ICON = "▪";
+    /// A pane a terminal workspace manager owns rather than alacritree.  A
+    /// split square says "multiplexed elsewhere" at row size, where a
+    /// vendor's logo would only say "smudge" — and it stays neutral as more
+    /// than one such manager becomes supportable.
+    DEFAULT_HERDR_ICON = "◫";
     DEFAULT_HOME_ICON = "⌂";
     DEFAULT_PROJECT_EXPANDED_ICON = "▾";
     DEFAULT_PROJECT_COLLAPSED_ICON = "▸";
@@ -664,6 +688,13 @@ baked_glyphs! {
     /// Every recognized agent shares one status mark; identity belongs in the
     /// tooltip and title instead of changing the sidebar's visual grammar.
     DEFAULT_AGENT_ICON = "◇";
+    /// An agent held at a dialog it needs a human to answer.  Solid against
+    /// the idle diamond's outline, so the two read apart before the attention
+    /// color does any work.  Deliberately the codepoint
+    /// `DEFAULT_WORKTREE_MAIN_ICON` already carries: the two never share a
+    /// slot, and a new one would mean rebuilding the baked face for a shape
+    /// it already has.
+    DEFAULT_BLOCKED_ICON = "●";
     /// Action buttons.  Each takes a config key of its own; the glyphs are
     /// declared here because coverage is owed regardless of who names them.
     DEFAULT_ADD_ICON = "+";
@@ -689,6 +720,13 @@ baked_glyphs! {
     DEFAULT_DRAG_HANDLE_GLYPH = "⠿";
     #[cfg(test)]
     DEFAULT_CURSOR_BLOCK_GLYPH = "▌";
+    /// herdr's "working" mark in the symbol set it offers alongside its dots.
+    /// A harness-owned row paints the state its harness reports in that
+    /// harness's vocabulary, so the glyph ships even though no alacritree
+    /// default names it.  The rest of that vocabulary is `● ○ · × ✓`, which
+    /// the slices above already carry.
+    #[cfg(test)]
+    DEFAULT_HALF_CIRCLE_GLYPH = "◐";
 }
 
 /// What happens when the on-screen workspace stops having sessions, whether a
@@ -957,6 +995,7 @@ pub struct Icons {
     pub worktree_main: IconStyle,
     pub worktree: IconStyle,
     pub session: IconStyle,
+    pub herdr: IconStyle,
     pub home: IconStyle,
     pub project_expanded: IconStyle,
     pub project_collapsed: IconStyle,
@@ -1011,6 +1050,7 @@ impl Default for Icons {
             worktree_main: glyph(DEFAULT_WORKTREE_MAIN_ICON),
             worktree: glyph(DEFAULT_WORKTREE_ICON),
             session: glyph(DEFAULT_SESSION_ICON),
+            herdr: glyph(DEFAULT_HERDR_ICON),
             home: glyph(DEFAULT_HOME_ICON),
             project_expanded: glyph(DEFAULT_PROJECT_EXPANDED_ICON),
             project_collapsed: glyph(DEFAULT_PROJECT_COLLAPSED_ICON),
@@ -1173,6 +1213,13 @@ pub struct UiTheme {
     pub attention_grace: Duration,
     /// Ask before the sidebar's per-session `×` kills the PTY.
     pub confirm_session_close: ConfirmSessionClose,
+    /// Ask before the sidebar's `×` detaches from a harness-managed pane.
+    /// Its own switch rather than a mode of [`Self::confirm_session_close`]:
+    /// a detach destroys nothing — the pane keeps running under its harness
+    /// and its row comes back — so the busy question a close asks has no
+    /// answer here, and a user who wants no close prompt may still want to
+    /// be asked before losing the view.
+    pub confirm_session_detach: bool,
     /// What closing the last session in the on-screen workspace does.
     pub last_session_close: LastSessionClose,
     /// How the projects sidebar repairs a cursor whose row stopped rendering.
@@ -1280,6 +1327,9 @@ pub struct UiTheme {
     pub drop: DropConfig,
     /// `[ui.paste]`: what Paste does with a clipboard that holds no text.
     pub paste: PasteConfig,
+    /// `[ui.herdr]`: whether agents running under a herdr server appear in
+    /// the sidebar, and how often their state is re-polled.
+    pub herdr: HerdrConfig,
 }
 
 impl Default for UiTheme {
@@ -1293,6 +1343,7 @@ impl Default for UiTheme {
             notifications: true,
             attention_grace: Duration::ZERO,
             confirm_session_close: ConfirmSessionClose::Never,
+            confirm_session_detach: true,
             last_session_close: LastSessionClose::Respawn,
             sidebar_focus: SidebarFocus::default(),
             sidebar_follow_active: false,
@@ -1321,6 +1372,7 @@ impl Default for UiTheme {
             path_style: PathStyleConfig::default(),
             drop: DropConfig::default(),
             paste: PasteConfig::default(),
+            herdr: HerdrConfig::default(),
         }
     }
 }
@@ -2132,6 +2184,8 @@ struct RawIcons {
     worktree: Option<RawIconStyle>,
     /// A terminal session row.
     session: Option<RawIconStyle>,
+    /// A pane owned by a terminal workspace manager such as herdr.
+    herdr: Option<RawIconStyle>,
     /// The home tab, whose sessions inherit the launch directory.
     home: Option<RawIconStyle>,
     /// An expanded project.
@@ -2185,6 +2239,7 @@ fn build_icons(raw: RawIcons) -> Icons {
         worktree_main: style_or(raw.worktree_main, &d.worktree_main),
         worktree: style_or(raw.worktree, &d.worktree),
         session: style_or(raw.session, &d.session),
+        herdr: style_or(raw.herdr, &d.herdr),
         home: style_or(raw.home, &d.home),
         project_expanded: style_or(raw.project_expanded, &d.project_expanded),
         project_collapsed: style_or(raw.project_collapsed, &d.project_collapsed),
@@ -2380,6 +2435,18 @@ struct RawUiPaste {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
+struct RawHerdr {
+    /// Discover herdr servers and list their agents in the sidebar.  Inert
+    /// when no herdr binary or server is present.
+    enabled: Option<bool>,
+    /// How often a reachable herdr server is re-polled for agent state.
+    poll_interval_ms: Option<u64>,
+    /// List agents whose working directory matches no worktree, under Home.
+    show_unmatched: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(default)]
 struct RawUi {
     /// Sidebar background.  Unset derives it from the terminal palette.
     sidebar_background: Option<RgbStr>,
@@ -2403,6 +2470,10 @@ struct RawUi {
     /// "never" (default) | "busy" | "always".
     #[schemars(extend("enum" = ["never", "busy", "always"]))]
     confirm_session_close: Option<String>,
+    /// Whether the sidebar × on a harness-managed row asks before detaching.
+    /// Separate from `confirm_session_close` because a detach leaves the
+    /// pane running and its row listed again. Default true.
+    confirm_session_detach: Option<bool>,
     /// What happens when the on-screen workspace stops having sessions,
     /// whether a close or a worktree deletion took the last one:
     /// "respawn" (default) | "navigate" | "ring_global" | "ring_project".
@@ -2513,6 +2584,8 @@ struct RawUi {
     drop: RawUiDrop,
     /// What the clipboard's non-text contents paste as.
     paste: RawUiPaste,
+    /// Whether agents running under a herdr server appear in the sidebar.
+    herdr: RawHerdr,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -2696,6 +2769,7 @@ impl RawConfig {
             confirm_session_close: parse_confirm_session_close(
                 self.ui.confirm_session_close.as_deref(),
             ),
+            confirm_session_detach: self.ui.confirm_session_detach.unwrap_or(true),
             last_session_close: parse_last_session_close(self.ui.last_session_close.as_deref()),
             sidebar_focus: parse_sidebar_focus(self.ui.sidebar_focus.as_deref()),
             sidebar_follow_active: self.ui.sidebar_follow_active.unwrap_or(false),
@@ -2777,6 +2851,13 @@ impl RawConfig {
                     .as_deref()
                     .and_then(|raw| parse_config_path(raw, "ui.paste.image_dir")),
                 image_keep: self.ui.paste.image_keep.unwrap_or(20).max(1),
+            },
+            herdr: HerdrConfig {
+                enabled: self.ui.herdr.enabled.unwrap_or(true),
+                poll_interval: Duration::from_millis(
+                    self.ui.herdr.poll_interval_ms.unwrap_or(2000),
+                ),
+                show_unmatched: self.ui.herdr.show_unmatched.unwrap_or(true),
             },
         };
 
@@ -3230,6 +3311,21 @@ mod tests {
         assert!(!dump.contains('\n'), "a multi-line dump can be interleaved");
     }
 
+    #[test]
+    fn herdr_defaults_to_enabled_with_a_two_second_poll() {
+        let config = Config::default();
+        assert!(config.ui.herdr.enabled);
+        assert_eq!(config.ui.herdr.poll_interval, Duration::from_millis(2000));
+        assert!(config.ui.herdr.show_unmatched);
+    }
+
+    #[test]
+    fn herdr_can_be_turned_off() {
+        let toml = "[ui.herdr]\nenabled = false\npoll_interval_ms = 5000\n";
+        let config = config_from(toml);
+        assert!(!config.ui.herdr.enabled);
+        assert_eq!(config.ui.herdr.poll_interval, Duration::from_millis(5000));
+    }
     fn ui_from_toml(input: &str) -> UiTheme {
         let value: toml::Value = toml::from_str(input).expect("valid toml");
         let raw: RawConfig = value.try_into().expect("valid config");
@@ -3344,6 +3440,19 @@ mod tests {
             let ui = ui_from_toml(&format!("[ui]\nconfirm_session_close = \"{raw}\""));
             assert_eq!(ui.confirm_session_close, expected, "value {raw:?}");
         }
+    }
+
+    /// Losing the view costs a click to get back, so the ask is on by
+    /// default even though the close prompt is not.
+    #[test]
+    fn confirm_session_detach_defaults_to_asking() {
+        assert!(ui_from_toml("").confirm_session_detach);
+    }
+
+    #[test]
+    fn confirm_session_detach_can_be_turned_off() {
+        let ui = ui_from_toml("[ui]\nconfirm_session_detach = false");
+        assert!(!ui.confirm_session_detach);
     }
 
     #[test]
@@ -4354,7 +4463,7 @@ program = "second"
         let mut icons: Vec<&str> = DEFAULT_ICON_GLYPHS.iter().map(|g| g.as_str()).collect();
         icons.sort_unstable();
         let mut expected =
-            ["⌕", "●", "○", "▪", "⌂", "▾", "▸", "⬤", "◯", "⬤", "⬤", "✓", "⇅", "⌫", "↑"];
+            ["⌕", "●", "○", "▪", "◫", "⌂", "▾", "▸", "⬤", "◯", "⬤", "⬤", "✓", "⇅", "⌫", "↑"];
         expected.sort_unstable();
         assert_eq!(icons, expected);
     }
@@ -4364,9 +4473,13 @@ program = "second"
     #[test]
     fn the_chrome_slice_carries_the_action_and_decorative_glyphs() {
         let chrome: Vec<&str> = CHROME_GLYPHS.iter().map(|g| g.as_str()).collect();
-        for g in ["◇", "+", "×", "↻", "⇅", "·", "—", "•", "…", "↓", "⠿", "▌"] {
+        for g in ["◇", "+", "×", "↻", "⇅", "·", "—", "•", "…", "↓", "⠿", "▌", "◐"]
+        {
             assert!(chrome.contains(&g), "{g} is missing from CHROME_GLYPHS");
         }
+        // The blocked mark shares `DEFAULT_WORKTREE_MAIN_ICON`'s codepoint, so
+        // the icon slice's own multiset check cannot notice it going missing.
+        assert!(chrome.contains(&"●"), "● is missing from CHROME_GLYPHS");
     }
 
     /// A derived `Default` on a bare `bool` would make this false and silently

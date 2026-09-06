@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use crate::app::WorkspaceKey;
 use crate::config::ReorderScope;
+use crate::herdr::Side;
 use crate::projects::{Project, Worktree};
 use crate::session::SessionId;
 
@@ -23,32 +24,64 @@ pub enum SidebarRow {
     /// Session row, keyed by its stable session id.  Only present when its
     /// workspace lists sessions in the sidebar.
     Session(SessionId),
+    /// A herdr-managed agent, keyed by the server it lives on and the
+    /// terminal it runs in.  Both parts are needed: terminal ids are unique
+    /// only within one server.
+    HerdrAgent(Side, String),
 }
 
-/// The session rows each workspace currently *displays*, keyed by workspace.
-/// The caller owns the listing rule (threshold, config overrides); taking the
-/// resolved listing keeps the cursor model unable to drift from the paint
-/// pass.
-pub type ListedSessions = HashMap<WorkspaceKey, Vec<SessionId>>;
+/// One row listed under a workspace: a session alacritree runs, or a herdr
+/// agent nothing is attached to.  The two are one sequence rather than two
+/// blocks because attaching turns the second into the first, and a pane that
+/// changed how it is drawn has not changed where it belongs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceEntry {
+    Session(SessionId),
+    Agent(Side, String),
+}
 
-fn push_session_rows(rows: &mut Vec<SidebarRow>, sessions: &ListedSessions, ws: &WorkspaceKey) {
-    if let Some(ids) = sessions.get(ws) {
-        rows.extend(ids.iter().copied().map(SidebarRow::Session));
+impl WorkspaceEntry {
+    pub fn row(&self) -> SidebarRow {
+        match self {
+            Self::Session(id) => SidebarRow::Session(*id),
+            Self::Agent(side, terminal_id) => {
+                SidebarRow::HerdrAgent(side.clone(), terminal_id.clone())
+            },
+        }
+    }
+
+    pub fn session(&self) -> Option<SessionId> {
+        match self {
+            Self::Session(id) => Some(*id),
+            Self::Agent(..) => None,
+        }
+    }
+}
+
+/// The rows each workspace currently *displays*, keyed by workspace and in
+/// the order it draws them.  The caller owns both the listing rule
+/// (threshold, config overrides) and the order, so the cursor model cannot
+/// drift from the paint pass.
+pub type ListedRows = HashMap<WorkspaceKey, Vec<WorkspaceEntry>>;
+
+fn push_entry_rows(rows: &mut Vec<SidebarRow>, listed: &ListedRows, ws: &WorkspaceKey) {
+    if let Some(entries) = listed.get(ws) {
+        rows.extend(entries.iter().map(WorkspaceEntry::row));
     }
 }
 
 /// Every row the sidebar currently renders, in render order: Home first,
 /// then each project's header followed by its worktrees when expanded, with
-/// each workspace's listed session rows directly after its own row.
-pub fn visible_rows(projects: &[Project], sessions: &ListedSessions) -> Vec<SidebarRow> {
+/// each workspace's listed rows directly after its own row.
+pub fn visible_rows(projects: &[Project], listed: &ListedRows) -> Vec<SidebarRow> {
     let mut rows = vec![SidebarRow::Home];
-    push_session_rows(&mut rows, sessions, &None);
+    push_entry_rows(&mut rows, listed, &None);
     for p in projects {
         rows.push(SidebarRow::Project(p.root.clone()));
         if p.expanded {
             for wt in &p.worktrees {
                 rows.push(SidebarRow::Worktree(wt.path.clone()));
-                push_session_rows(&mut rows, sessions, &Some(wt.path.clone()));
+                push_entry_rows(&mut rows, listed, &Some(wt.path.clone()));
             }
         }
     }
@@ -205,16 +238,16 @@ pub fn step(rows: &[SidebarRow], cursor: &SidebarRow, delta: i32) -> SidebarRow 
 }
 
 /// The row owning `cursor` — the standard tree-view "Left jumps to parent"
-/// idiom.  A worktree's parent is its project header; a session's parent is
-/// the worktree (or Home) row it's listed under.  `None` for Home and
-/// project cursors.
+/// idiom.  A worktree's parent is its project header; a session's or herdr
+/// agent's parent is the worktree (or Home) row it's listed under.  `None`
+/// for Home and project cursors.
 pub fn left_target(rows: &[SidebarRow], cursor: &SidebarRow) -> Option<SidebarRow> {
     let pos = rows.iter().position(|r| r == cursor)?;
     match cursor {
         SidebarRow::Worktree(_) => {
             rows[..pos].iter().rev().find(|r| matches!(r, SidebarRow::Project(_))).cloned()
         },
-        SidebarRow::Session(_) => rows[..pos]
+        SidebarRow::Session(_) | SidebarRow::HerdrAgent(..) => rows[..pos]
             .iter()
             .rev()
             .find(|r| matches!(r, SidebarRow::Worktree(_) | SidebarRow::Home))
@@ -244,7 +277,7 @@ pub fn previous_project(rows: &[SidebarRow], cursor: &SidebarRow) -> Option<Side
 pub fn seed(
     projects: &[Project],
     current_workspace: Option<&Path>,
-    sessions: &ListedSessions,
+    listed: &ListedRows,
     active: Option<SessionId>,
 ) -> SidebarRow {
     if let Some(id) = active {
@@ -256,7 +289,9 @@ pub fn seed(
                 projects.iter().any(|p| p.expanded && p.worktrees.iter().any(|wt| wt.path == *path))
             },
         };
-        if shown && sessions.get(&ws).is_some_and(|ids| ids.contains(&id)) {
+        let listed_here =
+            listed.get(&ws).is_some_and(|entries| entries.iter().any(|e| e.session() == Some(id)));
+        if shown && listed_here {
             return SidebarRow::Session(id);
         }
     }
@@ -290,20 +325,31 @@ pub struct RowPredicates<'a> {
 /// workspaces, not sessions.
 pub fn filtered_rows(
     projects: &[Project],
-    sessions: &ListedSessions,
+    listed: &ListedRows,
     preds: RowPredicates<'_>,
 ) -> Vec<SidebarRow> {
+    // Only session rows survive: a `HerdrAgent` row is keyed by `(Side,
+    // String)` and carries no display name, so the filter has nothing to
+    // match it on and a painted one would have no cursor path to reach it.
+    fn push_session_rows(rows: &mut Vec<SidebarRow>, listed: &ListedRows, ws: &WorkspaceKey) {
+        if let Some(entries) = listed.get(ws) {
+            rows.extend(
+                entries.iter().filter_map(WorkspaceEntry::session).map(SidebarRow::Session),
+            );
+        }
+    }
+
     let mut rows = Vec::new();
     if preds.home {
         rows.push(SidebarRow::Home);
-        push_session_rows(&mut rows, sessions, &None);
+        push_session_rows(&mut rows, listed, &None);
     }
     for p in projects {
         let self_matches = (preds.project_self)(p);
         let mut visible_worktrees: Vec<SidebarRow> = Vec::new();
         for wt in p.worktrees.iter().filter(|wt| (preds.worktree)(p, wt)) {
             visible_worktrees.push(SidebarRow::Worktree(wt.path.clone()));
-            push_session_rows(&mut visible_worktrees, sessions, &Some(wt.path.clone()));
+            push_session_rows(&mut visible_worktrees, listed, &Some(wt.path.clone()));
         }
         if self_matches || !visible_worktrees.is_empty() {
             rows.push(SidebarRow::Project(p.root.clone()));
@@ -326,8 +372,16 @@ pub(crate) mod tests {
     use super::*;
     use crate::projects::Worktree;
 
-    fn no_sessions() -> ListedSessions {
+    fn no_sessions() -> ListedRows {
         HashMap::new()
+    }
+
+    /// A listing of nothing but sessions, which is what every test that does
+    /// not care about herdr wants.
+    pub(crate) fn sessions_only(map: HashMap<WorkspaceKey, Vec<SessionId>>) -> ListedRows {
+        map.into_iter()
+            .map(|(ws, ids)| (ws, ids.into_iter().map(WorkspaceEntry::Session).collect()))
+            .collect()
     }
 
     fn ws(path: &str) -> WorkspaceKey {
@@ -691,7 +745,7 @@ pub(crate) mod tests {
         let sessions =
             HashMap::from([(None, vec![1, 2]), (Some(PathBuf::from("/a/wt1")), vec![3, 4])]);
         assert_eq!(
-            visible_rows(&projects, &sessions),
+            visible_rows(&projects, &sessions_only(sessions)),
             vec![
                 SidebarRow::Home,
                 SidebarRow::Session(1),
@@ -709,9 +763,35 @@ pub(crate) mod tests {
         let projects = vec![project("/a", false, &["/a/wt1"])];
         let sessions = HashMap::from([(Some(PathBuf::from("/a/wt1")), vec![3, 4])]);
         assert_eq!(
-            visible_rows(&projects, &sessions),
+            visible_rows(&projects, &sessions_only(sessions)),
             vec![SidebarRow::Home, SidebarRow::Project(PathBuf::from("/a"))]
         );
+    }
+
+    #[test]
+    fn herdr_rows_follow_a_workspaces_own_sessions() {
+        let projects = vec![project("/p", true, &["/p/wt"])];
+        let listed = ListedRows::from([(Some(PathBuf::from("/p/wt")), vec![
+            WorkspaceEntry::Session(1),
+            WorkspaceEntry::Agent(Side::Native, "term_a".to_string()),
+        ])]);
+
+        let rows = visible_rows(&projects, &listed);
+
+        let wt = rows.iter().position(|r| matches!(r, SidebarRow::Worktree(_))).unwrap();
+        assert!(matches!(rows[wt + 1], SidebarRow::Session(_)));
+        assert!(matches!(rows[wt + 2], SidebarRow::HerdrAgent(..)));
+    }
+
+    #[test]
+    fn unmatched_agents_land_under_home() {
+        let listed = ListedRows::from([(None, vec![WorkspaceEntry::Agent(
+            Side::Native,
+            "term_a".to_string(),
+        )])]);
+        let rows = visible_rows(&[], &listed);
+        assert!(matches!(rows[0], SidebarRow::Home));
+        assert!(matches!(rows[1], SidebarRow::HerdrAgent(..)));
     }
 
     #[test]
@@ -719,7 +799,7 @@ pub(crate) mod tests {
         let projects = vec![project("/a", true, &["/a/wt1"])];
         let sessions =
             HashMap::from([(None, vec![1, 2]), (Some(PathBuf::from("/a/wt1")), vec![3, 4])]);
-        let rows = visible_rows(&projects, &sessions);
+        let rows = visible_rows(&projects, &sessions_only(sessions));
         assert_eq!(left_target(&rows, &SidebarRow::Session(2)), Some(SidebarRow::Home));
         assert_eq!(
             left_target(&rows, &SidebarRow::Session(4)),
@@ -732,13 +812,13 @@ pub(crate) mod tests {
         let projects = vec![project("/a", true, &["/a/wt1"])];
         let sessions = HashMap::from([(Some(PathBuf::from("/a/wt1")), vec![3, 4])]);
         assert_eq!(
-            seed(&projects, Some(Path::new("/a/wt1")), &sessions, Some(4)),
+            seed(&projects, Some(Path::new("/a/wt1")), &sessions_only(sessions), Some(4)),
             SidebarRow::Session(4)
         );
         // An unlisted active id (single-session workspace) falls back to the
         // workspace row.
         assert_eq!(
-            seed(&projects, Some(Path::new("/a/wt1")), &HashMap::new(), Some(4)),
+            seed(&projects, Some(Path::new("/a/wt1")), &ListedRows::new(), Some(4)),
             SidebarRow::Worktree(PathBuf::from("/a/wt1"))
         );
     }
@@ -748,7 +828,7 @@ pub(crate) mod tests {
         let projects = vec![project("/a", false, &["/a/wt1"])];
         let sessions = HashMap::from([(Some(PathBuf::from("/a/wt1")), vec![3, 4])]);
         assert_eq!(
-            seed(&projects, Some(Path::new("/a/wt1")), &sessions, Some(3)),
+            seed(&projects, Some(Path::new("/a/wt1")), &sessions_only(sessions), Some(3)),
             SidebarRow::Project(PathBuf::from("/a"))
         );
     }
@@ -756,7 +836,7 @@ pub(crate) mod tests {
     #[test]
     fn seed_lands_on_home_session_rows_too() {
         let sessions = HashMap::from([(None, vec![1, 2])]);
-        assert_eq!(seed(&[], None, &sessions, Some(2)), SidebarRow::Session(2));
+        assert_eq!(seed(&[], None, &sessions_only(sessions), Some(2)), SidebarRow::Session(2));
     }
 
     #[test]
@@ -773,7 +853,7 @@ pub(crate) mod tests {
             worktree: &mut |_p, wt| wt.path == PathBuf::from("/a/wt1"),
         };
         assert_eq!(
-            filtered_rows(&projects, &sessions, preds),
+            filtered_rows(&projects, &sessions_only(sessions), preds),
             vec![
                 SidebarRow::Home,
                 SidebarRow::Session(1),
@@ -790,7 +870,7 @@ pub(crate) mod tests {
         let sessions = HashMap::from([(None, vec![1])]);
         let preds =
             RowPredicates { home: false, project_self: &|_| true, worktree: &mut |_, _| true };
-        let rows = filtered_rows(&projects, &sessions, preds);
+        let rows = filtered_rows(&projects, &sessions_only(sessions), preds);
         assert!(!rows.contains(&SidebarRow::Session(1)));
     }
 
@@ -848,7 +928,7 @@ pub(crate) mod tests {
     fn project_jumps_from_session_rows_and_vanished_cursors() {
         let projects = vec![project("/a", true, &["/a/wt1"]), project("/b", true, &["/b/wt1"])];
         let sessions = HashMap::from([(Some(PathBuf::from("/a/wt1")), vec![7])]);
-        let rows = visible_rows(&projects, &sessions);
+        let rows = visible_rows(&projects, &sessions_only(sessions));
         assert_eq!(
             next_project(&rows, &SidebarRow::Session(7)),
             Some(SidebarRow::Project(PathBuf::from("/b")))

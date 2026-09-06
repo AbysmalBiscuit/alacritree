@@ -15,14 +15,15 @@ use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
 use crate::command_palette::{self, CommandPalette, PaletteAction, PaletteItem};
 use crate::config::{
-    BakedGlyph, Config, DEFAULT_ADD_ICON, DEFAULT_AGENT_ICON, DEFAULT_CLOSE_ICON,
-    DEFAULT_HOME_ICON, DEFAULT_PR_CLOSED_ICON, DEFAULT_PR_DRAFT_ICON, DEFAULT_PR_MERGED_ICON,
-    DEFAULT_PR_OPEN_ICON, DEFAULT_PROJECT_COLLAPSED_ICON, DEFAULT_PROJECT_EXPANDED_ICON,
-    DEFAULT_REFRESH_ICON, DEFAULT_REORDER_ICON, DEFAULT_SEARCH_ICON, DEFAULT_SESSION_ICON,
+    BakedGlyph, Config, DEFAULT_ADD_ICON, DEFAULT_AGENT_ICON, DEFAULT_BLOCKED_ICON,
+    DEFAULT_CLOSE_ICON, DEFAULT_HERDR_ICON, DEFAULT_HOME_ICON, DEFAULT_PR_CLOSED_ICON,
+    DEFAULT_PR_DRAFT_ICON, DEFAULT_PR_MERGED_ICON, DEFAULT_PR_OPEN_ICON,
+    DEFAULT_PROJECT_COLLAPSED_ICON, DEFAULT_PROJECT_EXPANDED_ICON, DEFAULT_REFRESH_ICON,
+    DEFAULT_REORDER_ICON, DEFAULT_SEARCH_ICON, DEFAULT_SESSION_ICON,
     DEFAULT_UPSTREAM_DIVERGED_ICON, DEFAULT_UPSTREAM_GONE_ICON, DEFAULT_UPSTREAM_LEVEL_ICON,
     DEFAULT_UPSTREAM_UNTRACKED_ICON, DEFAULT_WORKTREE_ICON, DEFAULT_WORKTREE_MAIN_ICON, FontConfig,
     IconStyle, Icons, LastSessionClose, PathStyleConfig, ScrollbarStyle, SearchScope, SidebarFocus,
-    SidebarTooltips, TextEmphasis, UiFont, profile_command,
+    SidebarTooltips, TextEmphasis, UiFont, UiTheme, profile_command,
 };
 use crate::crash_log::{self, ExitReason};
 use crate::git_nav::{self, GitSection, SectionCount};
@@ -34,7 +35,7 @@ use crate::pending_spawn::{Finished, PendingSpawns};
 use crate::pr_status::{self, PrCache, PrInfo, PrState};
 use crate::projects::{Project, Worktree, project_json};
 use crate::session::{
-    self, AttentionVerdict, Session, SessionActivity, SessionId, SessionKind, TermSize,
+    self, AttentionVerdict, LiveState, Session, SessionActivity, SessionId, SessionKind, TermSize,
     poll_attention_debounce,
 };
 use crate::sidebar_nav::{self, SidebarRow, StepTarget};
@@ -44,8 +45,8 @@ use crate::worktree::{self as wt, CreateRequest, Progress};
 use crate::wsl::{self, ShellChoice};
 use crate::wsl_helper::{self, WslProbe};
 use crate::{
-    clipboard_image, doppler, file_drop, ipc, jobs, paste, path_style, scratchpad, sidebar_focus,
-    terminal_view, worktree_liveness,
+    clipboard_image, doppler, file_drop, herdr, ipc, jobs, paste, path_style, scratchpad,
+    sidebar_focus, terminal_view, worktree_liveness,
 };
 
 /// `None` is the home workspace (sessions inherit `$PWD`); `Some` is a worktree path.
@@ -89,6 +90,9 @@ struct Theme {
     upstream_diverged: Color32,
     upstream_gone: Color32,
     upstream_untracked: Color32,
+    /// Colors for a harness's own state vocabulary, mapped from the ANSI
+    /// palette the way the PR and upstream badges are.
+    harness_state: StateColors,
     /// Logical-pixel size for headings (titles like "Projects", "Git").
     /// `FontConfig::UI_HEADING_RATIO` of the terminal font size.
     font_heading: f32,
@@ -112,6 +116,29 @@ struct Theme {
     /// Where a row a sidebar scrolled to is parked; `None` is egui's own
     /// minimal scroll.
     scroll_align: Option<egui::Align>,
+}
+
+/// One color per [`StateTone`], since a harness names its states rather than
+/// its colors and alacritree owns the palette they land in.
+#[derive(Debug, Clone, Copy)]
+struct StateColors {
+    blocked: Color32,
+    working: Color32,
+    done: Color32,
+    idle: Color32,
+    unclear: Color32,
+}
+
+impl StateColors {
+    fn of(&self, tone: StateTone) -> Color32 {
+        match tone {
+            StateTone::Blocked => self.blocked,
+            StateTone::Working => self.working,
+            StateTone::Done => self.done,
+            StateTone::Idle => self.idle,
+            StateTone::Unclear => self.unclear,
+        }
+    }
 }
 
 /// Logical-pixel (normal, heading) sizes for UI text.  `[ui.font] size`
@@ -161,6 +188,13 @@ impl Theme {
             upstream_diverged: rgb_to_color32(config.palette.normal[3]), // yellow
             upstream_gone: rgb_to_color32(config.palette.normal[1]), // red
             upstream_untracked: rgb_to_color32(config.palette.normal[4]), // blue
+            harness_state: StateColors {
+                blocked: rgb_to_color32(config.palette.normal[1]), // red
+                working: rgb_to_color32(config.palette.normal[3]), // yellow
+                done: rgb_to_color32(config.palette.normal[6]),    // cyan, herdr's teal
+                idle: rgb_to_color32(config.palette.normal[2]),    // green
+                unclear: text_muted,
+            },
             font_heading,
             font_normal,
             ui_scale: font_normal / 11.25,
@@ -598,6 +632,13 @@ pub struct AlacritreeApp {
     project_refresh_jobs: HashMap<PathBuf, jobs::Job<()>>,
     /// PTYs opened on a worker, adopted in `poll_pending_spawns`.
     pending_spawns: PendingSpawns,
+    /// Shared-view attaches whose herdr calls are running on the pool,
+    /// adopted in `poll_herdr_attach`.
+    pending_herdr_attach: Vec<PendingHerdrAttach>,
+    /// The shared view herdr was last focused for, and the call still on its
+    /// way, both owned by `sync_herdr_view_focus`.
+    herdr_focused_view: Option<SessionId>,
+    herdr_view_focus: Option<HerdrViewFocus>,
     /// Resolved absolute path of `delta` inside each WSL distro, so diff panes
     /// stop re-sourcing a login profile on every open.  Successes only: a miss
     /// is never stored, so installing delta mid-session is picked up later.
@@ -628,6 +669,9 @@ pub struct AlacritreeApp {
     sidebar_focus_written: Option<SidebarFocusWrite>,
     /// A close verdict the reconciler still owes the terminal.
     sidebar_deferred_close: Option<DeferredClose>,
+    /// The herdr servers this app talks to: the native side plus one per
+    /// running WSL distro, kept in step with which distros are up.
+    herdr_endpoints: herdr::Endpoints,
 }
 
 struct DeleteRequest {
@@ -986,6 +1030,9 @@ impl AlacritreeApp {
             project_refreshes: Default::default(),
             project_refresh_jobs: HashMap::new(),
             pending_spawns: Default::default(),
+            pending_herdr_attach: Vec::new(),
+            herdr_focused_view: None,
+            herdr_view_focus: None,
             wsl_delta_paths: HashMap::new(),
             pending_delta: HashMap::new(),
             liveness: Default::default(),
@@ -996,6 +1043,7 @@ impl AlacritreeApp {
             sidebar_anchor: None,
             sidebar_focus_written: None,
             sidebar_deferred_close: None,
+            herdr_endpoints: herdr::Endpoints::default(),
         };
 
         app.pr_cache.set_concurrency(pr_status_concurrency);
@@ -1365,6 +1413,158 @@ impl AlacritreeApp {
         Ok(id)
     }
 
+    /// Opens a herdr agent in a session running herdr's attach client.  The
+    /// session is an ordinary shell, so nothing in the grid or input path
+    /// treats it specially; only the key marks it as this agent's row.
+    /// Returns whether the attach succeeded so the caller can switch
+    /// `current_workspace` to `workspace` first and restore it on failure —
+    /// the same replace-and-restore shape `spawn_shell_request` uses, needed
+    /// here for the same reason: a refusal is only readable in the
+    /// workspace it happened in.
+    fn attach_herdr_agent(
+        &mut self,
+        ctx: &Context,
+        key: herdr::HerdrKey,
+        pane_id: &str,
+        workspace: WorkspaceKey,
+    ) -> bool {
+        if let Some(id) = self.herdr_session_for(&key) {
+            self.activate_session_by_id(id);
+            return true;
+        }
+        if herdr::can_attach(&key.side) {
+            // Nothing to ask herdr first: the pane id is the whole target,
+            // and the client attaches to it directly.
+            let args = herdr::attach_args(pane_id);
+            let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+            let (program, argv) = key.side.command(&borrowed);
+            return self.open_herdr_session(ctx, key, workspace, program, argv);
+        }
+
+        // Every one of herdr's app clients draws the same focused pane, so a
+        // shared view shows a row's pane only while herdr is focused there.
+        // The attach focuses it so the first frame is already right, and
+        // `sync_herdr_view_focus` focuses it again whenever the session comes
+        // back up, which is what lets a side hold one session per row.
+        if self.pending_herdr_attach.iter().any(|pending| pending.key == key) {
+            return true;
+        }
+        let name = self.herdr_session_name(&key.side);
+        if self.config.ui.async_session_spawn {
+            let side = key.side.clone();
+            let pane = pane_id.to_string();
+            let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
+                herdr_attach_gesture(&side, &pane, name)
+            });
+            self.pending_herdr_attach.push(PendingHerdrAttach { job, key, workspace });
+            return true;
+        }
+        match herdr_attach_gesture(&key.side, pane_id, name) {
+            Ok((program, argv)) => self.open_herdr_session(ctx, key, workspace, program, argv),
+            Err(e) => {
+                self.error_dialog = Some(e);
+                false
+            },
+        }
+    }
+
+    /// Adopt the shared-view attaches whose herdr calls have landed.  Each
+    /// session opens in the workspace its own click came from, which that
+    /// click switched to before handing the gesture over.
+    fn poll_herdr_attach(&mut self, ctx: &Context) {
+        let mut running = Vec::new();
+        for pending in std::mem::take(&mut self.pending_herdr_attach) {
+            match pending.job.poll() {
+                Some(Ok((program, argv))) => {
+                    self.open_herdr_session(ctx, pending.key, pending.workspace, program, argv);
+                },
+                Some(Err(e)) => self.error_dialog = Some(e),
+                None if pending.job.failed() => {
+                    self.error_dialog = Some("the herdr attach did not finish".to_string());
+                },
+                None => running.push(pending),
+            }
+        }
+        self.pending_herdr_attach = running;
+    }
+
+    /// Open the session that runs an attach client.  A shared view starts on
+    /// the pane the gesture just focused, so herdr is already where the new
+    /// session's row says it is and no second focus is owed.
+    fn open_herdr_session(
+        &mut self,
+        ctx: &Context,
+        key: herdr::HerdrKey,
+        workspace: WorkspaceKey,
+        program: String,
+        argv: Vec<String>,
+    ) -> bool {
+        let shared_view = !herdr::can_attach(&key.side);
+        // `alacritty_terminal::tty::Shell`'s fields are crate-private, so
+        // this goes through the constructor rather than a struct literal.
+        let shell = Shell::new(program, argv);
+        match self.spawn_session_with_shell(ctx, workspace, Some(shell), None) {
+            Ok(id) => {
+                if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
+                    session.herdr_key = Some(key);
+                }
+                if shared_view {
+                    self.herdr_focused_view = Some(id);
+                }
+                true
+            },
+            Err(e) => {
+                self.error_dialog = Some(format!("failed to attach herdr agent: {e}"));
+                false
+            },
+        }
+    }
+
+    /// Keep herdr focused on the pane the visible shared view stands for.
+    ///
+    /// herdr's app clients all render one shared state, so several shared
+    /// views on a side draw the same pane at any moment.  Asking herdr to
+    /// focus the pane of whichever one the user is looking at is what makes
+    /// them behave as one session per agent: the visible one is right, and
+    /// the rest are off screen.
+    ///
+    /// One call at a time, and the tracker moves only once herdr has answered
+    /// — two focuses in flight would land in whatever order herdr finished
+    /// them in.  A refusal still moves it, so a herdr that keeps saying no
+    /// costs one call rather than one per frame.
+    fn sync_herdr_view_focus(&mut self) {
+        if let Some(pending) = self.herdr_view_focus.take() {
+            match pending.job.poll() {
+                Some(result) => {
+                    if let Err(e) = result {
+                        log::warn!("{e}");
+                    }
+                    self.herdr_focused_view = Some(pending.session);
+                },
+                None if pending.job.failed() => self.herdr_focused_view = Some(pending.session),
+                None => self.herdr_view_focus = Some(pending),
+            }
+            return;
+        }
+        let Some(id) = self.active_session.get(&self.current_workspace).copied() else {
+            return;
+        };
+        let key = self.sessions.iter().find(|s| s.id == id).and_then(|s| s.herdr_key.clone());
+        if !needs_view_focus(key.as_ref(), id, self.herdr_focused_view) {
+            return;
+        }
+        let Some(key) = key else { return };
+        let Some(pane_id) =
+            self.find_herdr_agent(&key.side, &key.terminal_id).map(|agent| agent.pane_id.clone())
+        else {
+            return;
+        };
+        let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
+            herdr::focus_agent(&key.side, &pane_id)
+        });
+        self.herdr_view_focus = Some(HerdrViewFocus { session: id, job });
+    }
+
     fn toggle_scratchpad_tab(&mut self, ctx: &Context) {
         let workspace = self.current_workspace.clone();
         if let Some(index) = self.scratchpad_session_index(&workspace) {
@@ -1548,7 +1748,7 @@ impl AlacritreeApp {
     /// workspace either navigated away in `close_session` or shows the
     /// "no session" placeholder.
     fn adopt_active_session(&mut self) {
-        let ws_idx = self.workspace_session_indices(&self.current_workspace);
+        let ws_idx = self.workspace_display_indices(&self.current_workspace);
         if let Some(&idx) = ws_idx.first() {
             let id = self.sessions[idx].id;
             self.active_session.insert(self.current_workspace.clone(), id);
@@ -1647,7 +1847,7 @@ impl AlacritreeApp {
         let Some(session) = self.sessions.iter().find(|s| s.id == id) else {
             return;
         };
-        if self.config.ui.confirm_session_close.requires_prompt(session.is_busy()) {
+        if close_needs_prompt(&self.config.ui, session.herdr_key.is_some(), session.is_busy()) {
             self.pending_session_close = Some(id);
         } else {
             self.close_session(ctx, id);
@@ -1813,13 +2013,41 @@ impl AlacritreeApp {
         }
     }
 
-    fn workspace_session_indices(&self, ws: &WorkspaceKey) -> Vec<usize> {
+    /// The sessions of `ws` a reorder may move, in the order they are drawn.
+    ///
+    /// A session attached to a harness pane is not among them: its place in
+    /// the sidebar is the pane's place in the harness, which alacritree does
+    /// not own and cannot write back.  Moving one inside `self.sessions`
+    /// would change nothing on screen and quietly change the tab order, so
+    /// every reorder path reads its subject and its landing slots from here.
+    fn workspace_reorder_indices(&self, ws: &WorkspaceKey) -> Vec<usize> {
         self.sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.working_directory == *ws && s.herdr_key.is_none())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// `ws`'s sessions in the order the sidebar and the tab strip draw them:
+    /// alacritree's own first, then the harness-backed ones in the harness's
+    /// order.  Every ring the user steps through is built from here, so a
+    /// press walks the list on screen rather than the order the sessions
+    /// happened to open in — the two part company as soon as a harness pane
+    /// is attached out of the harness's own order.
+    fn workspace_display_indices(&self, ws: &WorkspaceKey) -> Vec<usize> {
+        let mut indices: Vec<usize> = self
+            .sessions
             .iter()
             .enumerate()
             .filter(|(_, s)| s.working_directory == *ws)
             .map(|(i, _)| i)
-            .collect()
+            .collect();
+        indices.sort_by_key(|i| match self.sessions[*i].herdr_key.clone() {
+            Some(key) => (1, self.herdr_pane_index(&key).unwrap_or(usize::MAX)),
+            None => (0, 0),
+        });
+        indices
     }
 
     /// The workspaces a reorder may use: those the app is willing to switch
@@ -1862,7 +2090,7 @@ impl AlacritreeApp {
     fn reorder_session_within_workspace(&mut self, id: SessionId, position: usize) {
         let Some(abs) = self.sessions.iter().position(|s| s.id == id) else { return };
         let ws = self.sessions[abs].working_directory.clone();
-        let indices = self.workspace_session_indices(&ws);
+        let indices = self.workspace_reorder_indices(&ws);
         let Some(j) = indices.iter().position(|i| *i == abs) else { return };
         for (a, b) in walk_swaps(&indices, j, position) {
             self.sessions.swap(a, b);
@@ -1887,8 +2115,13 @@ impl AlacritreeApp {
     /// Apply a mouse drop, whose slot arithmetic `drop_position` decides.
     fn apply_session_drop(&mut self, id: SessionId, workspace: WorkspaceKey, insert_before: usize) {
         let Some(abs) = self.sessions.iter().position(|s| s.id == id) else { return };
+        // A harness owns this pane's place, so there is no slot to drop it
+        // into and no arithmetic to do.
+        if self.sessions[abs].herdr_key.is_some() {
+            return;
+        }
         let same_workspace = self.sessions[abs].working_directory == workspace;
-        let indices = self.workspace_session_indices(&workspace);
+        let indices = self.workspace_reorder_indices(&workspace);
         let from = indices.iter().position(|i| *i == abs).unwrap_or(indices.len());
         let Some(position) = drop_position(same_workspace, indices.len(), from, insert_before)
         else {
@@ -1919,8 +2152,10 @@ impl AlacritreeApp {
         let Some(abs) = self.sessions.iter().position(|s| s.id == id) else { return };
         let Some((origin, range)) = self.reorder_range(id) else { return };
         let lens: Vec<usize> =
-            range.iter().map(|ws| self.workspace_session_indices(ws).len()).collect();
-        let indices = self.workspace_session_indices(&origin);
+            range.iter().map(|ws| self.workspace_reorder_indices(ws).len()).collect();
+        let indices = self.workspace_reorder_indices(&origin);
+        // A harness-backed session is in no reorderable list, so the step has
+        // nowhere to start — the same silent no-op as a clamped end.
         let Some(index) = indices.iter().position(|i| *i == abs) else { return };
         let Some(target) = sidebar_nav::step_target(&range, &lens, &origin, index, delta) else {
             return;
@@ -1963,7 +2198,7 @@ impl AlacritreeApp {
     }
 
     fn current_session_indices(&self) -> Vec<usize> {
-        self.workspace_session_indices(&self.current_workspace)
+        self.workspace_display_indices(&self.current_workspace)
     }
 
     fn active_session_index(&self) -> Option<usize> {
@@ -2011,7 +2246,7 @@ impl AlacritreeApp {
             .into_iter()
             .flat_map(|ws| {
                 let entries: Vec<_> = self
-                    .workspace_session_indices(&ws)
+                    .workspace_display_indices(&ws)
                     .into_iter()
                     .map(|i| (ws.clone(), self.sessions[i].id))
                     .collect();
@@ -2056,7 +2291,7 @@ impl AlacritreeApp {
             .flat_map(|workspace| {
                 let project =
                     sidebar_nav::project_of(&self.projects, &workspace).map(Path::to_path_buf);
-                self.workspace_session_indices(&workspace)
+                self.workspace_display_indices(&workspace)
                     .into_iter()
                     .map(|i| RingEntry {
                         project: project.clone(),
@@ -2243,7 +2478,7 @@ impl AlacritreeApp {
         self.sidebar_cursor = Some(sidebar_nav::seed(
             &self.projects,
             self.current_workspace.as_deref(),
-            &self.listed_session_ids(),
+            &self.listed_workspace_rows(),
             self.active_session.get(&self.current_workspace).copied(),
         ));
         // Seeding reads the unfiltered tree, so a lingering filter from a prior
@@ -2485,9 +2720,9 @@ impl AlacritreeApp {
     /// Rows the sidebar cursor steps over this frame: the fuzzy/toggle-filtered
     /// set while a filter is active, the full visible set otherwise.
     fn current_project_rows(&mut self) -> Vec<SidebarRow> {
-        let listed_sessions = self.listed_session_ids();
+        let listed = self.listed_workspace_rows();
         if !self.project_filter.is_filtering() {
-            return sidebar_nav::visible_rows(&self.projects, &listed_sessions);
+            return sidebar_nav::visible_rows(&self.projects, &listed);
         }
 
         let apply = self.project_filter.toggles_apply(self.search_scope);
@@ -2562,7 +2797,7 @@ impl AlacritreeApp {
                 && toggles_pass(&Some(wt.path.clone()))
                 && worktree_pr_passes(any_pr, &pr_matches, &wt.path)
         };
-        sidebar_nav::filtered_rows(&self.projects, &listed_sessions, sidebar_nav::RowPredicates {
+        sidebar_nav::filtered_rows(&self.projects, &listed, sidebar_nav::RowPredicates {
             home,
             project_self: &project_self,
             worktree: &mut worktree,
@@ -2574,7 +2809,7 @@ impl AlacritreeApp {
     }
 
     /// Every live session as a `(workspace, id)` pair — the same shape
-    /// `close_fallback` and `sidebar_session_ids` take, and the model the
+    /// `close_fallback` takes, and the model the
     /// focus reconciler observes.
     fn session_pairs(&self) -> Vec<(WorkspaceKey, SessionId)> {
         self.sessions.iter().map(|s| (s.working_directory.clone(), s.id)).collect()
@@ -2608,11 +2843,14 @@ impl AlacritreeApp {
                 ),
                 active_workspace,
                 active_branch,
+                herdr_generation: self.herdr_generation(),
             },
         );
         let rows = self.current_project_rows();
         let live = self.session_pairs();
-        let snapshot = build_sidebar_snapshot(&self.projects, &live, &rows, skip_worktree, inputs);
+        let listed = self.listed_workspace_rows();
+        let snapshot =
+            build_sidebar_snapshot(&self.projects, &live, &listed, &rows, skip_worktree, inputs);
         // Paint reuses these until the next rebuild, so an unchanged filtering
         // frame runs no fuzzy matching at all.
         self.sidebar_rows_cache = Some(rows);
@@ -2658,6 +2896,7 @@ impl AlacritreeApp {
                         ),
                         active_workspace,
                         active_branch,
+                        herdr_generation: self.herdr_generation(),
                     },
                 );
                 if unchanged {
@@ -2760,7 +2999,7 @@ impl AlacritreeApp {
             },
             Key::ArrowLeft => match &cursor {
                 SidebarRow::Project(root) => self.set_project_expanded(root, false),
-                SidebarRow::Worktree(_) | SidebarRow::Session(_) => {
+                SidebarRow::Worktree(_) | SidebarRow::Session(_) | SidebarRow::HerdrAgent(..) => {
                     if let Some(target) = sidebar_nav::left_target(&rows, &cursor) {
                         self.set_sidebar_cursor(target);
                     }
@@ -2796,6 +3035,25 @@ impl AlacritreeApp {
                 let expanded =
                     self.projects.iter().find(|p| p.root == root).is_some_and(|p| p.expanded);
                 self.set_project_expanded(&root, !expanded);
+            },
+            SidebarRow::HerdrAgent(side, terminal_id) => {
+                let side = side.clone();
+                let terminal_id = terminal_id.clone();
+                let pane_id = self.find_herdr_agent(&side, &terminal_id).map(|a| a.pane_id.clone());
+                let workspace = self.herdr_row_workspace(&side, &terminal_id);
+                if let (Some(pane_id), Some(workspace)) = (pane_id, workspace) {
+                    let key = herdr::HerdrKey { side, terminal_id };
+                    // Switches first, same as the click path: a refusal is
+                    // only visible if the workspace it happened in is on
+                    // screen.
+                    let previous =
+                        std::mem::replace(&mut self.current_workspace, workspace.clone());
+                    if self.attach_herdr_agent(ctx, key, &pane_id, workspace) {
+                        self.focus_terminal();
+                    } else {
+                        self.current_workspace = previous;
+                    }
+                }
             },
         }
     }
@@ -3184,7 +3442,7 @@ impl AlacritreeApp {
                             });
                         }
                     },
-                    Some(SidebarRow::Home) | None => {},
+                    Some(SidebarRow::Home) | Some(SidebarRow::HerdrAgent(..)) | None => {},
                 }
             },
             BindingAction::Named(NamedAction::RenameSelected) => {
@@ -3464,7 +3722,7 @@ impl AlacritreeApp {
                 let seed = sidebar_nav::seed(
                     &self.projects,
                     self.current_workspace.as_deref(),
-                    &self.listed_session_ids(),
+                    &self.listed_workspace_rows(),
                     self.active_session.get(&self.current_workspace).copied(),
                 );
                 self.finish_project_search_at(Some(seed));
@@ -3669,6 +3927,8 @@ impl AlacritreeApp {
         let activate_session_request: std::cell::Cell<Option<(WorkspaceKey, SessionId)>> =
             std::cell::Cell::new(None);
         let close_session_request: std::cell::Cell<Option<SessionId>> = std::cell::Cell::new(None);
+        let attach_herdr_request: std::cell::Cell<Option<(WorkspaceKey, herdr::HerdrKey, String)>> =
+            std::cell::Cell::new(None);
         let base_picker_request: std::cell::Cell<Option<PathBuf>> = std::cell::Cell::new(None);
         // Drag-to-reorder: (dragged root, insert-before display index).
         let reorder_request: std::cell::Cell<Option<(PathBuf, usize)>> = std::cell::Cell::new(None);
@@ -3762,7 +4022,9 @@ impl AlacritreeApp {
                         visible_worktrees.insert(path);
                     },
                     // Session rows follow their workspace row's visibility.
-                    SidebarRow::Session(_) => {},
+                    // `filtered_rows` never emits `HerdrAgent`, so this arm
+                    // never actually sees one while filtering.
+                    SidebarRow::Session(_) | SidebarRow::HerdrAgent(..) => {},
                 }
             }
         }
@@ -3774,32 +4036,45 @@ impl AlacritreeApp {
         // Snapshot attention + agent-glyph state up-front so the `iter_mut`
         // over projects below isn't blocked from calling back into `&self`
         // helpers.
-        let home_session_rows = self.workspace_session_rows(&None);
-        let worktree_session_rows: Vec<Vec<Vec<SessionRowData>>> = self
+        // `sidebar_nav::filtered_rows` never emits `SidebarRow::HerdrAgent`
+        // (it would need the agent's display name, which the row's `(Side,
+        // String)` payload doesn't carry), so a herdr row painted while
+        // filtering would have no cursor path to reach it.  Dropping them
+        // from the listing rather than rebuilding it keeps the sessions the
+        // filter does render in the positions the nav model gave them.
+        let mut listed = self.listed_workspace_rows();
+        if filtering {
+            for entries in listed.values_mut() {
+                entries.retain(|entry| entry.session().is_some());
+            }
+        }
+        let home_rows = self.workspace_rows(&None, &listed);
+        let worktree_rows: Vec<Vec<Vec<WorkspaceRowData>>> = self
             .projects
             .iter()
             .map(|p| {
                 p.worktrees
                     .iter()
-                    .map(|wt| self.workspace_session_rows(&Some(wt.path.clone())))
+                    .map(|wt| self.workspace_rows(&Some(wt.path.clone()), &listed))
                     .collect()
             })
             .collect();
 
-        let worktree_listed: Vec<Vec<bool>> = worktree_session_rows
+        let worktree_listed: Vec<Vec<bool>> = worktree_rows
             .iter()
-            .map(|v| v.iter().map(|rows| !rows.is_empty()).collect())
+            .map(|v| v.iter().map(|rows| WorkspaceRowData::any_session(rows)).collect())
             .collect();
 
         // A rendered session list carries its own per-session status; repeating
         // it on the parent row reads as noise — the same
         // rule the project row applies when expanded.  Aggregates therefore
         // apply only while the list is hidden (fewer than two sessions).
-        let home_attention = home_session_rows.is_empty() && self.workspace_needs_attention(&None);
-        let home_activity = if home_session_rows.is_empty() {
-            self.workspace_activity(&None)
+        let home_lists_sessions = WorkspaceRowData::any_session(&home_rows);
+        let home_attention = !home_lists_sessions && self.workspace_needs_attention(&None);
+        let home_activity = if home_lists_sessions {
+            SessionActivity::Shell
         } else {
-            SessionActivity::Idle
+            self.workspace_activity(&None)
         };
         let project_attention: Vec<bool> =
             self.projects.iter().map(|p| self.project_needs_attention(p)).collect();
@@ -3837,7 +4112,7 @@ impl AlacritreeApp {
                             .copied()
                             .unwrap_or(false);
                         if listed {
-                            SessionActivity::Idle
+                            SessionActivity::Shell
                         } else {
                             self.workspace_activity(&Some(wt.path.clone()))
                         }
@@ -4037,28 +4312,61 @@ impl AlacritreeApp {
                             spawn_shell_request.set(Some(None));
                         }
                         session_drop(ui, home_action.rect, &None, None);
-                        for (display_idx, row) in home_session_rows.iter().enumerate() {
-                            let is_cursor = matches!(
-                                &cursor_row,
-                                Some(SidebarRow::Session(id)) if *id == row.id
-                            );
-                            let scroll = scrolls(is_cursor) || follows_session(row.id);
-                            let act = session_row(
-                                ui,
-                                row,
-                                is_cursor,
-                                scroll,
-                                session_drag,
-                                &icons,
-                                &theme,
-                            );
-                            if act.activate {
-                                activate_session_request.set(Some((None, row.id)));
+                        // Only rows a reorder can move take a drop slot, and
+                        // the slot index counts those alone: a herdr pane's
+                        // place is herdr's to decide, so it is neither a drag
+                        // subject nor a landing.
+                        let mut slot = 0usize;
+                        for row in &home_rows {
+                            match row {
+                                WorkspaceRowData::Session(row) => {
+                                    let is_cursor = matches!(
+                                        &cursor_row,
+                                        Some(SidebarRow::Session(id)) if *id == row.id
+                                    );
+                                    let scroll = scrolls(is_cursor) || follows_session(row.id);
+                                    let movable = row.managed.is_none();
+                                    let act = session_row(
+                                        ui,
+                                        row,
+                                        is_cursor,
+                                        scroll,
+                                        session_drag && movable,
+                                        &icons,
+                                        &theme,
+                                    );
+                                    if act.activate {
+                                        activate_session_request.set(Some((None, row.id)));
+                                    }
+                                    if act.close {
+                                        close_session_request.set(Some(row.id));
+                                    }
+                                    if movable {
+                                        session_drop(ui, act.rect, &None, Some((slot, row.id)));
+                                        slot += 1;
+                                    }
+                                },
+                                WorkspaceRowData::Herdr(row) => {
+                                    let is_cursor = matches!(
+                                        &cursor_row,
+                                        Some(SidebarRow::HerdrAgent(side, id))
+                                            if *side == row.side && *id == row.terminal_id
+                                    );
+                                    let scroll = scrolls(is_cursor);
+                                    let act =
+                                        herdr_row(ui, row, is_cursor, scroll, &icons, &theme);
+                                    if act.attach {
+                                        attach_herdr_request.set(Some((
+                                            None,
+                                            herdr::HerdrKey {
+                                                side: row.side.clone(),
+                                                terminal_id: row.terminal_id.clone(),
+                                            },
+                                            row.pane_id.clone(),
+                                        )));
+                                    }
+                                },
                             }
-                            if act.close {
-                                close_session_request.set(Some(row.id));
-                            }
-                            session_drop(ui, act.rect, &None, Some((display_idx, row.id)));
                         }
                         group_gap = 2.0;
                     }
@@ -4395,39 +4703,71 @@ impl AlacritreeApp {
                                     spawn_profile_request.set(Some((wt.path.clone(), name)));
                                 }
                                 session_drop(ui, action.rect, &Some(wt.path.clone()), None);
-                                let session_rows = worktree_session_rows
+                                let listed_rows = worktree_rows
                                     .get(idx)
                                     .and_then(|v| v.get(wt_idx))
                                     .map(Vec::as_slice)
                                     .unwrap_or(&[]);
-                                for (display_idx, row) in session_rows.iter().enumerate() {
-                                    let is_cursor = matches!(
-                                        &cursor_row,
-                                        Some(SidebarRow::Session(id)) if *id == row.id
-                                    );
-                                    let scroll = scrolls(is_cursor) || follows_session(row.id);
-                                    let act = session_row(
-                                        ui,
-                                        row,
-                                        is_cursor,
-                                        scroll,
-                                        session_drag,
-                                        &icons,
-                                        &theme,
-                                    );
-                                    if act.activate {
-                                        activate_session_request
-                                            .set(Some((Some(wt.path.clone()), row.id)));
+                                let mut slot = 0usize;
+                                for row in listed_rows {
+                                    match row {
+                                        WorkspaceRowData::Session(row) => {
+                                            let is_cursor = matches!(
+                                                &cursor_row,
+                                                Some(SidebarRow::Session(id)) if *id == row.id
+                                            );
+                                            let scroll =
+                                                scrolls(is_cursor) || follows_session(row.id);
+                                            let movable = row.managed.is_none();
+                                            let act = session_row(
+                                                ui,
+                                                row,
+                                                is_cursor,
+                                                scroll,
+                                                session_drag && movable,
+                                                &icons,
+                                                &theme,
+                                            );
+                                            if act.activate {
+                                                activate_session_request
+                                                    .set(Some((Some(wt.path.clone()), row.id)));
+                                            }
+                                            if act.close {
+                                                close_session_request.set(Some(row.id));
+                                            }
+                                            if movable {
+                                                session_drop(
+                                                    ui,
+                                                    act.rect,
+                                                    &Some(wt.path.clone()),
+                                                    Some((slot, row.id)),
+                                                );
+                                                slot += 1;
+                                            }
+                                        },
+                                        WorkspaceRowData::Herdr(row) => {
+                                            let is_cursor = matches!(
+                                                &cursor_row,
+                                                Some(SidebarRow::HerdrAgent(side, id))
+                                                    if *side == row.side
+                                                        && *id == row.terminal_id
+                                            );
+                                            let scroll = scrolls(is_cursor);
+                                            let act = herdr_row(
+                                                ui, row, is_cursor, scroll, &icons, &theme,
+                                            );
+                                            if act.attach {
+                                                attach_herdr_request.set(Some((
+                                                    Some(wt.path.clone()),
+                                                    herdr::HerdrKey {
+                                                        side: row.side.clone(),
+                                                        terminal_id: row.terminal_id.clone(),
+                                                    },
+                                                    row.pane_id.clone(),
+                                                )));
+                                            }
+                                        },
                                     }
-                                    if act.close {
-                                        close_session_request.set(Some(row.id));
-                                    }
-                                    session_drop(
-                                        ui,
-                                        act.rect,
-                                        &Some(wt.path.clone()),
-                                        Some((display_idx, row.id)),
-                                    );
                                 }
                             }
                             for (_, branch) in creating.iter().filter(|(pi, _)| *pi == idx) {
@@ -4502,6 +4842,16 @@ impl AlacritreeApp {
         }
         if let Some(id) = close_session_request.take() {
             self.request_close_session(ctx, id);
+        }
+        if let Some((ws, key, pane_id)) = attach_herdr_request.take() {
+            // Switches first, same as `spawn_shell_request` below: a refusal
+            // is only visible if the workspace it happened in is on screen.
+            let previous = std::mem::replace(&mut self.current_workspace, ws.clone());
+            if self.attach_herdr_agent(ctx, key, &pane_id, ws) {
+                workspace_activated = true;
+            } else {
+                self.current_workspace = previous;
+            }
         }
         if let Some(ws) = spawn_shell_request.take() {
             // Spawning activates the workspace and the new session, matching
@@ -6289,8 +6639,92 @@ fn three_square_loader(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Re
     response
 }
 
-/// Priority: attention dot > loader > generic agent > active highlight > the
-/// configured color > the built-in default.
+/// What the status slot draws for an agent's live state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentMark {
+    /// Live work animates.  A static glyph would have to blink to say as much.
+    Loader,
+    Glyph(BakedGlyph, Color32),
+}
+
+/// `quiet` is the row's own weight for an agent with nothing to report — dim
+/// on a listed herdr row, ordinary text on a live session.  Blocked takes
+/// `attention` wherever it appears, an active row's accent included: a state
+/// that wants a human cannot also be quiet.
+fn agent_mark(live: LiveState, quiet: Color32, attention: Color32) -> AgentMark {
+    match live {
+        LiveState::Idle => AgentMark::Glyph(DEFAULT_AGENT_ICON, quiet),
+        LiveState::Working => AgentMark::Loader,
+        LiveState::Blocked => AgentMark::Glyph(DEFAULT_BLOCKED_ICON, attention),
+    }
+}
+
+/// What the status slot says on hover.  A named agent is named, so a
+/// workspace running several can be told apart without opening any of them.
+fn agent_hint(live: LiveState, name: Option<&str>) -> String {
+    let doing = match live {
+        LiveState::Idle => "is running",
+        LiveState::Working => "is working",
+        LiveState::Blocked => "is waiting for you",
+    };
+    format!("{} {doing}", name.unwrap_or("agent"))
+}
+
+/// Draw a harness's own state mark into an already-allocated slot.  A harness
+/// that has stopped reporting leaves the slot empty rather than inventing a
+/// state for it.
+fn paint_harness_mark(
+    ui: &mut egui::Ui,
+    mark: Option<HarnessMark>,
+    rect: egui::Rect,
+    theme: &Theme,
+) {
+    let Some(mark) = mark else { return };
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        mark.glyph,
+        egui::FontId::new(10.0 * theme.ui_scale, crate::fonts::ui_variant_family(false, false)),
+        theme.harness_state.of(mark.tone),
+    );
+}
+
+/// Draw one agent mark into an already-allocated slot.
+fn paint_agent_mark(ui: &mut egui::Ui, mark: AgentMark, rect: egui::Rect, theme: &Theme) {
+    let s = theme.ui_scale;
+    match mark {
+        AgentMark::Loader => {
+            let loader = egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(10.0 * s));
+            paint_three_square_loader(ui, loader, theme.accent);
+        },
+        AgentMark::Glyph(glyph, color) => {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                glyph.as_str(),
+                egui::FontId::proportional(10.0 * s),
+                color,
+            );
+        },
+    }
+}
+
+/// What a row knows about its own state, in the order the status slot ranks
+/// it.  Grouped rather than passed loose because the three answer one
+/// question between them, and the slot draws whichever ranks highest.
+struct RowStatus<'a> {
+    attention: bool,
+    activity: SessionActivity,
+    managed: Option<&'a Managed>,
+}
+
+/// Priority: attention dot > the harness's own state mark > the agent's live
+/// state > active highlight > the configured color > the built-in default.
+///
+/// A harness outranks the live axis because it watches the pane from outside
+/// and alacritree only reads its title, so where both have a reading the
+/// harness's is the better one — and drawing it in the harness's vocabulary is
+/// what keeps a pane looking the same listed and attached.
 ///
 /// Returns what the slot has to say on hover, for the row to register with the
 /// rest of its icons. The row icon proper reports nothing the row does not
@@ -6298,46 +6732,37 @@ fn three_square_loader(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Re
 fn paint_row_status_icon(
     ui: &mut egui::Ui,
     theme: &Theme,
-    attention: bool,
-    activity: SessionActivity,
+    status: RowStatus<'_>,
     style: &IconStyle,
     default_glyph: BakedGlyph,
     is_active: bool,
 ) -> Option<(egui::Rect, String)> {
-    if attention {
+    if status.attention {
         return Some((attention_dot(ui, theme).rect, ATTENTION_HINT.to_owned()));
     }
-    let s = theme.ui_scale;
-    if let SessionActivity::Loading(agent) = activity {
-        let (rect, _) = ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
-        let loader = egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(10.0 * s));
-        paint_three_square_loader(ui, loader, theme.accent);
-        let hint = agent.map_or_else(|| "working".to_owned(), |name| format!("{name} is working"));
-        return Some((rect, hint));
+    // Centered into the fixed slot: laying a glyph out as text would size the
+    // slot to its advance width and shift the label with it.
+    let (rect, _) = ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
+    if let Some(managed) = status.managed
+        && let Some(mark) = managed.mark
+    {
+        paint_harness_mark(ui, Some(mark), rect, theme);
+        return Some((rect, format!("{} says {}", managed.harness, mark.label)));
     }
-    let (glyph, font, color, hint) = match activity {
-        SessionActivity::Agent(agent) => (
-            DEFAULT_AGENT_ICON.as_str(),
-            egui::FontId::proportional(10.0 * s),
-            if is_active { theme.accent } else { theme.text },
-            Some(agent.map_or_else(
-                || "agent is running".to_owned(),
-                |name| format!("{name} is running"),
-            )),
-        ),
-        SessionActivity::Idle => {
+    match status.activity {
+        SessionActivity::Agent { name, live } => {
+            let quiet = if is_active { theme.accent } else { theme.text };
+            paint_agent_mark(ui, agent_mark(live, quiet, theme.attention), rect, theme);
+            Some((rect, agent_hint(live, name)))
+        },
+        SessionActivity::Shell => {
             let (glyph, font, resolved) =
                 resolve_icon(style, default_glyph, theme.text_muted, 10.0, 10.0, theme);
             let color = if is_active { theme.accent } else { resolved };
-            (glyph, font, color, None)
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, glyph, font, color);
+            None
         },
-        SessionActivity::Loading(_) => unreachable!(),
-    };
-    // Centered into the fixed slot: laying the glyph out as text would size
-    // the slot to its advance width and shift the label with it.
-    let (rect, _) = ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
-    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, glyph, font, color);
-    hint.map(|hint| (rect, hint))
+    }
 }
 
 /// Gap between adjacent action buttons. They already pad their own glyph, so
@@ -6796,8 +7221,7 @@ fn home_row(
                     status_hint = paint_row_status_icon(
                         ui,
                         theme,
-                        attention,
-                        activity,
+                        RowStatus { attention, activity, managed: None },
                         &icons.home,
                         DEFAULT_HOME_ICON,
                         is_active,
@@ -6880,7 +7304,7 @@ struct WorktreeAction {
 /// closure so rendering doesn't borrow `self.sessions`.
 struct SessionRowData {
     id: SessionId,
-    title: String,
+    name: RowName,
     needs_attention: bool,
     activity: SessionActivity,
     /// This workspace's remembered active session (accent icon).
@@ -6888,41 +7312,240 @@ struct SessionRowData {
     /// Active *and* the workspace is current — the session on screen
     /// (row background highlight).
     is_displayed: bool,
+    /// Set while this session is attached to a harness-managed pane, so an
+    /// attached agent's row still says where it lives and how to leave.
+    managed: Option<Managed>,
+}
+
+/// One painted row under a workspace, in the order the sidebar draws them.
+/// Attaching turns a herdr row into a session row in place, so the two travel
+/// as one list rather than as two blocks that would reorder on attach.
+enum WorkspaceRowData {
+    Session(SessionRowData),
+    Herdr(HerdrRowData),
+}
+
+impl WorkspaceRowData {
+    /// Whether any of `rows` is a session of alacritree's own.  The workspace
+    /// row shows aggregate attention and activity only while none is: with a
+    /// list on screen, repeating its summary above it reads as noise.
+    fn any_session(rows: &[Self]) -> bool {
+        rows.iter().any(|row| matches!(row, Self::Session(_)))
+    }
+}
+
+/// Everything a sidebar herdr-agent row needs, snapshotted before the panel
+/// closure so rendering doesn't borrow `self.herdr_endpoints`.
+struct HerdrRowData {
+    side: herdr::Side,
+    terminal_id: String,
+    pane_id: String,
+    name: RowName,
+    managed: Managed,
+}
+
+/// The external supervisor a pane belongs to.  Named rather than flagged
+/// because a second harness would otherwise add a parallel boolean to every
+/// row, and because what a row must say — whose mark to paint, how to get
+/// out, whether the attach is exclusive — varies by harness rather than by
+/// row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Managed {
+    /// What the tooltip calls it.
+    harness: &'static str,
+    /// The harness's own detach chord, already rendered.  `None` when its
+    /// config could not be read or binds detach to nothing, both of which are
+    /// reasons to stay quiet rather than name a chord the user may not have.
+    detach: Option<String>,
+    /// The attach shares the harness's whole view rather than one pane, so
+    /// the row says so before a resize reveals it.
+    shared_view: bool,
+    /// The agent kind the harness detected, spelled the way it invokes it.
+    kind: Option<String>,
+    /// The pane's own title, when it says something the kind does not.
+    title: Option<String>,
+    /// How the harness draws the state it reports.  `None` when it is no
+    /// longer reporting one — a pane alacritree still holds open after its
+    /// harness stopped listing it.
+    mark: Option<HarnessMark>,
+}
+
+impl HerdrRowData {
+    fn from_agent(agent: &herdr::Agent, side: &herdr::Side, settings: &herdr::Settings) -> Self {
+        // A listed row has nothing better than the terminal id's tail behind
+        // the kind, so the kind takes the name rather than standing in front
+        // of six characters nobody reads.
+        let name = herdr_row_name(agent).unwrap_or_else(|| {
+            RowName::plain(agent.kind.clone().unwrap_or_else(|| {
+                let id = &agent.terminal_id;
+                let skip = id.chars().count().saturating_sub(6);
+                id.chars().skip(skip).collect()
+            }))
+        });
+        Self {
+            side: side.clone(),
+            terminal_id: agent.terminal_id.clone(),
+            pane_id: agent.pane_id.clone(),
+            name,
+            managed: Managed::herdr(side, settings, Some(agent)),
+        }
+    }
+}
+
+/// A row's name in two parts, ranked by weight rather than punctuation: the
+/// identity, and the category standing in front of it as context.  `context`
+/// is absent when the identity is already the category, so a row never spells
+/// one thing twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RowName {
+    text: String,
+    context: Option<String>,
+}
+
+impl RowName {
+    fn plain(text: String) -> Self {
+        Self { text, context: None }
+    }
+}
+
+/// The name herdr reports for a pane, and `None` when it reports none.  The
+/// kind rides along as context unless it says the same thing as the title.
+/// What a titleless agent falls back to differs by row, so each caller says
+/// so itself rather than passing its answer through here.
+fn herdr_row_name(agent: &herdr::Agent) -> Option<RowName> {
+    let title = agent.title.clone()?;
+    let context = agent.kind.clone().filter(|kind| *kind != title);
+    Some(RowName { text: title, context })
+}
+
+impl Managed {
+    /// `agent` is herdr's current word on the pane, and `None` once it stops
+    /// reporting one — a pane alacritree still holds open after its harness
+    /// let go of it, which has a harness and a way out but no state or name.
+    fn herdr(side: &herdr::Side, settings: &herdr::Settings, agent: Option<&herdr::Agent>) -> Self {
+        let kind = agent.and_then(|a| a.kind.clone());
+        let title =
+            agent.and_then(|a| a.title.clone()).filter(|t| Some(t.as_str()) != kind.as_deref());
+        Self {
+            harness: "herdr",
+            detach: settings.detach.clone(),
+            shared_view: !herdr::can_attach(side),
+            mark: agent.map(|a| herdr_mark(a.status, settings.indicators)),
+            kind,
+            title,
+        }
+    }
+
+    /// What the harness calls this pane: the agent kind backquoted as the
+    /// command it is, and the title quoted as the words it is.
+    fn pane_name(&self) -> Option<String> {
+        match (&self.kind, &self.title) {
+            (Some(kind), Some(title)) => Some(format!("`{kind}` \"{title}\"")),
+            (Some(kind), None) => Some(format!("`{kind}`")),
+            (None, Some(title)) => Some(format!("\"{title}\"")),
+            (None, None) => None,
+        }
+    }
+}
+
+/// The mark a harness paints for the state it reports, in that harness's own
+/// vocabulary.  Resolved once per row, so a pane reads the same whether it is
+/// listed or attached — the two are drawn by different painters, and attaching
+/// must not repaint a pane in a language it does not speak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HarnessMark {
+    glyph: &'static str,
+    tone: StateTone,
+    /// The harness's own word for this state, for the hover text.
+    label: &'static str,
+}
+
+/// What a harness means by a state's color.  Named rather than carried as a
+/// `Color32` so the palette stays alacritree's and a row snapshot stays free
+/// of the theme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateTone {
+    Blocked,
+    Working,
+    Done,
+    Idle,
+    /// The harness reported something alacritree does not recognise.
+    Unclear,
+}
+
+/// herdr's state vocabulary, taken from its own `state_icon_symbol` and
+/// `state_label_color`.  Which of the two sets applies is herdr's `[ui]
+/// status_indicators`, so a user who picked one in herdr gets it here too.
+///
+/// `done` is `idle` on herdr's internal axis and a status of its own over its
+/// API, which is the axis alacritree reads — so the two arrive already
+/// distinguished, without the "has a human looked at it yet" bit herdr tracks
+/// to tell them apart.
+fn herdr_mark(status: herdr::Status, indicators: herdr::Indicators) -> HarnessMark {
+    use herdr::Indicators::{Dots, Symbols};
+    use herdr::Status::{Blocked, Done, Idle, Unknown, Working};
+    let (glyph, tone) = match (indicators, status) {
+        (_, Idle) => ("○", StateTone::Idle),
+        (_, Unknown) => ("·", StateTone::Unclear),
+        (Dots, Blocked) => ("●", StateTone::Blocked),
+        (Dots, Working) => ("●", StateTone::Working),
+        (Dots, Done) => ("●", StateTone::Done),
+        (Symbols, Blocked) => ("×", StateTone::Blocked),
+        (Symbols, Working) => ("◐", StateTone::Working),
+        (Symbols, Done) => ("✓", StateTone::Done),
+    };
+    HarnessMark { glyph, tone, label: status.label() }
 }
 
 /// Spawn-ordered ids of the sessions in `ws`, or empty below the list
 /// threshold.  The threshold is normally two — a single-session workspace row
 /// keeps its compact form, mirroring the tab strip — and `always` lowers it
-/// to one.  Pure over (workspace, id) pairs so the grouping rule is testable
-/// without spawning PTYs.
-fn sidebar_session_ids(
-    pairs: &[(WorkspaceKey, SessionId)],
-    ws: &WorkspaceKey,
+/// to one.
+///
+/// herdr rows are never held back by it: a pane alacritree does not own has
+/// no other surface to appear on, and hiding it would hide the workspace's
+/// only row.  They do count toward the threshold, so a lone shell session
+/// beside one is listed rather than folded into the workspace row, which
+/// would leave a hole in a list its neighbours are already in.
+///
+/// `managed` carries herdr's own position for each of its rows, and sorts by
+/// it here so an attached session and a listed agent interleave the way herdr
+/// has them rather than by which kind of row they are.  The sort is stable,
+/// so panes herdr no longer lists keep the order they were spawned in.
+fn workspace_entries(
+    shells: &[SessionId],
+    managed: Vec<(usize, sidebar_nav::WorkspaceEntry)>,
     always: bool,
-) -> Vec<SessionId> {
-    let ids: Vec<SessionId> = pairs.iter().filter(|(w, _)| w == ws).map(|(_, id)| *id).collect();
+) -> Vec<sidebar_nav::WorkspaceEntry> {
     let threshold = if always { 1 } else { 2 };
-    if ids.len() < threshold { Vec::new() } else { ids }
+    let mut managed = managed;
+    managed.sort_by_key(|(at, _)| *at);
+    let mut entries = Vec::with_capacity(shells.len() + managed.len());
+    if shells.len() + managed.len() >= threshold {
+        entries.extend(shells.iter().copied().map(sidebar_nav::WorkspaceEntry::Session));
+    }
+    entries.extend(managed.into_iter().map(|(_, entry)| entry));
+    entries
 }
 
 /// Step the lockstep index over the rows a skipped worktree owns.
 ///
 /// The projection is built before the deletion is known, so it still lists
-/// the worktree and any sessions under it.  Leaving the index parked on a row
+/// the worktree with everything under it.  Leaving the index parked on a row
 /// no node will match again would mark every later node unprojected, and the
 /// cursor repair reads an unprojected row as one that has gone away.
 fn skip_projected_rows(
     rows: &[SidebarRow],
     next_row: &mut usize,
-    live: &[(WorkspaceKey, SessionId)],
+    listed: &sidebar_nav::ListedRows,
     path: &Path,
 ) {
     if rows.get(*next_row) != Some(&SidebarRow::Worktree(path.to_path_buf())) {
         return;
     }
     *next_row += 1;
-    while let Some(SidebarRow::Session(id)) = rows.get(*next_row) {
-        if !live.iter().any(|(ws, live_id)| live_id == id && ws.as_deref() == Some(path)) {
+    for entry in listed.get(&Some(path.to_path_buf())).map_or(&[][..], Vec::as_slice) {
+        if rows.get(*next_row) != Some(&entry.row()) {
             break;
         }
         *next_row += 1;
@@ -6935,6 +7558,10 @@ fn skip_projected_rows(
 /// membership from `listed` instead would make the last session in a workspace
 /// read as deleted the moment its sibling closed.
 ///
+/// `listed` is the listing the projection was built from.  A herdr row exists
+/// only while its agent is listed, so there is no wider model to take it from,
+/// and reading a second listing here could disagree with `rows`.
+///
 /// `skip_worktree` drops a worktree whose deletion is already committed but
 /// whose git operation has not finished, so nothing lands the cursor — or a
 /// new shell — inside a directory on its way out.
@@ -6946,11 +7573,13 @@ fn skip_projected_rows(
 fn build_sidebar_snapshot(
     projects: &[Project],
     live: &[(WorkspaceKey, SessionId)],
+    listed: &sidebar_nav::ListedRows,
     rows: &[SidebarRow],
     skip_worktree: Option<&Path>,
     inputs: sidebar_focus::ObservedInputs,
 ) -> sidebar_focus::TreeSnapshot {
     use sidebar_focus::Parent;
+    use sidebar_nav::WorkspaceEntry;
 
     let mut b = sidebar_focus::SnapshotBuilder::default();
     let mut next_row = 0usize;
@@ -6968,21 +7597,40 @@ fn build_sidebar_snapshot(
         }
         b.push(row, parent, projected)
     };
+    let push_workspace = |b: &mut sidebar_focus::SnapshotBuilder,
+                          next_row: &mut usize,
+                          placed: &mut [bool],
+                          ws: &WorkspaceKey,
+                          parent: Parent| {
+        let entries = listed.get(ws).map_or(&[][..], Vec::as_slice);
+        for entry in entries {
+            push(b, next_row, entry.row(), parent);
+        }
+        // A workspace lists every shell session it has or none of them, and a
+        // session attached to a herdr pane is always listed, so a session
+        // reaching the second arm here belongs to a workspace that listed
+        // nothing at all.  It is running, so the model keeps it; it is drawn
+        // nowhere, so the projection does not.
+        for (i, (w, id)) in live.iter().enumerate() {
+            if w != ws {
+                continue;
+            }
+            placed[i] = true;
+            if !entries.contains(&WorkspaceEntry::Session(*id)) {
+                b.push(SidebarRow::Session(*id), parent, false);
+            }
+        }
+    };
 
     let home_id = push(&mut b, &mut next_row, SidebarRow::Home, Parent::Root);
-    for (i, (ws, id)) in live.iter().enumerate() {
-        if ws.is_none() {
-            push(&mut b, &mut next_row, SidebarRow::Session(*id), Parent::Node(home_id));
-            placed[i] = true;
-        }
-    }
+    push_workspace(&mut b, &mut next_row, &mut placed, &None, Parent::Node(home_id));
 
     for p in projects {
         let project_id =
             push(&mut b, &mut next_row, SidebarRow::Project(p.root.clone()), Parent::Root);
         for wt in &p.worktrees {
             if skip_worktree == Some(wt.path.as_path()) {
-                skip_projected_rows(rows, &mut next_row, live, &wt.path);
+                skip_projected_rows(rows, &mut next_row, listed, &wt.path);
                 continue;
             }
             let wt_id = push(
@@ -6991,12 +7639,8 @@ fn build_sidebar_snapshot(
                 SidebarRow::Worktree(wt.path.clone()),
                 Parent::Node(project_id),
             );
-            for (i, (ws, id)) in live.iter().enumerate() {
-                if ws.as_deref() == Some(wt.path.as_path()) {
-                    push(&mut b, &mut next_row, SidebarRow::Session(*id), Parent::Node(wt_id));
-                    placed[i] = true;
-                }
-            }
+            let ws = Some(wt.path.clone());
+            push_workspace(&mut b, &mut next_row, &mut placed, &ws, Parent::Node(wt_id));
         }
     }
 
@@ -7112,7 +7756,8 @@ fn close_landing(
 /// `remaining` is the session list after removal; `main_checkout` is the
 /// removed workspace's project main (None when the workspace *is* the main,
 /// is home, or belongs to no known project). Pure over (workspace, id)
-/// pairs for the same reason as `sidebar_session_ids`.
+/// pairs for the same reason the sidebar listing does: the rule stays
+/// testable without spawning PTYs.
 fn close_fallback(
     removed_ws: &WorkspaceKey,
     current_ws: &WorkspaceKey,
@@ -7274,6 +7919,9 @@ fn row_project_root(
         SidebarRow::Worktree(path) => path.clone(),
         SidebarRow::Session(id) => session_workspace(*id).flatten()?,
         SidebarRow::Home => return None,
+        // Carries a (Side, terminal id) pair, not a workspace or a SessionId,
+        // so unlike a session row there is nothing here to resolve against.
+        SidebarRow::HerdrAgent(..) => return None,
     };
     projects
         .iter()
@@ -7314,7 +7962,7 @@ fn base_branch_target(
 
 /// The session a SelectNextSession/SelectPreviousSession press lands on:
 /// one flat ring over every open session, workspaces in sidebar order and
-/// each workspace's sessions in spawn order.  `None` means stay put — a
+/// each workspace's sessions in the order its rows are drawn.  `None` means stay put — a
 /// ring too small to cycle, or an active session missing from the ring
 /// (its worktree turned prunable).  With no active session (an emptied
 /// workspace on screen) the first entry re-anchors the cycle.
@@ -7359,11 +8007,43 @@ fn picker_cursor(
     }
 }
 
+/// The activity a session's row paints.  A session attached to a herdr agent
+/// takes herdr's word, because herdr watches the pane from outside and sees an
+/// approval dialog no title heuristic can reach.
+///
+/// `unknown` is herdr declining to say, so the session's own reading stands.
+/// The gate closes either way: an attached pane holds an agent whether or not
+/// the process probe recognized one.
+fn herdr_backed_activity(own: SessionActivity, status: Option<herdr::Status>) -> SessionActivity {
+    let Some(status) = status else { return own };
+    let live = LiveState::from_herdr(status).unwrap_or(own.live().unwrap_or_default());
+    own.with_live(live)
+}
+
 /// Agent titles commonly lead with their own decorative mark. Once the row
 /// paints a semantic agent/loader status, retaining that mark beside it would
 /// reintroduce the vendor-specific icon set this status model replaces.
+/// What an attached session's row is called.  On Linux and WSL an attach is
+/// full passthrough, so the pane on screen is herdr's and the row names it
+/// the way herdr's own listed row would — attaching must not rename the row
+/// under the user.  A pane herdr reports no title for keeps the title its own
+/// PTY set, with the kind in front of it.
+fn session_row_name(
+    pty_title: &str,
+    activity: SessionActivity,
+    agent: Option<&herdr::Agent>,
+) -> RowName {
+    let Some(agent) = agent else {
+        return RowName::plain(session_row_title(pty_title, activity));
+    };
+    herdr_row_name(agent).unwrap_or_else(|| RowName {
+        text: session_row_title(pty_title, activity),
+        context: agent.kind.clone(),
+    })
+}
+
 fn session_row_title(title: &str, activity: SessionActivity) -> String {
-    if activity != SessionActivity::Idle {
+    if activity.is_agent() {
         let trimmed = title.trim_start();
         if let Some(first) = trimmed.chars().next() {
             let rest = &trimmed[first.len_utf8()..];
@@ -7535,8 +8215,7 @@ fn worktree_row(
                     status_hint = paint_row_status_icon(
                         ui,
                         theme,
-                        attention,
-                        activity,
+                        RowStatus { attention, activity, managed: None },
                         default_icon,
                         default_glyph,
                         is_active,
@@ -7708,6 +8387,20 @@ fn worktree_is_switchable(wt: &Worktree, missing: Option<bool>, has_sessions: bo
     !worktree_looks_gone(wt, missing) || has_sessions
 }
 
+/// The workspaces a herdr agent may be matched against.  A checkout that
+/// looks gone offers none, which is what makes an agent working there
+/// unmatched rather than parked under a row that can only refuse it.
+/// `missing` is the liveness cache's word for a path, `None` where it has
+/// none, so the row's grey and this list agree about the same directory.
+fn herdr_workspaces(projects: &[Project], missing: impl Fn(&Path) -> Option<bool>) -> Vec<PathBuf> {
+    projects
+        .iter()
+        .flat_map(|p| p.worktrees.iter())
+        .filter(|wt| !worktree_looks_gone(wt, missing(&wt.path)))
+        .map(|wt| wt.path.clone())
+        .collect()
+}
+
 struct SessionRowAction {
     activate: bool,
     close: bool,
@@ -7735,9 +8428,10 @@ fn session_row(
     let mut hints = IconHints::default();
     let mut close_rect: Option<egui::Rect> = None;
     let mut title_elided = false;
-    // The leading and trailing groups run as sibling closures, so the status
-    // slot's hint travels out separately and joins the rest afterwards.
+    // The leading and trailing groups run as sibling closures, so the leading
+    // slots' hints travel out separately and join the rest afterwards.
     let mut status_hint = None;
+    let mut managed_slot = None;
     // One indent level deeper than worktree rows (16); right: 0 keeps the ×
     // at the same x as the other rows' trailing icons.
     let frame = Frame::default().inner_margin(Margin { left: 28, right: 0, top: 3, bottom: 3 });
@@ -7750,15 +8444,22 @@ fn session_row(
                     status_hint = paint_row_status_icon(
                         ui,
                         theme,
-                        row.needs_attention,
-                        row.activity,
+                        RowStatus {
+                            attention: row.needs_attention,
+                            activity: row.activity,
+                            managed: row.managed.as_ref(),
+                        },
                         &icons.session,
                         DEFAULT_SESSION_ICON,
                         row.is_active,
                     );
+                    if let Some(managed) = &row.managed {
+                        let rect = paint_managed_mark(ui, icons, theme, theme.text_muted);
+                        managed_slot = Some((rect, managed_tooltip(managed)));
+                    }
                     let (_, galley) = truncating_label(
                         ui,
-                        RichText::new(&row.title).small().color(title_color),
+                        row_name_text(ui, &row.name, title_color, theme.text_muted),
                         title_color,
                         egui::Sense::hover(),
                     );
@@ -7772,7 +8473,7 @@ fn session_row(
                         theme.text_muted,
                         theme,
                     );
-                    hints.add(btn.rect, "close session");
+                    hints.add(btn.rect, close_button_hint(row.managed.is_some()));
                     close_rect = Some(btn.rect);
                     if btn.clicked() {
                         close_clicked = true;
@@ -7789,8 +8490,15 @@ fn session_row(
     if let Some((rect, hint)) = status_hint {
         hints.add(rect, hint);
     }
-    let resp = hints.apply(resp, theme.icon_tooltips, |resp| {
-        name_tooltip(resp, &row.title, title_elided, theme.sidebar_tooltips)
+    if let Some((rect, hint)) = managed_slot {
+        hints.add(rect, hint);
+    }
+    // A managed row answers with the harness's own sentence wherever the
+    // pointer is not on an icon: the row the user attached is the one they
+    // ask how to leave, and the name tooltip cannot say it.
+    let resp = hints.apply(resp, theme.icon_tooltips, |resp| match &row.managed {
+        Some(managed) if theme.icon_tooltips => resp.on_hover_text(managed_tooltip(managed)),
+        _ => name_tooltip(resp, &row.name.text, title_elided, theme.sidebar_tooltips),
     });
 
     // Frame allocates its space at end-of-show, so its retroactive `interact`
@@ -7832,10 +8540,218 @@ fn session_row(
     }
 }
 
+struct HerdrRowAction {
+    attach: bool,
+}
+
+/// A row's name as two spans: the context, then the identity.  Nothing
+/// separates them but weight — a punctuation mark here would spell out a
+/// relationship the colours already show, and the status word one used to
+/// join only repeated the mark two slots to its left.
+///
+/// One `LayoutJob` rather than two labels, for the reasons `path_text` gives:
+/// no `item_spacing` gap, no second response competing for the row's click,
+/// and elision that measures the whole stream.
+fn row_name_text(
+    ui: &egui::Ui,
+    name: &RowName,
+    text_color: Color32,
+    context_color: Color32,
+) -> egui::WidgetText {
+    let Some(context) = &name.context else {
+        return RichText::new(&name.text).small().color(text_color).into();
+    };
+    let size = egui::TextStyle::Small.resolve(ui.style()).size;
+    // A hand-built job does not inherit the ui's text valign the way RichText
+    // does, so it must be carried across or the text sits off-centre against
+    // the marks beside it.
+    let valign = ui.text_valign();
+    let mut job = egui::text::LayoutJob::default();
+    for (text, color) in [(format!("{context} "), context_color), (name.text.clone(), text_color)] {
+        job.append(&text, 0.0, egui::TextFormat {
+            font_id: egui::FontId::new(size, egui::FontFamily::Proportional),
+            color,
+            valign,
+            ..Default::default()
+        });
+    }
+    job.into()
+}
+
+/// What a harness-managed row explains on hover, one fact per comma: the
+/// state, since that is what changes; who reports it; whether the attach is
+/// the harness's whole view; and what the harness calls the pane.  The way
+/// out follows in parentheses, since it is an instruction rather than
+/// another fact about the pane.
+///
+/// The same sentence serves a listed agent and an attached one.  Attaching
+/// changes how alacritree draws a pane, not what there is to say about it,
+/// and the chord has no other surface in alacritree — it is the harness's
+/// key, not one of ours — so it has to reach the row the user is sitting in.
+fn managed_tooltip(managed: &Managed) -> String {
+    let mut parts = Vec::new();
+    if let Some(mark) = managed.mark {
+        parts.push(mark.label.to_owned());
+    }
+    parts.push(managed.harness.to_owned());
+    if managed.shared_view {
+        parts.push("shared view".to_owned());
+    }
+    parts.extend(managed.pane_name());
+    let mut hint = parts.join(", ");
+    hint.push('.');
+    if let Some(chord) = &managed.detach {
+        // Backquoted because the chord is a sequence, not one combination:
+        // unquoted, "detach with Ctrl+B q" reads as a sentence whose last
+        // word happens to be `q`.
+        hint.push_str(&format!(" (detach with `{chord}`)"));
+    }
+    hint
+}
+
+/// A shared-view attach waiting on herdr.  The gesture answers with the argv
+/// its client runs, so everything the session needs is in hand by the time it
+/// opens.
+struct PendingHerdrAttach {
+    job: jobs::Job<Result<(String, Vec<String>), String>>,
+    key: herdr::HerdrKey,
+    workspace: WorkspaceKey,
+}
+
+/// The shared view herdr is being pointed at, and the call doing the
+/// pointing.  The handle is held rather than dropped because dropping a job
+/// cancels it.
+struct HerdrViewFocus {
+    session: SessionId,
+    job: jobs::Job<Result<(), String>>,
+}
+
+/// Whether the session on screen still owes herdr a focus call.  A direct
+/// attach draws its own pane whatever herdr focuses, and an ordinary shell
+/// has no pane at all, so neither ever asks.
+fn needs_view_focus(
+    key: Option<&herdr::HerdrKey>,
+    active: SessionId,
+    focused: Option<SessionId>,
+) -> bool {
+    key.is_some_and(|key| !herdr::can_attach(&key.side)) && focused != Some(active)
+}
+
+/// What a shared-view attach asks herdr before its client can start: focus
+/// the pane, since the client reads the focused one when it starts, then name
+/// the session, since that is what it attaches to.  Both are process spawns,
+/// and on native Windows both are herdr starting behind whatever the machine
+/// charges for it, which is why this runs on the pool wherever the spawn gate
+/// allows.
+///
+/// `cached_name` is what the endpoint learned in the background.  A gesture
+/// that beats the first read asks herdr itself: a wait is better than a
+/// refusal.
+fn herdr_attach_gesture(
+    side: &herdr::Side,
+    pane_id: &str,
+    cached_name: Option<String>,
+) -> Result<(String, Vec<String>), String> {
+    // Two argv spawns, no shell: the only shell a `Native` command could
+    // reach on this side is cmd.exe, which does not understand `sh_quote`'s
+    // single-quoting.
+    herdr::focus_agent(side, pane_id)?;
+    let session = match cached_name {
+        Some(session) => session,
+        None => herdr::running_session_name(side)?,
+    };
+    Ok(side.command(&["session", "attach", &session]))
+}
+
+/// Whether ending a session asks first.  A harness-managed one is a detach
+/// rather than a kill, so it answers to its own switch: the attach client is
+/// always running, which would make the busy question a close asks fire every
+/// time and warn about nothing.
+fn close_needs_prompt(ui: &UiTheme, managed: bool, busy: bool) -> bool {
+    if managed { ui.confirm_session_detach } else { ui.confirm_session_close.requires_prompt(busy) }
+}
+
+/// What the × on a session row does.  Ending a harness-managed session ends
+/// the attach client and nothing else — the pane keeps running under the
+/// harness, and the row it came from comes back — so calling that a close
+/// promises a destruction that does not happen.
+fn close_button_hint(managed: bool) -> &'static str {
+    if managed { "detach session" } else { "close session" }
+}
+
+/// Paint the harness mark and return the rect it claimed, so the caller can
+/// hang the hint on it.
+fn paint_managed_mark(
+    ui: &mut egui::Ui,
+    icons: &Icons,
+    theme: &Theme,
+    color: Color32,
+) -> egui::Rect {
+    // 10.0 is what the status marks beside it use, and `◫` shares its em
+    // height with `◇` and `●`, so the same size puts them on one optical line.
+    let (glyph, font, glyph_color) =
+        resolve_icon(&icons.herdr, DEFAULT_HERDR_ICON, color, 10.0, 10.0, theme);
+    ui.label(RichText::new(glyph).color(glyph_color).font(font)).rect
+}
+
+/// A herdr agent nothing is attached to.  Drawn in `theme.text_dim` because
+/// it is listed but not live — the same weight `worktree_gone` gives a row
+/// whose checkout has been removed.  An attached agent has an ordinary
+/// session row instead, so no agent is ever drawn twice.
+///
+/// Not draggable and carries no drop-target rect: a herdr agent has no
+/// position in the session order to reorder into.
+fn herdr_row(
+    ui: &mut egui::Ui,
+    row: &HerdrRowData,
+    is_cursor: bool,
+    scroll_into_view: bool,
+    icons: &Icons,
+    theme: &Theme,
+) -> HerdrRowAction {
+    // Reserve a slot *before* the label so the hover bg paints beneath it.
+    let bg_idx = ui.painter().add(egui::Shape::Noop);
+    let panel_x = ui.max_rect().x_range();
+
+    let frame = Frame::default().inner_margin(Margin { left: 28, right: 0, top: 3, bottom: 3 });
+    let resp = frame
+        .show(ui, |ui| {
+            row_with_trailing(
+                ui,
+                |ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
+                    paint_harness_mark(ui, row.managed.mark, rect, theme);
+                    paint_managed_mark(ui, icons, theme, theme.text_dim);
+                    let text = row_name_text(ui, &row.name, theme.text_dim, theme.text_muted);
+                    let _ = truncating_label(ui, text, theme.text_dim, egui::Sense::hover());
+                },
+                |_ui| {},
+            );
+        })
+        .response
+        .interact(egui::Sense::click());
+    let resp =
+        if theme.icon_tooltips { resp.on_hover_text(managed_tooltip(&row.managed)) } else { resp };
+
+    let bg = if resp.hovered() { theme.row_hover_bg } else { Color32::TRANSPARENT };
+    let full_rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
+    if bg != Color32::TRANSPARENT {
+        ui.painter().set(bg_idx, egui::Shape::rect_filled(full_rect, 0.0, bg));
+    }
+    if is_cursor {
+        paint_cursor_outline(ui, full_rect, theme);
+    }
+    if scroll_into_view {
+        ui.scroll_to_rect(full_rect, None);
+    }
+    HerdrRowAction { attach: resp.clicked() }
+}
+
 impl AlacritreeApp {
     fn reap_exited_sessions(&mut self, ctx: &Context) {
         let exited_ids: Vec<SessionId> =
-            self.sessions.iter().filter(|s| s.is_exited()).map(|s| s.id).collect();
+            self.sessions.iter().filter(|s| s.should_reap()).map(|s| s.id).collect();
         for id in exited_ids {
             self.close_session(ctx, id);
         }
@@ -7940,67 +8856,241 @@ impl AlacritreeApp {
     }
 
     /// Prefer the active session's status so parallel agents do not fight over
-    /// the parent row. If that session is idle, a loading background session
-    /// wins over a merely present agent because it communicates live work.
+    /// the parent row. If that session has nothing to report, a background
+    /// session that is working or blocked wins over a merely present agent,
+    /// because a collapsed row is the only place either state can surface.
     fn workspace_activity(&self, ws: &WorkspaceKey) -> SessionActivity {
         let active_id = self.active_session.get(ws).copied();
-        let mut other = SessionActivity::Idle;
+        let mut other = SessionActivity::Shell;
         for s in &self.sessions {
             if s.working_directory != *ws {
                 continue;
             }
-            let activity = s.activity();
-            if activity == SessionActivity::Idle {
+            let activity = herdr_backed_activity(s.activity(), self.session_herdr_status(s));
+            let Some(live) = activity.live() else {
                 continue;
-            }
+            };
             if Some(s.id) == active_id {
                 return activity;
             }
-            if matches!(activity, SessionActivity::Loading(_)) || other == SessionActivity::Idle {
+            if live > LiveState::Idle || !other.is_agent() {
                 other = activity;
             }
         }
         other
     }
 
-    /// The session rows every workspace currently lists, for the keyboard
-    /// cursor model.  Built from the same `sidebar_session_ids` rule the
-    /// paint pass uses, so cursor rows and painted rows cannot drift.
-    fn listed_session_ids(&self) -> sidebar_nav::ListedSessions {
-        let pairs: Vec<(WorkspaceKey, SessionId)> =
-            self.sessions.iter().map(|s| (s.working_directory.clone(), s.id)).collect();
-        let mut listed = sidebar_nav::ListedSessions::new();
-        for (ws, _) in &pairs {
-            if !listed.contains_key(ws) {
-                let ids = sidebar_session_ids(&pairs, ws, self.session_rows_always);
-                if !ids.is_empty() {
-                    listed.insert(ws.clone(), ids);
+    /// Every row each workspace lists, in the order it draws them: its own
+    /// shell sessions first, then every herdr pane the workspace holds — the
+    /// sessions attached to one and the agents nothing is attached to alike —
+    /// in herdr's own order.
+    ///
+    /// Position comes from herdr rather than from alacritree because herdr is
+    /// the only party that has an opinion surviving all three moments: attach,
+    /// detach, and a restart, which leaves every pane unattached again.  An
+    /// order built from when a session was attached agrees with itself until
+    /// the first restart and then contradicts everything the user saw.
+    ///
+    /// Agents are bucketed by the directory they work in, and an agent whose
+    /// directory matches no worktree — including one whose checkout has been
+    /// removed — lands under Home, which is the common case: an agent in a
+    /// repository alacritree does not track still belongs somewhere, and a
+    /// checkout that has gone cannot start a shell.
+    fn listed_workspace_rows(&self) -> sidebar_nav::ListedRows {
+        use sidebar_nav::WorkspaceEntry;
+
+        // `usize::MAX` parks a pane herdr has stopped listing at the tail of
+        // its own block rather than letting it fall in among the shells: the
+        // session is still herdr's, and it goes back to its slot when the
+        // listing carries it again.
+        let mut shells: HashMap<WorkspaceKey, Vec<SessionId>> = HashMap::new();
+        let mut managed: HashMap<WorkspaceKey, Vec<(usize, WorkspaceEntry)>> = HashMap::new();
+        for session in &self.sessions {
+            let ws = session.working_directory.clone();
+            match session.herdr_key.clone() {
+                Some(key) => {
+                    let at = self.herdr_pane_index(&key).unwrap_or(usize::MAX);
+                    managed.entry(ws).or_default().push((at, WorkspaceEntry::Session(session.id)));
+                },
+                None => shells.entry(ws).or_default().push(session.id),
+            }
+        }
+
+        if self.config.ui.herdr.enabled {
+            let claimed: Vec<herdr::HerdrKey> =
+                self.sessions.iter().filter_map(|s| s.herdr_key.clone()).collect();
+            let workspaces = herdr_workspaces(&self.projects, |path| self.liveness.missing(path));
+            for cache in self.herdr_endpoints.caches() {
+                let side = cache.side();
+                for agent in herdr::unattached(cache.agents(), side, &claimed) {
+                    let ws = herdr::match_workspace(agent, side, &workspaces);
+                    if ws.is_none() && !self.config.ui.herdr.show_unmatched {
+                        continue;
+                    }
+                    let key = herdr::HerdrKey {
+                        side: side.clone(),
+                        terminal_id: agent.terminal_id.clone(),
+                    };
+                    let at = self.herdr_pane_index(&key).unwrap_or(usize::MAX);
+                    let entry = WorkspaceEntry::Agent(side.clone(), agent.terminal_id.clone());
+                    managed.entry(ws).or_default().push((at, entry));
                 }
+            }
+        }
+
+        let mut listed = sidebar_nav::ListedRows::new();
+        for ws in shells.keys().chain(managed.keys()).cloned().collect::<Vec<_>>() {
+            if listed.contains_key(&ws) {
+                continue;
+            }
+            let entries = workspace_entries(
+                shells.get(&ws).map_or(&[][..], Vec::as_slice),
+                managed.remove(&ws).unwrap_or_default(),
+                self.session_rows_always,
+            );
+            if !entries.is_empty() {
+                listed.insert(ws, entries);
             }
         }
         listed
     }
 
-    /// Session rows for `ws`'s sidebar list, per `sidebar_session_ids`'s
-    /// list threshold.
-    fn workspace_session_rows(&self, ws: &WorkspaceKey) -> Vec<SessionRowData> {
-        let pairs: Vec<(WorkspaceKey, SessionId)> =
-            self.sessions.iter().map(|s| (s.working_directory.clone(), s.id)).collect();
-        let ids = sidebar_session_ids(&pairs, ws, self.session_rows_always);
+    /// Where a pane sits in herdr's own listing, counted across endpoints in
+    /// the order they are polled.  `None` for a pane no endpoint lists.
+    fn herdr_pane_index(&self, key: &herdr::HerdrKey) -> Option<usize> {
+        let mut before = 0;
+        for cache in self.herdr_endpoints.caches() {
+            if cache.side() == &key.side {
+                let at = cache.agents().iter().position(|a| a.terminal_id == key.terminal_id)?;
+                return Some(before + at);
+            }
+            before += cache.agents().len();
+        }
+        None
+    }
+
+    /// The workspace a herdr row is currently listed under, for the keyboard
+    /// path: `SidebarRow::HerdrAgent` itself carries no workspace, unlike a
+    /// click, which already knows which panel section it landed in.
+    fn herdr_row_workspace(&self, side: &herdr::Side, terminal_id: &str) -> Option<WorkspaceKey> {
+        let wanted = sidebar_nav::WorkspaceEntry::Agent(side.clone(), terminal_id.to_string());
+        self.listed_workspace_rows()
+            .into_iter()
+            .find(|(_, entries)| entries.contains(&wanted))
+            .map(|(ws, _)| ws)
+    }
+
+    /// The agent behind `(side, terminal_id)`, if its endpoint still has it
+    /// cached.  A stale key (the agent exited between poll and paint, or an
+    /// Enter that outraced this frame's own listing) yields no row rather
+    /// than a panic; the next poll drops it from the listing for good.
+    fn find_herdr_agent(&self, side: &herdr::Side, terminal_id: &str) -> Option<&herdr::Agent> {
+        self.herdr_endpoints
+            .caches()
+            .iter()
+            .find(|cache| cache.side() == side)
+            .and_then(|cache| cache.agents().iter().find(|a| a.terminal_id == terminal_id))
+    }
+
+    /// herdr's word on a session's agent: `Some` only while this session is
+    /// attached to one the endpoint listing still carries.
+    fn session_herdr_status(&self, session: &Session) -> Option<herdr::Status> {
+        self.session_herdr_agent(session).map(|agent| agent.status)
+    }
+
+    /// The agent this session is attached to, while the endpoint listing
+    /// still carries it.  herdr watches the pane from outside, so it is the
+    /// authority on both what the pane is called and what it is doing.
+    fn session_herdr_agent(&self, session: &Session) -> Option<&herdr::Agent> {
+        let key = session.herdr_key.as_ref()?;
+        self.find_herdr_agent(&key.side, &key.terminal_id)
+    }
+
+    /// What the endpoint learned this side's herdr session is called.
+    fn herdr_session_name(&self, side: &herdr::Side) -> Option<String> {
+        self.herdr_endpoints
+            .caches()
+            .iter()
+            .find(|cache| cache.side() == side)
+            .and_then(herdr::EndpointCache::session_name)
+    }
+
+    /// The session already attached to this agent, if one is open.
+    fn herdr_session_for(&self, key: &herdr::HerdrKey) -> Option<SessionId> {
+        self.sessions.iter().find(|s| s.herdr_key.as_ref() == Some(key)).map(|s| s.id)
+    }
+
+    /// herdr's detach chord on `side`, once that endpoint's config read has
+    /// landed.
+    fn herdr_settings(&self, side: &herdr::Side) -> herdr::Settings {
+        self.herdr_endpoints
+            .caches()
+            .iter()
+            .find(|cache| cache.side() == side)
+            .map(herdr::EndpointCache::settings)
+            .unwrap_or_default()
+    }
+
+    /// What supervises `session`, when anything does.  Derived per frame
+    /// rather than stored, so a config read that lands later, or a herdr that
+    /// stops listing the agent, reaches the row without a second source of
+    /// truth to keep in step.
+    fn session_managed(&self, session: &Session) -> Option<Managed> {
+        let key = session.herdr_key.as_ref()?;
+        let agent = self.session_herdr_agent(session);
+        Some(Managed::herdr(&key.side, &self.herdr_settings(&key.side), agent))
+    }
+
+    /// One number standing for every endpoint's rendered state, so the
+    /// sidebar's per-frame comparison stays a `u64` compare.
+    fn herdr_generation(&self) -> u64 {
+        self.herdr_endpoints.generation()
+    }
+
+    /// Refreshes the herdr endpoints on their own clock; a no-op per endpoint
+    /// until its poll interval elapses.  Disabled stops the polling, not just
+    /// the rows: the subprocesses are the whole cost of the feature, so an
+    /// opt-out that kept running them would opt out of nothing.
+    fn poll_herdr_endpoints(&mut self) {
+        if !self.config.ui.herdr.enabled {
+            return;
+        }
+        self.herdr_endpoints.poll(self.config.ui.herdr.poll_interval);
+    }
+
+    /// The rows `ws` paints, in `listed`'s order.  An entry whose session or
+    /// agent has gone since the listing was built yields no row rather than a
+    /// panic; the next rebuild drops it for good.
+    fn workspace_rows(
+        &self,
+        ws: &WorkspaceKey,
+        listed: &sidebar_nav::ListedRows,
+    ) -> Vec<WorkspaceRowData> {
+        let Some(entries) = listed.get(ws) else { return Vec::new() };
         let active = self.active_session.get(ws).copied();
         let is_current = self.current_workspace == *ws;
-        ids.iter()
-            .filter_map(|id| self.sessions.iter().find(|s| s.id == *id))
-            .map(|s| {
-                let activity = s.activity();
-                SessionRowData {
-                    id: s.id,
-                    title: session_row_title(&s.title, activity),
-                    needs_attention: s.needs_attention,
-                    activity,
-                    is_active: active == Some(s.id),
-                    is_displayed: is_current && active == Some(s.id),
-                }
+        entries
+            .iter()
+            .filter_map(|entry| match entry {
+                sidebar_nav::WorkspaceEntry::Session(id) => {
+                    let s = self.sessions.iter().find(|s| s.id == *id)?;
+                    let activity =
+                        herdr_backed_activity(s.activity(), self.session_herdr_status(s));
+                    Some(WorkspaceRowData::Session(SessionRowData {
+                        id: s.id,
+                        name: session_row_name(&s.title, activity, self.session_herdr_agent(s)),
+                        needs_attention: s.needs_attention,
+                        activity,
+                        is_active: active == Some(s.id),
+                        is_displayed: is_current && active == Some(s.id),
+                        managed: self.session_managed(s),
+                    }))
+                },
+                sidebar_nav::WorkspaceEntry::Agent(side, terminal_id) => {
+                    let agent = self.find_herdr_agent(side, terminal_id)?;
+                    let settings = self.herdr_settings(side);
+                    Some(WorkspaceRowData::Herdr(HerdrRowData::from_agent(agent, side, &settings)))
+                },
             })
             .collect()
     }
@@ -8168,8 +9258,16 @@ impl AlacritreeApp {
             self.pending_session_close = None;
             return;
         };
-        let title = format!("Close session `{}`?", session.title);
-        let busy = session.is_busy();
+        // A managed session's attach client is always running, so the busy
+        // warning would fire every time and warn about nothing: what it
+        // guards against is losing work, and detaching loses none.
+        let managed = session.herdr_key.is_some();
+        let title = if managed {
+            format!("Detach from `{}`?", session.title)
+        } else {
+            format!("Close session `{}`?", session.title)
+        };
+        let busy = session.is_busy() && !managed;
 
         let (cancel_via_key, confirm_via_key) =
             consume_modal_keys(ctx, &self.modal_gate, ModalKind::CloseSession);
@@ -8191,13 +9289,16 @@ impl AlacritreeApp {
                 }
                 ui.add_space(4.0 * s);
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Enter to close · Esc to cancel")
-                            .color(theme.text_muted)
-                            .small(),
-                    );
+                    let keys = if managed {
+                        "Enter to detach · Esc to cancel"
+                    } else {
+                        "Enter to close · Esc to cancel"
+                    };
+                    ui.label(RichText::new(keys).color(theme.text_muted).small());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let close_btn = modal_button(ui, &theme, "Close", danger);
+                        let (verb, tint) =
+                            if managed { ("Detach", theme.text) } else { ("Close", danger) };
+                        let close_btn = modal_button(ui, &theme, verb, tint);
                         if close_btn.clicked() {
                             confirmed = true;
                         }
@@ -9640,11 +10741,14 @@ impl eframe::App for AlacritreeApp {
         }
         self.poll_project_refreshes();
         self.poll_pending_spawns(ctx);
+        self.poll_herdr_attach(ctx);
+        self.sync_herdr_view_focus();
         // Unconditional: either sidebar can be hidden, and a drain hung off one
         // of them would strand every entry the other polled.
         self.pr_cache.drain_completed(ctx);
         self.poll_pending_deletes(ctx);
         self.poll_pending_creates(ctx);
+        self.poll_herdr_endpoints();
         // Poll first, then check `failed`: a panicked job's `poll` returns
         // `None` forever, so `failed` is what stops its handle from sitting
         // here for the rest of the process.
@@ -10799,19 +11903,26 @@ mod tests {
         assert_eq!(reorder_subject(true, Some(&row), || None, |_| None, || Some(3)), Some(3));
     }
 
-    #[test]
-    fn session_ids_filter_by_workspace_and_keep_spawn_order() {
-        let pairs = vec![(None, 1), (ws("/a"), 2), (None, 3), (ws("/b"), 4), (ws("/a"), 5)];
-        assert_eq!(sidebar_session_ids(&pairs, &None, false), vec![1, 3]);
-        assert_eq!(sidebar_session_ids(&pairs, &ws("/a"), false), vec![2, 5]);
-        // /b has a single session, below the two-session list threshold.
-        assert!(sidebar_session_ids(&pairs, &ws("/b"), false).is_empty());
+    fn entries(ids: &[SessionId]) -> Vec<sidebar_nav::WorkspaceEntry> {
+        ids.iter().copied().map(sidebar_nav::WorkspaceEntry::Session).collect()
+    }
+
+    /// herdr's index, paired with the row it belongs to, is what
+    /// `workspace_entries` sorts on.
+    fn at(
+        index: usize,
+        entry: sidebar_nav::WorkspaceEntry,
+    ) -> (usize, sidebar_nav::WorkspaceEntry) {
+        (index, entry)
+    }
+
+    fn agent_entry(terminal_id: &str) -> sidebar_nav::WorkspaceEntry {
+        sidebar_nav::WorkspaceEntry::Agent(herdr::Side::Native, terminal_id.to_string())
     }
 
     #[test]
-    fn session_ids_empty_for_unknown_workspace() {
-        let pairs = vec![(None, 1)];
-        assert!(sidebar_session_ids(&pairs, &ws("/missing"), false).is_empty());
+    fn workspace_entries_keep_shell_sessions_in_spawn_order() {
+        assert_eq!(workspace_entries(&[1, 3], Vec::new(), false), entries(&[1, 3]));
     }
 
     #[test]
@@ -10855,16 +11966,383 @@ mod tests {
 
     #[test]
     fn session_row_title_drops_an_agents_decorative_prefix() {
-        let agent = SessionActivity::Agent(Some("claude"));
+        let agent = SessionActivity::agent(Some("claude"), LiveState::Idle);
         assert_eq!(session_row_title("✳ claude", agent), "claude");
-        assert_eq!(session_row_title("⠋ Thinking…", SessionActivity::Loading(None)), "Thinking…");
+        assert_eq!(
+            session_row_title("⠋ Thinking…", SessionActivity::agent(None, LiveState::Working)),
+            "Thinking…"
+        );
         // An ordinary session title owns its decoration because the status
         // slot is not replacing it with an agent mark.
-        assert_eq!(session_row_title("✳ favorite", SessionActivity::Idle), "✳ favorite");
+        assert_eq!(session_row_title("✳ favorite", SessionActivity::Shell), "✳ favorite");
         // A recognized agent with a plain title strips nothing.
         assert_eq!(session_row_title("node build", agent), "node build");
         // Never strip down to an empty label.
         assert_eq!(session_row_title("✳ ", agent), "✳ ");
+    }
+
+    /// The status slot is the only place a blocked agent announces itself, so
+    /// the three live states must not collapse into the same mark.
+    #[test]
+    fn each_live_state_draws_its_own_mark() {
+        let quiet = Color32::from_rgb(1, 1, 1);
+        let attention = Color32::from_rgb(2, 2, 2);
+        assert_eq!(
+            agent_mark(LiveState::Idle, quiet, attention),
+            AgentMark::Glyph(DEFAULT_AGENT_ICON, quiet)
+        );
+        assert_eq!(agent_mark(LiveState::Working, quiet, attention), AgentMark::Loader);
+        assert_eq!(
+            agent_mark(LiveState::Blocked, quiet, attention),
+            AgentMark::Glyph(DEFAULT_BLOCKED_ICON, attention)
+        );
+    }
+
+    /// A blocked agent stays amber on the row the user is looking at, where
+    /// the accent would otherwise claim the slot.
+    #[test]
+    fn blocked_keeps_its_color_over_the_active_rows_accent() {
+        let accent = Color32::from_rgb(3, 3, 3);
+        let attention = Color32::from_rgb(4, 4, 4);
+        assert_eq!(
+            agent_mark(LiveState::Blocked, accent, attention),
+            AgentMark::Glyph(DEFAULT_BLOCKED_ICON, attention)
+        );
+    }
+
+    #[test]
+    fn the_status_hint_names_the_agent_and_what_it_is_doing() {
+        assert_eq!(agent_hint(LiveState::Idle, Some("claude")), "claude is running");
+        assert_eq!(agent_hint(LiveState::Working, Some("codex")), "codex is working");
+        assert_eq!(agent_hint(LiveState::Blocked, Some("claude")), "claude is waiting for you");
+        assert_eq!(agent_hint(LiveState::Blocked, None), "agent is waiting for you");
+    }
+
+    #[test]
+    fn an_attached_herdr_session_takes_herdrs_live_state() {
+        let claude = SessionActivity::agent(Some("claude"), LiveState::Idle);
+
+        // Not attached to herdr: nothing overrides the session's own reading.
+        assert_eq!(herdr_backed_activity(claude, None), claude);
+
+        // herdr sees the approval dialog no title heuristic can.
+        assert_eq!(
+            herdr_backed_activity(claude, Some(herdr::Status::Blocked)),
+            SessionActivity::agent(Some("claude"), LiveState::Blocked)
+        );
+
+        // An attached pane holds an agent even when the process probe missed
+        // one, so the gate closes on herdr's word alone.
+        assert_eq!(
+            herdr_backed_activity(SessionActivity::Shell, Some(herdr::Status::Working)),
+            SessionActivity::agent(None, LiveState::Working)
+        );
+
+        // `unknown` is herdr declining to say, not a claim of idleness: the
+        // session keeps whatever it already knew.
+        let working = SessionActivity::agent(Some("claude"), LiveState::Working);
+        assert_eq!(herdr_backed_activity(working, Some(herdr::Status::Unknown)), working);
+    }
+
+    fn herdr_agent(kind: Option<&str>) -> herdr::Agent {
+        herdr::Agent {
+            terminal_id: "term_65abfc8e300361".into(),
+            pane_id: "w5:p1".into(),
+            kind: kind.map(String::from),
+            title: None,
+            status: herdr::Status::Idle,
+            focused: false,
+            cwd: None,
+            foreground_cwd: None,
+        }
+    }
+
+    /// herdr distinguishes four live states and says so on its own panes.
+    /// Collapsing any pair onto one mark would make the sidebar say less
+    /// about a pane than the window it came from.
+    #[test]
+    fn herdr_marks_keep_its_four_states_apart() {
+        for set in [herdr::Indicators::Dots, herdr::Indicators::Symbols] {
+            let marks: Vec<HarnessMark> = [
+                herdr::Status::Blocked,
+                herdr::Status::Working,
+                herdr::Status::Done,
+                herdr::Status::Idle,
+            ]
+            .into_iter()
+            .map(|status| herdr_mark(status, set))
+            .collect();
+            for (i, a) in marks.iter().enumerate() {
+                for b in &marks[i + 1..] {
+                    assert_ne!(a, b, "{set:?} draws two states the same");
+                }
+            }
+        }
+    }
+
+    /// Taken from herdr's own `state_icon_symbol`, so a pane carries one mark
+    /// whether it is read in herdr or in the sidebar.
+    #[test]
+    fn herdr_marks_are_the_ones_herdr_paints() {
+        let dots = |status| herdr_mark(status, herdr::Indicators::Dots).glyph;
+        assert_eq!(dots(herdr::Status::Blocked), "●");
+        assert_eq!(dots(herdr::Status::Working), "●");
+        assert_eq!(dots(herdr::Status::Done), "●");
+        assert_eq!(dots(herdr::Status::Idle), "○");
+
+        let symbols = |status| herdr_mark(status, herdr::Indicators::Symbols).glyph;
+        assert_eq!(symbols(herdr::Status::Blocked), "×");
+        assert_eq!(symbols(herdr::Status::Working), "◐");
+        assert_eq!(symbols(herdr::Status::Done), "✓");
+        assert_eq!(symbols(herdr::Status::Idle), "○");
+    }
+
+    /// A status alacritree does not recognise is herdr declining to say, and
+    /// the row says that rather than claiming the agent is idle.
+    #[test]
+    fn an_unknown_herdr_status_is_drawn_as_no_reading() {
+        for set in [herdr::Indicators::Dots, herdr::Indicators::Symbols] {
+            let mark = herdr_mark(herdr::Status::Unknown, set);
+            assert_eq!(mark.glyph, "·");
+            assert_eq!(mark.tone, StateTone::Unclear);
+        }
+    }
+
+    #[test]
+    fn herdr_row_name_prefers_the_reported_kind() {
+        let row = HerdrRowData::from_agent(
+            &herdr_agent(Some("claude")),
+            &herdr::Side::Native,
+            &herdr::Settings::default(),
+        );
+        assert_eq!(row.name, RowName::plain("claude".into()));
+    }
+
+    #[test]
+    fn herdr_row_name_falls_back_to_the_terminal_id_tail() {
+        let row = HerdrRowData::from_agent(
+            &herdr_agent(None),
+            &herdr::Side::Native,
+            &herdr::Settings::default(),
+        );
+        assert_eq!(row.name, RowName::plain("300361".into()));
+    }
+
+    /// A shared view shows whatever pane herdr has focused, so the one on
+    /// screen has to keep asking for its own.
+    #[test]
+    fn a_shared_view_asks_herdr_for_its_pane() {
+        let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
+        let asks = needs_view_focus(Some(&key), 1, None);
+        assert_eq!(asks, cfg!(windows));
+    }
+
+    /// A direct attach is wired to one pane, so herdr's focus decides nothing
+    /// about what it draws.
+    #[test]
+    fn a_direct_attach_never_asks_herdr_for_its_pane() {
+        let key = herdr::HerdrKey { side: herdr::Side::Wsl("d".into()), terminal_id: "t1".into() };
+        assert!(!needs_view_focus(Some(&key), 1, None));
+        assert!(!needs_view_focus(None, 1, None));
+    }
+
+    /// The pane herdr was last pointed at is where it still is, and asking
+    /// again every frame would spawn a herdr per frame.
+    #[test]
+    fn a_shared_view_asks_once_per_switch() {
+        let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
+        assert!(!needs_view_focus(Some(&key), 1, Some(1)));
+        let asks = needs_view_focus(Some(&key), 2, Some(1));
+        assert_eq!(asks, cfg!(windows));
+    }
+
+    #[test]
+    fn herdr_row_shared_view_follows_can_attach() {
+        let native = HerdrRowData::from_agent(
+            &herdr_agent(None),
+            &herdr::Side::Native,
+            &herdr::Settings::default(),
+        );
+        assert_eq!(native.managed.shared_view, cfg!(windows));
+
+        let wsl = HerdrRowData::from_agent(
+            &herdr_agent(None),
+            &herdr::Side::Wsl("d".into()),
+            &herdr::Settings::default(),
+        );
+        assert!(!wsl.managed.shared_view);
+    }
+
+    #[test]
+    fn herdr_row_name_keeps_a_short_terminal_id_whole() {
+        // `saturating_sub(6)` exists precisely for ids shorter than the tail
+        // it takes; a plain `- 6` would panic on this one.
+        let agent = herdr::Agent {
+            terminal_id: "t1".into(),
+            pane_id: "w1:p1".into(),
+            kind: None,
+            title: None,
+            status: herdr::Status::Idle,
+            focused: false,
+            cwd: None,
+            foreground_cwd: None,
+        };
+        let row =
+            HerdrRowData::from_agent(&agent, &herdr::Side::Native, &herdr::Settings::default());
+        assert_eq!(row.name, RowName::plain("t1".into()));
+    }
+
+    /// On Linux and WSL an attach is full passthrough, so the pane the user
+    /// ends up looking at is herdr's.  The row says so by naming it the way
+    /// herdr's own listed row does, rather than by whatever the attach
+    /// process titled its PTY.
+    #[test]
+    fn an_attached_session_takes_herdrs_name() {
+        let agent = titled(Some("claude"), Some("primary"));
+        let name = session_row_name("bash", SessionActivity::Shell, Some(&agent));
+        assert_eq!((name.context.as_deref(), name.text.as_str()), (Some("claude"), "primary"));
+    }
+
+    /// herdr reporting no title is not a reason to lose the name the session
+    /// already had, so the PTY's title stands in.
+    #[test]
+    fn an_attached_session_without_a_herdr_title_keeps_its_own() {
+        let agent = titled(Some("claude"), None);
+        let name = session_row_name("✳ building", SessionActivity::Shell, Some(&agent));
+        assert_eq!((name.context.as_deref(), name.text.as_str()), (Some("claude"), "✳ building"));
+    }
+
+    /// A session no harness owns is untouched by any of this.
+    #[test]
+    fn an_ordinary_session_keeps_its_pty_title() {
+        let agent = SessionActivity::agent(Some("claude"), LiveState::Idle);
+        let name = session_row_name("✳ claude", agent, None);
+        assert_eq!((name.context, name.text.as_str()), (None, "claude"));
+    }
+
+    fn titled(kind: Option<&str>, title: Option<&str>) -> herdr::Agent {
+        herdr::Agent { title: title.map(String::from), ..herdr_agent(kind) }
+    }
+
+    fn row_of(kind: Option<&str>, title: Option<&str>) -> HerdrRowData {
+        HerdrRowData::from_agent(
+            &titled(kind, title),
+            &herdr::Side::Wsl("d".into()),
+            &herdr::Settings::default(),
+        )
+    }
+
+    /// The kind is a category and the title is an identity, so the title takes
+    /// the bright slot and the kind stands in front of it as context.
+    #[test]
+    fn a_titled_agent_reads_kind_then_title() {
+        let row = row_of(Some("claude"), Some("primary"));
+        assert_eq!(
+            (row.name.context.as_deref(), row.name.text.as_str()),
+            (Some("claude"), "primary")
+        );
+    }
+
+    /// Nothing is repeated: a title that only echoes the kind leaves the row
+    /// with one word, not the same word twice.
+    #[test]
+    fn a_title_equal_to_the_kind_is_not_repeated() {
+        let row = row_of(Some("codex"), Some("codex"));
+        assert_eq!((row.name.context.as_deref(), row.name.text.as_str()), (None, "codex"));
+    }
+
+    #[test]
+    fn an_untitled_agent_keeps_the_kind_as_its_name() {
+        let row = row_of(Some("claude"), None);
+        assert_eq!((row.name.context.as_deref(), row.name.text.as_str()), (None, "claude"));
+    }
+
+    /// An agent herdr has not identified still has a pane title, and that is a
+    /// better name than six characters of a terminal id.
+    #[test]
+    fn a_kindless_agent_is_named_by_its_title() {
+        let row = row_of(None, Some("scratch"));
+        assert_eq!((row.name.context.as_deref(), row.name.text.as_str()), (None, "scratch"));
+    }
+
+    #[test]
+    fn an_agent_with_neither_falls_back_to_the_terminal_id_tail() {
+        let row = row_of(None, None);
+        assert_eq!((row.name.context.as_deref(), row.name.text.as_str()), (None, "300361"));
+    }
+
+    /// Everything the row's marks cannot say goes here, one fact per comma,
+    /// with the way out in parentheses after them: a mark can carry a state
+    /// but not the word for it, and nothing on the row can carry a chord.
+    #[test]
+    fn the_tooltip_spells_out_what_the_marks_cannot() {
+        let agent = herdr::Agent {
+            status: herdr::Status::Working,
+            ..titled(Some("claude"), Some("Claude Code"))
+        };
+        let mut row = HerdrRowData::from_agent(
+            &agent,
+            &herdr::Side::Wsl("d".into()),
+            &herdr::Settings::default(),
+        );
+        assert_eq!(managed_tooltip(&row.managed), r#"working, herdr, `claude` "Claude Code"."#);
+
+        row.managed.detach = Some("Ctrl+B q".to_string());
+        assert_eq!(
+            managed_tooltip(&row.managed),
+            r#"working, herdr, `claude` "Claude Code". (detach with `Ctrl+B q`)"#
+        );
+
+        row.managed.shared_view = true;
+        assert_eq!(
+            managed_tooltip(&row.managed),
+            r#"working, herdr, shared view, `claude` "Claude Code". (detach with `Ctrl+B q`)"#
+        );
+    }
+
+    /// A pane whose title says no more than its kind is named once.
+    #[test]
+    fn the_tooltip_does_not_say_the_kind_twice() {
+        let row = row_of(Some("codex"), Some("codex"));
+        assert_eq!(managed_tooltip(&row.managed), "idle, herdr, `codex`.");
+    }
+
+    /// A session alacritree still holds open after herdr stopped listing its
+    /// pane has no state and no name left to report, but it is still herdr's
+    /// and the user still has to know how to leave it.
+    #[test]
+    fn an_unlisted_pane_still_says_how_to_leave() {
+        let settings =
+            herdr::Settings { detach: Some("Ctrl+B q".into()), ..herdr::Settings::default() };
+        let managed = Managed::herdr(&herdr::Side::Wsl("d".into()), &settings, None);
+        assert_eq!(managed_tooltip(&managed), "herdr. (detach with `Ctrl+B q`)");
+    }
+
+    /// Losing a view costs a click to get back and losing a shell costs the
+    /// shell, so the two prompts answer to separate switches — and the busy
+    /// question a close asks never reaches a detach, whose attach client is
+    /// running by definition.
+    #[test]
+    fn a_detach_asks_on_its_own_switch() {
+        use crate::config::ConfirmSessionClose;
+
+        let mut ui = UiTheme::default();
+        assert_eq!(ui.confirm_session_close, ConfirmSessionClose::Never);
+        assert!(close_needs_prompt(&ui, true, false));
+        assert!(!close_needs_prompt(&ui, false, true));
+
+        ui.confirm_session_close = ConfirmSessionClose::Always;
+        ui.confirm_session_detach = false;
+        assert!(!close_needs_prompt(&ui, true, true));
+        assert!(close_needs_prompt(&ui, false, false));
+    }
+
+    /// Ending a herdr-managed session ends the attach and leaves the pane
+    /// running, so the control cannot call itself a close.
+    #[test]
+    fn the_close_control_is_a_detach_on_a_managed_row() {
+        assert_eq!(close_button_hint(true), "detach session");
+        assert_eq!(close_button_hint(false), "close session");
     }
 
     #[test]
@@ -10890,25 +12368,58 @@ mod tests {
     }
 
     #[test]
-    fn session_ids_apply_two_session_threshold() {
-        let no_match: Vec<(WorkspaceKey, SessionId)> = vec![(ws("/other"), 1)];
-        assert!(sidebar_session_ids(&no_match, &ws("/a"), false).is_empty());
-
-        let one_match = vec![(ws("/a"), 1), (ws("/other"), 2)];
-        assert!(sidebar_session_ids(&one_match, &ws("/a"), false).is_empty());
-
-        let two_match = vec![(ws("/a"), 1), (ws("/other"), 2), (ws("/a"), 3)];
-        assert_eq!(sidebar_session_ids(&two_match, &ws("/a"), false), vec![1, 3]);
+    fn workspace_entries_apply_the_two_row_threshold() {
+        assert!(workspace_entries(&[], Vec::new(), false).is_empty());
+        assert!(workspace_entries(&[1], Vec::new(), false).is_empty());
+        assert_eq!(workspace_entries(&[1, 3], Vec::new(), false), entries(&[1, 3]));
     }
 
     #[test]
-    fn session_ids_always_flag_lists_single_sessions() {
-        let one_match = vec![(ws("/a"), 1), (ws("/other"), 2)];
-        assert_eq!(sidebar_session_ids(&one_match, &ws("/a"), true), vec![1]);
+    fn workspace_entries_always_flag_lists_single_sessions() {
+        assert_eq!(workspace_entries(&[1], Vec::new(), true), entries(&[1]));
+        assert!(workspace_entries(&[], Vec::new(), true).is_empty());
+    }
 
-        // Zero sessions stays empty even with the flag on.
-        let no_match: Vec<(WorkspaceKey, SessionId)> = vec![(ws("/other"), 2)];
-        assert!(sidebar_session_ids(&no_match, &ws("/a"), true).is_empty());
+    /// A herdr pane has no other surface to appear on, so the threshold can
+    /// never hide one — and a lone shell session beside one is listed rather
+    /// than folded into the workspace row, which would leave a hole in a list
+    /// its neighbour is already in.
+    #[test]
+    fn a_herdr_row_is_listed_whatever_the_threshold_says() {
+        let lone = workspace_entries(&[], vec![at(0, agent_entry("t1"))], false);
+        assert_eq!(lone, vec![agent_entry("t1")]);
+
+        let beside = workspace_entries(&[1], vec![at(0, agent_entry("t1"))], false);
+        assert_eq!(beside, vec![sidebar_nav::WorkspaceEntry::Session(1), agent_entry("t1")]);
+    }
+
+    /// The whole point of the merged list: a pane keeps herdr's position
+    /// whether alacritree is attached to it or not, so attaching changes how
+    /// a row is drawn and never where it sits.
+    #[test]
+    fn herdr_rows_take_their_order_from_herdr_not_from_the_attach() {
+        // herdr lists t1 then t2; alacritree attached to t2 first, so the
+        // session vec has them the other way round.
+        let managed =
+            vec![at(1, sidebar_nav::WorkspaceEntry::Session(9)), at(0, agent_entry("t1"))];
+        assert_eq!(workspace_entries(&[], managed, false), vec![
+            agent_entry("t1"),
+            sidebar_nav::WorkspaceEntry::Session(9)
+        ]);
+    }
+
+    /// A pane herdr has stopped listing keeps its block rather than falling
+    /// in among the shells: the session is still herdr's, and it goes back to
+    /// its slot when the listing carries it again.
+    #[test]
+    fn an_unlisted_pane_waits_at_the_tail_of_its_own_block() {
+        let managed =
+            vec![at(usize::MAX, sidebar_nav::WorkspaceEntry::Session(9)), at(0, agent_entry("t1"))];
+        assert_eq!(workspace_entries(&[1], managed, false), vec![
+            sidebar_nav::WorkspaceEntry::Session(1),
+            agent_entry("t1"),
+            sidebar_nav::WorkspaceEntry::Session(9),
+        ]);
     }
 
     use crate::projects::{Project, Worktree};
@@ -12022,7 +13533,7 @@ mod tests {
                 false,
                 false,
                 false,
-                SessionActivity::Idle,
+                SessionActivity::Shell,
                 false,
                 &[],
                 &icons,
@@ -12195,7 +13706,7 @@ mod tests {
                     false,
                     false,
                     false,
-                    SessionActivity::Idle,
+                    SessionActivity::Shell,
                     false,
                     &[],
                     &icons,
@@ -12329,7 +13840,7 @@ mod tests {
                 false,
                 false,
                 false,
-                SessionActivity::Idle,
+                SessionActivity::Shell,
                 false,
                 &[],
                 &icons,
@@ -12401,11 +13912,12 @@ mod tests {
 
             let row = SessionRowData {
                 id: 1,
-                title: "zsh".to_owned(),
+                name: RowName::plain("zsh".to_owned()),
                 needs_attention: false,
-                activity: SessionActivity::Idle,
+                activity: SessionActivity::Shell,
                 is_active: true,
                 is_displayed: true,
+                managed: None,
             };
             let mut session = |ui: &mut egui::Ui| {
                 session_row(ui, &row, false, false, false, &icons, &theme);
@@ -12417,7 +13929,7 @@ mod tests {
             );
 
             let mut home = |ui: &mut egui::Ui| {
-                home_row(ui, true, false, false, false, SessionActivity::Idle, &icons, &theme);
+                home_row(ui, true, false, false, false, SessionActivity::Shell, &icons, &theme);
             };
             assert_eq!(
                 hint_painted_over(&mut home, "+", "new shell"),
@@ -12488,11 +14000,12 @@ mod tests {
         let icons = crate::config::Icons::default();
         let session = |attention, activity| SessionRowData {
             id: 1,
-            title: "zsh".to_owned(),
+            name: RowName::plain("zsh".to_owned()),
             needs_attention: attention,
             activity,
             is_active: true,
             is_displayed: true,
+            managed: None,
         };
 
         for (icon_tooltips, want) in [(true, true), (false, false)] {
@@ -12501,7 +14014,7 @@ mod tests {
             config.ui.sidebar_tooltips = SidebarTooltips::Off;
             let theme = Theme::from_config(&config);
 
-            let agent = session(false, SessionActivity::Agent(Some("claude")));
+            let agent = session(false, SessionActivity::agent(Some("claude"), LiveState::Idle));
             let mut agent_row = |ui: &mut egui::Ui| {
                 session_row(ui, &agent, false, false, false, &icons, &theme);
             };
@@ -12516,7 +14029,8 @@ mod tests {
             let slot = painted_glyph_positions(probe.last().expect("the row painted"))
                 [DEFAULT_AGENT_ICON.as_str()];
 
-            let loading = session(false, SessionActivity::Loading(Some("claude")));
+            let loading =
+                session(false, SessionActivity::agent(Some("claude"), LiveState::Working));
             let texts = texts_while_hovering_at(slot, WIDTH, |ui| {
                 session_row(ui, &loading, false, false, false, &icons, &theme);
             });
@@ -12526,7 +14040,7 @@ mod tests {
                 "loading status, icon_tooltips = {icon_tooltips}"
             );
 
-            let waiting = session(true, SessionActivity::Idle);
+            let waiting = session(true, SessionActivity::Shell);
             let texts = texts_while_hovering_at(slot, WIDTH, |ui| {
                 session_row(ui, &waiting, false, false, false, &icons, &theme);
             });
@@ -12652,7 +14166,7 @@ mod tests {
                     false,
                     false,
                     false,
-                    SessionActivity::Idle,
+                    SessionActivity::Shell,
                     false,
                     &[],
                     &icons,
@@ -12718,7 +14232,7 @@ mod tests {
                     false,
                     false,
                     false,
-                    SessionActivity::Idle,
+                    SessionActivity::Shell,
                     false,
                     &[],
                     &icons,
@@ -12791,7 +14305,7 @@ mod tests {
                     false,
                     false,
                     false,
-                    SessionActivity::Idle,
+                    SessionActivity::Shell,
                     false,
                     &[],
                     &icons,
@@ -12822,11 +14336,12 @@ mod tests {
         let icons = crate::config::Icons::default();
         let row = SessionRowData {
             id: 1,
-            title: "cargo test --workspace --all-features -- --nocapture".to_owned(),
+            name: RowName::plain("cargo test --workspace --all-features -- --nocapture".to_owned()),
             needs_attention: false,
-            activity: SessionActivity::Idle,
+            activity: SessionActivity::Shell,
             is_active: true,
             is_displayed: true,
+            managed: None,
         };
 
         let texts = texts_while_hovering(140.0, |ui| {
@@ -12834,11 +14349,11 @@ mod tests {
         });
 
         assert!(
-            row_elided(&texts, &row.title),
+            row_elided(&texts, &row.name.text),
             "the row must be too narrow for the title, or the test proves nothing: {texts:?}"
         );
         assert!(
-            tooltip_shown(&texts, &row.title),
+            tooltip_shown(&texts, &row.name.text),
             "hovering the elided row painted no tooltip with the full title: {texts:?}"
         );
     }
@@ -12907,12 +14422,13 @@ mod tests {
         ];
         let live =
             vec![(None, 1), (Some(PathBuf::from("/a/wt1")), 2), (Some(PathBuf::from("/a/wt1")), 3)];
-        let listed = sidebar_nav::ListedSessions::from([
+        let listed = sidebar_nav::tests::sessions_only(HashMap::from([
             (None, vec![1]),
             (Some(PathBuf::from("/a/wt1")), vec![2, 3]),
-        ]);
+        ]));
         let rows = sidebar_nav::visible_rows(&projects, &listed);
-        let snapshot = build_sidebar_snapshot(&projects, &live, &rows, None, Default::default());
+        let snapshot =
+            build_sidebar_snapshot(&projects, &live, &listed, &rows, None, Default::default());
 
         for row in &rows {
             let id = snapshot.find(row).expect("every projected row is in the model");
@@ -12935,6 +14451,61 @@ mod tests {
         assert!(!snapshot.is_projected(hidden));
     }
 
+    /// Herdr rows are navigable rows, so the arena has to carry them in the
+    /// order the projection lists them.  Missing them parks the lockstep index
+    /// on the first agent row, which marks every row below it unprojected and
+    /// leaves the cursor with no node to sit on.
+    #[test]
+    fn herdr_rows_are_projected_under_the_workspace_they_are_listed_in() {
+        use crate::sidebar_focus::Parent;
+        use crate::sidebar_nav::{self, SidebarRow};
+
+        let projects = vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2"])];
+        let live: Vec<(WorkspaceKey, SessionId)> = vec![(Some(PathBuf::from("/a/wt1")), 1)];
+        let home_agent = SidebarRow::HerdrAgent(herdr::Side::Native, "term_home".into());
+        let worktree_agent = SidebarRow::HerdrAgent(herdr::Side::Wsl("d".into()), "term_wt".into());
+        let listed = sidebar_nav::ListedRows::from([
+            (None, vec![sidebar_nav::WorkspaceEntry::Agent(
+                herdr::Side::Native,
+                "term_home".to_string(),
+            )]),
+            (Some(PathBuf::from("/a/wt1")), vec![
+                sidebar_nav::WorkspaceEntry::Session(1),
+                sidebar_nav::WorkspaceEntry::Agent(
+                    herdr::Side::Wsl("d".into()),
+                    "term_wt".to_string(),
+                ),
+            ]),
+        ]);
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let snapshot =
+            build_sidebar_snapshot(&projects, &live, &listed, &rows, None, Default::default());
+
+        for row in &rows {
+            let id = snapshot.find(row).expect("every projected row is in the model");
+            assert!(snapshot.is_projected(id), "{row:?} must stay navigable");
+            let arena_parent = match snapshot.parent(id) {
+                Parent::Root => None,
+                Parent::Node(p) => Some(snapshot.row(p).clone()),
+                Parent::Detached => panic!("a projected row is never detached: {row:?}"),
+            };
+            assert_eq!(
+                arena_parent,
+                sidebar_nav::left_target(&rows, row),
+                "arena parent must agree with the row model for {row:?}"
+            );
+        }
+
+        assert_eq!(
+            snapshot.parent(snapshot.find(&home_agent).unwrap()),
+            Parent::Node(snapshot.find(&SidebarRow::Home).unwrap()),
+        );
+        assert_eq!(
+            snapshot.parent(snapshot.find(&worktree_agent).unwrap()),
+            Parent::Node(snapshot.find(&SidebarRow::Worktree(PathBuf::from("/a/wt1"))).unwrap()),
+        );
+    }
+
     #[test]
     fn a_session_below_the_listing_threshold_is_still_in_the_model() {
         use crate::sidebar_nav::{self, SidebarRow};
@@ -12944,16 +14515,17 @@ mod tests {
         // lists any, so this one is live but unprojected.
         let live = vec![(Some(PathBuf::from("/a/wt1")), 7)];
         let listed = {
-            let mut l = sidebar_nav::ListedSessions::new();
-            let ids = sidebar_session_ids(&live, &Some(PathBuf::from("/a/wt1")), false);
-            assert!(ids.is_empty(), "the threshold rule must actually drop this session");
-            if !ids.is_empty() {
-                l.insert(Some(PathBuf::from("/a/wt1")), ids);
+            let mut l = sidebar_nav::ListedRows::new();
+            let entries = workspace_entries(&[7], Vec::new(), false);
+            assert!(entries.is_empty(), "the threshold rule must actually drop this session");
+            if !entries.is_empty() {
+                l.insert(Some(PathBuf::from("/a/wt1")), entries);
             }
             l
         };
         let rows = sidebar_nav::visible_rows(&projects, &listed);
-        let snapshot = build_sidebar_snapshot(&projects, &live, &rows, None, Default::default());
+        let snapshot =
+            build_sidebar_snapshot(&projects, &live, &listed, &rows, None, Default::default());
 
         let id = snapshot
             .find(&SidebarRow::Session(7))
@@ -12969,9 +14541,10 @@ mod tests {
         // `remove_project` drops the project but keeps its sessions running.
         let projects: Vec<crate::projects::Project> = vec![];
         let live = vec![(Some(PathBuf::from("/orphan/wt1")), 5)];
-        let listed = sidebar_nav::ListedSessions::new();
+        let listed = sidebar_nav::ListedRows::new();
         let rows = sidebar_nav::visible_rows(&projects, &listed);
-        let snapshot = build_sidebar_snapshot(&projects, &live, &rows, None, Default::default());
+        let snapshot =
+            build_sidebar_snapshot(&projects, &live, &listed, &rows, None, Default::default());
 
         let id = snapshot.find(&SidebarRow::Session(5)).expect("the session is still running");
         assert_eq!(
@@ -12986,12 +14559,13 @@ mod tests {
         use crate::sidebar_nav::{self, SidebarRow};
 
         let projects = vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2"])];
-        let listed = sidebar_nav::ListedSessions::new();
+        let listed = sidebar_nav::ListedRows::new();
         let rows = sidebar_nav::visible_rows(&projects, &listed);
         let doomed = PathBuf::from("/a/wt2");
         let snapshot = build_sidebar_snapshot(
             &projects,
             &[],
+            &listed,
             &rows,
             Some(doomed.as_path()),
             Default::default(),
@@ -13019,12 +14593,13 @@ mod tests {
 
         let projects =
             vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2", "/a/wt3"])];
-        let listed = sidebar_nav::ListedSessions::new();
+        let listed = sidebar_nav::ListedRows::new();
         let rows = sidebar_nav::visible_rows(&projects, &listed);
         let doomed = PathBuf::from("/a/wt2");
         let snapshot = build_sidebar_snapshot(
             &projects,
             &[],
+            &listed,
             &rows,
             Some(doomed.as_path()),
             Default::default(),
@@ -13037,6 +14612,98 @@ mod tests {
             snapshot.is_projected(below),
             "a row below the one being deleted must still be navigable"
         );
+    }
+
+    /// A checkout the liveness cache calls gone offers no workspace, so the
+    /// agent working in it matches nothing and lists under Home.  Matched to
+    /// the removed worktree instead, its row's Enter could only refuse.
+    #[test]
+    fn a_gone_worktree_offers_no_workspace_to_an_agent() {
+        use crate::sidebar_nav;
+
+        let projects = vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2"])];
+        let gone = PathBuf::from("/a/wt2");
+        let workspaces = herdr_workspaces(&projects, |path| Some(path == gone));
+        assert_eq!(workspaces, vec![PathBuf::from("/a/wt1")]);
+
+        let agent = herdr::Agent {
+            terminal_id: "t1".into(),
+            pane_id: "w1:p1".into(),
+            kind: None,
+            title: None,
+            status: herdr::Status::Idle,
+            focused: false,
+            cwd: Some(gone.to_string_lossy().into_owned()),
+            foreground_cwd: None,
+        };
+        assert_eq!(
+            herdr::match_workspace(&agent, &herdr::Side::Native, &workspaces),
+            None,
+            "an agent under a removed checkout falls back to Home"
+        );
+    }
+
+    /// The lockstep walk follows the listing, not the session vector.
+    ///
+    /// Attaching to the second pane first leaves the two sessions in the
+    /// opposite order to herdr's, and a walk that trusted the vector would
+    /// push them the wrong way round, match neither against the projection
+    /// and trip its own assert.
+    #[test]
+    fn the_snapshot_walk_follows_the_listing_not_the_session_vector() {
+        use crate::sidebar_nav::{self, SidebarRow};
+
+        let projects = vec![sidebar_nav::tests::project("/a", true, &["/a/wt1"])];
+        let wt = Some(PathBuf::from("/a/wt1"));
+        // Attached in the order 9 then 4; herdr lists the panes 4 then 9.
+        let live = vec![(wt.clone(), 9), (wt.clone(), 4)];
+        let listed = sidebar_nav::ListedRows::from([(wt.clone(), vec![
+            sidebar_nav::WorkspaceEntry::Session(4),
+            sidebar_nav::WorkspaceEntry::Session(9),
+        ])]);
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let snapshot =
+            build_sidebar_snapshot(&projects, &live, &listed, &rows, None, Default::default());
+
+        assert_eq!(rows, vec![
+            SidebarRow::Home,
+            SidebarRow::Project(PathBuf::from("/a")),
+            SidebarRow::Worktree(PathBuf::from("/a/wt1")),
+            SidebarRow::Session(4),
+            SidebarRow::Session(9),
+        ]);
+        for row in &rows {
+            let id = snapshot.find(row).expect("every projected row is in the model");
+            assert!(snapshot.is_projected(id), "{row:?} must stay navigable");
+        }
+    }
+
+    /// Same lockstep hazard, with the doomed worktree carrying a herdr row:
+    /// the agent rows it owns have to be stepped over as well.
+    #[test]
+    fn rows_below_a_deleted_worktree_with_a_herdr_row_stay_navigable() {
+        use crate::sidebar_nav::{self, SidebarRow};
+
+        let projects =
+            vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2", "/a/wt3"])];
+        let doomed = PathBuf::from("/a/wt2");
+        let listed = sidebar_nav::ListedRows::from([(Some(doomed.clone()), vec![
+            sidebar_nav::WorkspaceEntry::Agent(herdr::Side::Native, "term_doomed".to_string()),
+        ])]);
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let snapshot = build_sidebar_snapshot(
+            &projects,
+            &[],
+            &listed,
+            &rows,
+            Some(doomed.as_path()),
+            Default::default(),
+        );
+
+        let below = snapshot
+            .find(&SidebarRow::Worktree(PathBuf::from("/a/wt3")))
+            .expect("the worktree below the deleted one is still in the tree");
+        assert!(snapshot.is_projected(below));
     }
 
     /// Dispatch cannot catch a wrong pairing: `toggle` drops an identity the
