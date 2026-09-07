@@ -4,102 +4,91 @@ So new UX/UI features need to provide config options that are used to enable the
 
 ## Working on features/bugfixes
 
-Every feature and bugfix gets its own worktree and branch, created by `devkit
-issue setup` and living at `../alacritree-worktrees/<branch>`, a sibling of this
-checkout.
+Every feature and bugfix gets its own worktree and branch, created by `devkit issue setup` and living at `../alacritree-worktrees/<branch>`, a sibling of this checkout.
 
-**Branches stack: branch off the newest open PR, never off `master`.** Two
-branches cut from `master` collide when the second one merges, and that
-collision lands after review, on whoever merges last. Stacking front-loads it
-into your own worktree, where you resolve it once. Read the tip fresh each time,
-since the stack grows while specs sit unimplemented.
+**Branches stack: branch off the newest open PR, never off `master`.** Two branches cut from `master` collide when the second one merges, and that collision lands after review, on whoever merges last. Stacking front-loads it into your own worktree, where you resolve it once. Read the tip fresh each time, since the stack grows while specs sit unimplemented.
 
-Stack branches that look independent, too. A clean merge between them today says
-nothing about what `master` moving under both does to them later.
+Stack branches that look independent, too. A clean merge between them today says nothing about what `master` moving under both does to them later.
 
 ```sh
 gh pr list --repo mathix420/alacritree --state open --json number,title,headRefName
 ```
 
-Take the entry whose title carries the highest `[n]` marker; its `headRefName` is
-your base and `n + 1` is your marker. PR titles carry that marker:
-`feat(logging): record why alacritree died [8]`.
+Take the entry whose title carries the highest `[n]` marker; its `headRefName` is your base and `n + 1` is your marker. PR titles carry that marker: `feat(logging): record why alacritree died [8]`.
 
-The slug is the whole branch name, type prefix included, and the GitHub issue
-number comes first:
+The slug is the whole branch name, type prefix included, and the GitHub issue number comes first:
 
 ```sh
 devkit issue setup 41 --slug feat/decoration-metrics
 ```
 
-`devkit issue setup` cuts every branch from `origin/master` and takes no base
-flag, so a stacked branch is re-pointed once, before it has any commits of its
-own:
+`devkit issue setup` cuts every branch from `origin/master` and takes no base flag, so a stacked branch is re-pointed once, before it has any commits of its own:
 
 ```sh
 git -C ../alacritree-worktrees/feat/decoration-metrics reset --hard origin/<base>
 ```
 
-The base moves under you. A branch that sat unimplemented for a few days is
-based on a commit its own PR has since rebased away, and nothing errors: the
-hash is simply gone from the base's history. Check before opening the PR.
+The base moves under you. A branch that sat unimplemented for a few days is based on a commit its own PR has since rebased away, and nothing errors: the hash is simply gone from the base's history. Check before opening the PR.
 
 ```sh
 git -C <worktree> merge-base --is-ancestor <recorded base> origin/<base>
 ```
 
-When that fails, the live commit usually carries the same subject at a new hash,
-and replaying onto the base fixes it:
+When that fails, the live commit usually carries the same subject at a new hash, and replaying onto the base fixes it:
 
 ```sh
 git -C <worktree> rebase --onto origin/<base> <recorded base> <branch>
 ```
 
-`devkit issue status` lists what exists, `devkit issue end` removes a finished
-worktree.
+`devkit issue status` lists what exists, `devkit issue end` removes a finished worktree.
 
-## Running tests
+## Running commands
 
-`cargo nextest run -p alacritree` is the test command in this checkout, in
-place of the `cargo test` line in `AGENTS.md`. That file keeps naming `cargo
-test` because Arnaud's CI runs it and nextest is installed only here.
+Build, test, lint and format through devkit rather than by typing cargo directly, so every run carries the flags this checkout needs instead of the ones CI happens to use:
+
+```sh
+devkit run task fmt      # nightly rustfmt
+devkit run task check    # cargo check
+devkit run task test     # nextest
+devkit run task build
+devkit run task clippy
+```
+
+`devkit config tasks` lists them, `--dry-run` prints the argv without running it, and `--dir <worktree>` runs one in a worktree.
+
+Two are not the command you would otherwise type. `fmt` runs nightly rustfmt, because ten of the fifteen options in `rustfmt.toml` are nightly-only and stable rustfmt ignores every one of them after a warning, reformatting files the change never touched. `test` runs nextest, which is installed only here, which is why `AGENTS.md` still names `cargo test` for Arnaud's CI.
+
+## Shared checkout
+
+Several agents work here at once, and `[harness] enforce_writes` refuses a write to any path the session has not claimed. Claim a file before editing it, under the identity the write harness matches on:
+
+```sh
+DEVKIT_SESSION=$CLAUDE_CODE_SESSION_ID lockm acquire <abs path> --note "<why>"
+```
+
+Without `DEVKIT_SESSION` the holder falls back to the parent pid, which differs between shell invocations, so the next write is refused by a lock you hold yourself. `lockm status` names the holder of each claim. Force-releasing is for a lock stranded under your own dead pid, never for one another agent is using.
 
 ## devkit
 
-This checkout is a devkit project. `devkit.local.toml` configures it and is
-untracked, so it rides on the `docs/specs-and-plans` branch with the other local
-files.
+This checkout is a devkit project. `devkit.local.toml` configures it and is untracked, so it rides on the `docs/specs-and-plans` branch with the other local files.
 
-`worktree_include` names the untracked instructions copied into each new
-worktree, so an agent working there reads the same rules as one working here.
-After editing `AGENTS.local.md` or `CLAUDE.local.md`, push the change into
-worktrees that already exist:
+`worktree_include` names the untracked instructions copied into each new worktree, so an agent working there reads the same rules as one working here. After editing `AGENTS.local.md` or `CLAUDE.local.md`, push the change into worktrees that already exist:
 
 ```sh
 devkit issue sync-includes --overwrite
 ```
 
-Several agents share this checkout, so claim a file with `lockm acquire` before
-editing it. `docm` resolves alacritty, kitty, ghostty, wezterm and zed at the
-versions this project pins; read those checkouts rather than recalling how they
-behave.
+`docm` resolves alacritty, kitty, ghostty, wezterm and zed at the versions this project pins; read those checkouts rather than recalling how they behave.
 
 ## Specs and plans
 
-Specs go in `docs/superpowers/specs/`, plans in `docs/superpowers/plans/`,
-always in the main checkout. Written into a worktree they die with it.
+Specs go in `docs/superpowers/specs/`, plans in `docs/superpowers/plans/`, always in the main checkout. Written into a worktree they die with it.
 
-`.git/info/exclude` keeps `docs/superpowers/` untracked, so specs and plans stay
-off feature branches and out of PRs; PR descriptions carry the context instead.
-The one branch that tracks them is `docs/specs-and-plans`, which holds no code
-and exists so they survive worktree deletion and reach another machine.
+`.git/info/exclude` keeps `docs/superpowers/` untracked, so specs and plans stay off feature branches and out of PRs; PR descriptions carry the context instead. The one branch that tracks them is `docs/specs-and-plans`, which holds no code and exists so they survive worktree deletion and reach another machine.
 
-The branch also carries the untracked local files this repository needs and git
-ignores: `AGENTS.local.md`, `CLAUDE.local.md`, `devkit.local.toml`,
-`install.local.py` and `sync.local.py`.
+The branch also carries the untracked local files this repository needs and git ignores: `AGENTS.local.md`, `CLAUDE.local.md`, `devkit.local.toml`, `install.local.py` and `sync.local.py`.
 
-`sync.local.py` moves both kinds of file between the main checkout and that
-branch, and works from either one. It needs the worktree to exist first:
+`sync.local.py` moves both kinds of file between the main checkout and that branch, and works from either one. It needs the worktree to exist first:
 
 ```sh
 git worktree add ../alacritree-worktrees/docs/specs-and-plans docs/specs-and-plans
@@ -107,12 +96,7 @@ python3 sync.local.py --dry-run
 python3 sync.local.py --push
 ```
 
-Direction is decided per file. One side missing it gets a copy; both sides
-holding different content sends the newer one, so writing a spec here pushes it
-onto the branch and pulling the branch on a new machine seeds this checkout.
-After a clone stamps every file at once, `--to-branch` or `--to-main` overrides
-that. Anything reaching the branch is committed there, one commit per logical
-change, and `--trailer` adds a `Co-Authored-By` line for an agent's commits.
+Direction is decided per file. One side missing it gets a copy; both sides holding different content sends the newer one, so writing a spec here pushes it onto the branch and pulling the branch on a new machine seeds this checkout. After a clone stamps every file at once, `--to-branch` or `--to-main` overrides that. Anything reaching the branch is committed there, one commit per logical change, and `--trailer` adds a `Co-Authored-By` line for an agent's commits.
 
 Merging the branch into a feature branch puts working documents into a PR.
 
@@ -122,8 +106,7 @@ Issue bodies, PR bodies, review comments and Markdown docs are soft-wrapped: one
 
 ## Git Commits
 
-Git commits you and/or your subagents make must have a commit trailer like: `Co-Authored-By: MODEL <EMAIL>`
-The `<EMAIL>` should follow standard practices for the model/harness being used.
+Git commits you and/or your subagents make must have a commit trailer like: `Co-Authored-By: MODEL <EMAIL>` The `<EMAIL>` should follow standard practices for the model/harness being used.
 
 Example for Claude Opus 5: `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>` or `Co-Authored-By: Claude Opus 5 (1M Context) <noreply@anthropic.com>`
 
@@ -131,14 +114,9 @@ Example for Claude Opus 5: `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com
 
 Whenever I ask to open a PR, or push open PR, etc. You need to push the branch to my fork/remote. The PR must be opened against upstream mathix420/Arnaud's repo.
 
-The GitHub base is always `master`, even though the branch descends from the
-previous PR in the stack rather than from `master`.
+The GitHub base is always `master`, even though the branch descends from the previous PR in the stack rather than from `master`.
 
-Open the PR with `devkit issue pr create`, not `gh pr create`. Its `pr_body`
-template in `devkit.local.toml` renders the body shape every PR here uses: my
-TL;DR, the `Closes` lines, then the Claude summary under a rule, ending in the
-model attribution. Writing the body by hand reproduces that shape by memory
-and drifts from it.
+Open the PR with `devkit issue pr create`, not `gh pr create`. Its `pr_body` template in `devkit.local.toml` renders the body shape every PR here uses: my TL;DR, the `Closes` lines, then the Claude summary under a rule, ending in the model attribution. Writing the body by hand reproduces that shape by memory and drifts from it.
 
 ```sh
 devkit issue pr create --ready \
@@ -148,28 +126,15 @@ devkit issue pr create --ready \
   --arg stacked_on=203
 ```
 
-The TL;DR is mine. I write it into the PR myself once it is open, so leave
-`--arg tldr` off the command and pass only `--pr-body`, `--arg closes` and
-`--arg stacked_on`.
+The TL;DR is mine. I write it into the PR myself once it is open, so leave `--arg tldr` off the command and pass only `--pr-body`, `--arg closes` and `--arg stacked_on`.
 
-`devkit issue review request` is a different command. It requests review on a PR
-that already exists, and it is mine to run, not yours. Never pass `--to` to `pr
-create` either: without it the command adds no reviewer and sends no Slack, so
-it opens the PR and stops.
+`devkit issue review request` is a different command. It requests review on a PR that already exists, and it is mine to run, not yours. Never pass `--to` to `pr create` either: without it the command adds no reviewer and sends no Slack, so it opens the PR and stops.
 
-`--ready` opens a real PR. Without it devkit opens a draft, and drafts get no
-review-bot coverage. Add `--no-push` only when the branch is already pushed.
+`--ready` opens a real PR. Without it devkit opens a draft, and drafts get no review-bot coverage. Add `--no-push` only when the branch is already pushed.
 
-`--pr-body` carries the Claude summary; pass it through a file rather than
-inline, since it can run long. The first `Closes` line comes from the
-worktree's own issue, so `--arg closes` carries only the extra ones,
-whitespace separated. `--arg stacked_on` takes the PR number this branch sits
-on and emits the review-order note; leave it off for a branch that really does
-descend from `master`. `--arg model` overrides the attribution when a
-different model did the work.
+`--pr-body` carries the Claude summary; pass it through a file rather than inline, since it can run long. The first `Closes` line comes from the worktree's own issue, so `--arg closes` carries only the extra ones, whitespace separated. `--arg stacked_on` takes the PR number this branch sits on and emits the review-order note; leave it off for a branch that really does descend from `master`. `--arg model` overrides the attribution when a different model did the work.
 
-The template renders only when the command creates a PR. Editing an open one is
-still `gh pr edit`, and the shape has to be preserved by hand there.
+The template renders only when the command creates a PR. Editing an open one is still `gh pr edit`, and the shape has to be preserved by hand there.
 
 
 After opening PR, merge in the features into the `all-features` branch. Then run the `install.local.py` script.
@@ -180,22 +145,18 @@ Features I plan to work are tracked via GitHub issues on my fork: `https://githu
 
 ## Upstreaming features for vendored crates
 
-Never propose to upstream features for vendored crates. This is an AI/vibe coded project, so nothing will be upstreamed to vendored crates.
-The only upstreaming PRs that we will do are to Arnaud's fork (`alacritree`).
+Never propose to upstream features for vendored crates. This is an AI/vibe coded project, so nothing will be upstreamed to vendored crates. The only upstreaming PRs that we will do are to Arnaud's fork (`alacritree`).
 
 ## Agent skills
 
 ### Issue tracker
 
-GitHub issues on the fork `AbysmalBiscuit/alacritree`, always with an explicit `-R`.
-See `docs/agents/issue-tracker.local.md`.
+GitHub issues on the fork `AbysmalBiscuit/alacritree`, always with an explicit `-R`. See `docs/agents/issue-tracker.local.md`.
 
 ### Triage labels
 
-The five canonical roles, each label string equal to its name.
-See `docs/agents/triage-labels.local.md`.
+The five canonical roles, each label string equal to its name. See `docs/agents/triage-labels.local.md`.
 
 ### Domain docs
 
-Single-context: `CONTEXT.md` and `docs/adr/` at the repo root.
-See `docs/agents/domain.local.md`.
+Single-context: `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.local.md`.
