@@ -23,6 +23,15 @@ one describing all of it.  A file can also arrive on the branch's disk without
 this script moving it, in which case both sides agree and only the commit is
 missing; that is committed too, so the order the tools run in does not decide
 whether the branch ends up carrying the change.
+
+A run is the whole round trip and needs no flags to be one.  The branch is
+brought up to date with its remote before anything is compared against it,
+because comparing first weighs a local file against a stale one and can copy
+the loser over work another machine already pushed.  At the end the branch is
+pushed whenever it sits ahead, rather than only when this run is what put it
+there: commits reach the branch by hand too, and leaving those behind is the
+failure the push exists to prevent.  `--no-commit` and `--no-push` stop at the
+earlier steps.
 """
 
 from __future__ import annotations
@@ -248,7 +257,7 @@ def message(subject: str, moves: list[Move], trailers: list[str]) -> str:
     return "\n\n".join(parts)
 
 
-def commit(branch: Path, subject: str, moves: list[Move], trailers: list[str]) -> None:
+def commit(branch: Path, subject: str, moves: list[Move], trailers: list[str]) -> bool:
     paths = [move.relative for move in moves]
     # Everything here is ignored on every branch, this one included, so it
     # never stages without `-f`.
@@ -257,8 +266,59 @@ def commit(branch: Path, subject: str, moves: list[Move], trailers: list[str]) -
         ["git", "-C", str(branch), "diff", "--cached", "--quiet", "--", *paths]
     )
     if staged.returncode == 0:
-        return
+        return False
     git(branch, "commit", "-m", message(subject, moves, trailers))
+    return True
+
+
+def record(branch: Path, grouped: list[tuple[str, list[Move]]], trailers: list[str]) -> bool:
+    """Write each group and name it, reporting whether anything was written."""
+    made = False
+    for subject, group in grouped:
+        if commit(branch, subject, group, trailers):
+            print(f"  {subject}")
+            made = True
+    return made
+
+
+def upstream(branch: Path) -> tuple[str, str] | None:
+    """The remote and the remote-tracking ref the branch follows, if it follows one."""
+    ref = git(
+        branch, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}", check=False
+    ).strip()
+    remote = git(branch, "config", f"branch.{BRANCH}.remote", check=False).strip()
+    return (remote, ref) if remote and ref else None
+
+
+def divergence(branch: Path, tracking: str) -> tuple[int, int]:
+    """Commits the branch holds that the remote does not, and the reverse."""
+    ahead, behind = git(branch, "rev-list", "--left-right", "--count", f"HEAD...{tracking}").split()
+    return int(ahead), int(behind)
+
+
+def rebase_onto(branch: Path, tracking: str) -> bool:
+    """Replay the branch's own commits on top of the remote's.
+
+    A conflict is left standing rather than aborted.  The worktree holds the
+    only copy of both sides at that point, and the resolution is the one a
+    hand-run rebase needs anyway.
+    """
+    result = subprocess.run(
+        ["git", "-C", str(branch), "rebase", tracking],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    if result.returncode == 0:
+        return True
+    print(result.stdout.strip())
+    print(
+        f"\nrebase onto {tracking} stopped. Resolve it in {branch}, finish it with\n"
+        f"  git -C {branch} rebase --continue\n"
+        "and run this again.",
+        file=sys.stderr,
+    )
+    return False
 
 
 def main() -> int:
@@ -266,7 +326,7 @@ def main() -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "-n", "--dry-run", action="store_true", help="report what would move, write nothing"
+        "-n", "-d", "--dry-run", action="store_true", help="report what would move, write nothing"
     )
     direction = parser.add_mutually_exclusive_group()
     direction.add_argument(
@@ -280,7 +340,9 @@ def main() -> int:
     parser.add_argument(
         "--no-commit", action="store_true", help="copy onto the branch but leave it uncommitted"
     )
-    parser.add_argument("--push", action="store_true", help="push the branch when it has commits")
+    parser.add_argument(
+        "--no-push", action="store_true", help="commit onto the branch but leave it unpushed"
+    )
     parser.add_argument(
         "--trailer",
         action="append",
@@ -300,45 +362,73 @@ def main() -> int:
         print(f"\nrunning from {here}, which is neither; it syncs the two above")
     print()
 
+    acted = False
+
+    # Payload the branch already holds uncommitted is committed before the
+    # remote is merged, because a rebase wants a clean worktree and this is the
+    # only thing that dirties one.
+    pending = uncommitted(branch, tracked_files(main_checkout, branch))
+    if pending:
+        for move in pending:
+            print(f"  keep -> {move.relative}  (already on the branch, uncommitted)")
+        if not args.dry_run and not args.no_commit:
+            acted |= record(branch, commits(pending), args.trailer)
+        print()
+
+    tracking = upstream(branch)
+    if tracking is None:
+        print(f"{BRANCH} tracks no remote branch, so nothing is fetched or pushed\n")
+    else:
+        remote, ref = tracking
+        if not args.dry_run:
+            git(branch, "fetch", remote)
+        behind = divergence(branch, ref)[1]
+        if behind and args.dry_run:
+            print(f"  {behind} commit(s) behind {ref}, which a real run would rebase onto\n")
+        elif behind:
+            if not rebase_onto(branch, ref):
+                return 1
+            print(f"  rebased onto {ref}, {behind} commit(s)\n")
+
+    # Recomputed rather than reused: the rebase can have brought in documents
+    # neither side had when the run started.
     names = tracked_files(main_checkout, branch)
     moves = [
         move
         for move in (compare(main_checkout, branch, relative, forced) for relative in names)
         if move is not None
     ]
-    moved = {move.relative for move in moves}
-    pending = [move for move in uncommitted(branch, names) if move.relative not in moved]
-    if not moves and not pending:
-        print("nothing to sync")
-        return 0
-
-    for move in moves:
-        arrow = "->" if move.direction == TO_BRANCH else "<-"
-        print(f"  {'add ' if move.created else 'edit'} {arrow} {move.relative}")
-    for move in pending:
-        print(f"  keep -> {move.relative}  (already on the branch, uncommitted)")
+    if moves:
+        for move in moves:
+            arrow = "->" if move.direction == TO_BRANCH else "<-"
+            print(f"  {'add ' if move.created else 'edit'} {arrow} {move.relative}")
+        if not args.dry_run:
+            for move in moves:
+                apply(move, main_checkout, branch)
+            if not args.no_commit:
+                acted |= record(branch, commits(moves), args.trailer)
+        print()
 
     if args.dry_run:
-        print("\ndry run, nothing written")
+        print("dry run, nothing written")
         return 0
-
-    for move in moves:
-        apply(move, main_checkout, branch)
 
     if args.no_commit:
-        print("\ncopied; the branch is left uncommitted")
+        print("copied; the branch is left uncommitted")
         return 0
 
-    grouped = commits(moves + pending)
-    if grouped:
-        print()
-    for subject, group in grouped:
-        commit(branch, subject, group, args.trailer)
-        print(f"  {subject}")
+    if tracking and not args.no_push:
+        # On what the branch is ahead by, not on what this run committed: work
+        # reaches the branch by hand too, and an unpushed commit is invisible
+        # to the machine that needs it.
+        ahead = divergence(branch, tracking[1])[0]
+        if ahead:
+            git(branch, "push")
+            print(f"pushed {ahead} commit(s)")
+            acted = True
 
-    if args.push and grouped:
-        git(branch, "push")
-        print("\npushed")
+    if not acted:
+        print("nothing to sync")
     return 0
 
 
