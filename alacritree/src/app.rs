@@ -15,7 +15,7 @@ use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
 use crate::command_palette::{self, CommandPalette, PaletteAction, PaletteItem};
 use crate::config::{
-    BakedGlyph, Config, DEFAULT_ADD_ICON, DEFAULT_AGENT_ICON, DEFAULT_BLOCKED_ICON,
+    AttachMode, BakedGlyph, Config, DEFAULT_ADD_ICON, DEFAULT_AGENT_ICON, DEFAULT_BLOCKED_ICON,
     DEFAULT_CLOSE_ICON, DEFAULT_HERDR_ICON, DEFAULT_HOME_ICON, DEFAULT_PR_CLOSED_ICON,
     DEFAULT_PR_DRAFT_ICON, DEFAULT_PR_MERGED_ICON, DEFAULT_PR_OPEN_ICON,
     DEFAULT_PROJECT_COLLAPSED_ICON, DEFAULT_PROJECT_EXPANDED_ICON, DEFAULT_REFRESH_ICON,
@@ -1432,7 +1432,7 @@ impl AlacritreeApp {
             self.activate_session_by_id(id);
             return true;
         }
-        if herdr::can_attach(&key.side) {
+        if herdr::attaches_directly(&key.side, self.config.integrations.herdr.attach) {
             // Nothing to ask herdr first: the pane id is the whole target,
             // and the client attaches to it directly.
             let args = herdr::attach_args(pane_id);
@@ -1449,23 +1449,17 @@ impl AlacritreeApp {
         if self.pending_herdr_attach.iter().any(|pending| pending.key == key) {
             return true;
         }
+        // The gesture is two herdr processes whatever `async_session_spawn`
+        // says, and running them from the click would hold the frame for as
+        // long as herdr takes to answer.
         let name = self.herdr_session_name(&key.side);
-        if self.config.ui.async_session_spawn {
-            let side = key.side.clone();
-            let pane = pane_id.to_string();
-            let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
-                herdr_attach_gesture(&side, &pane, name)
-            });
-            self.pending_herdr_attach.push(PendingHerdrAttach { job, key, workspace });
-            return true;
-        }
-        match herdr_attach_gesture(&key.side, pane_id, name) {
-            Ok((program, argv)) => self.open_herdr_session(ctx, key, workspace, program, argv),
-            Err(e) => {
-                self.error_dialog = Some(e);
-                false
-            },
-        }
+        let side = key.side.clone();
+        let pane = pane_id.to_string();
+        let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
+            herdr_attach_gesture(&side, &pane, name)
+        });
+        self.pending_herdr_attach.push(PendingHerdrAttach { job, key, workspace });
+        true
     }
 
     /// Adopt the shared-view attaches whose herdr calls have landed.  Each
@@ -1499,7 +1493,8 @@ impl AlacritreeApp {
         program: String,
         argv: Vec<String>,
     ) -> bool {
-        let shared_view = !herdr::can_attach(&key.side);
+        let shared_view =
+            !herdr::attaches_directly(&key.side, self.config.integrations.herdr.attach);
         // `alacritty_terminal::tty::Shell`'s fields are crate-private, so
         // this goes through the constructor rather than a struct literal.
         let shell = Shell::new(program, argv);
@@ -1550,7 +1545,12 @@ impl AlacritreeApp {
             return;
         };
         let key = self.sessions.iter().find(|s| s.id == id).and_then(|s| s.herdr_key.clone());
-        if !needs_view_focus(key.as_ref(), id, self.herdr_focused_view) {
+        if !needs_view_focus(
+            key.as_ref(),
+            self.config.integrations.herdr.attach,
+            id,
+            self.herdr_focused_view,
+        ) {
             return;
         }
         let Some(key) = key else { return };
@@ -7371,7 +7371,12 @@ struct Managed {
 }
 
 impl HerdrRowData {
-    fn from_agent(agent: &herdr::Agent, side: &herdr::Side, settings: &herdr::Settings) -> Self {
+    fn from_agent(
+        agent: &herdr::Agent,
+        side: &herdr::Side,
+        settings: &herdr::Settings,
+        attach: AttachMode,
+    ) -> Self {
         // A listed row has nothing better than the terminal id's tail behind
         // the kind, so the kind takes the name rather than standing in front
         // of six characters nobody reads.
@@ -7387,7 +7392,7 @@ impl HerdrRowData {
             terminal_id: agent.terminal_id.clone(),
             pane_id: agent.pane_id.clone(),
             name,
-            managed: Managed::herdr(side, settings, Some(agent)),
+            managed: Managed::herdr(side, settings, attach, Some(agent)),
         }
     }
 }
@@ -7422,14 +7427,19 @@ impl Managed {
     /// `agent` is herdr's current word on the pane, and `None` once it stops
     /// reporting one — a pane alacritree still holds open after its harness
     /// let go of it, which has a harness and a way out but no state or name.
-    fn herdr(side: &herdr::Side, settings: &herdr::Settings, agent: Option<&herdr::Agent>) -> Self {
+    fn herdr(
+        side: &herdr::Side,
+        settings: &herdr::Settings,
+        attach: AttachMode,
+        agent: Option<&herdr::Agent>,
+    ) -> Self {
         let kind = agent.and_then(|a| a.kind.clone());
         let title =
             agent.and_then(|a| a.title.clone()).filter(|t| Some(t.as_str()) != kind.as_deref());
         Self {
             harness: "herdr",
             detach: settings.detach.clone(),
-            shared_view: !herdr::can_attach(side),
+            shared_view: !herdr::attaches_directly(side, attach),
             mark: agent.map(|a| herdr_mark(a.status, settings.indicators)),
             kind,
             title,
@@ -8482,11 +8492,7 @@ fn session_row(
             );
         })
         .response
-        .interact(if draggable {
-            egui::Sense::click_and_drag()
-        } else {
-            egui::Sense::click()
-        });
+        .interact(if draggable { egui::Sense::click_and_drag() } else { egui::Sense::click() });
     if let Some((rect, hint)) = status_hint {
         hints.add(rect, hint);
     }
@@ -8631,18 +8637,18 @@ struct HerdrViewFocus {
 /// has no pane at all, so neither ever asks.
 fn needs_view_focus(
     key: Option<&herdr::HerdrKey>,
+    attach: AttachMode,
     active: SessionId,
     focused: Option<SessionId>,
 ) -> bool {
-    key.is_some_and(|key| !herdr::can_attach(&key.side)) && focused != Some(active)
+    key.is_some_and(|key| !herdr::attaches_directly(&key.side, attach)) && focused != Some(active)
 }
 
 /// What a shared-view attach asks herdr before its client can start: focus
-/// the pane, since the client reads the focused one when it starts, then name
-/// the session, since that is what it attaches to.  Both are process spawns,
-/// and on native Windows both are herdr starting behind whatever the machine
-/// charges for it, which is why this runs on the pool wherever the spawn gate
-/// allows.
+/// the pane, since every app client draws whatever herdr has focused, then
+/// name the session, since that is what the client attaches to.  Both are
+/// process spawns, and on native Windows both wait on herdr starting up,
+/// which is why this only ever runs on the pool.
 ///
 /// `cached_name` is what the endpoint learned in the background.  A gesture
 /// that beats the first read asks herdr itself: a wait is better than a
@@ -8916,7 +8922,7 @@ impl AlacritreeApp {
             }
         }
 
-        if self.config.ui.herdr.enabled {
+        if self.config.integrations.herdr.enabled {
             let claimed: Vec<herdr::HerdrKey> =
                 self.sessions.iter().filter_map(|s| s.herdr_key.clone()).collect();
             let workspaces = herdr_workspaces(&self.projects, |path| self.liveness.missing(path));
@@ -8924,7 +8930,7 @@ impl AlacritreeApp {
                 let side = cache.side();
                 for agent in herdr::unattached(cache.agents(), side, &claimed) {
                     let ws = herdr::match_workspace(agent, side, &workspaces);
-                    if ws.is_none() && !self.config.ui.herdr.show_unmatched {
+                    if ws.is_none() && !self.config.integrations.herdr.show_unmatched {
                         continue;
                     }
                     let key = herdr::HerdrKey {
@@ -9038,7 +9044,12 @@ impl AlacritreeApp {
     fn session_managed(&self, session: &Session) -> Option<Managed> {
         let key = session.herdr_key.as_ref()?;
         let agent = self.session_herdr_agent(session);
-        Some(Managed::herdr(&key.side, &self.herdr_settings(&key.side), agent))
+        Some(Managed::herdr(
+            &key.side,
+            &self.herdr_settings(&key.side),
+            self.config.integrations.herdr.attach,
+            agent,
+        ))
     }
 
     /// One number standing for every endpoint's rendered state, so the
@@ -9052,10 +9063,10 @@ impl AlacritreeApp {
     /// the rows: the subprocesses are the whole cost of the feature, so an
     /// opt-out that kept running them would opt out of nothing.
     fn poll_herdr_endpoints(&mut self) {
-        if !self.config.ui.herdr.enabled {
+        if !self.config.integrations.herdr.enabled {
             return;
         }
-        self.herdr_endpoints.poll(self.config.ui.herdr.poll_interval);
+        self.herdr_endpoints.poll(self.config.integrations.herdr.poll_interval);
     }
 
     /// The rows `ws` paints, in `listed`'s order.  An entry whose session or
@@ -9089,7 +9100,12 @@ impl AlacritreeApp {
                 sidebar_nav::WorkspaceEntry::Agent(side, terminal_id) => {
                     let agent = self.find_herdr_agent(side, terminal_id)?;
                     let settings = self.herdr_settings(side);
-                    Some(WorkspaceRowData::Herdr(HerdrRowData::from_agent(agent, side, &settings)))
+                    Some(WorkspaceRowData::Herdr(HerdrRowData::from_agent(
+                        agent,
+                        side,
+                        &settings,
+                        self.config.integrations.herdr.attach,
+                    )))
                 },
             })
             .collect()
@@ -11224,10 +11240,12 @@ mod tests {
 
     #[test]
     fn a_frame_of_idle_background_sessions_drops_the_self_boost() {
-        let frame = [
-            SessionBoost { raised: false, visible: false, pending: false },
-            SessionBoost { raised: false, visible: false, pending: true },
-        ];
+        let frame =
+            [SessionBoost { raised: false, visible: false, pending: false }, SessionBoost {
+                raised: false,
+                visible: false,
+                pending: true,
+            }];
 
         assert!(!frame_holds_self_boost(frame.into_iter()));
     }
@@ -11879,7 +11897,13 @@ mod tests {
         // yet, so the cursor sits on the worktree it arrived in.
         let row = SidebarRow::Worktree(PathBuf::from("/b"));
         assert_eq!(
-            reorder_subject(true, Some(&row), || None, |p| (p == Path::new("/b")).then_some(9), || Some(3)),
+            reorder_subject(
+                true,
+                Some(&row),
+                || None,
+                |p| (p == Path::new("/b")).then_some(9),
+                || Some(3)
+            ),
             Some(9)
         );
         assert_eq!(
@@ -12114,6 +12138,7 @@ mod tests {
             &herdr_agent(Some("claude")),
             &herdr::Side::Native,
             &herdr::Settings::default(),
+            AttachMode::Agent,
         );
         assert_eq!(row.name, RowName::plain("claude".into()));
     }
@@ -12124,6 +12149,7 @@ mod tests {
             &herdr_agent(None),
             &herdr::Side::Native,
             &herdr::Settings::default(),
+            AttachMode::Agent,
         );
         assert_eq!(row.name, RowName::plain("300361".into()));
     }
@@ -12133,7 +12159,7 @@ mod tests {
     #[test]
     fn a_shared_view_asks_herdr_for_its_pane() {
         let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
-        let asks = needs_view_focus(Some(&key), 1, None);
+        let asks = needs_view_focus(Some(&key), AttachMode::Agent, 1, None);
         assert_eq!(asks, cfg!(windows));
     }
 
@@ -12142,8 +12168,8 @@ mod tests {
     #[test]
     fn a_direct_attach_never_asks_herdr_for_its_pane() {
         let key = herdr::HerdrKey { side: herdr::Side::Wsl("d".into()), terminal_id: "t1".into() };
-        assert!(!needs_view_focus(Some(&key), 1, None));
-        assert!(!needs_view_focus(None, 1, None));
+        assert!(!needs_view_focus(Some(&key), AttachMode::Agent, 1, None));
+        assert!(!needs_view_focus(None, AttachMode::Agent, 1, None));
     }
 
     /// The pane herdr was last pointed at is where it still is, and asking
@@ -12151,8 +12177,8 @@ mod tests {
     #[test]
     fn a_shared_view_asks_once_per_switch() {
         let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
-        assert!(!needs_view_focus(Some(&key), 1, Some(1)));
-        let asks = needs_view_focus(Some(&key), 2, Some(1));
+        assert!(!needs_view_focus(Some(&key), AttachMode::Agent, 1, Some(1)));
+        let asks = needs_view_focus(Some(&key), AttachMode::Agent, 2, Some(1));
         assert_eq!(asks, cfg!(windows));
     }
 
@@ -12162,6 +12188,7 @@ mod tests {
             &herdr_agent(None),
             &herdr::Side::Native,
             &herdr::Settings::default(),
+            AttachMode::Agent,
         );
         assert_eq!(native.managed.shared_view, cfg!(windows));
 
@@ -12169,8 +12196,22 @@ mod tests {
             &herdr_agent(None),
             &herdr::Side::Wsl("d".into()),
             &herdr::Settings::default(),
+            AttachMode::Agent,
         );
         assert!(!wsl.managed.shared_view);
+    }
+
+    /// Asking for the session is honoured on a side that could have attached
+    /// directly: the capability says what is possible, the config what to do.
+    #[test]
+    fn herdr_row_shared_view_follows_the_configured_attach_mode() {
+        let row = HerdrRowData::from_agent(
+            &herdr_agent(None),
+            &herdr::Side::Wsl("d".into()),
+            &herdr::Settings::default(),
+            AttachMode::Session,
+        );
+        assert!(row.managed.shared_view);
     }
 
     #[test]
@@ -12187,8 +12228,12 @@ mod tests {
             cwd: None,
             foreground_cwd: None,
         };
-        let row =
-            HerdrRowData::from_agent(&agent, &herdr::Side::Native, &herdr::Settings::default());
+        let row = HerdrRowData::from_agent(
+            &agent,
+            &herdr::Side::Native,
+            &herdr::Settings::default(),
+            AttachMode::Agent,
+        );
         assert_eq!(row.name, RowName::plain("t1".into()));
     }
 
@@ -12229,6 +12274,7 @@ mod tests {
             &titled(kind, title),
             &herdr::Side::Wsl("d".into()),
             &herdr::Settings::default(),
+            AttachMode::Agent,
         )
     }
 
@@ -12284,6 +12330,7 @@ mod tests {
             &agent,
             &herdr::Side::Wsl("d".into()),
             &herdr::Settings::default(),
+            AttachMode::Agent,
         );
         assert_eq!(managed_tooltip(&row.managed), r#"working, herdr, `claude` "Claude Code"."#);
 
@@ -12314,7 +12361,8 @@ mod tests {
     fn an_unlisted_pane_still_says_how_to_leave() {
         let settings =
             herdr::Settings { detach: Some("Ctrl+B q".into()), ..herdr::Settings::default() };
-        let managed = Managed::herdr(&herdr::Side::Wsl("d".into()), &settings, None);
+        let managed =
+            Managed::herdr(&herdr::Side::Wsl("d".into()), &settings, AttachMode::Agent, None);
         assert_eq!(managed_tooltip(&managed), "herdr. (detach with `Ctrl+B q`)");
     }
 
