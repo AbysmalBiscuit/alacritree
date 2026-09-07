@@ -92,11 +92,15 @@ The branch also carries the untracked local files this repository needs and git 
 
 ```sh
 git worktree add ../alacritree-worktrees/docs/specs-and-plans docs/specs-and-plans
-python3 sync.local.py --dry-run
-python3 sync.local.py --push
+uv run sync.local.py -d
+uv run sync.local.py
 ```
 
+A bare run is the whole round trip and takes no flags to be one: it commits whatever already sits on the branch uncommitted, rebases the branch onto its remote, moves files both ways, commits what landed, and pushes. `-d` (or `-n`) reports all of that and writes nothing. `--no-commit` and `--no-push` stop at the earlier steps.
+
 Direction is decided per file. One side missing it gets a copy; both sides holding different content sends the newer one, so writing a spec here pushes it onto the branch and pulling the branch on a new machine seeds this checkout. After a clone stamps every file at once, `--to-branch` or `--to-main` overrides that. Anything reaching the branch is committed there, one commit per logical change, and `--trailer` adds a `Co-Authored-By` line for an agent's commits.
+
+The push goes on whether the branch is ahead, not on whether that run is what put it there, so a commit made in the worktree by hand still reaches the remote. A rebase that conflicts is left standing for you to resolve rather than aborted.
 
 Merging the branch into a feature branch puts working documents into a PR.
 
