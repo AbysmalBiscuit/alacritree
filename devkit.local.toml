@@ -1,40 +1,115 @@
 #:schema https://raw.githubusercontent.com/hlmtre/devkit/main/schema/devkit-config.json
 
-# alacritree is a personal fork with no dev servers and no Linear project, so
-# this file carries only what `issue` needs: where worktrees go, what they are
-# cut from, and which local files follow them in.
-
 [defaults]
-# Worktrees are siblings of this checkout, one directory per branch. A slug
-# carrying a slash (`feat/decoration-metrics`) nests exactly like the branch.
+# A slug carrying a slash (`feat/decoration-metrics`) nests exactly like the
+# branch.
 worktree_root = "../alacritree-worktrees"
 
 # Branch type is chosen per change (feat/, fix/, perf/, docs/), so it belongs
 # in the slug rather than in a fixed prefix.
 branch_prefix = ""
 
-# `issue setup` cuts every branch from this ref. Stacked work is re-pointed at
-# its real base afterwards; see "Specs and plans" and the stacking rule in
+# `issue setup` cuts every branch from this ref; a stacked branch is re-pointed
+# at its real base afterwards. See "Working on features/bugfixes" in
 # AGENTS.local.md.
 baseline_ref = "origin/master"
 
 # PRs go to Arnaud's repo, whose default branch is master, not devkit's staging.
 pr_base = "master"
 
-# No baseline server exists here. The directory names where one would be
-# created, and nothing creates it.
+# Names where a baseline worktree would go. Nothing here creates one.
 baseline_dir = "../alacritree-baselines"
 
 # Untracked instructions copied into each new worktree, so an agent working
 # there reads the same rules as one working in the main checkout.
 worktree_include = ["AGENTS.local.md", "CLAUDE.local.md"]
 
+
 [github]
 issues_repo = "AbysmalBiscuit/alacritree"
 pr_repo = "mathix420/alacritree"
 
+# Several agents share this checkout and its worktrees. `enforce_writes`
+# refuses a write to any path the session has not claimed with `lockm acquire`;
+# `enforce_commands` refuses a cargo verb `[tasks]` already wires up and names
+# the task to run instead.
+[harness]
+enforce_writes = true
+enforce_commands = true
+
+# Only these explicit rules refuse a bare cargo verb; deriving one from a task
+# that merely adds flags does not fire, with or without the task's `guard`.
+# `args` anchors at the head of the typed arguments, so `cargo +nightly fmt`
+# matches nothing here and the fmt task runs.
+#
+# `check` and `build` are left unguarded: `check` runs the same argv as its
+# task, and a bare `build` only misses the `--locked` lockfile check.
+[harness.commands.cargo-fmt]
+programs = ["cargo"]
+args = ["fmt"]
+reason = "Stable rustfmt ignores the nightly-only options in rustfmt.toml and reformats files your change never touched. Run `devkit run task fmt`."
+
+[harness.commands.cargo-test]
+programs = ["cargo"]
+args = ["test"]
+reason = "The suite is run with nextest in this checkout. Run `devkit run task test`."
+
+[harness.commands.cargo-clippy]
+programs = ["cargo"]
+args = ["clippy"]
+reason = "Without --no-deps clippy lints the vendored crates, which are #![deny(clippy::all)] and cannot be edited here. Run `devkit run task clippy`."
+
 [tracker]
 kind = "github"
+
+# `enforce_commands` refuses every cargo verb these tasks wire up, so a verb
+# with no task here is a verb nobody can run. All of them are scoped to
+# `-p alacritree`, since the vendored crates are read-only. `--locked` is on
+# the three CI gates and off the fast loops, so an uncommitted `Cargo.lock`
+# fails here rather than in CI.
+
+[tasks.fmt]
+# Ten of the fifteen options in `rustfmt.toml` are nightly-only, and stable
+# rustfmt ignores every one of them after a warning, so a bare `cargo fmt`
+# reformats files the change never touched. Nightly drifts against itself too,
+# so even this rewrites code it has no business touching: stage the files the
+# change edited, not everything `git status` lists afterwards.
+description = "Format alacritree with the nightly rustfmt its config requires"
+run = ["cargo", "+nightly", "fmt", "-p", "alacritree"]
+
+[tasks.check]
+description = "Type-check alacritree"
+run = ["cargo", "check", "-p", "alacritree"]
+
+[tasks.test]
+# nextest is installed here and is what the suite is run with. CI still says
+# `cargo test`, because it runs on machines where nextest is absent.
+description = "Run the alacritree tests with nextest"
+run = ["cargo", "nextest", "run", "-p", "alacritree", "--locked"]
+
+[tasks.build]
+description = "Build alacritree"
+run = ["cargo", "build", "-p", "alacritree", "--locked"]
+
+[tasks.clippy]
+# `--no-deps` keeps clippy off the vendored crates: they are
+# `#![deny(clippy::all)]`, so a lint a newer toolchain adds becomes an error
+# nothing here may fix. `-D clippy::disallowed_methods` is on the stacked
+# branches but not yet on master, making this stricter than master's CI and
+# aligned with where the fork is going.
+description = "Lint alacritree the way CI does"
+run = [
+    "cargo",
+    "clippy",
+    "-p",
+    "alacritree",
+    "--all-targets",
+    "--locked",
+    "--no-deps",
+    "--",
+    "-D",
+    "clippy::disallowed_methods",
+]
 
 [templates]
 # Every PR here has the same shape: a human TL;DR, the issues it closes, then a
@@ -44,8 +119,7 @@ kind = "github"
 # past the summary.
 #
 # `{{ input }}` is `--pr-body`, so the Claude summary goes there; the human half
-# and the issue numbers come in as `--arg`. For prose too long to type inline,
-# `--arg tldr="$(cat notes.md)"`.
+# and the issue numbers come in as `--arg`.
 pr_body = '''
 ## TL;DR (human written)
 
@@ -79,9 +153,8 @@ closes = ""
 # the heading and the Closes lines.
 tldr = ""
 
-# PR number this branch is stacked on. Every branch here is cut from the newest
-# open PR rather than master, so the diff carries its parent's commits and a
-# reviewer needs telling. Empty for a branch that really does sit on master.
+# PR number this branch is stacked on, which renders the review-order note.
+# Empty for a branch that really does sit on master.
 stacked_on = ""
 
 # Issues live on the fork, PRs go to Arnaud's repo, so a bare `#41` in the body
