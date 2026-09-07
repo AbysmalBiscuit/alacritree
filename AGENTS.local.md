@@ -126,7 +126,7 @@ devkit issue pr create --ready \
   --arg stacked_on=203
 ```
 
-The TL;DR is mine. I write it into the PR myself once it is open, so leave `--arg tldr` off the command and pass only `--pr-body`, `--arg closes` and `--arg stacked_on`.
+The TL;DR is mine and it is never yours to write. The template emits the heading with nothing under it, and I fill it in myself once the PR is open. There is no `--arg tldr` to pass. The variable does not exist and the template never renders one. Pass only `--pr-body`, `--arg closes` and `--arg stacked_on`.
 
 `devkit issue review request` is a different command. It requests review on a PR that already exists, and it is mine to run, not yours. Never pass `--to` to `pr create` either: without it the command adds no reviewer and sends no Slack, so it opens the PR and stops.
 

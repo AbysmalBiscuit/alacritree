@@ -118,8 +118,9 @@ run = [
 # a reader skimming the top should see what the PR resolves without scrolling
 # past the summary.
 #
-# `{{ input }}` is `--pr-body`, so the Claude summary goes there; the human half
-# and the issue numbers come in as `--arg`.
+# `{{ input }}` is `--pr-body`, so the Claude summary goes there. The template
+# emits the TL;DR heading and nothing under it. That half is written into the
+# open PR by hand, never rendered from an argument.
 pr_body = '''
 ## TL;DR (human written)
 
@@ -148,10 +149,6 @@ Written by {{ model }} in Claude Code.
 # The worktree's own issue is already in the render context as `issue`; this is
 # for the extra ones a PR closes, whitespace separated: `--arg closes="12 41"`.
 closes = ""
-
-# Human half of the body. Empty by default so a PR opened without it still gets
-# the heading and the Closes lines.
-tldr = ""
 
 # PR number this branch is stacked on, which renders the review-order note.
 # Empty for a branch that really does sit on master.
