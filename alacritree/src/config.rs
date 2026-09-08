@@ -2271,7 +2271,7 @@ struct RawSet {
     white: Option<RgbStr>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
 struct RawIndexed {
     /// Palette slot to override, 16–255.
     index: u8,
@@ -2795,7 +2795,7 @@ struct RawTextEmphasis {
 
 /// One `[[ui.profiles]]` entry.  Fields are optional so a malformed entry
 /// degrades to a warning instead of failing the whole config parse.
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Deserialize, serde::Serialize, JsonSchema)]
 #[serde(default)]
 struct RawProfile {
     /// Name shown in the session picker and matched by `default_profile`.
@@ -2816,7 +2816,7 @@ struct RawWorkspace {
     overrides: Vec<RawWorktreeOverride>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
 struct RawWorktreeOverride {
     /// Path to the project this override applies to.
     project: String,
@@ -2851,6 +2851,16 @@ impl<'de> Deserialize<'de> for RgbStr {
         parse_hex_rgb(&s)
             .map(RgbStr)
             .ok_or_else(|| serde::de::Error::custom(format!("invalid color string: {s:?}")))
+    }
+}
+
+/// Hand-written for the same reason `Deserialize` is: the accepted spellings
+/// live in `parse_hex_rgb`, and a derive on the inner `Rgb` would emit an
+/// object against a schema that says `"type": "string"`.
+impl serde::Serialize for RgbStr {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let Rgb { r, g, b } = self.0;
+        serializer.serialize_str(&format!("#{r:02x}{g:02x}{b:02x}"))
     }
 }
 

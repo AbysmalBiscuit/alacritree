@@ -196,6 +196,7 @@
           "type": "boolean"
         },
         "indexed_colors": {
+          "default": [],
           "description": "Overrides within the 16–255 range of the 256-color palette.  Unlisted\nindices keep their standard values.",
           "items": {
             "$ref": "#/$defs/RawIndexed"
@@ -1219,6 +1220,7 @@
           "type": "integer"
         },
         "profiles": {
+          "default": [],
           "description": "Named shell launch profiles, offered when starting a session.",
           "items": {
             "$ref": "#/$defs/RawProfile"
@@ -1489,6 +1491,7 @@
     "RawWorkspace": {
       "properties": {
         "overrides": {
+          "default": [],
           "description": "Per-project overrides of `worktree_dir`.",
           "items": {
             "$ref": "#/$defs/RawWorktreeOverride"
