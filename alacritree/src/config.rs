@@ -816,6 +816,50 @@ fn parse_last_session_close(raw: Option<&str>) -> LastSessionClose {
     }
 }
 
+/// `[ui] hold_exited_sessions`: whether a session whose child has exited stays
+/// on screen instead of closing with it.
+///
+/// Alacritty spells this as a `--hold` CLI flag that holds after any exit;
+/// wezterm's three-way `exit_behavior` is followed instead, because the case
+/// that matters is a shell that died with a message worth reading, and holding
+/// every clean exit as well turns an ordinary `exit` into a screen the user has
+/// to dismiss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub enum HoldExitedSessions {
+    /// Close a session as soon as its child exits.
+    #[default]
+    Never,
+    /// Hold a session whose child exited non-zero, so its last output survives.
+    OnError,
+    /// Hold any exited session.
+    Always,
+}
+
+impl HoldExitedSessions {
+    /// Whether an exit with this status is held on screen.  A herdr refusal is
+    /// held regardless — see [`crate::session::Session::should_reap`].
+    pub fn holds(self, clean_exit: bool) -> bool {
+        match self {
+            Self::Never => false,
+            Self::OnError => !clean_exit,
+            Self::Always => true,
+        }
+    }
+}
+
+fn parse_hold_exited_sessions(raw: Option<&str>) -> HoldExitedSessions {
+    match raw {
+        None => HoldExitedSessions::default(),
+        Some("never") => HoldExitedSessions::Never,
+        Some("on_error") => HoldExitedSessions::OnError,
+        Some("always") => HoldExitedSessions::Always,
+        Some(other) => {
+            log::warn!("unknown ui.hold_exited_sessions value {other:?}, using \"never\"");
+            HoldExitedSessions::default()
+        },
+    }
+}
+
 /// How far the projects sidebar goes when the cursor's row stops being
 /// rendered.  Both values keep the cursor; they differ only in whether the
 /// terminal comes along.
@@ -1285,6 +1329,9 @@ pub struct UiTheme {
     pub confirm_session_detach: bool,
     /// What closing the last session in the on-screen workspace does.
     pub last_session_close: LastSessionClose,
+    /// Whether an exited session stays on screen instead of closing with its
+    /// child.
+    pub hold_exited_sessions: HoldExitedSessions,
     /// How the projects sidebar repairs a cursor whose row stopped rendering.
     pub sidebar_focus: SidebarFocus,
     /// Whether the projects sidebar scrolls to the session on screen when it
@@ -1407,6 +1454,7 @@ impl Default for UiTheme {
             confirm_session_close: ConfirmSessionClose::Never,
             confirm_session_detach: true,
             last_session_close: LastSessionClose::Respawn,
+            hold_exited_sessions: HoldExitedSessions::default(),
             sidebar_focus: SidebarFocus::default(),
             sidebar_follow_active: false,
             sidebar_scroll_align: ScrollAlign::default(),
@@ -2564,6 +2612,13 @@ struct RawUi {
     /// "respawn" (default) | "navigate" | "ring_global" | "ring_project".
     #[schemars(extend("enum" = ["respawn", "navigate", "ring_global", "ring_project"]))]
     last_session_close: Option<String>,
+    /// Whether a session whose child has exited stays on screen instead of
+    /// closing with it: "never" (default) | "on_error" | "always".  A held
+    /// session writes one line into its own grid naming the key that closes
+    /// it.  A herdr attach that was refused is held whatever this says, since
+    /// its refusal message is the only report of what happened.
+    #[schemars(extend("enum" = ["never", "on_error", "always"]))]
+    hold_exited_sessions: Option<String>,
     /// How far the projects sidebar goes when the cursor's row stops being
     /// rendered: "preserve" (default) | "follow".
     #[schemars(extend("enum" = ["preserve", "follow"]))]
@@ -2859,6 +2914,9 @@ impl RawConfig {
             ),
             confirm_session_detach: self.ui.confirm_session_detach.unwrap_or(true),
             last_session_close: parse_last_session_close(self.ui.last_session_close.as_deref()),
+            hold_exited_sessions: parse_hold_exited_sessions(
+                self.ui.hold_exited_sessions.as_deref(),
+            ),
             sidebar_focus: parse_sidebar_focus(self.ui.sidebar_focus.as_deref()),
             sidebar_follow_active: self.ui.sidebar_follow_active.unwrap_or(false),
             sidebar_scroll_align: parse_scroll_align(self.ui.sidebar_scroll_align.as_deref()),
@@ -3812,6 +3870,42 @@ mod tests {
     fn sidebar_tooltips_invalid_falls_back_to_elided() {
         let ui = ui_from_toml("[ui]\nsidebar_tooltips = \"hover\"");
         assert_eq!(ui.sidebar_tooltips, SidebarTooltips::Elided);
+    }
+
+    #[test]
+    fn hold_exited_sessions_defaults_to_never() {
+        assert_eq!(ui_from_toml("").hold_exited_sessions, HoldExitedSessions::Never);
+    }
+
+    #[test]
+    fn hold_exited_sessions_parses_every_value() {
+        for (raw, expected) in [
+            ("never", HoldExitedSessions::Never),
+            ("on_error", HoldExitedSessions::OnError),
+            ("always", HoldExitedSessions::Always),
+        ] {
+            let ui = ui_from_toml(&format!("[ui]\nhold_exited_sessions = \"{raw}\""));
+            assert_eq!(ui.hold_exited_sessions, expected, "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn hold_exited_sessions_invalid_falls_back_to_never() {
+        let ui = ui_from_toml("[ui]\nhold_exited_sessions = \"forever\"");
+        assert_eq!(ui.hold_exited_sessions, HoldExitedSessions::Never);
+    }
+
+    /// The clean/dirty split is the whole difference between the three values.
+    #[test]
+    fn hold_exited_sessions_holds_by_exit_status() {
+        for (policy, clean, dirty) in [
+            (HoldExitedSessions::Never, false, false),
+            (HoldExitedSessions::OnError, false, true),
+            (HoldExitedSessions::Always, true, true),
+        ] {
+            assert_eq!(policy.holds(true), clean, "{policy:?} on a clean exit");
+            assert_eq!(policy.holds(false), dirty, "{policy:?} on a non-zero exit");
+        }
     }
 
     #[test]
