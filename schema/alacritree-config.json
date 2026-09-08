@@ -79,6 +79,7 @@
                 "AddProject",
                 "ToggleSidebarFocus",
                 "CloseSession",
+                "CloseExitedSession",
                 "SidebarTop",
                 "SidebarBottom",
                 "SidebarNextProject",
@@ -1167,6 +1168,15 @@
         "gpu_grid": {
           "description": "Draw the terminal grid through an OpenGL paint callback instead of\nhanding epaint a mesh.  Default `false`: it needs a GL 3 context and\nbypasses the renderer every other panel goes through, so an\nunmodified config keeps the path that has always drawn the grid.  A\ncontext too old for instanced arrays logs once and paints the mesh\nfrom the next frame on.",
           "type": "boolean"
+        },
+        "hold_exited_sessions": {
+          "description": "Whether a session whose child has exited stays on screen instead of\nclosing with it: \"never\" (default) | \"on_error\" | \"always\".  A held\nsession writes one line into its own grid naming the key that closes\nit.  A herdr attach that was refused is held whatever this says, since\nits refusal message is the only report of what happened.",
+          "enum": [
+            "never",
+            "on_error",
+            "always"
+          ],
+          "type": "string"
         },
         "icon_tooltips": {
           "description": "Whether a sidebar icon explains itself on hover: `true` (default).",
