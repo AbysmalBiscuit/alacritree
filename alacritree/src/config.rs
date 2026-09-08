@@ -374,13 +374,12 @@ impl ConfirmSessionClose {
     }
 }
 
-fn parse_confirm_session_close(raw: Option<&str>) -> ConfirmSessionClose {
+fn parse_confirm_session_close(raw: &str) -> ConfirmSessionClose {
     match raw {
-        None => ConfirmSessionClose::default(),
-        Some("never") => ConfirmSessionClose::Never,
-        Some("busy") => ConfirmSessionClose::Busy,
-        Some("always") => ConfirmSessionClose::Always,
-        Some(other) => {
+        "never" => ConfirmSessionClose::Never,
+        "busy" => ConfirmSessionClose::Busy,
+        "always" => ConfirmSessionClose::Always,
+        other => {
             log::warn!("unknown ui.confirm_session_close value {other:?}, using \"never\"");
             ConfirmSessionClose::default()
         },
@@ -450,16 +449,15 @@ impl ShellQuoting {
     }
 }
 
-fn parse_quoting(raw: Option<&str>) -> Quoting {
+fn parse_quoting(raw: &str) -> Quoting {
     match raw {
-        None => Quoting::default(),
-        Some("auto") => Quoting::Auto,
-        Some("none") => Quoting::None,
-        Some("spaces_only") => Quoting::SpacesOnly,
-        Some("posix") => Quoting::Posix,
-        Some("windows") => Quoting::Windows,
-        Some("windows_always_quoted") => Quoting::WindowsAlwaysQuoted,
-        Some(other) => {
+        "auto" => Quoting::Auto,
+        "none" => Quoting::None,
+        "spaces_only" => Quoting::SpacesOnly,
+        "posix" => Quoting::Posix,
+        "windows" => Quoting::Windows,
+        "windows_always_quoted" => Quoting::WindowsAlwaysQuoted,
+        other => {
             log::warn!("unknown ui.drop.quote value {other:?}, using \"auto\"");
             Quoting::default()
         },
@@ -565,12 +563,11 @@ pub enum AttachMode {
     Session,
 }
 
-fn parse_attach_mode(raw: Option<&str>) -> AttachMode {
+fn parse_attach_mode(raw: &str) -> AttachMode {
     match raw {
-        None => AttachMode::default(),
-        Some("agent") => AttachMode::Agent,
-        Some("session") => AttachMode::Session,
-        Some(other) => {
+        "agent" => AttachMode::Agent,
+        "session" => AttachMode::Session,
+        other => {
             log::warn!("unknown integrations.herdr.attach value {other:?}, using \"agent\"");
             AttachMode::default()
         },
@@ -581,7 +578,7 @@ fn parse_attach_mode(raw: Option<&str>) -> AttachMode {
 /// herdr server in the sidebar, and what opening one attaches to.  On by
 /// default; a probe with no herdr binary or server present costs nothing, so
 /// an unmodified config pays no price for it.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct HerdrConfig {
     /// Discover herdr servers and list their agents in the sidebar.
     pub enabled: bool,
@@ -596,12 +593,7 @@ pub struct HerdrConfig {
 
 impl Default for HerdrConfig {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            poll_interval: Duration::from_millis(2000),
-            show_unmatched: true,
-            attach: AttachMode::default(),
-        }
+        RawHerdr::default().resolve()
     }
 }
 
@@ -637,25 +629,23 @@ pub enum ScrollbarStyle {
     Solid,
 }
 
-fn parse_scrollbar(raw: Option<&str>) -> ScrollbarStyle {
+fn parse_scrollbar(raw: &str) -> ScrollbarStyle {
     match raw {
-        None => ScrollbarStyle::default(),
-        Some("floating") => ScrollbarStyle::Floating,
-        Some("solid") => ScrollbarStyle::Solid,
-        Some(other) => {
+        "floating" => ScrollbarStyle::Floating,
+        "solid" => ScrollbarStyle::Solid,
+        other => {
             log::warn!("unknown ui.scrollbar value {other:?}, using \"floating\"");
             ScrollbarStyle::default()
         },
     }
 }
 
-fn parse_path_style(raw: Option<&str>) -> PathStyle {
+fn parse_path_style(raw: &str) -> PathStyle {
     match raw {
-        None => PathStyle::default(),
-        Some("full") => PathStyle::Full,
-        Some("fish") => PathStyle::Fish,
-        Some("zed") => PathStyle::Zed,
-        Some(other) => {
+        "full" => PathStyle::Full,
+        "fish" => PathStyle::Fish,
+        "zed" => PathStyle::Zed,
+        other => {
             log::warn!("unknown ui.path_style value {other:?}, using \"full\"");
             PathStyle::default()
         },
@@ -665,8 +655,8 @@ fn parse_path_style(raw: Option<&str>) -> PathStyle {
 fn text_emphasis(raw: &RawTextEmphasis) -> TextEmphasis {
     TextEmphasis {
         color: raw.color.map(|v| rgb_to_color32(v.0)),
-        bold: raw.bold.unwrap_or(false),
-        italic: raw.italic.unwrap_or(false),
+        bold: raw.bold,
+        italic: raw.italic,
     }
 }
 
@@ -802,14 +792,13 @@ impl LastSessionClose {
     }
 }
 
-fn parse_last_session_close(raw: Option<&str>) -> LastSessionClose {
+fn parse_last_session_close(raw: &str) -> LastSessionClose {
     match raw {
-        None => LastSessionClose::default(),
-        Some("respawn") => LastSessionClose::Respawn,
-        Some("navigate") => LastSessionClose::Navigate,
-        Some("ring_global") => LastSessionClose::RingGlobal,
-        Some("ring_project") => LastSessionClose::RingProject,
-        Some(other) => {
+        "respawn" => LastSessionClose::Respawn,
+        "navigate" => LastSessionClose::Navigate,
+        "ring_global" => LastSessionClose::RingGlobal,
+        "ring_project" => LastSessionClose::RingProject,
+        other => {
             log::warn!("unknown ui.last_session_close value {other:?}, using \"respawn\"");
             LastSessionClose::default()
         },
@@ -837,12 +826,11 @@ impl SidebarFocus {
     }
 }
 
-fn parse_sidebar_focus(raw: Option<&str>) -> SidebarFocus {
+fn parse_sidebar_focus(raw: &str) -> SidebarFocus {
     match raw {
-        None => SidebarFocus::default(),
-        Some("preserve") => SidebarFocus::Preserve,
-        Some("follow") => SidebarFocus::Follow,
-        Some(other) => {
+        "preserve" => SidebarFocus::Preserve,
+        "follow" => SidebarFocus::Follow,
+        other => {
             log::warn!("unknown ui.sidebar_focus value {other:?}, using \"preserve\"");
             SidebarFocus::default()
         },
@@ -872,12 +860,11 @@ impl ScrollAlign {
     }
 }
 
-fn parse_scroll_align(raw: Option<&str>) -> ScrollAlign {
+fn parse_scroll_align(raw: &str) -> ScrollAlign {
     match raw {
-        None => ScrollAlign::default(),
-        Some("minimal") => ScrollAlign::Minimal,
-        Some("center") => ScrollAlign::Center,
-        Some(other) => {
+        "minimal" => ScrollAlign::Minimal,
+        "center" => ScrollAlign::Center,
+        other => {
             log::warn!("unknown ui.sidebar_scroll_align value {other:?}, using \"minimal\"");
             ScrollAlign::default()
         },
@@ -896,12 +883,11 @@ pub enum SearchScope {
     All,
 }
 
-fn parse_search_scope(raw: Option<&str>) -> SearchScope {
+fn parse_search_scope(raw: &str) -> SearchScope {
     match raw {
-        None => SearchScope::default(),
-        Some("filtered") => SearchScope::Filtered,
-        Some("all") => SearchScope::All,
-        Some(other) => {
+        "filtered" => SearchScope::Filtered,
+        "all" => SearchScope::All,
+        other => {
             log::warn!("unknown ui.search_scope value {other:?}, using \"filtered\"");
             SearchScope::default()
         },
@@ -924,13 +910,12 @@ pub enum ReorderScope {
     Anywhere,
 }
 
-fn parse_reorder_scope(raw: Option<&str>) -> ReorderScope {
+fn parse_reorder_scope(raw: &str) -> ReorderScope {
     match raw {
-        None => ReorderScope::default(),
-        Some("workspace") => ReorderScope::Workspace,
-        Some("project") => ReorderScope::Project,
-        Some("anywhere") => ReorderScope::Anywhere,
-        Some(other) => {
+        "workspace" => ReorderScope::Workspace,
+        "project" => ReorderScope::Project,
+        "anywhere" => ReorderScope::Anywhere,
+        other => {
             log::warn!("unknown ui.session_reorder.scope value {other:?}, using \"workspace\"");
             ReorderScope::default()
         },
@@ -963,13 +948,12 @@ pub enum SidebarTooltips {
     Always,
 }
 
-fn parse_sidebar_tooltips(raw: Option<&str>) -> SidebarTooltips {
+fn parse_sidebar_tooltips(raw: &str) -> SidebarTooltips {
     match raw {
-        None => SidebarTooltips::default(),
-        Some("off") => SidebarTooltips::Off,
-        Some("elided") => SidebarTooltips::Elided,
-        Some("always") => SidebarTooltips::Always,
-        Some(other) => {
+        "off" => SidebarTooltips::Off,
+        "elided" => SidebarTooltips::Elided,
+        "always" => SidebarTooltips::Always,
+        other => {
             log::warn!("unknown ui.sidebar_tooltips value {other:?}, using \"elided\"");
             SidebarTooltips::default()
         },
@@ -1078,39 +1062,9 @@ impl Default for FocusOutline {
     }
 }
 
-/// A default icon: just the glyph, no styling.
-fn glyph(g: BakedGlyph) -> IconStyle {
-    IconStyle { glyph: Some(g.as_str().to_string()), ..Default::default() }
-}
-
 impl Default for Icons {
     fn default() -> Self {
-        Self {
-            search: glyph(DEFAULT_SEARCH_ICON),
-            worktree_main: glyph(DEFAULT_WORKTREE_MAIN_ICON),
-            worktree: glyph(DEFAULT_WORKTREE_ICON),
-            session: glyph(DEFAULT_SESSION_ICON),
-            herdr: glyph(DEFAULT_HERDR_ICON),
-            home: glyph(DEFAULT_HOME_ICON),
-            project_expanded: glyph(DEFAULT_PROJECT_EXPANDED_ICON),
-            project_collapsed: glyph(DEFAULT_PROJECT_COLLAPSED_ICON),
-            pr_open: glyph(DEFAULT_PR_OPEN_ICON),
-            pr_draft: glyph(DEFAULT_PR_DRAFT_ICON),
-            pr_merged: glyph(DEFAULT_PR_MERGED_ICON),
-            pr_closed: glyph(DEFAULT_PR_CLOSED_ICON),
-            upstream_level: glyph(DEFAULT_UPSTREAM_LEVEL_ICON),
-            upstream_diverged: glyph(DEFAULT_UPSTREAM_DIVERGED_ICON),
-            upstream_gone: glyph(DEFAULT_UPSTREAM_GONE_ICON),
-            upstream_untracked: glyph(DEFAULT_UPSTREAM_UNTRACKED_ICON),
-            add_project: glyph(DEFAULT_ADD_ICON),
-            new_worktree: glyph(DEFAULT_ADD_ICON),
-            new_session: glyph(DEFAULT_ADD_ICON),
-            remove_project: glyph(DEFAULT_CLOSE_ICON),
-            delete_worktree: glyph(DEFAULT_CLOSE_ICON),
-            close_session: glyph(DEFAULT_CLOSE_ICON),
-            refresh: glyph(DEFAULT_REFRESH_ICON),
-            reorder: glyph(DEFAULT_REORDER_ICON),
-        }
+        build_icons(RawIcons::default())
     }
 }
 
@@ -1227,14 +1181,11 @@ impl Default for Decorations {
     }
 }
 
-/// A knob that will not parse logs and behaves as `"0"`, the way the rest of
-/// this file treats a value it does not recognize.
-fn parse_adjust(field: &str, raw: Option<&str>) -> Adjust {
-    let Some(text) = raw else {
-        return Adjust::NONE;
-    };
-    Adjust::parse(text).unwrap_or_else(|| {
-        log::warn!("unusable ui.decorations.{field} value {text:?}, using \"0\"");
+/// A knob that will not parse logs and behaves as `"0px"`, the way the rest
+/// of this file treats a value it does not recognize.
+fn parse_adjust(field: &str, raw: &str) -> Adjust {
+    Adjust::parse(raw).unwrap_or_else(|| {
+        log::warn!("unusable ui.decorations.{field} value {raw:?}, using \"0px\"");
         Adjust::NONE
     })
 }
@@ -1481,24 +1432,12 @@ impl Default for Config {
 
 impl Default for FontConfig {
     fn default() -> Self {
-        // Match alacritty's default of 11.25pt.  See `FontConfig::egui_size`
-        // for the pt-to-logical-pixel conversion applied at use sites.
-        Self {
-            size: 11.25,
-            normal: FontFace::default(),
-            bold: FontFace::default(),
-            italic: FontFace::default(),
-            bold_italic: FontFace::default(),
-            offset: FontDelta::default(),
-            glyph_offset: FontDelta::default(),
-            builtin_box_drawing: true,
-            fallback: Vec::new(),
-            color_glyphs: true,
-            color_glyph_cache_mb: 10,
-        }
+        RawFont::default().resolve()
     }
 }
 
+/// The resolution baseline for an absent `[cursor]` section; `into_config`
+/// overlays whatever the config file set on top of these values.
 impl Default for CursorConfig {
     fn default() -> Self {
         Self { shape: CursorShape::Block, blinking: false, unfocused_hollow: true }
@@ -1507,23 +1446,19 @@ impl Default for CursorConfig {
 
 impl Default for ScrollingConfig {
     fn default() -> Self {
-        Self { history: 10_000, multiplier: 3 }
+        RawScrolling::default().resolve()
     }
 }
 
 impl Default for WindowConfig {
     fn default() -> Self {
-        Self { padding_x: 0.0, padding_y: 0.0, opacity: 1.0 }
+        RawWindow::default().resolve()
     }
 }
 
 impl Default for SelectionConfig {
     fn default() -> Self {
-        // Mirrors alacritty_terminal::term::SEMANTIC_ESCAPE_CHARS.
-        Self {
-            semantic_escape_chars: String::from(",│`|:\"' ()[]{}<>\t"),
-            save_to_clipboard: false,
-        }
+        RawSelection::default().resolve()
     }
 }
 
@@ -1863,12 +1798,12 @@ struct RawConfig {
 /// lives in the shared `alacritty.toml`, so disabling alacritty's socket
 /// disables ours too — the two sockets are separate files, but the intent
 /// ("no IPC") is the same.
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawGeneral {
     /// Offer the local socket that `alacritree <command>` and the MCP bridge
-    /// connect to.  Default `true`.
-    ipc_socket: Option<bool>,
+    /// connect to.
+    ipc_socket: bool,
     /// Directory sessions on the home tab start in; worktree tabs always start
     /// in their checkout.  A leading `~` expands to the home directory.  Unset
     /// inherits the launching process's directory.
@@ -1892,28 +1827,34 @@ struct RawGeneral {
     state_dir: Option<String>,
 }
 
+impl Default for RawGeneral {
+    fn default() -> Self {
+        Self { ipc_socket: true, working_directory: None, state_dir: None }
+    }
+}
+
 /// alacritty's `[debug]` section, plus one alacritree-only key.
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawDebug {
     /// Write an artifact when the process panics.  alacritree-only, so it
-    /// belongs in `alacritree.toml`.  Default `true`: a crash that leaves no
-    /// record is the failure this exists to prevent.
-    crash_log: Option<bool>,
+    /// belongs in `alacritree.toml`.  A crash that leaves no record is the
+    /// failure this exists to prevent.
+    crash_log: bool,
     /// Keep the log file after quitting.  Upstream's name and upstream's
-    /// default (`false`).
-    persistent_logging: Option<bool>,
+    /// default.
+    persistent_logging: bool,
     /// Log what the GPU grid's paint callback costs: the wall time of
     /// issuing a frame, and the GPU's own time for the upload and each of
     /// the three draws.  alacritree-only, so it belongs in
-    /// `alacritree.toml`.  Default `false`; timer queries are cheap but not
-    /// free, and the line is only meaningful to someone reading it.  Needs
-    /// `[ui] gpu_grid` and a GL 3.3 context.  Keeps this session's log file
-    /// for as long as it is on, since the report has nowhere else to go.
-    gpu_timing: Option<bool>,
+    /// `alacritree.toml`.  Timer queries are cheap but not free, and the
+    /// line is only meaningful to someone reading it.  Needs `[ui] gpu_grid`
+    /// and a GL 3.3 context.  Keeps this session's log file for as long as
+    /// it is on, since the report has nowhere else to go.
+    gpu_timing: bool,
     /// Measure whole frames and report the period, CPU time, grid share and
     /// keystroke echo every few seconds.  alacritree-only, so it belongs in
-    /// `alacritree.toml`.  Default `false`.
+    /// `alacritree.toml`.
     ///
     /// `ALACRITREE_FRAME_LOG` wins over this key both ways: `1` turns
     /// measurements on, `0` and the empty string turn them off.  The variable
@@ -1921,7 +1862,7 @@ struct RawDebug {
     ///
     /// Keeps this session's log file for as long as it is on.  The report goes
     /// to the log stream, and a GUI-subsystem binary has no console.
-    frame_log: Option<bool>,
+    frame_log: bool,
     /// Where crash artifacts and session logs are written.  alacritree-only,
     /// so it belongs in `alacritree.toml`.  A leading `~` expands to the home
     /// directory; a relative path is ignored.
@@ -1937,6 +1878,18 @@ struct RawDebug {
     log_dir: Option<String>,
 }
 
+impl Default for RawDebug {
+    fn default() -> Self {
+        Self {
+            crash_log: true,
+            persistent_logging: false,
+            gpu_timing: false,
+            frame_log: false,
+            log_dir: None,
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawKeyboard {
@@ -1945,11 +1898,11 @@ struct RawKeyboard {
     bindings: Vec<bindings::RawBinding>,
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawFont {
-    /// Font size in points.  Default `11.25`.
-    size: Option<f32>,
+    /// Font size in points.
+    size: f32,
     /// The face ordinary text is drawn with.
     normal: RawFontFace,
     /// The bold face.  An unset family falls back to `normal`'s.
@@ -1959,7 +1912,7 @@ struct RawFont {
     /// The bold-italic face.  An unset family falls back to `normal`'s.
     bold_italic: RawFontFace,
     /// Extra space around each cell in pixels: `y` is line spacing, `x` is
-    /// letter spacing.  Default `{ x = 0, y = 0 }`.
+    /// letter spacing.
     offset: RawFontDelta,
     /// Where the glyph sits inside its cell, in pixels.  Increasing `x` moves
     /// it right, increasing `y` moves it up.  Built-in glyphs ignore this,
@@ -1967,23 +1920,61 @@ struct RawFont {
     glyph_offset: RawFontDelta,
     /// Draw box-drawing (U+2500–U+259F), legacy computing (U+1FB00–U+1FB3B)
     /// and Powerline (U+E0B0–U+E0BF) characters with the built-in renderer
-    /// instead of the font.  Default `true`.
-    builtin_box_drawing: Option<bool>,
+    /// instead of the font.
+    builtin_box_drawing: bool,
     /// Ordered list of fallback font families or font file paths, tried in
     /// order after the four primary faces and before the automatic system
     /// chain.  Recommended home is `alacritree.toml`: upstream alacritty
     /// warns about unknown keys, so putting it in the shared `alacritty.toml`
     /// would make the real alacritty noisy.
-    fallback: Option<Vec<String>>,
+    fallback: Vec<String>,
     /// Draw emoji from their font's colour tables.  Turning this off falls
     /// through to the first fallback face with ordinary outlines, so emoji
     /// render monochrome.  Also alacritree-only, so it belongs in
-    /// `alacritree.toml` alongside `fallback`.  Default `true`.
-    color_glyphs: Option<bool>,
+    /// `alacritree.toml` alongside `fallback`.
+    color_glyphs: bool,
     /// Budget in megabytes for the rasterized colour-glyph cache.  The cache
     /// is already bounded by how many codepoints the colour fonts cover, but
     /// that ceiling moves with cell size and with the fallback list.
-    color_glyph_cache_mb: Option<usize>,
+    color_glyph_cache_mb: usize,
+}
+
+impl Default for RawFont {
+    fn default() -> Self {
+        // Match alacritty's default of 11.25pt.  See `FontConfig::egui_size`
+        // for the pt-to-logical-pixel conversion applied at use sites.
+        Self {
+            size: 11.25,
+            normal: RawFontFace::default(),
+            bold: RawFontFace::default(),
+            italic: RawFontFace::default(),
+            bold_italic: RawFontFace::default(),
+            offset: RawFontDelta::default(),
+            glyph_offset: RawFontDelta::default(),
+            builtin_box_drawing: true,
+            fallback: Vec::new(),
+            color_glyphs: true,
+            color_glyph_cache_mb: 10,
+        }
+    }
+}
+
+impl RawFont {
+    fn resolve(self) -> FontConfig {
+        FontConfig {
+            size: self.size.max(1.0),
+            normal: self.normal.resolve(),
+            bold: self.bold.resolve(),
+            italic: self.italic.resolve(),
+            bold_italic: self.bold_italic.resolve(),
+            offset: self.offset.resolve(),
+            glyph_offset: self.glyph_offset.resolve(),
+            builtin_box_drawing: self.builtin_box_drawing,
+            fallback: self.fallback,
+            color_glyphs: self.color_glyphs,
+            color_glyph_cache_mb: self.color_glyph_cache_mb,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -1996,13 +1987,25 @@ struct RawFontFace {
     style: Option<String>,
 }
 
+impl RawFontFace {
+    fn resolve(self) -> FontFace {
+        FontFace { family: self.family, style: self.style }
+    }
+}
+
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawFontDelta {
     /// Horizontal offset in pixels.
-    x: Option<i8>,
+    x: i8,
     /// Vertical offset in pixels.
-    y: Option<i8>,
+    y: i8,
+}
+
+impl RawFontDelta {
+    fn resolve(self) -> FontDelta {
+        FontDelta { x: self.x, y: self.y }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -2013,12 +2016,17 @@ struct RawCursor {
     /// accepted.
     style: Option<RawCursorStyle>,
     /// Render the cursor as a hollow box when the window is not focused.
-    /// Default `true`.
+    /// Accepted for alacritty compatibility: alacritree paints the same
+    /// cursor whether or not the window has focus, so the real alacritty
+    /// acts on this and nothing here does.
     unfocused_hollow: Option<bool>,
-    /// Blink interval in milliseconds.  Default `750`.
+    /// Blink interval in milliseconds.  Accepted for alacritty
+    /// compatibility: alacritree does not blink the cursor, so the real
+    /// alacritty acts on this and nothing here does.
     blink_interval: Option<u64>,
     /// Seconds after which the cursor stops blinking; `0` never stops.
-    /// Default `5`.
+    /// Accepted for alacritty compatibility: alacritree does not blink the
+    /// cursor, so the real alacritty acts on this and nothing here does.
     blink_timeout: Option<u64>,
 }
 
@@ -2039,17 +2047,28 @@ enum RawCursorStyle {
     },
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawScrolling {
     /// Maximum number of lines kept in the scrollback buffer.
-    /// Default `10000`.
-    history: Option<u32>,
-    /// Lines scrolled per mouse-wheel increment.  Default `3`.
-    multiplier: Option<u8>,
+    history: u32,
+    /// Lines scrolled per mouse-wheel increment.
+    multiplier: u8,
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+impl Default for RawScrolling {
+    fn default() -> Self {
+        Self { history: 10_000, multiplier: 3 }
+    }
+}
+
+impl RawScrolling {
+    fn resolve(self) -> ScrollingConfig {
+        ScrollingConfig { history: self.history as usize, multiplier: self.multiplier }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawWindow {
     /// Blank space around the terminal grid, in pixels, added at both
@@ -2057,17 +2076,34 @@ struct RawWindow {
     padding: Option<RawPadding>,
     /// Background opacity from `0.0` (transparent) to `1.0` (opaque).
     /// Changing it requires a restart: transparency is a window flag set
-    /// before the window exists.  Default `1.0`.
-    opacity: Option<f32>,
+    /// before the window exists.
+    opacity: f32,
+}
+
+impl Default for RawWindow {
+    fn default() -> Self {
+        Self { padding: None, opacity: 1.0 }
+    }
+}
+
+impl RawWindow {
+    fn resolve(self) -> WindowConfig {
+        let padding = self.padding.unwrap_or_default();
+        WindowConfig {
+            padding_x: padding.x,
+            padding_y: padding.y,
+            opacity: self.opacity.clamp(0.0, 1.0),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawPadding {
     /// Horizontal padding in pixels.
-    x: Option<f32>,
+    x: f32,
     /// Vertical padding in pixels.
-    y: Option<f32>,
+    y: f32,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -2094,14 +2130,32 @@ enum RawShell {
     },
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawSelection {
     /// Characters that separate "semantic words" for double-click selection.
-    semantic_escape_chars: Option<String>,
+    semantic_escape_chars: String,
     /// Copy selected text to the system clipboard as soon as it is selected.
-    /// Default `false`.
-    save_to_clipboard: Option<bool>,
+    save_to_clipboard: bool,
+}
+
+impl Default for RawSelection {
+    fn default() -> Self {
+        // Mirrors alacritty_terminal::term::SEMANTIC_ESCAPE_CHARS.
+        Self {
+            semantic_escape_chars: String::from(",│`|:\"' ()[]{}<>\t"),
+            save_to_clipboard: false,
+        }
+    }
+}
+
+impl RawSelection {
+    fn resolve(self) -> SelectionConfig {
+        SelectionConfig {
+            semantic_escape_chars: self.semantic_escape_chars,
+            save_to_clipboard: self.save_to_clipboard,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -2119,10 +2173,10 @@ struct RawColors {
     selection: RawInverted,
     /// The eight normal ANSI colors (0–7).
     #[serde(default)]
-    normal: RawSet,
+    normal: RawNormalSet,
     /// The eight bright ANSI colors (8–15).
     #[serde(default)]
-    bright: RawSet,
+    bright: RawBrightSet,
     /// The eight dim ANSI colors.  Unset derives them from `normal`.
     #[serde(default)]
     dim: Option<RawSet>,
@@ -2130,24 +2184,36 @@ struct RawColors {
     /// indices keep their standard values.
     #[serde(default)]
     indexed_colors: Vec<RawIndexed>,
-    /// Draw bold text with the bright color variants.  Default `false`.
+    /// Draw bold text with the bright color variants.
     #[serde(default)]
     draw_bold_text_with_bright_colors: bool,
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawPrimary {
     /// Default text color.
-    foreground: Option<RgbStr>,
+    foreground: RgbStr,
     /// Default background color.
-    background: Option<RgbStr>,
+    background: RgbStr,
     /// Foreground for bold text, used only when
     /// `draw_bold_text_with_bright_colors` is `true`.  Unset uses
     /// `foreground`.
     bright_foreground: Option<RgbStr>,
     /// Foreground for dimmed text.  Unset derives it from `foreground`.
     dim_foreground: Option<RgbStr>,
+}
+
+impl Default for RawPrimary {
+    fn default() -> Self {
+        let stock = Palette::default();
+        Self {
+            foreground: RgbStr(stock.fg),
+            background: RgbStr(stock.bg),
+            bright_foreground: None,
+            dim_foreground: None,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -2184,6 +2250,71 @@ struct RawSet {
     white: Option<RgbStr>,
 }
 
+/// Two palette sections with the same eight slots and different defaults.
+/// schemars reads a field's default off the struct that declares it, so
+/// `normal` and `bright` cannot share one type without sharing one palette.
+macro_rules! raw_palette_set {
+    ($name:ident, $slots:expr) => {
+        #[derive(Debug, Deserialize, JsonSchema)]
+        #[serde(default)]
+        struct $name {
+            /// ANSI color 0.
+            black: RgbStr,
+            /// ANSI color 1.
+            red: RgbStr,
+            /// ANSI color 2.
+            green: RgbStr,
+            /// ANSI color 3.
+            yellow: RgbStr,
+            /// ANSI color 4.
+            blue: RgbStr,
+            /// ANSI color 5.
+            magenta: RgbStr,
+            /// ANSI color 6.
+            cyan: RgbStr,
+            /// ANSI color 7.
+            white: RgbStr,
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                let s: [Rgb; 8] = $slots;
+                Self {
+                    black: RgbStr(s[0]),
+                    red: RgbStr(s[1]),
+                    green: RgbStr(s[2]),
+                    yellow: RgbStr(s[3]),
+                    blue: RgbStr(s[4]),
+                    magenta: RgbStr(s[5]),
+                    cyan: RgbStr(s[6]),
+                    white: RgbStr(s[7]),
+                }
+            }
+        }
+
+        impl $name {
+            /// `apply_set` writes per slot off an `Option`, and every slot here
+            /// is present, so an absent section writes the stock value over the
+            /// stock value.
+            fn into_optional(self) -> RawSet {
+                RawSet {
+                    black: Some(self.black),
+                    red: Some(self.red),
+                    green: Some(self.green),
+                    yellow: Some(self.yellow),
+                    blue: Some(self.blue),
+                    magenta: Some(self.magenta),
+                    cyan: Some(self.cyan),
+                    white: Some(self.white),
+                }
+            }
+        }
+    };
+}
+
+raw_palette_set!(RawNormalSet, Palette::default().normal);
+raw_palette_set!(RawBrightSet, Palette::default().bright);
+
 #[derive(Debug, Deserialize, JsonSchema)]
 struct RawIndexed {
     /// Palette slot to override, 16–255.
@@ -2195,110 +2326,147 @@ struct RawIndexed {
 /// Top-level `[wsl]`: platform-integration options.  Lives outside `[ui]`
 /// because nothing here is presentation — it governs how the app talks to
 /// distros.
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawWsl {
     /// Keep a resident helper process per distro for foreground probes,
     /// batched git queries, and tool discovery.  `false` restores one-shot
     /// wsl.exe spawns everywhere; WSL sessions then always report "no
     /// TUI", so FocusLeft/FocusRight always move panel focus.
-    resident_helper: Option<bool>,
+    resident_helper: bool,
     /// Distro-side mount point for Windows drives, mirroring wsl.conf's
     /// `[automount] root`.  Only used for paths *we* translate (git output
     /// from inside a distro); `wsl.exe --cd` translates with the distro's
-    /// real mount table regardless of this value.
+    /// real mount table regardless of this value.  Unset means `/mnt`; the
+    /// key stays optional so the deprecated `[ui.wsl]` spelling can still win
+    /// when this one is absent.
     automount_root: Option<String>,
+}
+
+impl Default for RawWsl {
+    fn default() -> Self {
+        Self { resident_helper: true, automount_root: None }
+    }
 }
 
 /// `[ui.icons]`: sidebar glyph overrides.  A bare string sets the glyph
 /// alone; a table also styles color/weight/slant/size.  Any glyph works, so
 /// Nerd Font users can substitute their own icons.
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
 #[serde(default)]
 struct RawIcons {
     /// The panel search box.
-    search: Option<RawIconStyle>,
+    search: RawIconStyle,
     /// A project's main checkout.
-    worktree_main: Option<RawIconStyle>,
+    worktree_main: RawIconStyle,
     /// A linked worktree.
-    worktree: Option<RawIconStyle>,
+    worktree: RawIconStyle,
     /// A terminal session row.
-    session: Option<RawIconStyle>,
+    session: RawIconStyle,
     /// A pane owned by a terminal workspace manager such as herdr.
-    herdr: Option<RawIconStyle>,
+    herdr: RawIconStyle,
     /// The home tab, whose sessions inherit the launch directory.
-    home: Option<RawIconStyle>,
+    home: RawIconStyle,
     /// An expanded project.
-    project_expanded: Option<RawIconStyle>,
+    project_expanded: RawIconStyle,
     /// A collapsed project.
-    project_collapsed: Option<RawIconStyle>,
+    project_collapsed: RawIconStyle,
     /// A branch with an open pull request.
-    pr_open: Option<RawIconStyle>,
+    pr_open: RawIconStyle,
     /// A branch whose pull request is a draft.
-    pr_draft: Option<RawIconStyle>,
+    pr_draft: RawIconStyle,
     /// A branch whose pull request was merged.
-    pr_merged: Option<RawIconStyle>,
+    pr_merged: RawIconStyle,
     /// A branch whose pull request was closed unmerged.
-    pr_closed: Option<RawIconStyle>,
+    pr_closed: RawIconStyle,
     /// A branch level with its upstream.
-    upstream_level: Option<RawIconStyle>,
+    upstream_level: RawIconStyle,
     /// A branch that has both moved ahead of and fallen behind its upstream.
-    upstream_diverged: Option<RawIconStyle>,
+    upstream_diverged: RawIconStyle,
     /// A branch whose upstream no longer exists locally.
-    upstream_gone: Option<RawIconStyle>,
+    upstream_gone: RawIconStyle,
     /// A branch that tracks nothing.
-    upstream_untracked: Option<RawIconStyle>,
+    upstream_untracked: RawIconStyle,
     /// The "add project" button.
-    add_project: Option<RawIconStyle>,
+    add_project: RawIconStyle,
     /// The "new worktree" button.
-    new_worktree: Option<RawIconStyle>,
+    new_worktree: RawIconStyle,
     /// The "new session" button.
-    new_session: Option<RawIconStyle>,
+    new_session: RawIconStyle,
     /// The "remove project" button.
-    remove_project: Option<RawIconStyle>,
+    remove_project: RawIconStyle,
     /// The "delete worktree" button.
-    delete_worktree: Option<RawIconStyle>,
+    delete_worktree: RawIconStyle,
     /// The "close session" button.
-    close_session: Option<RawIconStyle>,
+    close_session: RawIconStyle,
     /// The "refresh" button.
-    refresh: Option<RawIconStyle>,
+    refresh: RawIconStyle,
     /// The drag handle a row is reordered by.
-    reorder: Option<RawIconStyle>,
+    reorder: RawIconStyle,
 }
 
-/// An absent key falls back to the key's default style (glyph included); a
-/// present one always wins, even if it styles without setting `glyph`.
-fn style_or(raw: Option<RawIconStyle>, default: &IconStyle) -> IconStyle {
-    raw.map(IconStyle::from).unwrap_or_else(|| default.clone())
+/// A default icon is the glyph alone — no colour, no weight, no size.
+fn raw_glyph(g: BakedGlyph) -> RawIconStyle {
+    RawIconStyle::Glyph(g.as_str().to_string())
+}
+
+impl Default for RawIcons {
+    fn default() -> Self {
+        Self {
+            search: raw_glyph(DEFAULT_SEARCH_ICON),
+            worktree_main: raw_glyph(DEFAULT_WORKTREE_MAIN_ICON),
+            worktree: raw_glyph(DEFAULT_WORKTREE_ICON),
+            session: raw_glyph(DEFAULT_SESSION_ICON),
+            herdr: raw_glyph(DEFAULT_HERDR_ICON),
+            home: raw_glyph(DEFAULT_HOME_ICON),
+            project_expanded: raw_glyph(DEFAULT_PROJECT_EXPANDED_ICON),
+            project_collapsed: raw_glyph(DEFAULT_PROJECT_COLLAPSED_ICON),
+            pr_open: raw_glyph(DEFAULT_PR_OPEN_ICON),
+            pr_draft: raw_glyph(DEFAULT_PR_DRAFT_ICON),
+            pr_merged: raw_glyph(DEFAULT_PR_MERGED_ICON),
+            pr_closed: raw_glyph(DEFAULT_PR_CLOSED_ICON),
+            upstream_level: raw_glyph(DEFAULT_UPSTREAM_LEVEL_ICON),
+            upstream_diverged: raw_glyph(DEFAULT_UPSTREAM_DIVERGED_ICON),
+            upstream_gone: raw_glyph(DEFAULT_UPSTREAM_GONE_ICON),
+            upstream_untracked: raw_glyph(DEFAULT_UPSTREAM_UNTRACKED_ICON),
+            add_project: raw_glyph(DEFAULT_ADD_ICON),
+            new_worktree: raw_glyph(DEFAULT_ADD_ICON),
+            new_session: raw_glyph(DEFAULT_ADD_ICON),
+            remove_project: raw_glyph(DEFAULT_CLOSE_ICON),
+            delete_worktree: raw_glyph(DEFAULT_CLOSE_ICON),
+            close_session: raw_glyph(DEFAULT_CLOSE_ICON),
+            refresh: raw_glyph(DEFAULT_REFRESH_ICON),
+            reorder: raw_glyph(DEFAULT_REORDER_ICON),
+        }
+    }
 }
 
 fn build_icons(raw: RawIcons) -> Icons {
-    let d = Icons::default();
     Icons {
-        search: style_or(raw.search, &d.search),
-        worktree_main: style_or(raw.worktree_main, &d.worktree_main),
-        worktree: style_or(raw.worktree, &d.worktree),
-        session: style_or(raw.session, &d.session),
-        herdr: style_or(raw.herdr, &d.herdr),
-        home: style_or(raw.home, &d.home),
-        project_expanded: style_or(raw.project_expanded, &d.project_expanded),
-        project_collapsed: style_or(raw.project_collapsed, &d.project_collapsed),
-        pr_open: style_or(raw.pr_open, &d.pr_open),
-        pr_draft: style_or(raw.pr_draft, &d.pr_draft),
-        pr_merged: style_or(raw.pr_merged, &d.pr_merged),
-        pr_closed: style_or(raw.pr_closed, &d.pr_closed),
-        upstream_level: style_or(raw.upstream_level, &d.upstream_level),
-        upstream_diverged: style_or(raw.upstream_diverged, &d.upstream_diverged),
-        upstream_gone: style_or(raw.upstream_gone, &d.upstream_gone),
-        upstream_untracked: style_or(raw.upstream_untracked, &d.upstream_untracked),
-        add_project: style_or(raw.add_project, &d.add_project),
-        new_worktree: style_or(raw.new_worktree, &d.new_worktree),
-        new_session: style_or(raw.new_session, &d.new_session),
-        remove_project: style_or(raw.remove_project, &d.remove_project),
-        delete_worktree: style_or(raw.delete_worktree, &d.delete_worktree),
-        close_session: style_or(raw.close_session, &d.close_session),
-        refresh: style_or(raw.refresh, &d.refresh),
-        reorder: style_or(raw.reorder, &d.reorder),
+        search: raw.search.into(),
+        worktree_main: raw.worktree_main.into(),
+        worktree: raw.worktree.into(),
+        session: raw.session.into(),
+        herdr: raw.herdr.into(),
+        home: raw.home.into(),
+        project_expanded: raw.project_expanded.into(),
+        project_collapsed: raw.project_collapsed.into(),
+        pr_open: raw.pr_open.into(),
+        pr_draft: raw.pr_draft.into(),
+        pr_merged: raw.pr_merged.into(),
+        pr_closed: raw.pr_closed.into(),
+        upstream_level: raw.upstream_level.into(),
+        upstream_diverged: raw.upstream_diverged.into(),
+        upstream_gone: raw.upstream_gone.into(),
+        upstream_untracked: raw.upstream_untracked.into(),
+        add_project: raw.add_project.into(),
+        new_worktree: raw.new_worktree.into(),
+        new_session: raw.new_session.into(),
+        remove_project: raw.remove_project.into(),
+        delete_worktree: raw.delete_worktree.into(),
+        close_session: raw.close_session.into(),
+        refresh: raw.refresh.into(),
+        reorder: raw.reorder.into(),
     }
 }
 
@@ -2306,7 +2474,7 @@ fn build_icons(raw: RawIcons) -> Icons {
 // arm.
 /// A styled icon override: either a bare glyph string (`worktree = "◆"`) or a
 /// table (`worktree = { glyph = "◆", color = "#ff5555", bold = true }`).
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
 #[serde(untagged)]
 enum RawIconStyle {
     /// The glyph alone.
@@ -2357,28 +2525,34 @@ struct RawUiWsl {
 #[serde(default)]
 struct RawSessionDisplay {
     /// Show a workspace's sidebar session row even with a single session.
-    sidebar_always: Option<bool>,
+    sidebar_always: bool,
     /// Draw a tab-strip segment even with a single session.
-    tabs_always: Option<bool>,
+    tabs_always: bool,
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawSessionReorder {
     /// Let a session row be dragged with the mouse to reorder it.
-    drag: Option<bool>,
-    /// How far a reorder may carry a session: "workspace" (default) |
-    /// "project" | "anywhere".
+    drag: bool,
+    /// How far a reorder may carry a session: "workspace" | "project" |
+    /// "anywhere".
     #[schemars(extend("enum" = ["workspace", "project", "anywhere"]))]
-    scope: Option<String>,
+    scope: String,
+}
+
+impl Default for RawSessionReorder {
+    fn default() -> Self {
+        Self { drag: false, scope: "workspace".to_string() }
+    }
 }
 
 /// Corrections applied to what the font reports for its underline and
 /// strikeout.  Each value is `"2px"` (physical pixels, added), `"2pt"` or a
 /// bare `"2"` (points, added), or `"150%"` (a multiplier).  Positive moves a
-/// line down, matching kitty and ghostty.  A percentage takes no sign.
-/// Default `"0"`, which draws what the font asked for.
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+/// line down, matching kitty and ghostty.  A percentage takes no sign.  A
+/// zero offset draws what the font asked for.
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawDecorations {
     /// Shift or scale of how far the underline sits from the top of the
@@ -2386,20 +2560,31 @@ struct RawDecorations {
     /// curly styles are placed from the font's descent instead, so this
     /// knob does not reach them.
     #[schemars(extend("pattern" = r"^(-?[0-9]*\.?[0-9]+(px|pt)?|[0-9]*\.?[0-9]+%)$"))]
-    underline_position: Option<String>,
+    underline_position: String,
     /// Shift or scale of the underline's stroke weight.  Every style draws
     /// with this value, including double and curly.
     #[schemars(extend("pattern" = r"^(-?[0-9]*\.?[0-9]+(px|pt)?|[0-9]*\.?[0-9]+%)$"))]
-    underline_thickness: Option<String>,
+    underline_thickness: String,
     /// Shift or scale of how far the strikeout sits from the top of the cell.
     #[schemars(extend("pattern" = r"^(-?[0-9]*\.?[0-9]+(px|pt)?|[0-9]*\.?[0-9]+%)$"))]
-    strikeout_position: Option<String>,
+    strikeout_position: String,
     /// Shift or scale of the strikeout bar's weight.
     #[schemars(extend("pattern" = r"^(-?[0-9]*\.?[0-9]+(px|pt)?|[0-9]*\.?[0-9]+%)$"))]
-    strikeout_thickness: Option<String>,
+    strikeout_thickness: String,
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+impl Default for RawDecorations {
+    fn default() -> Self {
+        Self {
+            underline_position: "0px".to_string(),
+            underline_thickness: "0px".to_string(),
+            strikeout_position: "0px".to_string(),
+            strikeout_thickness: "0px".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawUiFont {
     /// Family for sidebars, tabs and dialogs.  Unset uses the terminal font.
@@ -2414,33 +2599,52 @@ struct RawUiFont {
     bold_italic_family: Option<String>,
     /// Draw the sidebar's own symbols from the bundled subset rather than from
     /// the configured family, so a font missing them still renders.
-    builtin_symbols: Option<bool>,
+    builtin_symbols: bool,
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+impl Default for RawUiFont {
+    fn default() -> Self {
+        Self {
+            family: None,
+            size: None,
+            bold_family: None,
+            italic_family: None,
+            bold_italic_family: None,
+            builtin_symbols: true,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawFocusOutline {
     /// Outline the sidebar when it holds keyboard focus.
-    sidebar: Option<bool>,
+    sidebar: bool,
     /// Outline the terminal when it holds keyboard focus.
-    terminal: Option<bool>,
+    terminal: bool,
     /// Outline color.  Unset uses the sidebar accent.
     color: Option<RgbStr>,
     /// Outline thickness in pixels.
-    thickness: Option<f32>,
+    thickness: f32,
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+impl Default for RawFocusOutline {
+    fn default() -> Self {
+        Self { sidebar: false, terminal: false, color: None, thickness: 1.0 }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawUiDrop {
     /// Accept dropped files at all.  `false` turns every target off.
-    enabled: Option<bool>,
+    enabled: bool,
     /// Write a dropped file's path into the terminal.
-    terminal: Option<bool>,
+    terminal: bool,
     /// Let a file dropped on the projects sidebar add its repository.
-    sidebar: Option<bool>,
+    sidebar: bool,
     /// Write a dropped file's path into the workspace scratchpad.
-    scratchpad: Option<bool>,
+    scratchpad: bool,
     /// How a path is quoted for the shell that receives it.  The five concrete
     /// modes are wezterm's `quote_dropped_files` values.
     #[schemars(extend("enum" = [
@@ -2451,26 +2655,46 @@ struct RawUiDrop {
         "windows",
         "windows_always_quoted"
     ]))]
-    quote: Option<String>,
+    quote: String,
     /// Rewrite a Windows path to its distro spelling when the session runs
     /// inside WSL.
-    wsl_translate: Option<bool>,
+    wsl_translate: bool,
     /// Highlight the target a drag is over.
-    highlight: Option<bool>,
+    highlight: bool,
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+impl Default for RawUiDrop {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            terminal: true,
+            sidebar: true,
+            scratchpad: true,
+            quote: "auto".to_string(),
+            wsl_translate: true,
+            highlight: true,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawUiPaste {
     /// Paste files held on the clipboard as their paths.
-    files: Option<bool>,
+    files: bool,
     /// Paste an image held on the clipboard by writing it to a file and
     /// pasting that path.
-    image: Option<bool>,
+    image: bool,
     /// Where pasted images are written.  Unset uses a cache directory.
     image_dir: Option<String>,
     /// How many pasted images to keep before the oldest are removed.
-    image_keep: Option<usize>,
+    image_keep: usize,
+}
+
+impl Default for RawUiPaste {
+    fn default() -> Self {
+        Self { files: true, image: true, image_dir: None, image_keep: 20 }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -2480,19 +2704,19 @@ struct RawIntegrations {
     herdr: RawHerdr,
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawHerdr {
     /// Discover herdr servers and list their agents in the sidebar.  Inert
     /// when no herdr binary or server is present.
-    enabled: Option<bool>,
+    enabled: bool,
     /// How often a reachable herdr server is re-polled for agent state.
-    poll_interval_ms: Option<u64>,
+    poll_interval_ms: u64,
     /// List agents whose working directory matches no worktree, under Home.
-    show_unmatched: Option<bool>,
+    show_unmatched: bool,
     /// Whether opening a row attaches to that agent's pane directly
-    /// ("agent", default) or to the herdr session around it with the pane
-    /// focused ("session").
+    /// ("agent") or to the herdr session around it with the pane focused
+    /// ("session").
     ///
     /// "session" hands the mouse to herdr's own client, where a selection
     /// joins soft-wrapped rows and copy mode works; a direct attach is
@@ -2501,10 +2725,32 @@ struct RawHerdr {
     /// attaches to the session, because herdr implements no direct attach
     /// there.
     #[schemars(extend("enum" = ["agent", "session"]))]
-    attach: Option<String>,
+    attach: String,
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+impl Default for RawHerdr {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_interval_ms: 2000,
+            show_unmatched: true,
+            attach: "agent".to_string(),
+        }
+    }
+}
+
+impl RawHerdr {
+    fn resolve(self) -> HerdrConfig {
+        HerdrConfig {
+            enabled: self.enabled,
+            poll_interval: Duration::from_millis(self.poll_interval_ms),
+            show_unmatched: self.show_unmatched,
+            attach: parse_attach_mode(&self.attach),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawUi {
     /// Sidebar background.  Unset derives it from the terminal palette.
@@ -2521,47 +2767,46 @@ struct RawUi {
     sidebar_attention: Option<RgbStr>,
     /// Post a desktop notification when a hidden session rings the bell;
     /// clicking it focuses that session.
-    notifications: Option<bool>,
+    notifications: bool,
     /// Grace window in milliseconds before an attention trigger pings; a
-    /// session that resumes work inside it swallows the ping.  Default 0.
-    attention_grace_ms: Option<u64>,
+    /// session that resumes work inside it swallows the ping.
+    attention_grace_ms: u64,
     /// When the sidebar × on a session row asks before killing the PTY:
-    /// "never" (default) | "busy" | "always".
+    /// "never" | "busy" | "always".
     #[schemars(extend("enum" = ["never", "busy", "always"]))]
-    confirm_session_close: Option<String>,
+    confirm_session_close: String,
     /// Whether the sidebar × on a harness-managed row asks before detaching.
     /// Separate from `confirm_session_close` because a detach leaves the
-    /// pane running and its row listed again. Default true.
-    confirm_session_detach: Option<bool>,
+    /// pane running and its row listed again.
+    confirm_session_detach: bool,
     /// What happens when the on-screen workspace stops having sessions,
     /// whether a close or a worktree deletion took the last one:
-    /// "respawn" (default) | "navigate" | "ring_global" | "ring_project".
+    /// "respawn" | "navigate" | "ring_global" | "ring_project".
     #[schemars(extend("enum" = ["respawn", "navigate", "ring_global", "ring_project"]))]
-    last_session_close: Option<String>,
+    last_session_close: String,
     /// How far the projects sidebar goes when the cursor's row stops being
-    /// rendered: "preserve" (default) | "follow".
+    /// rendered: "preserve" | "follow".
     #[schemars(extend("enum" = ["preserve", "follow"]))]
-    sidebar_focus: Option<String>,
+    sidebar_focus: String,
     /// Whether the projects sidebar scrolls to the session on screen whenever
     /// it changes — a cycling key, a click, the palette, an IPC request.
-    /// The sidebar cursor is left where it was: `false` (default).
-    sidebar_follow_active: Option<bool>,
-    /// Where a row the sidebar scrolled to is parked:
-    /// "minimal" (default) | "center".  Under "center" every cursor step
-    /// re-centres the list, and clicking a row near the panel edge scrolls it
-    /// out from under the pointer.
+    /// The sidebar cursor is left where it was.
+    sidebar_follow_active: bool,
+    /// Where a row the sidebar scrolled to is parked: "minimal" | "center".
+    /// Under "center" every cursor step re-centres the list, and clicking a
+    /// row near the panel edge scrolls it out from under the pointer.
     #[schemars(extend("enum" = ["minimal", "center"]))]
-    sidebar_scroll_align: Option<String>,
+    sidebar_scroll_align: String,
     /// Whether a fuzzy query is confined by the panel's active toggle filters:
-    /// "filtered" (default) | "all".
+    /// "filtered" | "all".
     #[schemars(extend("enum" = ["filtered", "all"]))]
-    search_scope: Option<String>,
+    search_scope: String,
     /// When a sidebar row spells its full name out on hover:
-    /// "elided" (default) | "always" | "off".
+    /// "elided" | "always" | "off".
     #[schemars(extend("enum" = ["elided", "always", "off"]))]
-    sidebar_tooltips: Option<String>,
-    /// Whether a sidebar icon explains itself on hover: `true` (default).
-    icon_tooltips: Option<bool>,
+    sidebar_tooltips: String,
+    /// Whether a sidebar icon explains itself on hover.
+    icon_tooltips: bool,
     /// Whether per-session rows and tabs appear before a workspace has two
     /// sessions.
     session_display: RawSessionDisplay,
@@ -2574,32 +2819,31 @@ struct RawUi {
     delta_path: Option<String>,
     /// Sidebar glyph overrides.
     icons: RawIcons,
-    /// Sidebar scrollbar style: "floating" (default) | "solid".
+    /// Sidebar scrollbar style: "floating" | "solid".
     #[schemars(extend("enum" = ["floating", "solid"]))]
-    scrollbar: Option<String>,
+    scrollbar: String,
     /// Draw the terminal grid through an OpenGL paint callback instead of
-    /// handing epaint a mesh.  Default `false`: it needs a GL 3 context and
-    /// bypasses the renderer every other panel goes through, so an
-    /// unmodified config keeps the path that has always drawn the grid.  A
-    /// context too old for instanced arrays logs once and paints the mesh
-    /// from the next frame on.
-    gpu_grid: Option<bool>,
+    /// handing epaint a mesh.  It needs a GL 3 context and bypasses the
+    /// renderer every other panel goes through, so an unmodified config keeps
+    /// the path that has always drawn the grid.  A context too old for
+    /// instanced arrays logs once and paints the mesh from the next frame on.
+    gpu_grid: bool,
     /// Corrections to the underline and strikeout the font placed
     /// ([`RawDecorations`]).
     decorations: RawDecorations,
     /// Poll `gh` for each branch's open pull request, which drives the PR row
     /// icons, the PR-state filters, and `$pr` in row templates.
-    pr_status: Option<bool>,
+    pr_status: bool,
     /// Paint a badge on each worktree row for its branch's upstream state.
     /// Local refs only: nothing fetches, so a branch deleted on the remote
     /// reads as tracked until something prunes locally.
-    upstream_status: Option<bool>,
+    upstream_status: bool,
     /// Re-check on a 1.5 s tick whether each listed worktree's checkout is
     /// still on disk, so a `git worktree remove` typed into one of our own
-    /// sessions greys the row without waiting for a manual refresh.  Default
-    /// `true`; the probe is one `stat` per listed row, which an exotic
-    /// filesystem could make expensive.
-    worktree_liveness: Option<bool>,
+    /// sessions greys the row without waiting for a manual refresh.  The
+    /// probe is one `stat` per listed row, which an exotic filesystem could
+    /// make expensive.
+    worktree_liveness: bool,
     /// Max `gh` lookups in flight at once.  Unset lets the pool decide, which
     /// is one below its own background ceiling so a lookup can never take
     /// the last slot local work needs.  A value lowers that; nothing raises
@@ -2620,49 +2864,107 @@ struct RawUi {
     default_profile: Option<String>,
     /// Outline drawn around whichever pane holds keyboard focus.
     focus_outline: RawFocusOutline,
-    /// Clicking a sidebar moves keyboard focus to it.  Default false.
-    sidebar_click_focus: Option<bool>,
+    /// Clicking a sidebar moves keyboard focus to it.
+    sidebar_click_focus: bool,
     /// Put the session on screen one scheduling class above normal — its
     /// shell and every process that shell starts — so a busy machine cannot
     /// starve what the user is typing into.  Follows focus.  Windows only.
-    /// Default false.
-    focus_priority_boost: Option<bool>,
+    focus_priority_boost: bool,
     /// Open a session's PTY on a worker rather than in the frame that asked
-    /// for it, so spawning does not stutter.  Default false.
-    async_session_spawn: Option<bool>,
+    /// for it, so spawning does not stutter.
+    async_session_spawn: bool,
     /// End everything a session started when that session closes, at any
     /// depth, except processes that ask to break away.  Windows only.
-    /// Default false.
-    reap_descendants_on_close: Option<bool>,
+    reap_descendants_on_close: bool,
     /// Wait for the display's refresh before showing a finished frame.
-    /// Default true.
-    vsync: Option<bool>,
+    vsync: bool,
     /// How paths are abbreviated where the UI writes them.
     path_style: RawPathStyle,
-    /// What a file dragged onto the window does.  Default: every target on.
+    /// What a file dragged onto the window does.
     drop: RawUiDrop,
     /// What the clipboard's non-text contents paste as.
     paste: RawUiPaste,
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+impl Default for RawUi {
+    fn default() -> Self {
+        Self {
+            sidebar_background: None,
+            sidebar_foreground: None,
+            sidebar_border: None,
+            sidebar_accent: None,
+            sidebar_attention: None,
+            notifications: true,
+            attention_grace_ms: 0,
+            confirm_session_close: "never".to_string(),
+            confirm_session_detach: true,
+            last_session_close: "respawn".to_string(),
+            sidebar_focus: "preserve".to_string(),
+            sidebar_follow_active: false,
+            sidebar_scroll_align: "minimal".to_string(),
+            search_scope: "filtered".to_string(),
+            sidebar_tooltips: "elided".to_string(),
+            icon_tooltips: true,
+            session_display: RawSessionDisplay::default(),
+            session_reorder: RawSessionReorder::default(),
+            delta_path: None,
+            icons: RawIcons::default(),
+            scrollbar: "floating".to_string(),
+            gpu_grid: false,
+            decorations: RawDecorations::default(),
+            pr_status: false,
+            upstream_status: false,
+            worktree_liveness: true,
+            pr_status_concurrency: None,
+            font: RawUiFont::default(),
+            worktree_name: None,
+            project_name: None,
+            wsl: RawUiWsl::default(),
+            profiles: Vec::new(),
+            default_profile: None,
+            focus_outline: RawFocusOutline::default(),
+            sidebar_click_focus: false,
+            focus_priority_boost: false,
+            async_session_spawn: false,
+            reap_descendants_on_close: false,
+            vsync: true,
+            path_style: RawPathStyle::default(),
+            drop: RawUiDrop::default(),
+            paste: RawUiPaste::default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawPathStyle {
-    /// "full" (default) | "fish" | "zed", per site.
+    /// "full" | "fish" | "zed", per site.
     ///
     /// The diff pane's title.
     #[schemars(extend("enum" = ["full", "fish", "zed"]))]
-    diff_title: Option<String>,
+    diff_title: String,
     /// Paths in the git panel's file rows.
     #[schemars(extend("enum" = ["full", "fish", "zed"]))]
-    git_rows: Option<String>,
+    git_rows: String,
     /// The path in the git panel's header.
     #[schemars(extend("enum" = ["full", "fish", "zed"]))]
-    git_header: Option<String>,
+    git_header: String,
     /// How the last path segment is emphasized.
     filename: RawTextEmphasis,
     /// How the leading path segments are emphasized.
     parent: RawTextEmphasis,
+}
+
+impl Default for RawPathStyle {
+    fn default() -> Self {
+        Self {
+            diff_title: "full".to_string(),
+            git_rows: "full".to_string(),
+            git_header: "full".to_string(),
+            filename: RawTextEmphasis::default(),
+            parent: RawTextEmphasis::default(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -2671,9 +2973,9 @@ struct RawTextEmphasis {
     /// Text color.  Unset inherits the row's foreground.
     color: Option<RgbStr>,
     /// Draw bold.
-    bold: Option<bool>,
+    bold: bool,
     /// Draw italic.
-    italic: Option<bool>,
+    italic: bool,
 }
 
 /// One `[[ui.profiles]]` entry.  Fields are optional so a malformed entry
@@ -2708,7 +3010,7 @@ struct RawWorktreeOverride {
 }
 
 /// Wrapper that parses `"0xrrggbb"`, `"#rrggbb"`, or `"rrggbb"` into an `Rgb`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct RgbStr(Rgb);
 
 /// Hand-written because `RgbStr` deserializes from a string it parses itself,
@@ -2734,6 +3036,16 @@ impl<'de> Deserialize<'de> for RgbStr {
         parse_hex_rgb(&s)
             .map(RgbStr)
             .ok_or_else(|| serde::de::Error::custom(format!("invalid color string: {s:?}")))
+    }
+}
+
+/// Hand-written for the same reason `Deserialize` is: the accepted spellings
+/// live in `parse_hex_rgb`, and a derive on the inner `Rgb` would emit an
+/// object against a schema that says `"type": "string"`.
+impl serde::Serialize for RgbStr {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let Rgb { r, g, b } = self.0;
+        serializer.serialize_str(&format!("#{r:02x}{g:02x}{b:02x}"))
     }
 }
 
@@ -2779,12 +3091,8 @@ impl RawConfig {
         let mut palette = config.palette;
         let c = self.colors;
 
-        if let Some(v) = c.primary.foreground {
-            palette.fg = v.0;
-        }
-        if let Some(v) = c.primary.background {
-            palette.bg = v.0;
-        }
+        palette.fg = c.primary.foreground.0;
+        palette.bg = c.primary.background.0;
         palette.bright_fg = c.primary.bright_foreground.map(|v| v.0);
         palette.dim_fg = c.primary.dim_foreground.map(|v| v.0);
 
@@ -2798,8 +3106,8 @@ impl RawConfig {
             c.selection.text.map(|v| v.0).or_else(|| c.selection.foreground.map(|v| v.0));
         palette.selection_bg = c.selection.background.map(|v| v.0);
 
-        apply_set(&mut palette.normal, c.normal);
-        apply_set(&mut palette.bright, c.bright);
+        apply_set(&mut palette.normal, c.normal.into_optional());
+        apply_set(&mut palette.bright, c.bright.into_optional());
         if let Some(d) = c.dim {
             let mut dim = palette.normal;
             apply_set(&mut dim, d);
@@ -2821,133 +3129,96 @@ impl RawConfig {
             sidebar_border: self.ui.sidebar_border.map(|v| rgb_to_color32(v.0)),
             sidebar_accent: self.ui.sidebar_accent.map(|v| rgb_to_color32(v.0)),
             sidebar_attention: self.ui.sidebar_attention.map(|v| rgb_to_color32(v.0)),
-            notifications: self.ui.notifications.unwrap_or(true),
-            attention_grace: Duration::from_millis(self.ui.attention_grace_ms.unwrap_or(0)),
-            confirm_session_close: parse_confirm_session_close(
-                self.ui.confirm_session_close.as_deref(),
-            ),
-            confirm_session_detach: self.ui.confirm_session_detach.unwrap_or(true),
-            last_session_close: parse_last_session_close(self.ui.last_session_close.as_deref()),
-            sidebar_focus: parse_sidebar_focus(self.ui.sidebar_focus.as_deref()),
-            sidebar_follow_active: self.ui.sidebar_follow_active.unwrap_or(false),
-            sidebar_scroll_align: parse_scroll_align(self.ui.sidebar_scroll_align.as_deref()),
-            search_scope: parse_search_scope(self.ui.search_scope.as_deref()),
-            sidebar_tooltips: parse_sidebar_tooltips(self.ui.sidebar_tooltips.as_deref()),
-            icon_tooltips: self.ui.icon_tooltips.unwrap_or(true),
+            notifications: self.ui.notifications,
+            attention_grace: Duration::from_millis(self.ui.attention_grace_ms),
+            confirm_session_close: parse_confirm_session_close(&self.ui.confirm_session_close),
+            confirm_session_detach: self.ui.confirm_session_detach,
+            last_session_close: parse_last_session_close(&self.ui.last_session_close),
+            sidebar_focus: parse_sidebar_focus(&self.ui.sidebar_focus),
+            sidebar_follow_active: self.ui.sidebar_follow_active,
+            sidebar_scroll_align: parse_scroll_align(&self.ui.sidebar_scroll_align),
+            search_scope: parse_search_scope(&self.ui.search_scope),
+            sidebar_tooltips: parse_sidebar_tooltips(&self.ui.sidebar_tooltips),
+            icon_tooltips: self.ui.icon_tooltips,
             session_display: SessionDisplay {
-                sidebar_always: self.ui.session_display.sidebar_always.unwrap_or(false),
-                tabs_always: self.ui.session_display.tabs_always.unwrap_or(false),
+                sidebar_always: self.ui.session_display.sidebar_always,
+                tabs_always: self.ui.session_display.tabs_always,
             },
             session_reorder: SessionReorder {
-                drag: self.ui.session_reorder.drag.unwrap_or(false),
-                scope: parse_reorder_scope(self.ui.session_reorder.scope.as_deref()),
+                drag: self.ui.session_reorder.drag,
+                scope: parse_reorder_scope(&self.ui.session_reorder.scope),
             },
-            gpu_grid: self.ui.gpu_grid.unwrap_or(false),
+            gpu_grid: self.ui.gpu_grid,
             decorations: Decorations {
                 underline_position: parse_adjust(
                     "underline_position",
-                    self.ui.decorations.underline_position.as_deref(),
+                    &self.ui.decorations.underline_position,
                 ),
                 underline_thickness: parse_adjust(
                     "underline_thickness",
-                    self.ui.decorations.underline_thickness.as_deref(),
+                    &self.ui.decorations.underline_thickness,
                 ),
                 strikeout_position: parse_adjust(
                     "strikeout_position",
-                    self.ui.decorations.strikeout_position.as_deref(),
+                    &self.ui.decorations.strikeout_position,
                 ),
                 strikeout_thickness: parse_adjust(
                     "strikeout_thickness",
-                    self.ui.decorations.strikeout_thickness.as_deref(),
+                    &self.ui.decorations.strikeout_thickness,
                 ),
             },
-            pr_status: self.ui.pr_status.unwrap_or(false),
-            upstream_status: self.ui.upstream_status.unwrap_or(false),
-            worktree_liveness: self.ui.worktree_liveness.unwrap_or(true),
+            pr_status: self.ui.pr_status,
+            upstream_status: self.ui.upstream_status,
+            worktree_liveness: self.ui.worktree_liveness,
             pr_status_concurrency: self.ui.pr_status_concurrency,
             icons: build_icons(self.ui.icons),
             focus_outline: FocusOutline {
-                sidebar: self.ui.focus_outline.sidebar.unwrap_or(false),
-                terminal: self.ui.focus_outline.terminal.unwrap_or(false),
+                sidebar: self.ui.focus_outline.sidebar,
+                terminal: self.ui.focus_outline.terminal,
                 color: self.ui.focus_outline.color.map(|v| rgb_to_color32(v.0)),
-                thickness: self.ui.focus_outline.thickness.map_or(1.0, |t| t.max(0.5)),
+                thickness: self.ui.focus_outline.thickness.max(0.5),
             },
-            scrollbar: parse_scrollbar(self.ui.scrollbar.as_deref()),
-            sidebar_click_focus: self.ui.sidebar_click_focus.unwrap_or(false),
-            focus_priority_boost: self.ui.focus_priority_boost.unwrap_or(false),
-            async_session_spawn: self.ui.async_session_spawn.unwrap_or(false),
-            reap_descendants_on_close: self.ui.reap_descendants_on_close.unwrap_or(false),
-            vsync: self.ui.vsync.unwrap_or(true),
+            scrollbar: parse_scrollbar(&self.ui.scrollbar),
+            sidebar_click_focus: self.ui.sidebar_click_focus,
+            focus_priority_boost: self.ui.focus_priority_boost,
+            async_session_spawn: self.ui.async_session_spawn,
+            reap_descendants_on_close: self.ui.reap_descendants_on_close,
+            vsync: self.ui.vsync,
             worktree_name: self.ui.worktree_name.clone().filter(|t| !t.trim().is_empty()),
             project_name: self.ui.project_name.clone().filter(|t| !t.trim().is_empty()),
             path_style: PathStyleConfig {
-                diff_title: parse_path_style(self.ui.path_style.diff_title.as_deref()),
-                git_rows: parse_path_style(self.ui.path_style.git_rows.as_deref()),
-                git_header: parse_path_style(self.ui.path_style.git_header.as_deref()),
+                diff_title: parse_path_style(&self.ui.path_style.diff_title),
+                git_rows: parse_path_style(&self.ui.path_style.git_rows),
+                git_header: parse_path_style(&self.ui.path_style.git_header),
                 filename: text_emphasis(&self.ui.path_style.filename),
                 parent: text_emphasis(&self.ui.path_style.parent),
             },
             drop: DropConfig {
-                enabled: self.ui.drop.enabled.unwrap_or(true),
-                terminal: self.ui.drop.terminal.unwrap_or(true),
-                sidebar: self.ui.drop.sidebar.unwrap_or(true),
-                scratchpad: self.ui.drop.scratchpad.unwrap_or(true),
+                enabled: self.ui.drop.enabled,
+                terminal: self.ui.drop.terminal,
+                sidebar: self.ui.drop.sidebar,
+                scratchpad: self.ui.drop.scratchpad,
                 spelling: PathSpelling {
-                    quote: parse_quoting(self.ui.drop.quote.as_deref()),
-                    wsl_translate: self.ui.drop.wsl_translate.unwrap_or(true),
+                    quote: parse_quoting(&self.ui.drop.quote),
+                    wsl_translate: self.ui.drop.wsl_translate,
                 },
-                highlight: self.ui.drop.highlight.unwrap_or(true),
+                highlight: self.ui.drop.highlight,
             },
             paste: PasteConfig {
-                files: self.ui.paste.files.unwrap_or(true),
-                image: self.ui.paste.image.unwrap_or(true),
+                files: self.ui.paste.files,
+                image: self.ui.paste.image,
                 image_dir: self
                     .ui
                     .paste
                     .image_dir
                     .as_deref()
                     .and_then(|raw| parse_config_path(raw, "ui.paste.image_dir")),
-                image_keep: self.ui.paste.image_keep.unwrap_or(20).max(1),
+                image_keep: self.ui.paste.image_keep.max(1),
             },
         };
 
         // ---- Font ----
-        let mut font = config.font.clone();
-        if let Some(s) = self.font.size {
-            font.size = s.max(1.0);
-        }
-        font.normal = FontFace {
-            family: self.font.normal.family.clone(),
-            style: self.font.normal.style.clone(),
-        };
-        font.bold =
-            FontFace { family: self.font.bold.family.clone(), style: self.font.bold.style.clone() };
-        font.italic = FontFace {
-            family: self.font.italic.family.clone(),
-            style: self.font.italic.style.clone(),
-        };
-        font.bold_italic = FontFace {
-            family: self.font.bold_italic.family.clone(),
-            style: self.font.bold_italic.style.clone(),
-        };
-        font.offset = FontDelta {
-            x: self.font.offset.x.unwrap_or(font.offset.x),
-            y: self.font.offset.y.unwrap_or(font.offset.y),
-        };
-        font.glyph_offset = FontDelta {
-            x: self.font.glyph_offset.x.unwrap_or(font.glyph_offset.x),
-            y: self.font.glyph_offset.y.unwrap_or(font.glyph_offset.y),
-        };
-        if let Some(b) = self.font.builtin_box_drawing {
-            font.builtin_box_drawing = b;
-        }
-        font.fallback = self.font.fallback.clone().unwrap_or_default();
-        if let Some(c) = self.font.color_glyphs {
-            font.color_glyphs = c;
-        }
-        if let Some(mb) = self.font.color_glyph_cache_mb {
-            font.color_glyph_cache_mb = mb;
-        }
+        let font = self.font.resolve();
 
         // ---- Cursor ----
         let mut cursor = config.cursor;
@@ -2959,36 +3230,13 @@ impl RawConfig {
         }
 
         // ---- Scrolling ----
-        let mut scrolling = config.scrolling;
-        if let Some(h) = self.scrolling.history {
-            scrolling.history = h as usize;
-        }
-        if let Some(m) = self.scrolling.multiplier {
-            scrolling.multiplier = m;
-        }
+        let scrolling = self.scrolling.resolve();
 
-        // ---- Window padding ----
-        let mut window = config.window;
-        if let Some(p) = self.window.padding {
-            if let Some(x) = p.x {
-                window.padding_x = x;
-            }
-            if let Some(y) = p.y {
-                window.padding_y = y;
-            }
-        }
-        if let Some(o) = self.window.opacity {
-            window.opacity = o.clamp(0.0, 1.0);
-        }
+        // ---- Window ----
+        let window = self.window.resolve();
 
         // ---- Selection ----
-        let mut selection = config.selection.clone();
-        if let Some(s) = self.selection.semantic_escape_chars {
-            selection.semantic_escape_chars = s;
-        }
-        if let Some(v) = self.selection.save_to_clipboard {
-            selection.save_to_clipboard = v;
-        }
+        let selection = self.selection.resolve();
 
         // ---- Shell ----
         let shell = self.terminal.shell.map(|s| match s {
@@ -3027,7 +3275,7 @@ impl RawConfig {
             .map(|r| r.trim_end_matches('/').to_string())
             .filter(|r| r.starts_with('/') && r.len() > 1)
             .unwrap_or_else(|| "/mnt".to_string());
-        let wsl_resident_helper = self.wsl.resident_helper.unwrap_or(true);
+        let wsl_resident_helper = self.wsl.resident_helper;
 
         // ---- UI Font ----
         let ui_font = UiFont {
@@ -3041,7 +3289,7 @@ impl RawConfig {
                 .bold_italic_family
                 .clone()
                 .filter(|f| !f.trim().is_empty()),
-            builtin_symbols: self.ui.font.builtin_symbols.unwrap_or(true),
+            builtin_symbols: self.ui.font.builtin_symbols,
         };
 
         // ---- Profiles ----
@@ -3067,12 +3315,12 @@ impl RawConfig {
             shell,
             selection,
             bindings,
-            ipc_socket: self.general.ipc_socket.unwrap_or(true),
+            ipc_socket: self.general.ipc_socket,
             debug: DebugConfig {
-                crash_log: self.debug.crash_log.unwrap_or(true),
-                persistent_logging: self.debug.persistent_logging.unwrap_or(false),
-                gpu_timing: self.debug.gpu_timing.unwrap_or(false),
-                frame_log: self.debug.frame_log.unwrap_or(false),
+                crash_log: self.debug.crash_log,
+                persistent_logging: self.debug.persistent_logging,
+                gpu_timing: self.debug.gpu_timing,
+                frame_log: self.debug.frame_log,
                 log_dir: self
                     .debug
                     .log_dir
@@ -3094,16 +3342,7 @@ impl RawConfig {
             delta_path: self.ui.delta_path.filter(|s| !s.trim().is_empty()),
             profiles,
             default_profile,
-            integrations: IntegrationsConfig {
-                herdr: HerdrConfig {
-                    enabled: self.integrations.herdr.enabled.unwrap_or(true),
-                    poll_interval: Duration::from_millis(
-                        self.integrations.herdr.poll_interval_ms.unwrap_or(2000),
-                    ),
-                    show_unmatched: self.integrations.herdr.show_unmatched.unwrap_or(true),
-                    attach: parse_attach_mode(self.integrations.herdr.attach.as_deref()),
-                },
-            },
+            integrations: IntegrationsConfig { herdr: self.integrations.herdr.resolve() },
         }
     }
 }
@@ -3396,6 +3635,57 @@ mod tests {
         let nonsense = config_from("[integrations.herdr]\nattach = \"pane\"\n");
         assert_eq!(nonsense.integrations.herdr.attach, AttachMode::Agent);
     }
+
+    #[test]
+    fn an_absent_herdr_section_resolves_to_the_raw_defaults() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        let resolved = raw.into_config();
+        assert_eq!(resolved.integrations.herdr, HerdrConfig::default());
+    }
+
+    #[test]
+    fn the_herdr_defaults_live_in_the_raw_layer() {
+        assert_eq!(HerdrConfig::default(), RawHerdr::default().resolve());
+    }
+
+    /// A raw struct that gained a `Default` but lost its `serde(default)`
+    /// resolves an install with no config file correctly and silently
+    /// discards what a real config file wrote, which the stock-config
+    /// snapshot cannot see.
+    #[test]
+    fn a_written_key_still_beats_its_default() {
+        let config =
+            config_from("[integrations.herdr]\npoll_interval_ms = 500\nshow_unmatched = false\n");
+        assert_eq!(config.integrations.herdr.poll_interval, Duration::from_millis(500));
+        assert!(!config.integrations.herdr.show_unmatched);
+        // A key the file did not mention keeps the default it now owns.
+        assert!(config.integrations.herdr.enabled);
+    }
+
+    #[test]
+    fn the_primary_colours_default_to_the_stock_palette() {
+        let raw = RawPrimary::default();
+        assert_eq!(raw.foreground, RgbStr(Palette::default().fg));
+        assert_eq!(raw.background, RgbStr(Palette::default().bg));
+    }
+
+    #[test]
+    fn each_palette_section_defaults_to_its_own_colours() {
+        let stock = Palette::default();
+        let normal = RawNormalSet::default().into_optional();
+        let bright = RawBrightSet::default().into_optional();
+        assert_eq!(normal.black.unwrap().0, stock.normal[0]);
+        assert_eq!(bright.black.unwrap().0, stock.bright[0]);
+        assert_ne!(normal.black.unwrap().0, bright.black.unwrap().0);
+    }
+
+    #[test]
+    fn an_absent_bright_section_keeps_the_bright_palette() {
+        let resolved = toml::from_str::<RawConfig>("").unwrap().into_config();
+        assert_eq!(resolved.palette.bright, Palette::default().bright);
+        assert_eq!(resolved.palette.normal, Palette::default().normal);
+    }
+
     fn ui_from_toml(input: &str) -> UiTheme {
         let value: toml::Value = toml::from_str(input).expect("valid toml");
         let raw: RawConfig = value.try_into().expect("valid config");
@@ -4669,6 +4959,16 @@ program = "second"
         assert_eq!(Adjust::NONE.apply(7.0, 2.0), 7.0);
     }
 
+    /// `"0"` parses to `Points(0.0)` where `NONE` is `Pixels(0.0)`: the same
+    /// line through `apply`, but unequal under the `PartialEq` that
+    /// `changed_from_defaults` compares with, so a `"0"` default would report
+    /// an untouched config as modified.  That is why the default is `"0px"`.
+    #[test]
+    fn the_decoration_default_parses_to_no_adjustment() {
+        assert_eq!(Adjust::parse("0px"), Some(Adjust::NONE));
+        assert_ne!(Adjust::parse("0"), Some(Adjust::NONE));
+    }
+
     /// Pixels are physical and points are not, which is the whole reason both
     /// spellings exist.
     #[test]
@@ -4682,7 +4982,93 @@ program = "second"
     /// the line somewhere the user cannot predict.
     #[test]
     fn a_malformed_adjustment_behaves_as_zero() {
-        assert_eq!(parse_adjust("underline_position", Some("2 px")), Adjust::NONE);
-        assert_eq!(parse_adjust("underline_position", None), Adjust::NONE);
+        assert_eq!(parse_adjust("underline_position", "2 px"), Adjust::NONE);
+        assert_eq!(parse_adjust("underline_position", "0px"), Adjust::NONE);
+    }
+
+    #[test]
+    fn a_color_serializes_to_the_spelling_it_parses() {
+        let parsed: RgbStr = toml::from_str::<toml::Value>("c = \"#6a9fb5\"").unwrap()["c"]
+            .clone()
+            .try_into()
+            .unwrap();
+        let json = serde_json::to_value(parsed).unwrap();
+        assert_eq!(json, serde_json::json!("#6a9fb5"));
+    }
+
+    #[test]
+    fn a_color_round_trips_through_json() {
+        let original = RgbStr(rgb(0x18, 0x18, 0x18));
+        let json = serde_json::to_value(original).unwrap();
+        let back: RgbStr = serde_json::from_value(json).unwrap();
+        assert_eq!(original, back);
+    }
+
+    /// What an install with no config file resolves to.  Every literal this plan
+    /// moves out of an `unwrap_or` and into a `Default` has to land on the same
+    /// value it had before, and a moved literal is invisible to every other test
+    /// here: the schema would publish the wrong default and agree with itself.
+    ///
+    /// `ALACRITREE_UPDATE_STOCK=1` rewrites the fixture.  Doing that is only ever
+    /// correct when a default genuinely changed on purpose.
+    #[test]
+    fn the_stock_config_is_unchanged() {
+        let path = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/stock-config.json"
+        ));
+        // `default_bindings` adds Cmd chords under `#[cfg(target_os = "macos")]`,
+        // so a fixture holding them fails on a Mac for a reason that has nothing
+        // to do with a default moving.  No binding literal moves in this change.
+        let mut resolved = serde_json::to_value(super::stock_config()).unwrap();
+        resolved.as_object_mut().unwrap().remove("bindings");
+        let now = serde_json::to_string_pretty(&resolved).unwrap() + "\n";
+        let committed = std::fs::read_to_string(&path).unwrap_or_default();
+        if committed == now {
+            return;
+        }
+        if std::env::var("ALACRITREE_UPDATE_STOCK").as_deref() == Ok("1") {
+            std::fs::write(&path, &now).unwrap();
+            return;
+        }
+        let (line, was, is) = committed
+            .lines()
+            .zip(now.lines())
+            .enumerate()
+            .find(|(_, (a, b))| a != b)
+            .map_or((0, "", ""), |(i, (a, b))| (i + 1, a, b));
+        panic!(
+            "a config default moved — regenerate with `devkit run task test --env \
+             ALACRITREE_UPDATE_STOCK=1` only if you meant to change it\n\nfirst difference at \
+             line {line}:\n  was: {was}\n  is:  {is}"
+        );
+    }
+
+    /// An untagged enum can serialize to a shape its own Deserialize rejects,
+    /// which would publish a default no config file may legally write.
+    #[test]
+    fn every_icon_default_round_trips() {
+        let raw = RawIcons::default();
+        let json = serde_json::to_value(&raw).unwrap();
+        let back: RawIcons = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(
+            build_icons(back),
+            build_icons(raw),
+            "an icon default does not survive its own schema"
+        );
+        // The Glyph variant must publish as a bare string: it is the branch
+        // Deserialize tries first, and the one an editor offers.
+        assert!(json["search"].is_string(), "search published as {}", json["search"]);
+    }
+
+    /// A key the file styles without naming a glyph keeps the built-in one,
+    /// which or_glyph supplies at paint rather than at resolution.
+    #[test]
+    fn an_absent_icon_key_keeps_its_glyph() {
+        let raw: RawConfig = toml::from_str("[ui.icons]\nworktree = { bold = true }\n").unwrap();
+        let icons = raw.into_config().ui.icons;
+        assert!(icons.worktree.bold);
+        assert!(icons.worktree.glyph.is_none(), "a styled key resolves with no glyph of its own");
+        assert_eq!(icons.session, Icons::default().session, "an untouched key is untouched");
     }
 }
