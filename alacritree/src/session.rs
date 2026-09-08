@@ -14,10 +14,10 @@ use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{ClipboardType, Config as TermConfig, Term};
 use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
-use alacritty_terminal::vte::ansi::Rgb;
+use alacritty_terminal::vte::ansi::{Processor, Rgb, StdSyncHandler};
 
 use crate::clipboard::Target;
-use crate::config::{Config, Palette};
+use crate::config::{Config, HoldExitedSessions, Palette};
 use crate::wsl_helper::{self, WslProbe};
 use crate::{colors, herdr, scratchpad};
 
@@ -171,6 +171,17 @@ impl LiveState {
             herdr::Status::Working => Some(Self::Working),
             herdr::Status::Blocked => Some(Self::Blocked),
             herdr::Status::Unknown => None,
+        }
+    }
+
+    /// Word a row paints for this state, mirroring `herdr::Status::label` so
+    /// an agent alacritree reads on its own speaks the same vocabulary herdr
+    /// does.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Working => "working",
+            Self::Blocked => "blocked",
         }
     }
 }
@@ -407,6 +418,10 @@ pub struct DrainOutcome {
     /// written here so the drain — which runs once per frame for every session
     /// — stays free of OS clipboard access.
     pub clipboard: Vec<(Target, String)>,
+    /// Set on the batch that carried the child's exit.  It is the one moment a
+    /// held session can be written to: the exit arrives after the child's last
+    /// output, and every later frame would append the notice again.
+    pub exited: bool,
 }
 
 /// Bytes answering an OSC colour query, or `None` when the query has no
@@ -1218,7 +1233,7 @@ pub fn open(request: OpenRequest) -> std::io::Result<Attachment> {
     #[cfg(windows)]
     let pty = crate::pty_rearm::RearmingPty::new(pty);
 
-    let event_loop = EventLoop::new(term, proxy, pty, false, false)?;
+    let event_loop = EventLoop::new(term, proxy, pty, pty_options.drain_on_exit, false)?;
     let sender = event_loop.channel();
     event_loop.spawn();
     crate::frame_log::spawn_phase(Some(id), "open", started.elapsed());
@@ -1391,7 +1406,11 @@ impl Session {
         let pty_options = PtyOptions {
             shell,
             working_directory: pty_cwd,
-            drain_on_exit: false,
+            // Without this the loop drops whatever the child wrote and it had
+            // not yet read: the last output a held session exists to show.
+            // Unconditional because any session can be held — a refused herdr
+            // attach is, under every `hold_exited_sessions` value.
+            drain_on_exit: true,
             env,
             // Windows has no argv: alacritty_terminal joins these args into a
             // single CreateProcess command line, quoting them only when this
@@ -1587,9 +1606,26 @@ impl Session {
     /// attach — the agent already has a client, or herdr refuses on this
     /// platform — exits within a frame; reaping it would take herdr's
     /// message with it and leave only a flash, so a session holding a herdr
-    /// key stays until the user closes it, unless it exited cleanly.
-    pub fn should_reap(&self) -> bool {
-        self.is_exited() && (self.herdr_key.is_none() || self.exit_was_clean())
+    /// key stays until the user closes it, unless it exited cleanly.  That
+    /// carve-out outranks `hold`, which only ever widens what is held.
+    pub fn should_reap(&self, hold: HoldExitedSessions) -> bool {
+        if !self.is_exited() {
+            return false;
+        }
+        let clean = self.exit_was_clean();
+        if self.herdr_key.is_some() && !clean {
+            return false;
+        }
+        !hold.holds(clean)
+    }
+
+    /// Write the notice a held session ends on, naming `chord` — the key bound
+    /// to `CloseExitedSession` — or the command palette when nothing is bound.
+    /// Fed through alacritty's own parser because the PTY that would otherwise
+    /// carry it is already gone.
+    pub fn write_hold_notice(&self, chord: Option<&str>) {
+        let mut term = self.term.lock();
+        Processor::<StdSyncHandler>::new().advance(&mut *term, &hold_notice_bytes(chord));
     }
 
     /// The distro a shimmed WSL session runs in.  Dropped paths need it to
@@ -1756,7 +1792,10 @@ fn apply_term_event(
             }
             *title = t;
         },
-        TermEvent::ChildExit(status) => *exit_status = Some(status),
+        TermEvent::ChildExit(status) => {
+            *exit_status = Some(status);
+            outcome.exited = true;
+        },
         TermEvent::Bell => outcome.attention = true,
         // OSC 52.  Apps that copy this way (Claude Code, tmux, vim) get no
         // acknowledgement, so dropping it leaves them reporting a successful
@@ -1765,6 +1804,29 @@ fn apply_term_event(
         _ => {},
     }
     None
+}
+
+/// The line a held session ends on.  It is written into the grid rather than
+/// painted as chrome so it scrolls with the output it explains and can be
+/// selected and copied like any other line.
+///
+/// `chord` is a snapshot of what was bound when the child exited: a rebind
+/// afterwards leaves stale text on a session nothing will ever redraw, which
+/// is preferable to naming a key the config does not have.
+fn hold_notice(chord: Option<&str>) -> String {
+    match chord {
+        Some(chord) => format!("[alacritree] session exited — press {chord} to close it"),
+        None => "[alacritree] session exited — close it from the command palette".to_string(),
+    }
+}
+
+/// The notice as the parser receives it.  A fresh `Processor` resets parser
+/// state but not the terminal's cursor template, so a child that died in
+/// reverse video or `ESC[8m` would otherwise paint the notice in its pen —
+/// invisibly, in the worst case.  wezterm's `emit_output_for_pane` leads with
+/// the same reset for the same reason.
+fn hold_notice_bytes(chord: Option<&str>) -> Vec<u8> {
+    format!("\x1b[0m\r\n{}\r\n", hold_notice(chord)).into_bytes()
 }
 
 fn clipboard_target(ty: ClipboardType) -> Target {
@@ -1815,7 +1877,6 @@ mod tests {
     use std::sync::Mutex;
 
     use alacritty_terminal::Term;
-    use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 
     use super::*;
 
@@ -2260,43 +2321,142 @@ mod tests {
         assert!(!session.exit_was_clean());
     }
 
-    /// A refused herdr attach must outlive the flash `reap_exited_sessions`
-    /// would otherwise give it; every other combination reaps normally.
-    #[test]
-    fn should_reap_keeps_only_a_dirty_herdr_exit_on_screen() {
+    fn clean_status() -> ExitStatus {
         #[cfg(not(windows))]
         use std::os::unix::process::ExitStatusExt;
         #[cfg(windows)]
         use std::os::windows::process::ExitStatusExt;
+        ExitStatus::from_raw(0)
+    }
 
-        let clean = std::process::ExitStatus::from_raw(0);
-        #[cfg(windows)]
-        let dirty = std::process::ExitStatus::from_raw(1);
+    fn dirty_status() -> ExitStatus {
         #[cfg(not(windows))]
-        let dirty = std::process::ExitStatus::from_raw(1 << 8);
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+        #[cfg(windows)]
+        return ExitStatus::from_raw(1);
+        #[cfg(not(windows))]
+        return ExitStatus::from_raw(1 << 8);
+    }
 
-        let key = || herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
+    fn exited(status: ExitStatus, herdr_keyed: bool) -> Session {
+        let mut session = pty_less_probe(SessionKind::Shell, "shell");
+        session.exit_status = Some(status);
+        if herdr_keyed {
+            session.herdr_key =
+                Some(herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() });
+        }
+        session
+    }
+
+    /// A refused herdr attach must outlive the flash `reap_exited_sessions`
+    /// would otherwise give it; every other combination reaps normally.
+    #[test]
+    fn should_reap_keeps_only_a_dirty_herdr_exit_on_screen() {
+        let hold = HoldExitedSessions::Never;
 
         let not_exited = pty_less_probe(SessionKind::Shell, "shell");
-        assert!(!not_exited.should_reap());
+        assert!(!not_exited.should_reap(hold));
 
-        let mut plain_clean = pty_less_probe(SessionKind::Shell, "shell");
-        plain_clean.exit_status = Some(clean);
-        assert!(plain_clean.should_reap());
+        assert!(exited(clean_status(), false).should_reap(hold));
+        assert!(
+            exited(dirty_status(), false).should_reap(hold),
+            "an ordinary shell reaps whatever its exit code"
+        );
+        assert!(exited(clean_status(), true).should_reap(hold));
+        assert!(
+            !exited(dirty_status(), true).should_reap(hold),
+            "a refused attach must stay on screen to be read"
+        );
+    }
 
-        let mut plain_dirty = pty_less_probe(SessionKind::Shell, "shell");
-        plain_dirty.exit_status = Some(dirty);
-        assert!(plain_dirty.should_reap(), "an ordinary shell reaps whatever its exit code");
+    /// `hold_exited_sessions` only ever widens what stays on screen: the herdr
+    /// carve-out holds under every value, and no value reaps something
+    /// `"never"` would have held.
+    #[test]
+    fn hold_exited_sessions_widens_what_stays_on_screen() {
+        for (hold, plain_clean, plain_dirty) in [
+            (HoldExitedSessions::Never, true, true),
+            (HoldExitedSessions::OnError, true, false),
+            (HoldExitedSessions::Always, false, false),
+        ] {
+            assert_eq!(
+                exited(clean_status(), false).should_reap(hold),
+                plain_clean,
+                "{hold:?} on a clean shell exit"
+            );
+            assert_eq!(
+                exited(dirty_status(), false).should_reap(hold),
+                plain_dirty,
+                "{hold:?} on a crashed shell"
+            );
+            assert_eq!(
+                exited(clean_status(), true).should_reap(hold),
+                plain_clean,
+                "{hold:?} on a clean herdr detach"
+            );
+            assert!(
+                !exited(dirty_status(), true).should_reap(hold),
+                "{hold:?} must not reap a refused attach"
+            );
+        }
+    }
 
-        let mut herdr_clean = pty_less_probe(SessionKind::Shell, "shell");
-        herdr_clean.herdr_key = Some(key());
-        herdr_clean.exit_status = Some(clean);
-        assert!(herdr_clean.should_reap());
+    /// The notice lands in the grid, after the child's own last line, so it
+    /// scrolls and copies with the message it explains.
+    #[test]
+    fn a_held_session_ends_on_a_line_naming_the_chord() {
+        let session = pty_less_probe(SessionKind::Shell, "shell");
+        {
+            let mut term = session.term.lock();
+            Processor::<StdSyncHandler>::new().advance(&mut *term, b"herdr: server shut down");
+        }
+        session.write_hold_notice(Some("Enter"));
 
-        let mut herdr_dirty = pty_less_probe(SessionKind::Shell, "shell");
-        herdr_dirty.herdr_key = Some(key());
-        herdr_dirty.exit_status = Some(dirty);
-        assert!(!herdr_dirty.should_reap(), "a refused attach must stay on screen to be read");
+        let lines = session.screen_snapshot(0).lines;
+        let written: Vec<&String> = lines.iter().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(written.len(), 2, "{written:?}");
+        assert_eq!(written[0].trim_end(), "herdr: server shut down");
+        // Column zero, not wherever the child left the cursor.
+        assert!(written[1].starts_with("[alacritree] "), "{:?}", written[1]);
+        assert!(written[1].contains("press Enter to close it"), "{:?}", written[1]);
+    }
+
+    /// A TUI that died mid-frame leaves its own pen in the cursor template.
+    /// The notice has to lead with a reset or it inherits it — reverse video,
+    /// a colour, or `ESC[8m`, which paints it invisibly.
+    #[test]
+    fn the_notice_does_not_inherit_the_dead_childs_pen() {
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::Flags;
+
+        assert!(hold_notice_bytes(Some("Enter")).starts_with(b"\x1b[0m"));
+
+        let session = pty_less_probe(SessionKind::Shell, "shell");
+        {
+            let mut term = session.term.lock();
+            Processor::<StdSyncHandler>::new().advance(&mut *term, b"\x1b[7;1;8mdied mid-frame");
+        }
+        session.write_hold_notice(Some("Enter"));
+
+        let term = session.term.lock();
+        let row = &term.grid()[Line(1)];
+        let painted: Flags =
+            (0..12).map(|col| row[Column(col)].flags).fold(Flags::empty(), |acc, f| acc | f);
+        assert!(
+            !painted.intersects(Flags::INVERSE | Flags::BOLD | Flags::HIDDEN),
+            "notice inherited {painted:?}"
+        );
+    }
+
+    /// A user who unbound the action gets pointed at the palette instead of at
+    /// a key their config does not have.
+    #[test]
+    fn an_unbound_close_names_the_command_palette() {
+        assert!(hold_notice(None).contains("command palette"));
+        assert!(!hold_notice(None).contains("press"));
+        assert!(hold_notice(Some("Ctrl+Shift+W")).contains("press Ctrl+Shift+W to close it"));
     }
 
     /// Zero grace is the config default and must keep the pre-debounce
@@ -2749,6 +2909,13 @@ mod tests {
     fn the_live_axis_ranks_by_how_much_a_state_wants_a_human() {
         assert!(LiveState::Idle < LiveState::Working);
         assert!(LiveState::Working < LiveState::Blocked);
+    }
+
+    #[test]
+    fn live_state_labels_mirror_herdrs_own_words() {
+        assert_eq!(LiveState::Idle.label(), "idle");
+        assert_eq!(LiveState::Working.label(), "working");
+        assert_eq!(LiveState::Blocked.label(), "blocked");
     }
 
     #[test]

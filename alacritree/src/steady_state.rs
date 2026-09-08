@@ -90,30 +90,43 @@ mod tests {
             .collect()
     }
 
-    fn sessions(count: usize) -> Vec<(Option<std::path::PathBuf>, u64)> {
+    /// Sessions carrying the titles a live query makes the compare walk.  An
+    /// empty title compares without allocating whatever `matches` does with
+    /// it, so a fixture full of them cannot tell a borrowed comparison from
+    /// one that copies each title first.
+    fn sessions(count: usize) -> Vec<(Option<std::path::PathBuf>, u64, String)> {
         (0..count)
             .map(|i| {
                 (
                     Some(std::path::PathBuf::from(format!("/home/user/code/p0/worktree-{i}"))),
                     i as u64,
+                    format!("nvim src/worktree-{i}.rs"),
                 )
             })
             .collect()
     }
 
     fn inputs<'a>(
-        s: &'a [(Option<std::path::PathBuf>, u64)],
+        s: &'a [(Option<std::path::PathBuf>, u64, String)],
     ) -> impl Iterator<Item = SessionInput<'a>> {
-        s.iter().map(|(ws, id)| SessionInput { workspace: ws, id: *id, attention: false })
+        s.iter().map(|(ws, id, title)| SessionInput {
+            workspace: ws,
+            id: *id,
+            attention: false,
+            title,
+        })
     }
 
+    /// A live query that every title matches exercises the per-title compare
+    /// with no toggle filtering narrowing anything on top of it.
     #[test]
-    fn an_unchanged_frame_allocates_nothing() {
+    fn an_unchanged_frame_with_a_matching_query_allocates_nothing() {
         let projects = tree(10, 5);
         let live = sessions(150);
         let ui = UiInputs {
             session_rows_always: false,
-            query: "",
+            sessions_filter_counts_detached: false,
+            query: "worktree",
             toggles: 0,
             toggles_apply: true,
             pr_generation: 0,
@@ -134,12 +147,15 @@ mod tests {
         );
     }
 
+    /// Toggle filters plus a query that only some titles match exercise the
+    /// narrower projection on top of the per-title compare.
     #[test]
-    fn an_unchanged_filtering_frame_allocates_nothing() {
+    fn an_unchanged_frame_with_toggle_filters_and_a_narrow_query_allocates_nothing() {
         let projects = tree(10, 5);
         let live = sessions(150);
         let ui = UiInputs {
             session_rows_always: false,
+            sessions_filter_counts_detached: false,
             query: "worktree-3",
             toggles: 0b11,
             toggles_apply: true,
@@ -178,6 +194,7 @@ mod tests {
         let big = tree(50, 10);
         let ui = UiInputs {
             session_rows_always: false,
+            sessions_filter_counts_detached: false,
             query: "",
             toggles: 0,
             toggles_apply: true,
@@ -217,7 +234,8 @@ mod tests {
             let live = sessions(s);
             let ui = UiInputs {
                 session_rows_always: false,
-                query: "",
+                sessions_filter_counts_detached: false,
+                query: "worktree",
                 toggles: 0,
                 toggles_apply: true,
                 pr_generation: 0,

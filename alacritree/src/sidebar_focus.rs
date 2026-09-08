@@ -291,6 +291,9 @@ pub struct SessionInput<'a> {
     pub workspace: &'a WorkspaceKey,
     pub id: SessionId,
     pub attention: bool,
+    /// Empty unless a query is live: a title only changes the row set while
+    /// the filter is matching on one, and PTY titles change every prompt.
+    pub title: &'a str,
 }
 
 /// Sidebar UI inputs that change the projection without changing the model.
@@ -299,6 +302,10 @@ pub struct SessionInput<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct UiInputs<'a> {
     pub session_rows_always: bool,
+    /// Whether a listed herdr pane counts as occupancy for the sessions
+    /// toggle.  Flipping it moves the row set while the toggle bits hold
+    /// still, so the projection has to rebuild when it does.
+    pub sessions_filter_counts_detached: bool,
     pub query: &'a str,
     pub toggles: u32,
     /// Whether the toggles narrow rows this frame.  A search scope that stands
@@ -394,8 +401,9 @@ impl<'a> From<&'a Worktree> for WorktreeView<'a> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ObservedInputs {
     projects: Vec<ProjectInput>,
-    sessions: Vec<(WorkspaceKey, SessionId, bool)>,
+    sessions: Vec<(WorkspaceKey, SessionId, bool, String)>,
     session_rows_always: bool,
+    sessions_filter_counts_detached: bool,
     query: String,
     toggles: u32,
     toggles_apply: bool,
@@ -430,8 +438,11 @@ impl ObservedInputs {
                         .collect(),
                 })
                 .collect(),
-            sessions: sessions.map(|s| (s.workspace.clone(), s.id, s.attention)).collect(),
+            sessions: sessions
+                .map(|s| (s.workspace.clone(), s.id, s.attention, s.title.to_string()))
+                .collect(),
             session_rows_always: ui.session_rows_always,
+            sessions_filter_counts_detached: ui.sessions_filter_counts_detached,
             query: ui.query.to_string(),
             toggles: ui.toggles,
             toggles_apply: ui.toggles_apply,
@@ -457,6 +468,7 @@ impl ObservedInputs {
         ui: UiInputs<'_>,
     ) -> bool {
         if self.session_rows_always != ui.session_rows_always
+            || self.sessions_filter_counts_detached != ui.sessions_filter_counts_detached
             || self.query != ui.query
             || self.toggles != ui.toggles
             || self.toggles_apply != ui.toggles_apply
@@ -490,8 +502,11 @@ impl ObservedInputs {
         for s in sessions {
             visit();
             match self.sessions.get(seen) {
-                Some((ws, id, attention))
-                    if ws == s.workspace && *id == s.id && *attention == s.attention =>
+                Some((ws, id, attention, title))
+                    if ws == s.workspace
+                        && *id == s.id
+                        && *attention == s.attention
+                        && title == s.title =>
                 {
                     seen += 1;
                 },
@@ -517,6 +532,7 @@ mod tests {
     fn ui(query: &str, toggles: u32) -> UiInputs<'_> {
         UiInputs {
             session_rows_always: false,
+            sessions_filter_counts_detached: false,
             query,
             toggles,
             toggles_apply: true,
@@ -537,6 +553,7 @@ mod tests {
     ) -> UiInputs<'a> {
         UiInputs {
             session_rows_always: false,
+            sessions_filter_counts_detached: false,
             query,
             toggles,
             toggles_apply,
@@ -661,40 +678,45 @@ mod tests {
 
     #[test]
     fn every_observed_input_in_isolation_triggers_a_rebuild() {
-        let session = |ws: &'static WorkspaceKey, id, attention| SessionInput {
+        let session = |ws: &'static WorkspaceKey, id, attention, title| SessionInput {
             workspace: ws,
             id,
             attention,
+            title,
         };
         static HOME: WorkspaceKey = None;
 
-        let base = ObservedInputs::capture(&[], [session(&HOME, 1, false)].into_iter(), ui("", 0));
+        let base =
+            ObservedInputs::capture(&[], [session(&HOME, 1, false, "")].into_iter(), ui("", 0));
 
-        assert!(base.matches(&[], [session(&HOME, 1, false)].into_iter(), ui("", 0)));
+        assert!(base.matches(&[], [session(&HOME, 1, false, "")].into_iter(), ui("", 0)));
 
         // Each UI input on its own.
-        assert!(!base.matches(&[], [session(&HOME, 1, false)].into_iter(), ui("x", 0)));
-        assert!(!base.matches(&[], [session(&HOME, 1, false)].into_iter(), ui("", 0b01)));
-        assert!(!base.matches(&[], [session(&HOME, 1, false)].into_iter(), UiInputs {
+        assert!(!base.matches(&[], [session(&HOME, 1, false, "")].into_iter(), ui("x", 0)));
+        assert!(!base.matches(&[], [session(&HOME, 1, false, "")].into_iter(), ui("", 0b01)));
+        assert!(!base.matches(&[], [session(&HOME, 1, false, "")].into_iter(), UiInputs {
             session_rows_always: true,
-            query: "",
-            toggles: 0,
-            toggles_apply: true,
-            pr_generation: 0,
-            active_workspace: None,
-            active_branch: None,
-            herdr_generation: 0,
+            ..ui("", 0)
+        },));
+        // A herdr pane counting as occupancy adds and removes whole workspaces
+        // under the sessions toggle without moving a toggle bit.
+        assert!(!base.matches(&[], [session(&HOME, 1, false, "")].into_iter(), UiInputs {
+            sessions_filter_counts_detached: true,
+            ..ui("", 0)
         },));
 
-        // Each session input on its own: attention, id, count.
-        assert!(!base.matches(&[], [session(&HOME, 1, true)].into_iter(), ui("", 0)));
-        assert!(!base.matches(&[], [session(&HOME, 2, false)].into_iter(), ui("", 0)));
+        // Each session input on its own: attention, id, count, title.
+        assert!(!base.matches(&[], [session(&HOME, 1, true, "")].into_iter(), ui("", 0)));
+        assert!(!base.matches(&[], [session(&HOME, 2, false, "")].into_iter(), ui("", 0)));
         assert!(!base.matches(&[], std::iter::empty(), ui("", 0)));
         assert!(!base.matches(
             &[],
-            [session(&HOME, 1, false), session(&HOME, 2, false)].into_iter(),
+            [session(&HOME, 1, false, ""), session(&HOME, 2, false, "")].into_iter(),
             ui("", 0),
         ));
+        // A title-matched row appears and disappears as the title changes, so the
+        // projection has to rebuild when one does.
+        assert!(!base.matches(&[], [session(&HOME, 1, false, "nvim")].into_iter(), ui("", 0)));
     }
 
     #[test]

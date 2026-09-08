@@ -78,7 +78,9 @@ project, its Git worktrees.
 
 herdr is a terminal workspace manager for coding agents. When a herdr server is running, the agents it manages appear in the sidebar under the worktree each agent's working directory matches, dimmed and carrying the `◫` mark that says the pane belongs to herdr rather than to alacritree. A row names the agent's pane title where herdr reports one, with the agent kind in front of it as context, so two agents of one kind in one checkout can be told apart; an agent with no title is named by its kind alone. An agent whose directory matches no worktree — including one whose checkout has been removed — is listed under Home.
 
+- **Panes with no agent.** `[integrations.herdr] show_panes` widens the listing from the panes herdr detected an agent in to every pane it owns, so a herdr pane running a plain shell gets a row too. Such a row is named by the pane's own title and carries no status word, since `unknown` is what herdr calls an agent it cannot classify rather than a way of saying there is none. Opening one shares herdr's view of the tab that holds it: every `herdr agent` subcommand resolves its target through the agent registry, which holds nothing for such a pane, so a direct attach is never offered for it whatever `attach` says. The unit herdr can be pointed at is the tab, so in a tab holding several panes the attach lands on the whole split: the pane is drawn, but keyboard focus sits wherever herdr last left it, and herdr's own pane chord moves it.
 - **Attaching.** Enter or a click opens a session attached to that agent, and the row is replaced by the session's own row, which keeps the herdr mark so an attached agent still says where it lives. Hovering either row spells out the same sentence — the state, the harness, and what herdr calls the pane, with the way out after them. Detaching is herdr's own chord, not one of alacritree's, read from herdr's `config.toml` so a rebound `keys.prefix` or `keys.detach` is what you are told. The row's `×` ends the attach and leaves the pane running under herdr, so it offers to detach rather than to close, and the agent's own row comes back. Whether it asks first is `[ui] confirm_session_detach`, a switch of its own: a detach destroys nothing, so the busy question `confirm_session_close` asks has no answer here, and turning one off says nothing about the other.
+- **Finding an agent by name.** The command palette (`Ctrl+K`) lists agents alongside sessions: an attached one sits under *Open sessions*, named the way its sidebar row is, and one nothing is attached to sits under *Herdr agents*, where Enter attaches it in the workspace its working directory matched. Typing `herdr` brings up both kinds. The sidebar's own search (`/`) reaches agents and session titles too when `[ui] search_depth` is `"sessions"`, so a query naming one agent shows that agent rather than its whole workspace; at the default `"workspaces"` a query only ever matches project and worktree names, and a query naming the workspace still shows everything under it. A session the sidebar does not list has no row to match — by default a workspace's only shell is folded into its workspace row, which `session_display.sidebar_always` turns off.
 - **Order.** A workspace draws its own shell sessions first, then every herdr pane it holds — the sessions attached to one and the agents nothing is attached to alike — in herdr's own order. Attaching therefore changes how a pane is drawn and never where it sits, and neither does detaching or a restart. Reordering is for alacritree's own sessions: a herdr pane's place belongs to herdr, so drag and `MoveSessionUp` / `MoveSessionDown` pass over one. Sort the panes in herdr and the sidebar follows within a poll.
 - **Status.** The row's mark is herdr's own, so a pane carries one symbol whether you read it in herdr or in the sidebar. herdr distinguishes blocked, working, done and idle, and offers two indicator sets; alacritree follows whichever its `[ui] status_indicators` selects, drawing `● ● ● ○` for the dotted set and `× ◐ ✓ ○` for the symbol one, coloured red, yellow, teal and green out of your own palette. A status alacritree does not recognise is drawn as `·` rather than as idle. An attached agent's session row takes herdr's word too, so a dialog the pane title never mentions still reaches the sidebar, and attaching never repaints a pane in a different vocabulary.
 - **Native Windows.** herdr cannot attach a single agent there, so attaching focuses the pane in your own herdr window and shares the whole herdr session — the view resizes with the alacritree pane, and the tooltip says `shared view`. Each row still gets its own session, so every attached agent keeps its `×` and its place in the tab cycle. Every one of herdr's clients draws the same focused pane, though, so alacritree points herdr at the pane of whichever shared view you are looking at: switching to a session moves herdr's focus, in your own herdr window too. Moving that focus inside herdr rather than from the sidebar leaves the session showing a pane its row does not name, until you pick a row again. Both the focus and the session-name lookup are herdr processes, so they always run off the UI thread and the window keeps painting while herdr answers. `[integrations.herdr] attach = "session"` asks for that same shared view on every side, which is worth having where a direct attach costs you something: herdr repaints an attached pane row by row, so the terminal sees each soft wrap as a line break and a selection copies a wrapped command broken across lines, while herdr's own client knows where the wraps are.
@@ -442,6 +444,11 @@ search_scope       = "filtered"  # whether a sidebar search is confined by the
                                  # the toggles already allow
                                  # "all": a query reaches every row; the
                                  # toggles resume when it empties
+search_depth       = "workspaces"  # how far a sidebar query reaches
+                                   # "workspaces" (default): matches project
+                                   # and worktree names only
+                                   # "sessions": also matches session titles
+                                   # and herdr agent names
 sidebar_tooltips   = "elided"    # when a sidebar row spells its full name out
                                  # on hover — both sidebars, so a git panel
                                  # path answers to it like a worktree name
@@ -468,6 +475,10 @@ confirm_session_detach = true    # whether the × on a harness-managed row asks
                                  # before detaching. Its own switch, since a
                                  # detach leaves the pane running under its
                                  # harness and lists its row again
+sessions_filter_counts_detached = false  # whether the sidebar's sessions
+                                         # toggle also counts a listed detached
+                                         # herdr agent as occupying a workspace
+                                         # (default false)
 last_session_close = "respawn"   # what happens when the on-screen workspace
                                  # stops having sessions, whether the last one
                                  # closed or the worktree was deleted:
@@ -476,6 +487,20 @@ last_session_close = "respawn"   # what happens when the on-screen workspace
                                  # "ring_global" and "ring_project" move to the
                                  # nearest surviving session in the ring, else
                                  # home
+hold_exited_sessions = "never"   # whether a session whose child has exited
+                                 # stays on screen instead of closing with it
+                                 # "never" (default): every exit closes its
+                                 # session
+                                 # "on_error": a non-zero exit is held, so the
+                                 # error the child printed survives
+                                 # "always": any exit is held
+                                 # A held session writes one line into its own
+                                 # grid naming the key bound to
+                                 # CloseExitedSession, or the command palette
+                                 # when nothing is bound.
+                                 # A refused herdr attach is held whatever this
+                                 # says: its refusal message is the only report
+                                 # of what happened.
 pr_status          = false  # poll `gh` for each branch's open PR, which drives
                             # the PR row icons, the PR-state filters, and $pr
                             # below (default false)
@@ -509,9 +534,13 @@ bold_family        = "Inter Display"  # unset falls back to family
 italic_family      = "Inter"          # unset falls back to family
 bold_italic_family = "Inter Display"  # unset falls back to family
 
-[ui.session_display]        # startup defaults; key bindings toggle both at runtime
+[ui.session_display]        # sidebar_always and tabs_always are startup
+                            # defaults key bindings toggle at runtime
 sidebar_always = false      # keep a sidebar session row even with one session
 tabs_always    = false      # keep a tab-strip segment even with one session
+palette_marks  = false      # paint a session's sidebar status mark in its
+                            # command-palette row too, so a row reads the same
+                            # in both places
 
 [ui.session_reorder]        # startup default; ToggleSessionDrag flips drag at runtime
 drag  = false               # drag a session row with the mouse to reorder it
@@ -605,8 +634,15 @@ poll_interval_ms = 2000     # how often a reachable server is asked for its
                             # after one attempt, so a machine without herdr
                             # pays a single failed spawn; a side that has one
                             # is retried even while its server is down
-show_unmatched   = true     # list an agent whose directory matches no
+show_unmatched   = true     # list a pane whose directory matches no
                             # worktree under Home; false hides it instead
+show_panes       = false    # list every pane a herdr server owns, not only
+                            # the ones it detected an agent in. A pane running
+                            # a plain shell is named by its own title and
+                            # shows no status. Needs a herdr that knows
+                            # `pane list` (0.8.2 does); an older one reads as
+                            # no herdr on that side, and a side that never
+                            # answered is abandoned until restart
 attach           = "agent"  # what opening a row attaches to. "agent" opens the
                             # pane on its own; "session" opens the herdr session
                             # around it with that pane focused, which hands the
@@ -705,7 +741,7 @@ Two things worth knowing about what the schema does and does not do:
   `alacritty.toml` legitimately carries keys only the real alacritty acts on —
   `[hints]`, `[bell]`, `[mouse]`, `[general] import`. Those get no completion,
   but they are not flagged.
-- **Closed-value keys are completed.** `confirm_session_close`, `scrollbar`, `sidebar_focus`, `sidebar_scroll_align`, `search_scope`, `sidebar_tooltips`, `last_session_close`, `path_style.*` and `drop.quote` offer their accepted spellings. A binding's `action` completes from every action alacritree implements but rejects nothing, so an alacritty-only action still validates. Cursor `shape` and `blinking`, where Alacritty accepts more than one spelling for the same value, are deliberately left unconstrained, so a working config is never marked wrong.
+- **Closed-value keys are completed.** `confirm_session_close`, `scrollbar`, `sidebar_focus`, `sidebar_scroll_align`, `search_scope`, `sidebar_tooltips`, `last_session_close`, `hold_exited_sessions`, `path_style.*` and `drop.quote` offer their accepted spellings. A binding's `action` completes from every action alacritree implements but rejects nothing, so an alacritty-only action still validates. Cursor `shape` and `blinking`, where Alacritty accepts more than one spelling for the same value, are deliberately left unconstrained, so a working config is never marked wrong.
 
 [taplo]: https://taplo.tamasfe.dev/
 [ebt]: https://marketplace.visualstudio.com/items?itemName=tamasfe.even-better-toml

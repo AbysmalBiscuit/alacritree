@@ -79,6 +79,7 @@
                 "AddProject",
                 "ToggleSidebarFocus",
                 "CloseSession",
+                "CloseExitedSession",
                 "SidebarTop",
                 "SidebarBottom",
                 "SidebarNextProject",
@@ -100,6 +101,7 @@
                 "Quit",
                 "TogglePalette",
                 "ToggleSessionsFilter",
+                "ToggleDetachedSessionsFilter",
                 "ToggleAttentionFilter",
                 "TogglePrOpenFilter",
                 "TogglePrDraftFilter",
@@ -536,9 +538,14 @@
           "minimum": 0,
           "type": "integer"
         },
+        "show_panes": {
+          "default": false,
+          "description": "List every pane a herdr server owns, not only the ones it detected an\nagent in.  A pane running a plain shell gets a row named by its own\ntitle, carrying no status, and opening it shares herdr's view of the\ntab that holds it rather than attaching to the pane.\n\nNeeds a herdr that knows `pane list` (0.8.2 does).  An older one\nanswers with a usage error, which reads as no herdr on that side.  A\nside that has never answered is then abandoned for the process\nlifetime; one that answered before this was turned on keeps retrying\nand recovers when it goes back off.",
+          "type": "boolean"
+        },
         "show_unmatched": {
           "default": true,
-          "description": "List agents whose working directory matches no worktree, under Home.",
+          "description": "List panes whose working directory matches no worktree, under Home.",
           "type": "boolean"
         }
       },
@@ -985,6 +992,11 @@
     },
     "RawSessionDisplay": {
       "properties": {
+        "palette_marks": {
+          "default": false,
+          "description": "Paint a session's sidebar status mark in its command-palette row too.",
+          "type": "boolean"
+        },
         "sidebar_always": {
           "default": false,
           "description": "Show a workspace's sidebar session row even with a single session.",
@@ -1215,6 +1227,16 @@
           "description": "Draw the terminal grid through an OpenGL paint callback instead of\nhanding epaint a mesh.  It needs a GL 3 context and bypasses the\nrenderer every other panel goes through, so an unmodified config keeps\nthe path that has always drawn the grid.  A context too old for\ninstanced arrays logs once and paints the mesh from the next frame on.",
           "type": "boolean"
         },
+        "hold_exited_sessions": {
+          "default": "never",
+          "description": "Whether a session whose child has exited stays on screen instead of\nclosing with it: \"never\" | \"on_error\" | \"always\".  A held session\nwrites one line into its own grid naming the key that closes it.  A\nherdr attach that was refused is held whatever this says, since its\nrefusal message is the only report of what happened.",
+          "enum": [
+            "never",
+            "on_error",
+            "always"
+          ],
+          "type": "string"
+        },
         "icon_tooltips": {
           "default": true,
           "description": "Whether a sidebar icon explains itself on hover.",
@@ -1310,6 +1332,15 @@
           ],
           "type": "string"
         },
+        "search_depth": {
+          "default": "workspaces",
+          "description": "How far a sidebar query reaches: \"workspaces\" matches project and\nworktree names only; \"sessions\" also matches session titles and herdr\nagent names.",
+          "enum": [
+            "workspaces",
+            "sessions"
+          ],
+          "type": "string"
+        },
         "search_scope": {
           "default": "filtered",
           "description": "Whether a fuzzy query is confined by the panel's active toggle filters:\n\"filtered\" | \"all\".",
@@ -1326,6 +1357,11 @@
         "session_reorder": {
           "$ref": "#/$defs/RawSessionReorder",
           "description": "Whether session rows can be dragged, and how far a reorder may carry\na session."
+        },
+        "sessions_filter_counts_detached": {
+          "default": false,
+          "description": "Whether the sidebar's sessions toggle counts an unattached herdr row\nthe same as a live session — an agent nothing is attached to, and,\nonce `show_panes` is on, an agentless pane.",
+          "type": "boolean"
         },
         "sidebar_accent": {
           "anyOf": [

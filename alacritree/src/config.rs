@@ -584,8 +584,11 @@ pub struct HerdrConfig {
     pub enabled: bool,
     /// How often a reachable herdr server is re-polled for agent state.
     pub poll_interval: Duration,
-    /// List agents whose working directory matches no worktree, under Home.
+    /// List panes whose working directory matches no worktree, under Home.
     pub show_unmatched: bool,
+    /// List every pane a herdr server owns, not only the ones it detected an
+    /// agent in.
+    pub show_panes: bool,
     /// What a row opens.  Honoured per side; the native side of a Windows
     /// host attaches to the session whatever this says.
     pub attach: AttachMode,
@@ -805,6 +808,49 @@ fn parse_last_session_close(raw: &str) -> LastSessionClose {
     }
 }
 
+/// `[ui] hold_exited_sessions`: whether a session whose child has exited stays
+/// on screen instead of closing with it.
+///
+/// Alacritty spells this as a `--hold` CLI flag that holds after any exit;
+/// wezterm's three-way `exit_behavior` is followed instead, because the case
+/// that matters is a shell that died with a message worth reading, and holding
+/// every clean exit as well turns an ordinary `exit` into a screen the user has
+/// to dismiss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub enum HoldExitedSessions {
+    /// Close a session as soon as its child exits.
+    #[default]
+    Never,
+    /// Hold a session whose child exited non-zero, so its last output survives.
+    OnError,
+    /// Hold any exited session.
+    Always,
+}
+
+impl HoldExitedSessions {
+    /// Whether an exit with this status is held on screen.  A herdr refusal is
+    /// held regardless — see [`crate::session::Session::should_reap`].
+    pub fn holds(self, clean_exit: bool) -> bool {
+        match self {
+            Self::Never => false,
+            Self::OnError => !clean_exit,
+            Self::Always => true,
+        }
+    }
+}
+
+fn parse_hold_exited_sessions(raw: &str) -> HoldExitedSessions {
+    match raw {
+        "never" => HoldExitedSessions::Never,
+        "on_error" => HoldExitedSessions::OnError,
+        "always" => HoldExitedSessions::Always,
+        other => {
+            log::warn!("unknown ui.hold_exited_sessions value {other:?}, using \"never\"");
+            HoldExitedSessions::default()
+        },
+    }
+}
+
 /// How far the projects sidebar goes when the cursor's row stops being
 /// rendered.  Both values keep the cursor; they differ only in whether the
 /// terminal comes along.
@@ -894,6 +940,28 @@ fn parse_search_scope(raw: &str) -> SearchScope {
     }
 }
 
+/// `[ui] search_depth`: how far a sidebar query reaches.  `search_scope`
+/// says what a query is confined by; this says how far down it descends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub enum SearchDepth {
+    /// Matches project and worktree names only.
+    #[default]
+    Workspaces,
+    /// Also matches session titles and herdr agent names.
+    Sessions,
+}
+
+fn parse_search_depth(raw: &str) -> SearchDepth {
+    match raw {
+        "workspaces" => SearchDepth::Workspaces,
+        "sessions" => SearchDepth::Sessions,
+        other => {
+            log::warn!("unknown ui.search_depth value {other:?}, using \"workspaces\"");
+            SearchDepth::default()
+        },
+    }
+}
+
 /// `[ui.session_reorder] scope`: how far a session may travel when the user
 /// reorders it.  Widening it makes a reorder step able to change which
 /// workspace a session belongs to, which is why the default keeps a session
@@ -968,6 +1036,7 @@ fn parse_sidebar_tooltips(raw: &str) -> SidebarTooltips {
 pub struct SessionDisplay {
     pub sidebar_always: bool,
     pub tabs_always: bool,
+    pub palette_marks: bool,
 }
 
 /// alacritree-only `[ui.font]`: font family/size for the chrome (sidebars,
@@ -1211,8 +1280,18 @@ pub struct UiTheme {
     /// answer here, and a user who wants no close prompt may still want to
     /// be asked before losing the view.
     pub confirm_session_detach: bool,
+    /// Whether the sidebar's sessions toggle also counts a listed but
+    /// unattached herdr row as occupying a workspace — an agent nothing is
+    /// attached to, and, once `show_panes` is on, an agentless pane.  Off by
+    /// default: such a row is a `WorkspaceEntry::Agent`, not a
+    /// [`crate::session::Session`], so `false` reproduces the toggle's
+    /// original session-only behavior.
+    pub sessions_filter_counts_detached: bool,
     /// What closing the last session in the on-screen workspace does.
     pub last_session_close: LastSessionClose,
+    /// Whether an exited session stays on screen instead of closing with its
+    /// child.
+    pub hold_exited_sessions: HoldExitedSessions,
     /// How the projects sidebar repairs a cursor whose row stopped rendering.
     pub sidebar_focus: SidebarFocus,
     /// Whether the projects sidebar scrolls to the session on screen when it
@@ -1222,6 +1301,8 @@ pub struct UiTheme {
     pub sidebar_scroll_align: ScrollAlign,
     /// Whether a fuzzy query is confined by the panel's active toggle filters.
     pub search_scope: SearchScope,
+    /// How far a sidebar query reaches beyond workspace names.
+    pub search_depth: SearchDepth,
     /// When a sidebar row spells its full name out on hover.
     pub sidebar_tooltips: SidebarTooltips,
     /// Whether a sidebar icon explains itself on hover — what a button does,
@@ -1332,11 +1413,14 @@ impl Default for UiTheme {
             attention_grace: Duration::ZERO,
             confirm_session_close: ConfirmSessionClose::Never,
             confirm_session_detach: true,
+            sessions_filter_counts_detached: false,
             last_session_close: LastSessionClose::Respawn,
+            hold_exited_sessions: HoldExitedSessions::default(),
             sidebar_focus: SidebarFocus::default(),
             sidebar_follow_active: false,
             sidebar_scroll_align: ScrollAlign::default(),
             search_scope: SearchScope::default(),
+            search_depth: SearchDepth::default(),
             sidebar_tooltips: SidebarTooltips::default(),
             icon_tooltips: true,
             session_display: SessionDisplay::default(),
@@ -2528,6 +2612,8 @@ struct RawSessionDisplay {
     sidebar_always: bool,
     /// Draw a tab-strip segment even with a single session.
     tabs_always: bool,
+    /// Paint a session's sidebar status mark in its command-palette row too.
+    palette_marks: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2712,8 +2798,19 @@ struct RawHerdr {
     enabled: bool,
     /// How often a reachable herdr server is re-polled for agent state.
     poll_interval_ms: u64,
-    /// List agents whose working directory matches no worktree, under Home.
+    /// List panes whose working directory matches no worktree, under Home.
     show_unmatched: bool,
+    /// List every pane a herdr server owns, not only the ones it detected an
+    /// agent in.  A pane running a plain shell gets a row named by its own
+    /// title, carrying no status, and opening it shares herdr's view of the
+    /// tab that holds it rather than attaching to the pane.
+    ///
+    /// Needs a herdr that knows `pane list` (0.8.2 does).  An older one
+    /// answers with a usage error, which reads as no herdr on that side.  A
+    /// side that has never answered is then abandoned for the process
+    /// lifetime; one that answered before this was turned on keeps retrying
+    /// and recovers when it goes back off.
+    show_panes: bool,
     /// Whether opening a row attaches to that agent's pane directly
     /// ("agent") or to the herdr session around it with the pane focused
     /// ("session").
@@ -2734,6 +2831,7 @@ impl Default for RawHerdr {
             enabled: true,
             poll_interval_ms: 2000,
             show_unmatched: true,
+            show_panes: false,
             attach: "agent".to_string(),
         }
     }
@@ -2745,6 +2843,7 @@ impl RawHerdr {
             enabled: self.enabled,
             poll_interval: Duration::from_millis(self.poll_interval_ms),
             show_unmatched: self.show_unmatched,
+            show_panes: self.show_panes,
             attach: parse_attach_mode(&self.attach),
         }
     }
@@ -2779,11 +2878,22 @@ struct RawUi {
     /// Separate from `confirm_session_close` because a detach leaves the
     /// pane running and its row listed again.
     confirm_session_detach: bool,
+    /// Whether the sidebar's sessions toggle counts an unattached herdr row
+    /// the same as a live session — an agent nothing is attached to, and,
+    /// once `show_panes` is on, an agentless pane.
+    sessions_filter_counts_detached: bool,
     /// What happens when the on-screen workspace stops having sessions,
     /// whether a close or a worktree deletion took the last one:
     /// "respawn" | "navigate" | "ring_global" | "ring_project".
     #[schemars(extend("enum" = ["respawn", "navigate", "ring_global", "ring_project"]))]
     last_session_close: String,
+    /// Whether a session whose child has exited stays on screen instead of
+    /// closing with it: "never" | "on_error" | "always".  A held session
+    /// writes one line into its own grid naming the key that closes it.  A
+    /// herdr attach that was refused is held whatever this says, since its
+    /// refusal message is the only report of what happened.
+    #[schemars(extend("enum" = ["never", "on_error", "always"]))]
+    hold_exited_sessions: String,
     /// How far the projects sidebar goes when the cursor's row stops being
     /// rendered: "preserve" | "follow".
     #[schemars(extend("enum" = ["preserve", "follow"]))]
@@ -2801,6 +2911,11 @@ struct RawUi {
     /// "filtered" | "all".
     #[schemars(extend("enum" = ["filtered", "all"]))]
     search_scope: String,
+    /// How far a sidebar query reaches: "workspaces" matches project and
+    /// worktree names only; "sessions" also matches session titles and herdr
+    /// agent names.
+    #[schemars(extend("enum" = ["workspaces", "sessions"]))]
+    search_depth: String,
     /// When a sidebar row spells its full name out on hover:
     /// "elided" | "always" | "off".
     #[schemars(extend("enum" = ["elided", "always", "off"]))]
@@ -2898,11 +3013,14 @@ impl Default for RawUi {
             attention_grace_ms: 0,
             confirm_session_close: "never".to_string(),
             confirm_session_detach: true,
+            sessions_filter_counts_detached: false,
             last_session_close: "respawn".to_string(),
+            hold_exited_sessions: "never".to_string(),
             sidebar_focus: "preserve".to_string(),
             sidebar_follow_active: false,
             sidebar_scroll_align: "minimal".to_string(),
             search_scope: "filtered".to_string(),
+            search_depth: "workspaces".to_string(),
             sidebar_tooltips: "elided".to_string(),
             icon_tooltips: true,
             session_display: RawSessionDisplay::default(),
@@ -3133,16 +3251,20 @@ impl RawConfig {
             attention_grace: Duration::from_millis(self.ui.attention_grace_ms),
             confirm_session_close: parse_confirm_session_close(&self.ui.confirm_session_close),
             confirm_session_detach: self.ui.confirm_session_detach,
+            sessions_filter_counts_detached: self.ui.sessions_filter_counts_detached,
             last_session_close: parse_last_session_close(&self.ui.last_session_close),
+            hold_exited_sessions: parse_hold_exited_sessions(&self.ui.hold_exited_sessions),
             sidebar_focus: parse_sidebar_focus(&self.ui.sidebar_focus),
             sidebar_follow_active: self.ui.sidebar_follow_active,
             sidebar_scroll_align: parse_scroll_align(&self.ui.sidebar_scroll_align),
             search_scope: parse_search_scope(&self.ui.search_scope),
+            search_depth: parse_search_depth(&self.ui.search_depth),
             sidebar_tooltips: parse_sidebar_tooltips(&self.ui.sidebar_tooltips),
             icon_tooltips: self.ui.icon_tooltips,
             session_display: SessionDisplay {
                 sidebar_always: self.ui.session_display.sidebar_always,
                 tabs_always: self.ui.session_display.tabs_always,
+                palette_marks: self.ui.session_display.palette_marks,
             },
             session_reorder: SessionReorder {
                 drag: self.ui.session_reorder.drag,
@@ -3616,6 +3738,7 @@ mod tests {
         assert!(config.integrations.herdr.enabled);
         assert_eq!(config.integrations.herdr.poll_interval, Duration::from_millis(2000));
         assert!(config.integrations.herdr.show_unmatched);
+        assert!(!config.integrations.herdr.show_panes);
         assert_eq!(config.integrations.herdr.attach, AttachMode::Agent);
     }
 
@@ -3625,6 +3748,19 @@ mod tests {
         let config = config_from(toml);
         assert!(!config.integrations.herdr.enabled);
         assert_eq!(config.integrations.herdr.poll_interval, Duration::from_millis(5000));
+    }
+
+    /// Panes with no agent in them are opt-in: the key needs a herdr that
+    /// knows `pane list`, so a config that never names it keeps the listing it
+    /// has always had.
+    #[test]
+    fn herdr_pane_listing_is_opt_in() {
+        let config = config_from(
+            "[integrations.herdr]
+show_panes = true
+",
+        );
+        assert!(config.integrations.herdr.show_panes);
     }
 
     #[test]
@@ -3813,6 +3949,17 @@ mod tests {
     fn confirm_session_detach_can_be_turned_off() {
         let ui = ui_from_toml("[ui]\nconfirm_session_detach = false");
         assert!(!ui.confirm_session_detach);
+    }
+
+    #[test]
+    fn sessions_filter_counts_detached_defaults_to_off() {
+        assert!(!ui_from_toml("").sessions_filter_counts_detached);
+    }
+
+    #[test]
+    fn sessions_filter_counts_detached_can_be_turned_on() {
+        let ui = ui_from_toml("[ui]\nsessions_filter_counts_detached = true");
+        assert!(ui.sessions_filter_counts_detached);
     }
 
     #[test]
@@ -4073,6 +4220,42 @@ mod tests {
     }
 
     #[test]
+    fn hold_exited_sessions_defaults_to_never() {
+        assert_eq!(ui_from_toml("").hold_exited_sessions, HoldExitedSessions::Never);
+    }
+
+    #[test]
+    fn hold_exited_sessions_parses_every_value() {
+        for (raw, expected) in [
+            ("never", HoldExitedSessions::Never),
+            ("on_error", HoldExitedSessions::OnError),
+            ("always", HoldExitedSessions::Always),
+        ] {
+            let ui = ui_from_toml(&format!("[ui]\nhold_exited_sessions = \"{raw}\""));
+            assert_eq!(ui.hold_exited_sessions, expected, "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn hold_exited_sessions_invalid_falls_back_to_never() {
+        let ui = ui_from_toml("[ui]\nhold_exited_sessions = \"forever\"");
+        assert_eq!(ui.hold_exited_sessions, HoldExitedSessions::Never);
+    }
+
+    /// The clean/dirty split is the whole difference between the three values.
+    #[test]
+    fn hold_exited_sessions_holds_by_exit_status() {
+        for (policy, clean, dirty) in [
+            (HoldExitedSessions::Never, false, false),
+            (HoldExitedSessions::OnError, false, true),
+            (HoldExitedSessions::Always, true, true),
+        ] {
+            assert_eq!(policy.holds(true), clean, "{policy:?} on a clean exit");
+            assert_eq!(policy.holds(false), dirty, "{policy:?} on a non-zero exit");
+        }
+    }
+
+    #[test]
     fn search_scope_defaults_to_filtered() {
         let ui = ui_from_toml("");
         assert_eq!(ui.search_scope, SearchScope::Filtered);
@@ -4090,6 +4273,28 @@ mod tests {
     fn search_scope_invalid_falls_back_to_filtered() {
         let ui = ui_from_toml("[ui]\nsearch_scope = \"everywhere\"");
         assert_eq!(ui.search_scope, SearchScope::Filtered);
+    }
+
+    #[test]
+    fn search_depth_defaults_to_workspaces() {
+        let ui = ui_from_toml("");
+        assert_eq!(ui.search_depth, SearchDepth::Workspaces);
+    }
+
+    #[test]
+    fn search_depth_parses_both_values() {
+        for (raw, expected) in
+            [("workspaces", SearchDepth::Workspaces), ("sessions", SearchDepth::Sessions)]
+        {
+            let ui = ui_from_toml(&format!("[ui]\nsearch_depth = \"{raw}\""));
+            assert_eq!(ui.search_depth, expected, "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn search_depth_invalid_falls_back_to_workspaces() {
+        let ui = ui_from_toml("[ui]\nsearch_depth = \"everything\"");
+        assert_eq!(ui.search_depth, SearchDepth::Workspaces);
     }
 
     #[test]
@@ -4327,6 +4532,13 @@ program = "second"
         let ui = ui_from_toml("");
         assert!(!ui.session_display.sidebar_always);
         assert!(!ui.session_display.tabs_always);
+        assert!(!ui.session_display.palette_marks);
+    }
+
+    #[test]
+    fn session_display_parses_palette_marks() {
+        let ui = ui_from_toml("[ui.session_display]\npalette_marks = true");
+        assert!(ui.session_display.palette_marks);
     }
 
     #[test]
