@@ -1332,10 +1332,12 @@ pub struct UiTheme {
     /// answer here, and a user who wants no close prompt may still want to
     /// be asked before losing the view.
     pub confirm_session_detach: bool,
-    /// Whether the sidebar's sessions toggle also counts a listed detached
-    /// herdr agent as occupying a workspace.  Off by default: a detached
-    /// agent is a row (`WorkspaceEntry::Agent`), not a [`crate::session::Session`],
-    /// so `false` reproduces the toggle's original session-only behavior.
+    /// Whether the sidebar's sessions toggle also counts a listed but
+    /// unattached herdr row as occupying a workspace — an agent nothing is
+    /// attached to, and, once `show_panes` is on, an agentless pane.  Off by
+    /// default: such a row is a `WorkspaceEntry::Agent`, not a
+    /// [`crate::session::Session`], so `false` reproduces the toggle's
+    /// original session-only behavior.
     pub sessions_filter_counts_detached: bool,
     /// What closing the last session in the on-screen workspace does.
     pub last_session_close: LastSessionClose,
@@ -2631,9 +2633,10 @@ struct RawUi {
     /// Separate from `confirm_session_close` because a detach leaves the
     /// pane running and its row listed again. Default true.
     confirm_session_detach: Option<bool>,
-    /// Whether the sidebar's sessions toggle counts a listed detached herdr
-    /// agent the same as a live session.  Default false: an existing config
-    /// keeps the toggle's original session-only behavior.
+    /// Whether the sidebar's sessions toggle counts an unattached herdr row
+    /// the same as a live session — an agent nothing is attached to, and,
+    /// once `show_panes` is on, an agentless pane.  Default false: an
+    /// existing config keeps the toggle's original session-only behavior.
     sessions_filter_counts_detached: Option<bool>,
     /// What happens when the on-screen workspace stops having sessions,
     /// whether a close or a worktree deletion took the last one:
