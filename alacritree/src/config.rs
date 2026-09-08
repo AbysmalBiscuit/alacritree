@@ -1283,6 +1283,11 @@ pub struct UiTheme {
     /// answer here, and a user who wants no close prompt may still want to
     /// be asked before losing the view.
     pub confirm_session_detach: bool,
+    /// Whether the sidebar's sessions toggle also counts a listed detached
+    /// herdr agent as occupying a workspace.  Off by default: a detached
+    /// agent is a row (`WorkspaceEntry::Agent`), not a [`crate::session::Session`],
+    /// so `false` reproduces the toggle's original session-only behavior.
+    pub sessions_filter_counts_detached: bool,
     /// What closing the last session in the on-screen workspace does.
     pub last_session_close: LastSessionClose,
     /// How the projects sidebar repairs a cursor whose row stopped rendering.
@@ -1406,6 +1411,7 @@ impl Default for UiTheme {
             attention_grace: Duration::ZERO,
             confirm_session_close: ConfirmSessionClose::Never,
             confirm_session_detach: true,
+            sessions_filter_counts_detached: false,
             last_session_close: LastSessionClose::Respawn,
             sidebar_focus: SidebarFocus::default(),
             sidebar_follow_active: false,
@@ -2559,6 +2565,10 @@ struct RawUi {
     /// Separate from `confirm_session_close` because a detach leaves the
     /// pane running and its row listed again. Default true.
     confirm_session_detach: Option<bool>,
+    /// Whether the sidebar's sessions toggle counts a listed detached herdr
+    /// agent the same as a live session.  Default false: an existing config
+    /// keeps the toggle's original session-only behavior.
+    sessions_filter_counts_detached: Option<bool>,
     /// What happens when the on-screen workspace stops having sessions,
     /// whether a close or a worktree deletion took the last one:
     /// "respawn" (default) | "navigate" | "ring_global" | "ring_project".
@@ -2858,6 +2868,10 @@ impl RawConfig {
                 self.ui.confirm_session_close.as_deref(),
             ),
             confirm_session_detach: self.ui.confirm_session_detach.unwrap_or(true),
+            sessions_filter_counts_detached: self
+                .ui
+                .sessions_filter_counts_detached
+                .unwrap_or(false),
             last_session_close: parse_last_session_close(self.ui.last_session_close.as_deref()),
             sidebar_focus: parse_sidebar_focus(self.ui.sidebar_focus.as_deref()),
             sidebar_follow_active: self.ui.sidebar_follow_active.unwrap_or(false),
@@ -3555,6 +3569,17 @@ mod tests {
     fn confirm_session_detach_can_be_turned_off() {
         let ui = ui_from_toml("[ui]\nconfirm_session_detach = false");
         assert!(!ui.confirm_session_detach);
+    }
+
+    #[test]
+    fn sessions_filter_counts_detached_defaults_to_off() {
+        assert!(!ui_from_toml("").sessions_filter_counts_detached);
+    }
+
+    #[test]
+    fn sessions_filter_counts_detached_can_be_turned_on() {
+        let ui = ui_from_toml("[ui]\nsessions_filter_counts_detached = true");
+        assert!(ui.sessions_filter_counts_detached);
     }
 
     #[test]
