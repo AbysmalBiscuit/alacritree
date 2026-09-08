@@ -1007,6 +1007,7 @@ fn parse_sidebar_tooltips(raw: Option<&str>) -> SidebarTooltips {
 pub struct SessionDisplay {
     pub sidebar_always: bool,
     pub tabs_always: bool,
+    pub palette_marks: bool,
 }
 
 /// alacritree-only `[ui.font]`: font family/size for the chrome (sidebars,
@@ -2386,6 +2387,8 @@ struct RawSessionDisplay {
     sidebar_always: Option<bool>,
     /// Draw a tab-strip segment even with a single session.
     tabs_always: Option<bool>,
+    /// Paint a session's sidebar status mark in its command-palette row too.
+    palette_marks: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -2869,6 +2872,7 @@ impl RawConfig {
             session_display: SessionDisplay {
                 sidebar_always: self.ui.session_display.sidebar_always.unwrap_or(false),
                 tabs_always: self.ui.session_display.tabs_always.unwrap_or(false),
+                palette_marks: self.ui.session_display.palette_marks.unwrap_or(false),
             },
             session_reorder: SessionReorder {
                 drag: self.ui.session_reorder.drag.unwrap_or(false),
@@ -4091,6 +4095,13 @@ program = "second"
         let ui = ui_from_toml("");
         assert!(!ui.session_display.sidebar_always);
         assert!(!ui.session_display.tabs_always);
+        assert!(!ui.session_display.palette_marks);
+    }
+
+    #[test]
+    fn session_display_parses_palette_marks() {
+        let ui = ui_from_toml("[ui.session_display]\npalette_marks = true");
+        assert!(ui.session_display.palette_marks);
     }
 
     #[test]
