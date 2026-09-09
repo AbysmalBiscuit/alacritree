@@ -58,6 +58,11 @@ devkit run task clippy
 
 Two are not the command you would otherwise type. `fmt` runs nightly rustfmt, because ten of the fifteen options in `rustfmt.toml` are nightly-only and stable rustfmt ignores every one of them after a warning, reformatting files the change never touched. `test` runs nextest, which is installed only here, which is why `AGENTS.md` still names `cargo test` for Arnaud's CI.
 
+<critical>
+Never disable rustc cache via env var prefix.
+Caching works correctly on this system.
+</critical>
+
 ## Shared checkout
 
 Several agents work here at once, and `[harness] enforce_writes` refuses a write to any path the session has not claimed. Claim a file before editing it, under the identity the write harness matches on:
