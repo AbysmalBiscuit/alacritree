@@ -97,6 +97,7 @@ run = ["cargo", "build", "-p", "alacritree", "--locked"]
 # nothing here may fix. `-D clippy::disallowed_methods` is on the stacked
 # branches but not yet on master, making this stricter than master's CI and
 # aligned with where the fork is going.
+env = { ZCCACHE_PATH_REMAP = "off" }
 description = "Lint alacritree the way CI does"
 run = [
     "cargo",
