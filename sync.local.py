@@ -17,6 +17,16 @@ branch on a new machine seeds the checkout.  `--to-branch` and `--to-main`
 override that when a modification time is not the truth, after a clone that
 stamped every file at once.
 
+A run opens by pulling in what the feature worktrees hold.  Specs and plans
+belong in the main checkout, but an agent writes them where it is standing, and
+a document written into a worktree dies with the worktree.  Anything a worktree
+has that the main checkout does not is copied back before the branch is
+consulted.  It closes by sending the instruction files the other way: every
+worktree carries its own `AGENTS.local.md` and `CLAUDE.local.md`, seeded by
+devkit when the worktree is cut and refreshed by nothing else, so once the run
+has settled which copy of them wins, every worktree copy that disagrees is
+overwritten.
+
 Anything that reaches the branch is committed there, grouped so one run that
 touches an instruction file and two specs produces three commits rather than
 one describing all of it.  A file can also arrive on the branch's disk without
@@ -48,13 +58,19 @@ BRANCH = "docs/specs-and-plans"
 
 WORKING_DOCS = ("docs/superpowers/specs", "docs/superpowers/plans")
 
+#: The instruction files every worktree carries its own copy of.  `devkit
+#: issue setup` seeds them from `worktree_include` when the worktree is cut,
+#: and nothing refreshes them afterwards, so an old worktree reads rules the
+#: main checkout stopped following weeks ago.
+INSTRUCTIONS = ("AGENTS.local.md", "CLAUDE.local.md")
+
 #: Root files git ignores that the branch carries, grouped by the commit each
 #: one lands in.  A run that touches two groups produces two commits, because
 #: an instruction file and a build script are not one change.
 #:
 #: Each entry is (scope, conventional-commit type, what to call them, files).
 PAYLOAD = (
-    ("agents", "docs", "the local agent instructions", ("AGENTS.local.md", "CLAUDE.local.md")),
+    ("agents", "docs", "the local agent instructions", INSTRUCTIONS),
     ("devkit", "chore", "the local devkit config", ("devkit.local.toml",)),
     ("scripts", "chore", "the local scripts", ("sync.local.py", "install.local.py")),
     ("superpowers", "docs", "the working-docs README", ("docs/superpowers/README.md",)),
@@ -80,6 +96,16 @@ class Move:
     #: The destination has no such file, which is what separates "add" from
     #: "update" in the commit subject.
     created: bool
+
+
+@dataclass(frozen=True)
+class Copy:
+    """One file to place, and the worktree the run is placing it for."""
+
+    relative: str
+    source: Path
+    target: Path
+    origin: str
 
 
 def git(repo: Path, *args: str, check: bool = True) -> str:
@@ -132,6 +158,66 @@ def locate(start: Path) -> tuple[Path, Path, str | None]:
         )
     side = SIDE_MAIN if start == main else SIDE_BRANCH if start == branch_path else None
     return main, branch_path, side
+
+
+def feature_worktrees(start: Path, main: Path, branch: Path) -> list[tuple[Path, str]]:
+    """Every worktree that is neither the main checkout nor the branch's.
+
+    These are where the work happens, which makes them both the place stray
+    specs turn up and the place stale instructions are read.  A worktree git
+    still lists but whose directory is gone is dropped: `git worktree prune`
+    has not run yet, and there is nothing there to read or write.
+    """
+    return [
+        (resolved, name or path.name)
+        for path, name in worktrees(start)
+        if (resolved := path.resolve()) not in (main, branch) and resolved.is_dir()
+    ]
+
+
+def collect(main: Path, trees: list[tuple[Path, str]]) -> list[Copy]:
+    """Working documents that exist in a feature worktree and nowhere else.
+
+    Only documents the main checkout is missing come back.  A worktree copy
+    that merely differs is left alone: it is as likely to be a leftover from
+    whenever the worktree was cut as it is to be an edit, and the main checkout
+    is the side the branch is compared against.
+    """
+    found: list[Copy] = []
+    claimed: set[str] = set()
+    for tree, origin in trees:
+        for directory in WORKING_DOCS:
+            for path in sorted((tree / directory).glob("*.md")):
+                relative = f"{directory}/{path.name}"
+                if relative in claimed or (main / relative).exists():
+                    continue
+                claimed.add(relative)
+                found.append(Copy(relative, path, main / relative, origin))
+    return found
+
+
+def stale_instructions(main: Path, trees: list[tuple[Path, str]]) -> list[Copy]:
+    """Worktree copies of the instruction files that disagree with the main checkout.
+
+    The main checkout is always the source, which is why this runs at the end:
+    until the branch has had its say, `main` is not yet holding the copy that
+    won.
+    """
+    stale: list[Copy] = []
+    for tree, origin in trees:
+        for name in INSTRUCTIONS:
+            source, target = main / name, tree / name
+            if not source.exists() or (target.exists() and content(target) == content(source)):
+                continue
+            stale.append(Copy(name, source, target, origin))
+    return stale
+
+
+def copy_into(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # `copy2` carries the modification time across, so the next run sees two
+    # files that agree rather than one that looks newer for having been copied.
+    shutil.copy2(source, target)
 
 
 def tracked_files(main: Path, branch: Path) -> list[str]:
@@ -191,11 +277,7 @@ def uncommitted(branch: Path, names: list[str]) -> list[Move]:
 
 def apply(move: Move, main: Path, branch: Path) -> None:
     source, destination = (main, branch) if move.direction == TO_BRANCH else (branch, main)
-    target = destination / move.relative
-    target.parent.mkdir(parents=True, exist_ok=True)
-    # `copy2` carries the modification time across, so the next run sees two
-    # files that agree rather than one that looks newer for having been copied.
-    shutil.copy2(source / move.relative, target)
+    copy_into(source / move.relative, destination / move.relative)
 
 
 def topic(relative: str) -> str:
@@ -363,6 +445,19 @@ def main() -> int:
     print()
 
     acted = False
+    trees = feature_worktrees(here, main_checkout, branch)
+
+    # Strays come home before the branch is consulted, so a spec written in a
+    # worktree is compared against the branch on this run rather than the next.
+    strays = collect(main_checkout, trees)
+    if strays:
+        for stray in strays:
+            print(f"  add  <- {stray.relative}  (from {stray.origin})")
+        if not args.dry_run:
+            for stray in strays:
+                copy_into(stray.source, stray.target)
+            acted = True
+        print()
 
     # Payload the branch already holds uncommitted is committed before the
     # remote is merged, because a rebase wants a clean worktree and this is the
@@ -407,6 +502,20 @@ def main() -> int:
                 apply(move, main_checkout, branch)
             if not args.no_commit:
                 acted |= record(branch, commits(moves), args.trailer)
+        print()
+
+    # After the moves, because until they are applied the main checkout is not
+    # yet holding the copy of the instructions that won.
+    stale = stale_instructions(main_checkout, trees)
+    if stale:
+        for name in INSTRUCTIONS:
+            count = sum(1 for instruction in stale if instruction.relative == name)
+            if count:
+                print(f"  send -> {name}  ({count} worktree{'s' if count > 1 else ''})")
+        if not args.dry_run:
+            for instruction in stale:
+                copy_into(instruction.source, instruction.target)
+            acted = True
         print()
 
     if args.dry_run:
