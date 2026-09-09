@@ -141,7 +141,8 @@ The TL;DR is mine and it is never yours to write. The template emits the heading
 The template renders only when the command creates a PR. Editing an open one is still `gh pr edit`, and the shape has to be preserved by hand there.
 
 
-After opening PR, merge in the features into the `all-features` branch. Then run the `install.local.py` script.
+Before opening PR or whenever I ask you, cherry-pick your changes/features into the `all-features` branch (it's normally checked out in a worktree). Then run the `install.local.py` script inside the `all-features` worktree.
+This is important so I test features before a PR.
 
 ## Tracking features
 
