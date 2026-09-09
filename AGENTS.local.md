@@ -72,7 +72,7 @@ Without `DEVKIT_SESSION` the holder falls back to the parent pid, which differs 
 
 This checkout is a devkit project. `devkit.local.toml` configures it and is untracked, so it rides on the `docs/specs-and-plans` branch with the other local files.
 
-`worktree_include` names the untracked instructions copied into each new worktree, so an agent working there reads the same rules as one working here. After editing `AGENTS.local.md` or `CLAUDE.local.md`, push the change into worktrees that already exist:
+`worktree_include` names the untracked instructions copied into each new worktree, so an agent working there reads the same rules as one working here. It seeds them when the worktree is cut and nothing refreshes them afterwards, so after editing `AGENTS.local.md` or `CLAUDE.local.md` the change has to be pushed into the worktrees that already exist. A bare `sync.local.py` run does that as its last step; `devkit issue sync-includes --overwrite` does it on its own:
 
 ```sh
 devkit issue sync-includes --overwrite
@@ -82,7 +82,7 @@ devkit issue sync-includes --overwrite
 
 ## Specs and plans
 
-Specs go in `docs/superpowers/specs/`, plans in `docs/superpowers/plans/`, always in the main checkout. Written into a worktree they die with it.
+Specs go in `docs/superpowers/specs/`, plans in `docs/superpowers/plans/`, always in the main checkout. A sync run collects one written into a worktree back, but only when the main checkout has no file by that name, so write them here rather than relying on that.
 
 `.git/info/exclude` keeps `docs/superpowers/` untracked, so specs and plans stay off feature branches and out of PRs; PR descriptions carry the context instead. The one branch that tracks them is `docs/specs-and-plans`, which holds no code and exists so they survive worktree deletion and reach another machine.
 
@@ -96,9 +96,11 @@ uv run sync.local.py -d
 uv run sync.local.py
 ```
 
-A bare run is the whole round trip and takes no flags to be one: it commits whatever already sits on the branch uncommitted, rebases the branch onto its remote, moves files both ways, commits what landed, and pushes. `-d` (or `-n`) reports all of that and writes nothing. `--no-commit` and `--no-push` stop at the earlier steps.
+A bare run is the whole round trip and takes no flags to be one: it collects the working documents the feature worktrees hold and the main checkout does not, commits whatever already sits on the branch uncommitted, rebases the branch onto its remote, moves files both ways, commits what landed, copies the instruction files back out to every worktree whose copy differs, and pushes. `-d` (or `-n`) reports all of that and writes nothing. `--no-commit` and `--no-push` stop at the earlier steps.
 
 Direction is decided per file. One side missing it gets a copy; both sides holding different content sends the newer one, so writing a spec here pushes it onto the branch and pulling the branch on a new machine seeds this checkout. After a clone stamps every file at once, `--to-branch` or `--to-main` overrides that. Anything reaching the branch is committed there, one commit per logical change, and `--trailer` adds a `Co-Authored-By` line for an agent's commits.
+
+Both ends of that round trip reach past the two checkouts. Working documents come back from every feature worktree, because an agent writes them where it is standing. A worktree copy of a document the main checkout already has is left where it is: it is as likely to be a leftover from when the worktree was cut as an edit worth keeping. The instruction files go the other way once the run has settled which copy of them wins, which is what keeps an old worktree from reading rules this checkout stopped following.
 
 The push goes on whether the branch is ahead, not on whether that run is what put it there, so a commit made in the worktree by hand still reaches the remote. A rebase that conflicts is left standing for you to resolve rather than aborted.
 
