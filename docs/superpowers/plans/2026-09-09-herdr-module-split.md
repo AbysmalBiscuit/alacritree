@@ -10,7 +10,6 @@
 
 ## Global Constraints
 
-- **sccache is broken on this machine.** Every `cargo` or `devrun` invocation must be prefixed with `RUSTC_WRAPPER=` or the compile dies with "Failed to read response header".
 - **This is a shared checkout.** Claim every file before editing it: `DEVKIT_SESSION=$CLAUDE_CODE_SESSION_ID lockm acquire <abs path> --note "<why>"`. `lockm` is project-root scoped and takes no `--dir`.
 - **Pure move rule.** A task's diff may contain only: moved code, `use` statements, visibility keywords, `mod` declarations, and `pub use` re-exports. No renames, no signature changes, no logic edits, no reordering within a moved block. If the code looks wrong while you are moving it, leave it wrong and say so in your report.
 - **Comments move verbatim.** Do not reword, add, or delete a doc comment while moving it. Comments must never narrate the move: no "moved from", no "this PR", no "previously".
