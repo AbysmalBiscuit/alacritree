@@ -49,6 +49,7 @@
     "herdr": {
       "attach": "Agent",
       "enabled": true,
+      "follow_focus": "Herdr",
       "poll_interval": {
         "nanos": 0,
         "secs": 2
