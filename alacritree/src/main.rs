@@ -36,6 +36,7 @@ mod logging;
 mod mcp;
 mod modal_gate;
 mod mouse;
+mod multiplexer;
 #[cfg(target_os = "macos")]
 mod notify_macos;
 mod panel_filter;
