@@ -1204,7 +1204,7 @@
         },
         "confirm_session_detach": {
           "default": true,
-          "description": "Whether the sidebar × on a harness-managed row asks before detaching.\nSeparate from `confirm_session_close` because a detach leaves the\npane running and its row listed again.",
+          "description": "Whether the sidebar × on a harness-managed row asks before detaching,\nand whether DetachAllMultiplexerPanes asks once for the whole batch.\nSeparate from `confirm_session_close` because a detach leaves the\npane running and its row listed again.",
           "type": "boolean"
         },
         "decorations": {
