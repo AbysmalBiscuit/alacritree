@@ -12,6 +12,7 @@ mod command_ext;
 mod command_palette;
 mod config;
 mod crash_log;
+mod decoration_sprites;
 mod digest;
 mod doppler;
 mod file_drop;
@@ -21,6 +22,9 @@ mod frame_log;
 mod git_nav;
 mod git_status;
 mod glyph_cache;
+mod gpu_timing;
+mod grid_gl;
+mod grid_instances;
 mod ime;
 mod input;
 mod ipc;
@@ -154,7 +158,10 @@ fn main() -> eframe::Result<()> {
     if let Some(dir) = &log_dir {
         logging::prune_session_logs(dir);
     }
-    if config.debug.persistent_logging
+    // `gpu_timing` reports through the log stream, and a GUI-subsystem binary
+    // has no console for stderr to reach.  Asking for the report has to open
+    // the file it lands in, or it is written where nothing can read it.
+    if (config.debug.persistent_logging || config.debug.gpu_timing)
         && let Some(dir) = &log_dir
     {
         *log_sink.lock().unwrap_or_else(|e| e.into_inner()) = logging::open_session_log(dir);
