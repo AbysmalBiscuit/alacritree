@@ -10418,7 +10418,8 @@ impl AlacritreeApp {
             if count == 1 { "pane" } else { "panes" }
         );
 
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modal_gate, ModalKind::DetachAll);
         let frame = modal_frame(&theme);
         let mut confirmed = false;
         let mut cancelled = false;

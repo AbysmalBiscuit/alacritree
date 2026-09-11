@@ -21,6 +21,7 @@ use std::cell::Cell;
 pub enum ModalKind {
     Delete,
     CloseSession,
+    DetachAll,
     RemoveProject,
     Error,
     Palette,
