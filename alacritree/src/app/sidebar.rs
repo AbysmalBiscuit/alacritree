@@ -80,7 +80,7 @@ impl AlacritreeApp {
             return sidebar_nav::visible_rows(&self.projects, &listed);
         }
 
-        let apply = self.sidebar.filter.toggles_apply(self.search_scope);
+        let apply = self.sidebar.filter.toggles_apply(self.sidebar_focus_state.search_scope);
         let toggle_sessions = apply && self.sidebar.filter.is_toggled('s');
         let toggle_attention = apply && self.sidebar.filter.is_toggled('a');
         let pr_open = apply && self.sidebar.filter.is_toggled('o');
@@ -237,7 +237,7 @@ impl AlacritreeApp {
                         &self.sidebar.filter,
                         &self.config.ui.icons.search,
                         &theme,
-                        self.sidebar.filter.toggles_apply(self.search_scope),
+                        self.sidebar.filter.toggles_apply(self.sidebar_focus_state.search_scope),
                     );
                     projects_header_buttons(ui, &view, &mut requests);
                 });
@@ -464,7 +464,8 @@ impl AlacritreeApp {
         listed: &sidebar_nav::ListedRows,
     ) -> Vec<ProjectView> {
         let pr_enabled = self.config.ui.pr_status;
-        let any_pr_toggle = any_pr_toggle_active(&self.sidebar.filter, self.search_scope);
+        let any_pr_toggle =
+            any_pr_toggle_active(&self.sidebar.filter, self.sidebar_focus_state.search_scope);
         let current_workspace = self.current_workspace.as_deref();
         let live_branch = current_workspace
             .and_then(|p| self.git_panel.status.get(p))
