@@ -108,6 +108,9 @@ struct Theme {
     sidebar_tooltips: SidebarTooltips,
     /// Whether a sidebar button says what it does on hover.
     icon_tooltips: bool,
+    /// Where a row a sidebar scrolled to is parked; `None` is egui's own
+    /// minimal scroll.
+    scroll_align: Option<egui::Align>,
 }
 
 /// Logical-pixel (normal, heading) sizes for UI text.  `[ui.font] size`
@@ -169,6 +172,7 @@ impl Theme {
             path_style: config.ui.path_style,
             sidebar_tooltips: config.ui.sidebar_tooltips,
             icon_tooltips: config.ui.icon_tooltips,
+            scroll_align: config.ui.sidebar_scroll_align.align(),
         }
     }
 }
@@ -476,6 +480,11 @@ pub struct AlacritreeApp {
     sidebar_auto_shown: bool,
     /// One-shot: scroll the cursor row into view on the next sidebar paint.
     sidebar_cursor_moved: bool,
+    /// The workspace and session the projects panel last scrolled to, so a
+    /// change is detected by comparison rather than by every writer of those
+    /// two fields remembering to raise a flag.  Written only once a scroll
+    /// actually fires, so a change whose row renders nowhere is retried.
+    last_followed: (WorkspaceKey, Option<SessionId>),
     /// Fuzzy-search query and `s`/`a` toggle state for the projects panel.
     /// Transient: never persisted, never touches the `expanded` flag.
     project_filter: PanelFilter,
@@ -916,6 +925,7 @@ impl AlacritreeApp {
             reorder_mode: false,
             sidebar_auto_shown: false,
             sidebar_cursor_moved: false,
+            last_followed: (None, None),
             project_filter: PanelFilter::new(project_filter_toggles(config.ui.pr_status)),
             git_filter: PanelFilter::new(GIT_FILTER_TOGGLES),
             search_scope: config.ui.search_scope,
@@ -1551,6 +1561,8 @@ impl AlacritreeApp {
             return;
         };
         let workspace = self.sessions[idx].working_directory.clone();
+        let policy = self.config.ui.last_session_close;
+        let ring = policy.rings().then(|| self.session_ring()).unwrap_or_default();
         self.sessions.remove(idx);
 
         let remaining: Vec<(WorkspaceKey, SessionId)> =
@@ -1570,15 +1582,24 @@ impl AlacritreeApp {
         // Closing the on-screen workspace's last session must not strand the
         // view on an empty pane. What happens instead is policy: `respawn`
         // recycles a shell in place (the last session is by design
-        // unclosable), `navigate` falls back to the project main, then home.
+        // unclosable), `navigate` falls back to the project main, then home,
+        // and the ring policies land on the nearest surviving session in the
+        // flat session ring instead.
         let main = workspace.as_deref().and_then(|p| project_main_for(&self.projects, p));
-        let verdict = close_navigation(
+        let mut verdict = close_navigation(
             reason,
             close_fallback(&workspace, &self.current_workspace, &remaining, main),
         );
-        if verdict != CloseFallback::Stay
-            && self.config.ui.last_session_close == LastSessionClose::Respawn
-        {
+        if verdict != CloseFallback::Stay && policy.rings() {
+            let prefer = policy
+                .prefers_project()
+                .then(|| sidebar_nav::project_of(&self.projects, &workspace))
+                .flatten();
+            if let Some((_, landing)) = ring_landing(&ring, &[id], prefer) {
+                verdict = CloseFallback::ActivateSession(landing);
+            }
+        }
+        if verdict != CloseFallback::Stay && policy == LastSessionClose::Respawn {
             if let Err(e) = self.spawn_session(ctx, workspace.clone()) {
                 self.report_spawn_failure(ctx, &workspace, &e);
             }
@@ -1595,8 +1616,8 @@ impl AlacritreeApp {
         self.apply_close_fallback(ctx, verdict);
     }
 
-    /// Act on a close verdict: stay put, move to the project's main checkout,
-    /// or go home.
+    /// Act on a removal verdict: stay put, move to the project's main
+    /// checkout, move to a session the ring chose, or go home.
     fn apply_close_fallback(&mut self, ctx: &Context, verdict: CloseFallback) {
         match verdict {
             CloseFallback::Stay => {},
@@ -1604,6 +1625,10 @@ impl AlacritreeApp {
                 self.activate_worktree(ctx, &main);
                 // Adopting an existing idle session produces no PTY event, so
                 // nothing else would wake the paint that shows it.
+                ctx.request_repaint();
+            },
+            CloseFallback::ActivateSession(id) => {
+                self.activate_session_by_id(id);
                 ctx.request_repaint();
             },
             CloseFallback::Home => {
@@ -2001,6 +2026,10 @@ impl AlacritreeApp {
         }
     }
 
+    /// Every workspace the app is willing to switch to, in sidebar order.
+    /// Duplicates are kept: git lets two projects list one path, and
+    /// dropping the second would change what `cycle_workspaces` visits for
+    /// a user who configured nothing.
     fn workspace_order(&self) -> Vec<WorkspaceKey> {
         let mut order: Vec<WorkspaceKey> = vec![None];
         for project in &self.projects {
@@ -2012,6 +2041,26 @@ impl AlacritreeApp {
             }
         }
         order
+    }
+
+    /// The flat session ring, tagged with each workspace's owning project.
+    /// Callers build it only under a ring policy: it allocates per removal.
+    fn session_ring(&self) -> Vec<RingEntry> {
+        self.workspace_order()
+            .into_iter()
+            .flat_map(|workspace| {
+                let project =
+                    sidebar_nav::project_of(&self.projects, &workspace).map(Path::to_path_buf);
+                self.workspace_session_indices(&workspace)
+                    .into_iter()
+                    .map(|i| RingEntry {
+                        project: project.clone(),
+                        workspace: workspace.clone(),
+                        id: self.sessions[i].id,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     fn add_project_via_dialog(&mut self, ctx: &Context) {
@@ -3646,20 +3695,58 @@ impl AlacritreeApp {
         let cursor_moved = std::mem::take(&mut self.sidebar_cursor_moved);
         let scrolls = |is_cursor: bool| is_cursor && cursor_moved;
 
+        let filtering = self.project_filter.is_filtering();
+        let active_now = self.active_session.get(&self.current_workspace).copied();
+        // egui keeps one scroll target per frame and the last writer wins, so the
+        // two reasons to scroll are resolved here rather than by paint order.  An
+        // explicit cursor move outranks following the terminal.
+        let wants_follow = sidebar_nav::wants_follow(
+            self.config.ui.sidebar_follow_active,
+            cursor_moved,
+            &self.last_followed,
+            &self.current_workspace,
+            active_now,
+        );
+        let rows: Vec<SidebarRow> = if filtering || wants_follow {
+            match &self.sidebar_rows_cache {
+                Some(rows) => rows.clone(),
+                None => self.current_project_rows(),
+            }
+        } else {
+            Vec::new()
+        };
+        let follow_row = wants_follow
+            .then(|| {
+                let project_root = sidebar_nav::project_of(&self.projects, &self.current_workspace)
+                    .map(Path::to_path_buf);
+                sidebar_nav::follow_scroll_row(
+                    &rows,
+                    &self.current_workspace,
+                    active_now,
+                    project_root.as_deref(),
+                )
+            })
+            .flatten();
+        if follow_row.is_some() {
+            self.last_followed = (self.current_workspace.clone(), active_now);
+        }
+        // `Project`/`Worktree` rows carry a `PathBuf`; matching by reference
+        // here (mirroring the `cursor_row` matches below) keeps every scroll
+        // check on the paint path allocation-free, follow target or not.
+        let follows_home = follow_row == Some(SidebarRow::Home);
+        let follows_session = |id: SessionId| follow_row == Some(SidebarRow::Session(id));
+        let follows_project = |root: &Path| matches!(&follow_row, Some(SidebarRow::Project(r)) if r.as_path() == root);
+        let follows_worktree = |path: &Path| matches!(&follow_row, Some(SidebarRow::Worktree(p)) if p.as_path() == path);
+
         // Membership for the active filter, resolved once so paint can skip
         // non-surviving rows.  While filtering, matched projects render their
         // matched worktrees regardless of `expanded` (display-only — the flag
         // is never written).
-        let filtering = self.project_filter.is_filtering();
         let mut home_visible = true;
         let mut visible_projects: HashSet<PathBuf> = HashSet::new();
         let mut visible_worktrees: HashSet<PathBuf> = HashSet::new();
         if filtering {
             home_visible = false;
-            let rows = match &self.sidebar_rows_cache {
-                Some(rows) => rows.clone(),
-                None => self.current_project_rows(),
-            };
             for row in rows {
                 match row {
                     SidebarRow::Home => home_visible = true,
@@ -3932,7 +4019,7 @@ impl AlacritreeApp {
                             ui,
                             self.current_workspace.is_none(),
                             home_is_cursor,
-                            scrolls(home_is_cursor),
+                            scrolls(home_is_cursor) || follows_home,
                             home_attention,
                             home_activity,
                             &icons,
@@ -3950,7 +4037,7 @@ impl AlacritreeApp {
                                 &cursor_row,
                                 Some(SidebarRow::Session(id)) if *id == row.id
                             );
-                            let scroll = scrolls(is_cursor);
+                            let scroll = scrolls(is_cursor) || follows_session(row.id);
                             let act = session_row(
                                 ui,
                                 row,
@@ -4116,15 +4203,15 @@ impl AlacritreeApp {
                         );
                         let header_is_cursor =
                             matches!(&cursor_row, Some(SidebarRow::Project(r)) if *r == project.root);
+                        let header_rect = egui::Rect::from_x_y_ranges(
+                            ui.max_rect().x_range(),
+                            row_rect.y_range(),
+                        );
                         if header_is_cursor {
-                            let rect = egui::Rect::from_x_y_ranges(
-                                ui.max_rect().x_range(),
-                                row_rect.y_range(),
-                            );
-                            paint_cursor_outline(ui, rect, &theme);
-                            if scrolls(header_is_cursor) {
-                                ui.scroll_to_rect(rect, None);
-                            }
+                            paint_cursor_outline(ui, header_rect, &theme);
+                        }
+                        if scrolls(header_is_cursor) || follows_project(&project.root) {
+                            ui.scroll_to_rect(header_rect, theme.scroll_align);
                         }
 
                         // Drop target for a reorder drag.  Detected against the
@@ -4249,7 +4336,7 @@ impl AlacritreeApp {
                                     &cursor_row,
                                     Some(SidebarRow::Worktree(p)) if *p == wt.path
                                 );
-                                let wt_scroll = scrolls(is_cursor);
+                                let wt_scroll = scrolls(is_cursor) || follows_worktree(&wt.path);
                                 let is_deleting = deleting_paths.contains(&wt.path);
                                 // A `\\wsl.localhost\` stat boots the distro's
                                 // 9P server, so probing one would restart a VM
@@ -4313,7 +4400,7 @@ impl AlacritreeApp {
                                         &cursor_row,
                                         Some(SidebarRow::Session(id)) if *id == row.id
                                     );
-                                    let scroll = scrolls(is_cursor);
+                                    let scroll = scrolls(is_cursor) || follows_session(row.id);
                                     let act = session_row(
                                         ui,
                                         row,
@@ -6470,7 +6557,7 @@ fn paint_git_row_cursor(
     let rect = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), resp.rect.y_range());
     paint_cursor_outline(ui, rect, theme);
     if scroll_into_view {
-        ui.scroll_to_rect(rect, None);
+        ui.scroll_to_rect(rect, theme.scroll_align);
     }
 }
 
@@ -6727,7 +6814,7 @@ fn home_row(
         paint_cursor_outline(ui, full_rect, theme);
     }
     if scroll_into_view {
-        ui.scroll_to_rect(full_rect, None);
+        ui.scroll_to_rect(full_rect, theme.scroll_align);
     }
     HomeAction { activate: resp.clicked() && !spawn_clicked, spawn: spawn_clicked, rect: full_rect }
 }
@@ -6914,6 +7001,8 @@ enum CloseFallback {
     Stay,
     /// Switch to the project's main checkout, which still has a session.
     Activate(PathBuf),
+    /// A session in another workspace, chosen by `ring_landing`.
+    ActivateSession(SessionId),
     /// Switch to home; `activate_home` spawns a shell there if none exists.
     Home,
 }
@@ -6995,6 +7084,56 @@ fn close_fallback(
     }
 }
 
+/// One session's place in the flat ring: workspaces in sidebar order, each
+/// workspace's sessions in spawn order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RingEntry {
+    /// The owning project's root, from `project_of`.  None for home.
+    project: Option<PathBuf>,
+    workspace: WorkspaceKey,
+    id: SessionId,
+}
+
+/// The session a removal lands on under the `ring_*` policies.  `ring` is the
+/// flat session ring captured before the removal and `removed` is what left
+/// it: one session for a close, a worktree's whole list for a delete.
+/// Successor first, the earliest survivor past the last removed entry, else
+/// the latest survivor before the first.
+///
+/// `prefer` is the removed workspace's owning project under `ring_project`,
+/// and None under `ring_global` and for home.  When set, the search runs over
+/// that project's entries before running over the whole ring.
+///
+/// A path two projects both list appears in the ring twice.  Both entries
+/// carry the same `project_of` tag and name the same session, so a duplicate
+/// changes no answer; indices are taken by first occurrence, the way
+/// `session_ring_target` takes them.
+fn ring_landing(
+    ring: &[RingEntry],
+    removed: &[SessionId],
+    prefer: Option<&Path>,
+) -> Option<(WorkspaceKey, SessionId)> {
+    let positions: Vec<usize> =
+        removed.iter().filter_map(|id| ring.iter().position(|e| e.id == *id)).collect();
+    let first = *positions.iter().min()?;
+    let last = *positions.iter().max()?;
+
+    let search = |group: Option<&Path>| {
+        let in_group = |e: &RingEntry| match group {
+            Some(root) => e.project.as_deref() == Some(root),
+            None => true,
+        };
+        let survives = |e: &RingEntry| !removed.contains(&e.id);
+        ring[last + 1..]
+            .iter()
+            .find(|e| in_group(e) && survives(e))
+            .or_else(|| ring[..first].iter().rev().find(|e| in_group(e) && survives(e)))
+            .map(|e| (e.workspace.clone(), e.id))
+    };
+
+    prefer.and_then(|root| search(Some(root))).or_else(|| search(None))
+}
+
 /// A close-fallback verdict the reconciler owes the terminal, and the worktree
 /// whose rows must already read as gone.  The verdict is carried rather than
 /// recomputed because only `close_fallback` knows the difference between
@@ -7004,7 +7143,8 @@ struct DeferredClose {
     verdict: CloseFallback,
     /// Set when an asynchronous worktree deletion is in flight: `projects`
     /// still lists it, so without this the reconciler would see an intact row
-    /// and could spawn a shell inside the directory being removed.
+    /// and could spawn a shell inside the directory being removed.  It pairs
+    /// with any verdict, including a ring landing in another project.
     removed_worktree: Option<PathBuf>,
 }
 
@@ -7052,7 +7192,8 @@ fn plan_move(
 /// is the main (including non-git roots, whose single pseudo-worktree is
 /// its own main) or belongs to no known project.
 fn project_main_for(projects: &[Project], ws: &Path) -> Option<PathBuf> {
-    let project = projects.iter().find(|p| p.worktrees.iter().any(|w| w.path == ws))?;
+    let root = sidebar_nav::project_of(projects, &Some(ws.to_path_buf()))?;
+    let project = projects.iter().find(|p| p.root == root)?;
     let main = project.worktrees.iter().find(|w| w.is_main)?;
     if main.path == ws { None } else { Some(main.path.clone()) }
 }
@@ -7495,7 +7636,7 @@ fn worktree_row(
         paint_cursor_outline(ui, full_rect, theme);
     }
     if scroll_into_view {
-        ui.scroll_to_rect(full_rect, None);
+        ui.scroll_to_rect(full_rect, theme.scroll_align);
     }
     WorktreeAction {
         // A prunable row is still worth clicking when shells are homed there;
@@ -7633,7 +7774,7 @@ fn session_row(
         paint_cursor_outline(ui, full_rect, theme);
     }
     if scroll_into_view {
-        ui.scroll_to_rect(full_rect, None);
+        ui.scroll_to_rect(full_rect, theme.scroll_align);
     }
     if draggable {
         resp.dnd_set_drag_payload(DraggedSession(row.id));
@@ -8348,23 +8489,54 @@ impl AlacritreeApp {
             return;
         };
         let project_root = self.projects[req.project_idx].root.clone();
+        let policy = self.config.ui.last_session_close;
+        let ring = policy.rings().then(|| self.session_ring()).unwrap_or_default();
+        let removed: Vec<SessionId> = policy
+            .rings()
+            .then(|| {
+                self.sessions
+                    .iter()
+                    .filter(|s| s.working_directory.as_deref() == Some(&req.worktree_path))
+                    .map(|s| s.id)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // Drop sessions whose cwd is the worktree before deleting it; the PTY
         // would otherwise block the directory removal on some filesystems.
         self.sessions.retain(|s| s.working_directory.as_deref() != Some(&req.worktree_path));
         self.active_session.remove(&Some(req.worktree_path.clone()));
         if self.current_workspace.as_deref() == Some(&req.worktree_path) {
+            let landing = policy
+                .rings()
+                .then(|| {
+                    let prefer = policy
+                        .prefers_project()
+                        .then(|| {
+                            sidebar_nav::project_of(
+                                &self.projects,
+                                &Some(req.worktree_path.clone()),
+                            )
+                        })
+                        .flatten();
+                    ring_landing(&ring, &removed, prefer)
+                })
+                .flatten();
+            let verdict = match landing {
+                Some((_, id)) => CloseFallback::ActivateSession(id),
+                None => CloseFallback::Home,
+            };
             if defers_close_navigation(self.config.ui.sidebar_focus) {
                 self.sidebar_deferred_close = Some(DeferredClose {
-                    verdict: CloseFallback::Home,
+                    verdict,
                     removed_worktree: Some(req.worktree_path.clone()),
                 });
                 ctx.request_repaint();
             } else {
                 // Deleting the on-screen worktree is an explicit user action,
-                // so home should greet with a live shell rather than the "no
-                // session" placeholder.
-                self.activate_home(ctx);
+                // so the view should greet with a live shell rather than the
+                // "no session" placeholder.
+                self.apply_close_fallback(ctx, verdict);
             }
         }
 
@@ -10280,6 +10452,97 @@ mod tests {
         assert_eq!(session_ring_target(&ring, None, 1), Some((None, 1)));
         // An active session missing from the ring does nothing.
         assert_eq!(session_ring_target(&ring, Some(9), 1), None);
+    }
+
+    fn entry(project: Option<&str>, workspace: &str, id: SessionId) -> RingEntry {
+        RingEntry { project: project.map(PathBuf::from), workspace: ws(workspace), id }
+    }
+
+    /// The tree from the spec: home holds nothing, p1 owns w1 and w2, p2 owns
+    /// w3.  Ring order is sidebar order, so p1's sessions precede p2's.
+    fn spec_ring() -> Vec<RingEntry> {
+        vec![
+            entry(Some("/p1"), "/p1/w1", 1),
+            entry(Some("/p1"), "/p1/w2", 2),
+            entry(Some("/p2"), "/p2/w3", 3),
+        ]
+    }
+
+    #[test]
+    fn a_close_lands_on_the_successor() {
+        assert_eq!(ring_landing(&spec_ring(), &[1], None), Some((ws("/p1/w2"), 2)));
+    }
+
+    #[test]
+    fn a_close_at_the_tail_lands_on_the_predecessor() {
+        assert_eq!(ring_landing(&spec_ring(), &[3], None), Some((ws("/p1/w2"), 2)));
+    }
+
+    /// A worktree deletion takes every session in the workspace at once, so
+    /// the successor is measured past the last of them and the predecessor
+    /// before the first.
+    #[test]
+    fn a_deletion_steps_over_every_session_it_removed() {
+        let ring = vec![
+            entry(Some("/p1"), "/p1/w1", 1),
+            entry(Some("/p1"), "/p1/w2", 2),
+            entry(Some("/p1"), "/p1/w2", 3),
+            entry(Some("/p2"), "/p2/w3", 4),
+        ];
+        assert_eq!(ring_landing(&ring, &[2, 3], None), Some((ws("/p2/w3"), 4)));
+    }
+
+    #[test]
+    fn an_empty_ring_and_an_unknown_removal_have_no_landing() {
+        assert_eq!(ring_landing(&[], &[1], None), None);
+        assert_eq!(ring_landing(&spec_ring(), &[99], None), None);
+    }
+
+    #[test]
+    fn removing_everything_leaves_no_landing() {
+        assert_eq!(ring_landing(&spec_ring(), &[1, 2, 3], None), None);
+    }
+
+    #[test]
+    fn prefer_project_takes_its_own_project_over_a_nearer_neighbour() {
+        // p2's session sits between the two p1 sessions, so a global search
+        // from id 1 finds id 9 and a project-preferring one finds id 2.
+        let ring = vec![
+            entry(Some("/p1"), "/p1/w1", 1),
+            entry(Some("/p2"), "/p2/w3", 9),
+            entry(Some("/p1"), "/p1/w2", 2),
+        ];
+        assert_eq!(ring_landing(&ring, &[1], None), Some((ws("/p2/w3"), 9)));
+        assert_eq!(ring_landing(&ring, &[1], Some(Path::new("/p1"))), Some((ws("/p1/w2"), 2)));
+    }
+
+    /// `ring_project` is `ring_global` plus a first pass, so the two must
+    /// agree whenever that pass finds nothing.
+    #[test]
+    fn prefer_project_falls_through_to_the_whole_ring() {
+        let ring = spec_ring();
+        assert_eq!(
+            ring_landing(&ring, &[3], Some(Path::new("/p2"))),
+            ring_landing(&ring, &[3], None),
+        );
+    }
+
+    #[test]
+    fn home_has_no_project_to_prefer() {
+        let ring = vec![entry(None, "/home-placeholder", 1), entry(Some("/p1"), "/p1/w1", 2)];
+        assert_eq!(ring_landing(&ring, &[1], None), Some((ws("/p1/w1"), 2)));
+    }
+
+    /// A path two projects list is in the ring twice with one owner, so
+    /// either occurrence resolves to the same landing.
+    #[test]
+    fn a_duplicated_workspace_changes_no_landing() {
+        let ring = vec![
+            entry(Some("/p1"), "/shared", 1),
+            entry(Some("/p1"), "/shared", 1),
+            entry(Some("/p2"), "/p2/w", 2),
+        ];
+        assert_eq!(ring_landing(&ring, &[1], None), Some((ws("/p2/w"), 2)));
     }
 
     #[test]

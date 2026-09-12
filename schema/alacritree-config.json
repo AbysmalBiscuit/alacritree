@@ -1108,10 +1108,12 @@
           "description": "Sidebar glyph overrides."
         },
         "last_session_close": {
-          "description": "What closing the on-screen workspace's last session does:\n\"respawn\" (default) | \"navigate\".",
+          "description": "What happens when the on-screen workspace stops having sessions,\nwhether a close or a worktree deletion took the last one:\n\"respawn\" (default) | \"navigate\" | \"ring_global\" | \"ring_project\".",
           "enum": [
             "respawn",
-            "navigate"
+            "navigate",
+            "ring_global",
+            "ring_project"
           ],
           "type": "string"
         },
@@ -1220,6 +1222,10 @@
           ],
           "type": "string"
         },
+        "sidebar_follow_active": {
+          "description": "Whether the projects sidebar scrolls to the session on screen whenever\nit changes — a cycling key, a click, the palette, an IPC request.\nThe sidebar cursor is left where it was: `false` (default).",
+          "type": "boolean"
+        },
         "sidebar_foreground": {
           "anyOf": [
             {
@@ -1227,6 +1233,14 @@
             }
           ],
           "description": "Sidebar text color.  Unset derives it from the terminal palette."
+        },
+        "sidebar_scroll_align": {
+          "description": "Where a row the sidebar scrolled to is parked:\n\"minimal\" (default) | \"center\".  Under \"center\" every cursor step\nre-centres the list, and clicking a row near the panel edge scrolls it\nout from under the pointer.",
+          "enum": [
+            "minimal",
+            "center"
+          ],
+          "type": "string"
         },
         "sidebar_tooltips": {
           "description": "When a sidebar row spells its full name out on hover:\n\"elided\" (default) | \"always\" | \"off\".",

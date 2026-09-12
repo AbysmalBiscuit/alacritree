@@ -587,7 +587,8 @@ baked_glyphs! {
     DEFAULT_CURSOR_BLOCK_GLYPH = "▌";
 }
 
-/// What happens when the on-screen workspace's last session closes.
+/// What happens when the on-screen workspace stops having sessions, whether a
+/// close or a worktree deletion took the last one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LastSessionClose {
     /// Recycle a shell in place — the workspace always has a live session,
@@ -597,6 +598,26 @@ pub enum LastSessionClose {
     /// Move to the project's main checkout when it has a live session,
     /// otherwise home (which spawns a shell only if it has none).
     Navigate,
+    /// Move to the nearest session in the flat session ring, otherwise home.
+    RingGlobal,
+    /// Move to the nearest session in the removed workspace's own project,
+    /// then to the nearest anywhere in the ring, otherwise home.
+    RingProject,
+}
+
+impl LastSessionClose {
+    /// Whether the destination comes from the session ring.  Both removal
+    /// paths build that ring only when this is true, so the default costs
+    /// no allocation.
+    pub fn rings(self) -> bool {
+        matches!(self, Self::RingGlobal | Self::RingProject)
+    }
+
+    /// Whether the search is confined to the removed workspace's project
+    /// before it widens to the whole ring.
+    pub fn prefers_project(self) -> bool {
+        matches!(self, Self::RingProject)
+    }
 }
 
 fn parse_last_session_close(raw: Option<&str>) -> LastSessionClose {
@@ -604,6 +625,8 @@ fn parse_last_session_close(raw: Option<&str>) -> LastSessionClose {
         None => LastSessionClose::default(),
         Some("respawn") => LastSessionClose::Respawn,
         Some("navigate") => LastSessionClose::Navigate,
+        Some("ring_global") => LastSessionClose::RingGlobal,
+        Some("ring_project") => LastSessionClose::RingProject,
         Some(other) => {
             log::warn!("unknown ui.last_session_close value {other:?}, using \"respawn\"");
             LastSessionClose::default()
@@ -640,6 +663,41 @@ fn parse_sidebar_focus(raw: Option<&str>) -> SidebarFocus {
         Some(other) => {
             log::warn!("unknown ui.sidebar_focus value {other:?}, using \"preserve\"");
             SidebarFocus::default()
+        },
+    }
+}
+
+/// `[ui] sidebar_scroll_align`: where a row a sidebar scrolled to is parked.
+/// Governs both panels and both reasons to scroll, because it describes the
+/// resting position rather than what chose the row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub enum ScrollAlign {
+    /// egui's minimal scroll: move just far enough to bring the row into
+    /// view, which leaves it against whichever edge it entered from.
+    #[default]
+    Minimal,
+    /// Park the row in the middle of the panel.  egui clamps to the scroll
+    /// range, so a short list stays put instead of overscrolling.
+    Center,
+}
+
+impl ScrollAlign {
+    pub fn align(self) -> Option<egui::Align> {
+        match self {
+            Self::Minimal => None,
+            Self::Center => Some(egui::Align::Center),
+        }
+    }
+}
+
+fn parse_scroll_align(raw: Option<&str>) -> ScrollAlign {
+    match raw {
+        None => ScrollAlign::default(),
+        Some("minimal") => ScrollAlign::Minimal,
+        Some("center") => ScrollAlign::Center,
+        Some(other) => {
+            log::warn!("unknown ui.sidebar_scroll_align value {other:?}, using \"minimal\"");
+            ScrollAlign::default()
         },
     }
 }
@@ -1015,6 +1073,11 @@ pub struct UiTheme {
     pub last_session_close: LastSessionClose,
     /// How the projects sidebar repairs a cursor whose row stopped rendering.
     pub sidebar_focus: SidebarFocus,
+    /// Whether the projects sidebar scrolls to the session on screen when it
+    /// changes.
+    pub sidebar_follow_active: bool,
+    /// Where a row a sidebar scrolled to is parked.
+    pub sidebar_scroll_align: ScrollAlign,
     /// Whether a fuzzy query is confined by the panel's active toggle filters.
     pub search_scope: SearchScope,
     /// When a sidebar row spells its full name out on hover.
@@ -1128,6 +1191,8 @@ impl Default for UiTheme {
             confirm_session_close: ConfirmSessionClose::Never,
             last_session_close: LastSessionClose::Respawn,
             sidebar_focus: SidebarFocus::default(),
+            sidebar_follow_active: false,
+            sidebar_scroll_align: ScrollAlign::default(),
             search_scope: SearchScope::default(),
             sidebar_tooltips: SidebarTooltips::default(),
             icon_tooltips: true,
@@ -2162,14 +2227,25 @@ struct RawUi {
     /// "never" (default) | "busy" | "always".
     #[schemars(extend("enum" = ["never", "busy", "always"]))]
     confirm_session_close: Option<String>,
-    /// What closing the on-screen workspace's last session does:
-    /// "respawn" (default) | "navigate".
-    #[schemars(extend("enum" = ["respawn", "navigate"]))]
+    /// What happens when the on-screen workspace stops having sessions,
+    /// whether a close or a worktree deletion took the last one:
+    /// "respawn" (default) | "navigate" | "ring_global" | "ring_project".
+    #[schemars(extend("enum" = ["respawn", "navigate", "ring_global", "ring_project"]))]
     last_session_close: Option<String>,
     /// How far the projects sidebar goes when the cursor's row stops being
     /// rendered: "preserve" (default) | "follow".
     #[schemars(extend("enum" = ["preserve", "follow"]))]
     sidebar_focus: Option<String>,
+    /// Whether the projects sidebar scrolls to the session on screen whenever
+    /// it changes — a cycling key, a click, the palette, an IPC request.
+    /// The sidebar cursor is left where it was: `false` (default).
+    sidebar_follow_active: Option<bool>,
+    /// Where a row the sidebar scrolled to is parked:
+    /// "minimal" (default) | "center".  Under "center" every cursor step
+    /// re-centres the list, and clicking a row near the panel edge scrolls it
+    /// out from under the pointer.
+    #[schemars(extend("enum" = ["minimal", "center"]))]
+    sidebar_scroll_align: Option<String>,
     /// Whether a fuzzy query is confined by the panel's active toggle filters:
     /// "filtered" (default) | "all".
     #[schemars(extend("enum" = ["filtered", "all"]))]
@@ -2446,6 +2522,8 @@ impl RawConfig {
             ),
             last_session_close: parse_last_session_close(self.ui.last_session_close.as_deref()),
             sidebar_focus: parse_sidebar_focus(self.ui.sidebar_focus.as_deref()),
+            sidebar_follow_active: self.ui.sidebar_follow_active.unwrap_or(false),
+            sidebar_scroll_align: parse_scroll_align(self.ui.sidebar_scroll_align.as_deref()),
             search_scope: parse_search_scope(self.ui.search_scope.as_deref()),
             sidebar_tooltips: parse_sidebar_tooltips(self.ui.sidebar_tooltips.as_deref()),
             icon_tooltips: self.ui.icon_tooltips.unwrap_or(true),
@@ -3008,9 +3086,12 @@ mod tests {
 
     #[test]
     fn last_session_close_parses_all_values() {
-        for (raw, expected) in
-            [("respawn", LastSessionClose::Respawn), ("navigate", LastSessionClose::Navigate)]
-        {
+        for (raw, expected) in [
+            ("respawn", LastSessionClose::Respawn),
+            ("navigate", LastSessionClose::Navigate),
+            ("ring_global", LastSessionClose::RingGlobal),
+            ("ring_project", LastSessionClose::RingProject),
+        ] {
             let ui = ui_from_toml(&format!("[ui]\nlast_session_close = \"{raw}\""));
             assert_eq!(ui.last_session_close, expected, "value {raw:?}");
         }
@@ -3020,6 +3101,14 @@ mod tests {
     fn last_session_close_invalid_falls_back_to_respawn() {
         let ui = ui_from_toml("[ui]\nlast_session_close = \"panic\"");
         assert_eq!(ui.last_session_close, LastSessionClose::Respawn);
+    }
+
+    #[test]
+    fn only_the_ring_values_ring() {
+        assert!(!LastSessionClose::Respawn.rings());
+        assert!(!LastSessionClose::Navigate.rings());
+        assert!(LastSessionClose::RingGlobal.rings());
+        assert!(LastSessionClose::RingProject.rings());
     }
 
     #[test]
@@ -3056,6 +3145,36 @@ mod tests {
     fn only_follow_moves_the_terminal() {
         assert!(!SidebarFocus::Preserve.follows());
         assert!(SidebarFocus::Follow.follows());
+    }
+
+    #[test]
+    fn sidebar_follow_active_defaults_to_off() {
+        assert!(!ui_from_toml("").sidebar_follow_active);
+    }
+
+    #[test]
+    fn sidebar_follow_active_parses() {
+        assert!(ui_from_toml("[ui]\nsidebar_follow_active = true").sidebar_follow_active);
+    }
+
+    #[test]
+    fn sidebar_scroll_align_defaults_to_minimal() {
+        assert_eq!(ui_from_toml("").sidebar_scroll_align, ScrollAlign::Minimal);
+    }
+
+    #[test]
+    fn sidebar_scroll_align_parses_all_values() {
+        for (raw, expected) in [("minimal", ScrollAlign::Minimal), ("center", ScrollAlign::Center)]
+        {
+            let ui = ui_from_toml(&format!("[ui]\nsidebar_scroll_align = \"{raw}\""));
+            assert_eq!(ui.sidebar_scroll_align, expected, "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn sidebar_scroll_align_invalid_falls_back_to_minimal() {
+        let ui = ui_from_toml("[ui]\nsidebar_scroll_align = \"middle-ish\"");
+        assert_eq!(ui.sidebar_scroll_align, ScrollAlign::Minimal);
     }
 
     /// The hints are what an unmodified config already shows, so the key has

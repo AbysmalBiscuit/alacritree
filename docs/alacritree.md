@@ -379,6 +379,17 @@ sidebar_focus      = "preserve"  # how far the projects sidebar goes when the
                                   # landing that has a live session, and lands a
                                   # closed session on its neighbour instead of on
                                   # the workspace's first session
+sidebar_follow_active = false  # scroll the projects sidebar to the session on
+                                # screen whenever it changes — a cycling key, a
+                                # click, the palette, an IPC request (default
+                                # false); the cursor is left where it was
+sidebar_scroll_align = "minimal"  # where a row a sidebar scrolled to is
+                                   # parked. "minimal" (default) rests it
+                                   # against whichever edge it entered from.
+                                   # "center" re-centres the list on every
+                                   # cursor step, and scrolls a clicked row
+                                   # out from under the pointer — not a
+                                   # scrolloff, the row always lands mid-panel
 vsync              = true   # restart required — wait for the display's refresh
                             # before showing a finished frame (default true).
                             # false presents each frame as soon as it is drawn,
@@ -443,9 +454,14 @@ icon_tooltips      = true        # whether a sidebar icon explains itself on
                                  # icon's hint never depends on panel width
 confirm_session_close = "never"  # when the sidebar × asks before killing a PTY:
                                  # "never" (default) | "busy" | "always"
-last_session_close = "respawn"   # closing the on-screen workspace's last
-                                 # session: "respawn" (default) starts a fresh
-                                 # one, "navigate" moves to another workspace
+last_session_close = "respawn"   # what happens when the on-screen workspace
+                                 # stops having sessions, whether the last one
+                                 # closed or the worktree was deleted:
+                                 # "respawn" (default) starts a fresh one,
+                                 # "navigate" moves to another workspace,
+                                 # "ring_global" and "ring_project" move to the
+                                 # nearest surviving session in the ring, else
+                                 # home
 pr_status          = false  # poll `gh` for each branch's open PR, which drives
                             # the PR row icons, the PR-state filters, and $pr
                             # below (default false)
@@ -654,14 +670,7 @@ Two things worth knowing about what the schema does and does not do:
   `alacritty.toml` legitimately carries keys only the real alacritty acts on —
   `[hints]`, `[bell]`, `[mouse]`, `[general] import`. Those get no completion,
   but they are not flagged.
-- **Closed-value keys are completed.** `confirm_session_close`, `scrollbar`,
-  `sidebar_focus`, `search_scope`, `sidebar_tooltips`, `last_session_close`,
-  `path_style.*` and `drop.quote` offer their accepted spellings. A binding's
-  `action` completes from every action alacritree implements but rejects
-  nothing, so an alacritty-only action still validates. Cursor `shape` and
-  `blinking`, where Alacritty accepts more than one spelling for the same
-  value, are deliberately left unconstrained, so a working config is never
-  marked wrong.
+- **Closed-value keys are completed.** `confirm_session_close`, `scrollbar`, `sidebar_focus`, `sidebar_scroll_align`, `search_scope`, `sidebar_tooltips`, `last_session_close`, `path_style.*` and `drop.quote` offer their accepted spellings. A binding's `action` completes from every action alacritree implements but rejects nothing, so an alacritty-only action still validates. Cursor `shape` and `blinking`, where Alacritty accepts more than one spelling for the same value, are deliberately left unconstrained, so a working config is never marked wrong.
 
 [taplo]: https://taplo.tamasfe.dev/
 [ebt]: https://marketplace.visualstudio.com/items?itemName=tamasfe.even-better-toml
