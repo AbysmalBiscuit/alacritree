@@ -721,7 +721,7 @@ impl AlacritreeApp {
             )
         });
         let frame = modal_frame(&theme);
-        let current = self.base_branch_overrides.get(&picker.worktree).cloned();
+        let current = self.git_panel.base_branch_overrides.get(&picker.worktree).cloned();
         let s = theme.ui_scale;
 
         // Row 0 is always "Auto"; branch rows follow, narrowed by the query.
