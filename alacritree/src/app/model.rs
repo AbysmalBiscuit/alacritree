@@ -1179,7 +1179,7 @@ impl WorkspaceRowData {
 }
 
 /// Everything a sidebar herdr-agent row needs, snapshotted before the panel
-/// closure so rendering doesn't borrow `self.herdr_endpoints`.
+/// closure so rendering doesn't borrow `self.herdr.endpoints`.
 pub(super) struct HerdrRowData {
     pub(super) side: herdr::Side,
     pub(super) terminal_id: String,
