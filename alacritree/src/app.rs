@@ -1490,8 +1490,29 @@ impl AlacritreeApp {
         ctx: &Context,
         working_directory: WorkspaceKey,
     ) -> std::io::Result<SessionId> {
-        let (shell, wsl_probe) = self.resolve_shell(&working_directory);
-        self.spawn_session_with_shell(ctx, working_directory, shell, wsl_probe)
+        let (shell, wsl_probe, wsl_distro) =
+            self.resolve_shell(&working_directory, working_directory.as_deref());
+        self.spawn_session_with_shell(
+            ctx,
+            working_directory.clone(),
+            working_directory,
+            shell,
+            wsl_probe,
+            wsl_distro,
+        )
+    }
+
+    fn spawn_sibling_session(&mut self, ctx: &Context) -> std::io::Result<SessionId> {
+        let workspace = self.current_workspace.clone();
+        let directory = self.sibling_spawn_directory();
+        let (shell, wsl_probe, wsl_distro) = self.resolve_shell(&workspace, directory.as_deref());
+        self.spawn_session_with_shell(ctx, workspace, directory, shell, wsl_probe, wsl_distro)
+    }
+
+    fn sibling_spawn_directory(&self) -> WorkspaceKey {
+        let reported =
+            self.active_session_index().and_then(|idx| self.sessions[idx].reported_cwd.as_ref());
+        session::spawn_directory(reported, self.current_workspace.as_ref())
     }
 
     /// The geometry to open a PTY at, so it is born at the size it will keep.
@@ -1524,11 +1545,13 @@ impl AlacritreeApp {
     fn spawn_session_with_shell(
         &mut self,
         ctx: &Context,
-        working_directory: WorkspaceKey,
+        workspace: WorkspaceKey,
+        directory: WorkspaceKey,
         shell: Option<Shell>,
         wsl_probe: Option<WslProbe>,
+        wsl_distro: Option<String>,
     ) -> std::io::Result<SessionId> {
-        if let Some(dir) = &working_directory {
+        if let Some(dir) = &workspace {
             // A checkout git has forgotten is refused here rather than in
             // `session::open`, which can only see whether the directory
             // exists — a half-finished `git worktree remove` leaves one that
@@ -1552,14 +1575,17 @@ impl AlacritreeApp {
         let (session, request) = Session::pending_shell(
             ctx.clone(),
             &self.config,
-            working_directory.clone(),
+            directory,
             size,
             cell_size,
             shell,
+            wsl_distro,
             wsl_probe,
         );
+        let mut session = session;
+        session.working_directory = workspace.clone();
         let id = self.open_session(session, request)?;
-        self.active_session.insert(working_directory, id);
+        self.active_session.insert(workspace, id);
         Ok(id)
     }
 
@@ -1900,7 +1926,14 @@ impl AlacritreeApp {
         // `alacritty_terminal::tty::Shell`'s fields are crate-private, so
         // this goes through the constructor rather than a struct literal.
         let shell = Shell::new(program, argv);
-        match self.spawn_session_with_shell(ctx, workspace, Some(shell), None) {
+        match self.spawn_session_with_shell(
+            ctx,
+            workspace.clone(),
+            workspace,
+            Some(shell),
+            None,
+            None,
+        ) {
             Ok(id) => {
                 if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
                     session.bind_herdr(key.clone(), shared_view);
@@ -2151,8 +2184,8 @@ impl AlacritreeApp {
             log::warn!("{msg}");
             return Err(std::io::Error::new(std::io::ErrorKind::NotFound, msg));
         };
-        let (shell, wsl_probe) = profile_session_shell(profile);
-        self.spawn_session_with_shell(ctx, ws, shell, wsl_probe)
+        let (shell, wsl_probe, wsl_distro) = profile_session_shell(profile);
+        self.spawn_session_with_shell(ctx, ws.clone(), ws, shell, wsl_probe, wsl_distro)
     }
 
     /// Shell for a workspace; `None` means "no override" —
@@ -2160,7 +2193,11 @@ impl AlacritreeApp {
     /// shell with its OS-guaranteed fallback.  The home tab (`None`
     /// workspace) has no project or location, so only the default profile can
     /// apply there.
-    fn resolve_shell(&self, workspace: &WorkspaceKey) -> (Option<Shell>, Option<WslProbe>) {
+    fn resolve_shell(
+        &self,
+        workspace: &WorkspaceKey,
+        directory: Option<&Path>,
+    ) -> (Option<Shell>, Option<WslProbe>, Option<String>) {
         let path = workspace.as_deref();
         let choice = path.and_then(|p| {
             self.projects
@@ -2168,7 +2205,7 @@ impl AlacritreeApp {
                 .find(|proj| proj.worktrees.iter().any(|wt| wt.path.as_path() == p))
                 .and_then(|proj| proj.shell_override.clone())
         });
-        let location_distro = path.and_then(|p| match wsl::classify(p) {
+        let location_distro = directory.or(path).and_then(|p| match wsl::classify(p) {
             wsl::Location::Wsl { distro, .. } => Some(distro),
             wsl::Location::Windows(_) => None,
         });
@@ -2181,15 +2218,15 @@ impl AlacritreeApp {
             self.config.default_profile.as_deref(),
         ) {
             ShellDecision::ConfigShell => config_session_shell(&self.config),
-            // A WSL decision only arises from a workspace path (override or
-            // location), never from the home tab.
-            ShellDecision::WslDistro(distro) => match path {
+            // A WSL decision comes from the project override or the actual
+            // directory being launched, which may be a reported sibling path.
+            ShellDecision::WslDistro(distro) => match directory.or(path) {
                 Some(p) => wsl_session_shell(&distro, p),
-                None => (None, None),
+                None => (None, None, None),
             },
             ShellDecision::Profile(name) => match self.config.profile(&name) {
                 Some(profile) => profile_session_shell(profile),
-                None => (None, None),
+                None => (None, None, None),
             },
         }
     }
@@ -3890,7 +3927,7 @@ impl AlacritreeApp {
             },
             BindingAction::Named(NamedAction::SpawnNewInstance) => {
                 let ws = self.current_workspace.clone();
-                if let Err(e) = self.spawn_session(ctx, ws.clone()) {
+                if let Err(e) = self.spawn_sibling_session(ctx) {
                     self.report_spawn_failure(ctx, &ws, &e);
                 }
             },
@@ -6191,49 +6228,66 @@ fn wsl_shell(distro: &str, workdir: &Path) -> Shell {
 }
 
 /// Shimmed when the resident helper is on; the plain wsl.exe login-shell
-/// launch (and an unknown probe) otherwise.
-fn wsl_session_shell(distro: &str, workdir: &Path) -> (Option<Shell>, Option<WslProbe>) {
+/// launch otherwise. The distro remains known even without a probe.
+fn wsl_session_shell(
+    distro: &str,
+    workdir: &Path,
+) -> (Option<Shell>, Option<WslProbe>, Option<String>) {
     if !wsl_helper::enabled() {
-        return (Some(wsl_shell(distro, workdir)), None);
+        return (Some(wsl_shell(distro, workdir)), None, Some(distro.to_string()));
     }
     let key = wsl_helper::new_probe_key();
     let (program, args) = wsl_helper::shim_invocation(distro, workdir, &key);
-    (Some(Shell::new(program, args)), Some(WslProbe { distro: distro.to_string(), key }))
+    (
+        Some(Shell::new(program, args)),
+        Some(WslProbe { distro: distro.to_string(), key }),
+        Some(distro.to_string()),
+    )
 }
 
-/// The probe shim for any user-supplied wsl.exe argv (profile or
-/// `[terminal.shell]`): `Some` only when the argv is fully understood and
-/// a distro name is known — the probe registry needs one, so a wrapped
-/// default-distro launch resolves it via enumeration.  Anything exotic
-/// runs unmodified and probes as unknown.
-fn shimmed_wsl_argv(program: &str, args: &[String]) -> Option<(Shell, WslProbe)> {
-    if !wsl_helper::enabled() {
-        return None;
-    }
+/// Recognized WSL argv carries its distro even without the optional probe
+/// shim. Exotic argv stays raw and its distro stays unknown.
+fn shimmed_wsl_argv(
+    program: &str,
+    args: &[String],
+) -> Option<(Option<Shell>, Option<WslProbe>, String)> {
     let key = wsl_helper::new_probe_key();
     let (args, distro) = wsl_helper::wrap_profile_argv(program, args, &key)?;
     let distro =
         distro.or_else(|| wsl::distros().into_iter().find(|d| d.is_default).map(|d| d.name))?;
-    Some((Shell::new(program.to_string(), args), WslProbe { distro, key }))
+    if !wsl_helper::enabled() {
+        return Some((None, None, distro));
+    }
+    Some((
+        Some(Shell::new(program.to_string(), args)),
+        Some(WslProbe { distro: distro.clone(), key }),
+        distro,
+    ))
 }
 
-fn profile_session_shell(profile: &crate::config::Profile) -> (Option<Shell>, Option<WslProbe>) {
+fn profile_session_shell(
+    profile: &crate::config::Profile,
+) -> (Option<Shell>, Option<WslProbe>, Option<String>) {
     match shimmed_wsl_argv(&profile.program, &profile.args) {
-        Some((shell, probe)) => (Some(shell), Some(probe)),
-        None => (Some(profile_shell(profile)), None),
+        Some((shell, probe, distro)) => {
+            (shell.or_else(|| Some(profile_shell(profile))), probe, Some(distro))
+        },
+        None => (Some(profile_shell(profile)), None, None),
     }
 }
 
 /// `[terminal.shell] program = "wsl.exe"` gets the same shim as a wsl.exe
 /// profile; any other config shell (or none) spawns unchanged through
 /// `Session::pending_shell`'s own config-shell default.
-fn config_session_shell(config: &crate::config::Config) -> (Option<Shell>, Option<WslProbe>) {
+fn config_session_shell(
+    config: &crate::config::Config,
+) -> (Option<Shell>, Option<WslProbe>, Option<String>) {
     match &config.shell {
         Some(s) => match shimmed_wsl_argv(&s.program, &s.args) {
-            Some((shell, probe)) => (Some(shell), Some(probe)),
-            None => (None, None),
+            Some((shell, probe, distro)) => (shell, probe, Some(distro)),
+            None => (None, None, None),
         },
-        None => (None, None),
+        None => (None, None, None),
     }
 }
 
@@ -7104,6 +7158,24 @@ fn name_tooltip(
         SidebarTooltips::Elided if !elided => resp,
         _ => resp.on_hover_text(name),
     }
+}
+
+/// Offer a session's reported directory alongside its name using the same
+/// mode that governs every other sidebar name tooltip.
+fn session_name_tooltip(
+    resp: egui::Response,
+    name: &str,
+    reported_cwd: Option<&Path>,
+    elided: bool,
+    mode: SidebarTooltips,
+) -> egui::Response {
+    let Some(path) = reported_cwd else {
+        return name_tooltip(resp, name, elided, mode);
+    };
+    if matches!(mode, SidebarTooltips::Off) || matches!(mode, SidebarTooltips::Elided if !elided) {
+        return resp;
+    }
+    name_tooltip(resp, &format!("{name}\n{}", path.display()), elided, mode)
 }
 
 /// Lay a path out as the text of one truncating label.
@@ -8005,6 +8077,7 @@ struct WorktreeAction {
 struct SessionRowData {
     id: SessionId,
     name: RowName,
+    reported_cwd: Option<PathBuf>,
     needs_attention: bool,
     activity: SessionActivity,
     /// This workspace's remembered active session (accent icon).
@@ -9395,7 +9468,13 @@ fn session_row(
     // ask how to leave, and the name tooltip cannot say it.
     let resp = hints.apply(resp, theme.icon_tooltips, |resp| match &row.managed {
         Some(managed) if theme.icon_tooltips => resp.on_hover_text(managed_tooltip(managed)),
-        _ => name_tooltip(resp, &row.name.text, title_elided, theme.sidebar_tooltips),
+        _ => session_name_tooltip(
+            resp,
+            &row.name.text,
+            row.reported_cwd.as_deref(),
+            title_elided,
+            theme.sidebar_tooltips,
+        ),
     });
 
     // Frame allocates its space at end-of-show, so its retroactive `interact`
@@ -10111,6 +10190,7 @@ impl AlacritreeApp {
                     Some(WorkspaceRowData::Session(SessionRowData {
                         id: s.id,
                         name: session_row_name(&s.title, activity, self.session_herdr_agent(s)),
+                        reported_cwd: s.reported_cwd.clone(),
                         needs_attention: s.needs_attention,
                         activity,
                         is_active: active == Some(s.id),
@@ -12576,6 +12656,7 @@ mod tests {
             (8.0, 16.0),
             None,
             None,
+            None,
         );
         app.sessions.push(session);
         app
@@ -12588,6 +12669,7 @@ mod tests {
             None,
             TermSize { columns: 80, screen_lines: 24 },
             (8.0, 16.0),
+            None,
             None,
             None,
         );
@@ -16742,6 +16824,135 @@ mod tests {
     }
 
     #[test]
+    fn reported_cwd_survives_wsl_profile_without_the_helper() {
+        assert_wsl_cwd_without_helper(false);
+    }
+
+    #[test]
+    fn reported_cwd_survives_wsl_config_without_the_helper() {
+        assert_wsl_cwd_without_helper(true);
+    }
+
+    fn assert_wsl_cwd_without_helper(config_shell: bool) {
+        static HELPER_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = HELPER_GATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        struct RestoreHelper(bool);
+        impl Drop for RestoreHelper {
+            fn drop(&mut self) {
+                wsl_helper::set_enabled(self.0);
+            }
+        }
+        let _restore = RestoreHelper(wsl_helper::enabled());
+        wsl_helper::set_enabled(false);
+
+        let profile = crate::config::Profile {
+            name: "ubuntu".into(),
+            program: "wsl.exe".into(),
+            args: vec!["--distribution".into(), "Ubuntu".into(), "--cd".into(), "/home/dev".into()],
+        };
+        let mut config = Config::default();
+        config.vt.report_cwd = true;
+        config.shell = Some(crate::config::ShellConfig {
+            program: profile.program.clone(),
+            args: profile.args.clone(),
+        });
+
+        let (shell, probe, distro) = if config_shell {
+            config_session_shell(&config)
+        } else {
+            profile_session_shell(&profile)
+        };
+        assert!(probe.is_none());
+        session::tests::assert_wsl_reported_cwd_through_tap(
+            &config,
+            shell,
+            probe,
+            distro,
+            &profile.args,
+        );
+
+        for enabled in [false, true] {
+            wsl_helper::set_enabled(enabled);
+            for args in
+                [vec!["-d", "Ubuntu"], vec![], vec!["-d", "Ubuntu", "--exec", "bash"], vec![
+                    "--distribution",
+                ]]
+            {
+                let mut profile = profile.clone();
+                profile.args = args.iter().map(|arg| (*arg).to_string()).collect();
+                config.shell.as_mut().unwrap().args = profile.args.clone();
+                let (shell, probe, distro) = if config_shell {
+                    config_session_shell(&config)
+                } else {
+                    profile_session_shell(&profile)
+                };
+                let expected_distro = match args.as_slice() {
+                    ["-d", "Ubuntu"] => Some("Ubuntu".to_string()),
+                    [] => wsl::distros().into_iter().find(|d| d.is_default).map(|d| d.name),
+                    _ => None,
+                };
+                assert_eq!(distro, expected_distro, "helper={enabled}, argv={args:?}");
+                if enabled && expected_distro.is_some() {
+                    let probe = probe.unwrap();
+                    assert_eq!(Some(probe.distro), expected_distro);
+                    let (wrapped, _) =
+                        wsl_helper::wrap_profile_argv(&profile.program, &profile.args, &probe.key)
+                            .unwrap();
+                    assert_eq!(shell, Some(Shell::new(profile.program, wrapped)));
+                } else {
+                    assert!(probe.is_none());
+                    assert_eq!(shell, (!config_shell).then(|| profile_shell(&profile)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reported_cwd_sibling_falls_back_without_an_active_session() {
+        let mut app = test_app();
+        let workspace = tempfile::tempdir().unwrap();
+        app.current_workspace = Some(workspace.path().to_path_buf());
+        let stale_id = app.sessions[0].id;
+        app.sessions.clear();
+        app.active_session.clear();
+
+        assert_eq!(app.sibling_spawn_directory(), app.current_workspace);
+        app.active_session.insert(app.current_workspace.clone(), stale_id);
+        assert_eq!(app.sibling_spawn_directory(), app.current_workspace);
+        app.current_workspace = None;
+        assert_eq!(app.sibling_spawn_directory(), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reported_cwd_location_selects_the_sibling_shell() {
+        let mut app = test_app();
+        let native = Path::new("C:/workspace");
+        let ubuntu = Path::new(r"\\wsl.localhost\Ubuntu\home\dev\src");
+        let debian = Path::new(r"\\wsl.localhost\Debian\home\dev\src");
+
+        for (workspace, directory, expected) in [
+            (None, ubuntu, Some("Ubuntu")),
+            (Some(native.to_path_buf()), ubuntu, Some("Ubuntu")),
+            (Some(ubuntu.to_path_buf()), debian, Some("Debian")),
+            (Some(ubuntu.to_path_buf()), native, None),
+        ] {
+            let (_, _, distro) = app.resolve_shell(&workspace, Some(directory));
+            assert_eq!(distro.as_deref(), expected);
+        }
+
+        app.config.profiles = test_profiles();
+        let mut project = project_with("C:/workspace", &[]);
+        for choice in [ShellChoice::Windows, ShellChoice::Profile("pwsh".into())] {
+            project.shell_override = Some(choice);
+            app.projects = vec![project.clone()];
+            let (_, probe, distro) = app.resolve_shell(&Some(native.to_path_buf()), Some(ubuntu));
+            assert!(probe.is_none());
+            assert_eq!(distro, None);
+        }
+    }
+
+    #[test]
     fn override_windows_skips_default_profile() {
         let d = shell_decision(
             Some(&ShellChoice::Windows),
@@ -17709,6 +17920,7 @@ mod tests {
             let row = SessionRowData {
                 id: 1,
                 name: RowName::plain("zsh".to_owned()),
+                reported_cwd: None,
                 needs_attention: false,
                 activity: SessionActivity::Shell,
                 is_active: true,
@@ -17797,6 +18009,7 @@ mod tests {
         let session = |attention, activity| SessionRowData {
             id: 1,
             name: RowName::plain("zsh".to_owned()),
+            reported_cwd: None,
             needs_attention: attention,
             activity,
             is_active: true,
@@ -18046,6 +18259,57 @@ mod tests {
     }
 
     #[test]
+    fn reported_session_cwd_follows_sidebar_tooltip_mode() {
+        let icons = crate::config::Icons::default();
+        let cwd = PathBuf::from("C:/repo/src");
+        let long = "feature/a-session-name-far-too-long-for-the-sidebar";
+
+        for (mode, name, want) in [
+            (SidebarTooltips::Off, "shell", false),
+            (SidebarTooltips::Elided, "shell", false),
+            (SidebarTooltips::Always, "shell", true),
+            (SidebarTooltips::Off, long, false),
+            (SidebarTooltips::Elided, long, true),
+            (SidebarTooltips::Always, long, true),
+        ] {
+            let mut config = Config::default();
+            config.ui.sidebar_tooltips = mode;
+            let theme = Theme::from_config(&config);
+            let mut row = SessionRowData {
+                id: 1,
+                name: RowName::plain(name.to_owned()),
+                reported_cwd: Some(cwd.clone()),
+                needs_attention: false,
+                activity: SessionActivity::Shell,
+                is_active: true,
+                is_displayed: true,
+                managed: None,
+            };
+            let tooltip = format!("{name}\n{}", cwd.display());
+            let texts = texts_while_hovering(140.0, |ui| {
+                session_row(ui, &row, false, false, false, &icons, &theme);
+            });
+
+            let shown = texts.iter().flatten().any(|(text, _)| text == &tooltip);
+            assert_eq!(shown, want, "{mode:?} on {name:?}: {texts:?}");
+
+            let managed = Managed::herdr(
+                &herdr::Side::Wsl("Ubuntu".into()),
+                &herdr::Settings::default(),
+                AttachMode::Agent,
+                None,
+            );
+            let managed_text = managed_tooltip(&managed);
+            row.managed = Some(managed);
+            let texts = texts_while_hovering(140.0, |ui| {
+                session_row(ui, &row, false, false, false, &icons, &theme);
+            });
+            assert!(texts.iter().flatten().any(|(text, _)| text == &managed_text));
+            assert!(!texts.iter().flatten().any(|(text, _)| text == &tooltip));
+        }
+    }
+
+    #[test]
     fn the_upstream_tooltip_names_the_upstream_ref() {
         let icons = crate::config::Icons::default();
         let theme = Theme::from_config(&Config::default());
@@ -18133,6 +18397,7 @@ mod tests {
         let row = SessionRowData {
             id: 1,
             name: RowName::plain("cargo test --workspace --all-features -- --nocapture".to_owned()),
+            reported_cwd: None,
             needs_attention: false,
             activity: SessionActivity::Shell,
             is_active: true,

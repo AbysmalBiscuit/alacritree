@@ -243,6 +243,13 @@ pub struct Session {
     pub id: SessionId,
     pub title: String,
     pub working_directory: Option<PathBuf>,
+    /// Where the shell says it is. Deliberately not `working_directory`,
+    /// which is the sidebar's workspace key: writing a report into that
+    /// would re-home a session on every `cd`.
+    ///
+    /// Anything that writes to the PTY can set this, local or remote, so
+    /// every consumer guards at use.
+    pub reported_cwd: Option<PathBuf>,
     pub kind: SessionKind,
     pub size: TermSize,
     pub cell_size: (f32, f32),
@@ -270,6 +277,9 @@ pub struct Session {
     /// timer instead of polling the process table every frame.  `Cell` is
     /// enough since `Session` isn't `Sync` and the values are `Copy`.
     agent_cache: Cell<AgentCache>,
+    /// Distro identity used to parse and translate reports, even when the
+    /// foreground-process helper is disabled and no probe exists.
+    wsl_distro: Option<String>,
     /// Set for shimmed WSL sessions: the distro plus the probe key its
     /// shim published, unregistered again on drop.  The Windows process
     /// table ends at wsl.exe, so this is the only live view inside.
@@ -302,6 +312,25 @@ pub struct Session {
     /// loses an agent afterwards does not change what the running client
     /// draws.
     pub herdr_shared_view: bool,
+}
+
+/// A WSL session's payload is a Linux path. The distro comes from the
+/// session rather than the sequence, which is why the resulting UNC path is
+/// trustworthy where one built from the payload would not be.
+fn resolve_reported_cwd(path: &str, distro: Option<&str>) -> Option<PathBuf> {
+    Some(match distro {
+        Some(distro) => crate::wsl::linux_to_windows(path, distro),
+        None => PathBuf::from(path),
+    })
+}
+
+/// The reported directory when it exists here, the workspace otherwise. One
+/// stat, taken when the user asks for a session rather than on every `cd`.
+pub(crate) fn spawn_directory(
+    reported: Option<&PathBuf>,
+    workspace: Option<&PathBuf>,
+) -> Option<PathBuf> {
+    reported.filter(|path| path.is_dir()).or(workspace).cloned()
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1313,6 +1342,7 @@ impl Session {
             id: next_session_id(),
             title: "scratchpad".to_string(),
             working_directory,
+            reported_cwd: None,
             kind: SessionKind::Scratchpad { path },
             size,
             cell_size,
@@ -1326,6 +1356,7 @@ impl Session {
             last_report_cell: None,
             shell_pid: None,
             agent_cache: Cell::new(AgentCache::default()),
+            wsl_distro: None,
             wsl_probe: None,
             priority_job: None,
             notifier: None,
@@ -1378,6 +1409,7 @@ impl Session {
         size: TermSize,
         cell_size: (f32, f32),
         shell_override: Option<Shell>,
+        wsl_distro: Option<String>,
         wsl_probe: Option<WslProbe>,
     ) -> (Self, OpenRequest) {
         // Overrides are argv built in code (`wsl.exe -d <distro> --cd <dir>`),
@@ -1401,6 +1433,7 @@ impl Session {
             title,
             SessionKind::Shell,
             escape_args,
+            wsl_distro,
             wsl_probe,
         )
     }
@@ -1431,6 +1464,7 @@ impl Session {
             kind,
             true,
             None,
+            None,
         )
     }
 
@@ -1447,12 +1481,15 @@ impl Session {
         title: String,
         kind: SessionKind,
         escape_args: bool,
+        wsl_distro: Option<String>,
         wsl_probe: Option<WslProbe>,
     ) -> (Self, OpenRequest) {
         let pty_cwd = pty_working_directory(working_directory.clone(), config);
         let window_size = window_size(size, cell_size);
+        let wsl_distro =
+            wsl_distro.or_else(|| wsl_probe.as_ref().map(|probe| probe.distro.clone()));
 
-        let shell_platform = if wsl_probe.is_some() || cfg!(unix) {
+        let shell_platform = if wsl_distro.is_some() || cfg!(unix) {
             osc_tap::ShellPlatform::Unix
         } else {
             osc_tap::ShellPlatform::Windows
@@ -1503,6 +1540,7 @@ impl Session {
             id,
             title,
             working_directory,
+            reported_cwd: None,
             kind,
             size,
             cell_size,
@@ -1516,6 +1554,7 @@ impl Session {
             last_report_cell: None,
             shell_pid: None,
             agent_cache: Cell::new(AgentCache::default()),
+            wsl_distro,
             wsl_probe,
             priority_job: None,
             notifier: None,
@@ -1647,7 +1686,14 @@ impl Session {
         }
         if let Some(receiver) = self.osc_events.take() {
             while let Ok(event) = receiver.try_recv() {
-                let _ = event;
+                match event {
+                    osc_tap::OscEvent::Cwd(path) => {
+                        let distro = self.wsl_distro().map(str::to_string);
+                        self.reported_cwd =
+                            path.and_then(|path| resolve_reported_cwd(&path, distro.as_deref()));
+                    },
+                    _ => {},
+                }
             }
             self.osc_events = Some(receiver);
         }
@@ -1711,10 +1757,10 @@ impl Session {
         Processor::<StdSyncHandler>::new().advance(&mut *term, &hold_notice_bytes(chord));
     }
 
-    /// The distro a shimmed WSL session runs in.  Dropped paths need it to
+    /// The distro a WSL session runs in. Dropped paths need it to
     /// decide whether a `C:\` path has to be rewritten before a shell sees it.
     pub fn wsl_distro(&self) -> Option<&str> {
-        self.wsl_probe.as_ref().map(|probe| probe.distro.as_str())
+        self.wsl_distro.as_deref()
     }
 
     /// Semantic sidebar state for this session. Process probing identifies a
@@ -1961,7 +2007,7 @@ fn next_session_id() -> SessionId {
 #[cfg(test)]
 // Fixtures drive real processes and wait on them; no frame is pending.
 #[allow(clippy::disallowed_methods)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Mutex;
 
     use alacritty_terminal::Term;
@@ -2350,6 +2396,139 @@ mod tests {
         assert_eq!(format("hello"), "reply:hello");
     }
 
+    #[test]
+    fn a_reported_cwd_is_translated_for_a_wsl_session() {
+        assert_eq!(
+            resolve_reported_cwd("/home/dev/src", Some("Ubuntu")),
+            Some(crate::wsl::linux_to_windows("/home/dev/src", "Ubuntu")),
+        );
+    }
+
+    #[test]
+    fn a_reported_cwd_is_taken_as_given_without_a_distro() {
+        assert_eq!(
+            resolve_reported_cwd("/home/dev/src", None),
+            Some(PathBuf::from("/home/dev/src")),
+        );
+    }
+
+    #[test]
+    fn the_spawn_directory_falls_back_when_the_reported_path_is_not_here() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().to_path_buf();
+
+        assert_eq!(
+            spawn_directory(Some(&PathBuf::from("/nowhere/at/all")), Some(&workspace)),
+            Some(workspace.clone()),
+        );
+        assert_eq!(spawn_directory(Some(&workspace), Some(&workspace)), Some(workspace));
+    }
+
+    #[test]
+    fn draining_a_wsl_cwd_event_updates_the_reported_directory() {
+        let mut session = pty_less_probe(SessionKind::Shell, "shell");
+        session.wsl_distro = Some("Ubuntu".to_string());
+        let (sender, receiver) = mpsc::channel();
+        session.osc_events = Some(receiver);
+        sender.send(osc_tap::OscEvent::Cwd(Some("/home/dev/src".to_string()))).unwrap();
+
+        session.drain_events(&Palette::default());
+
+        assert_eq!(
+            session.reported_cwd,
+            Some(crate::wsl::linux_to_windows("/home/dev/src", "Ubuntu")),
+        );
+        assert_eq!(session.working_directory, None);
+    }
+
+    #[test]
+    fn reported_cwd_osc_bytes_reach_a_wsl_session_without_a_probe() {
+        let mut config = Config::default();
+        config.vt.report_cwd = true;
+        let workspace = Some(PathBuf::from("C:/workspace"));
+        let (mut session, mut request) = Session::pending_shell(
+            egui::Context::default(),
+            &config,
+            workspace.clone(),
+            TermSize { columns: 80, screen_lines: 24 },
+            (8.0, 16.0),
+            None,
+            Some("Ubuntu".into()),
+            None,
+        );
+        assert_eq!(session.wsl_distro(), Some("Ubuntu"));
+        assert!(session.wsl_probe.is_none());
+
+        for (bytes, expected) in [
+            ("\x1b]7;file://localhost/home/dev/src\x07", Some("/home/dev/src")),
+            ("\x1b]9;9;/home/dev/other\x1b\\", Some("/home/dev/other")),
+            ("\x1b]7;\x07", None),
+        ] {
+            let expected = expected.map(|path| crate::wsl::linux_to_windows(path, "Ubuntu"));
+            request.tap.as_mut().unwrap().offer(bytes.as_bytes());
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                session.drain_events(&Palette::default());
+                if session.reported_cwd == expected {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "cwd report was not drained: {bytes:?}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(session.working_directory, workspace);
+        }
+    }
+
+    pub(crate) fn assert_wsl_reported_cwd_through_tap(
+        config: &Config,
+        shell: Option<Shell>,
+        probe: Option<WslProbe>,
+        distro: Option<String>,
+        expected_args: &[String],
+    ) {
+        let workspace = Some(PathBuf::from("C:/workspace"));
+        let (mut session, mut request) = Session::pending_shell(
+            egui::Context::default(),
+            config,
+            workspace.clone(),
+            TermSize { columns: 80, screen_lines: 24 },
+            (8.0, 16.0),
+            shell,
+            distro,
+            probe,
+        );
+        assert_eq!(
+            request.pty_options.shell,
+            Some(Shell::new("wsl.exe".into(), expected_args.to_vec())),
+        );
+        for (bytes, expected) in [
+            (
+                "\x1b]7;file://localhost/home/dev/src\x07",
+                Some(r"\\wsl.localhost\Ubuntu\home\dev\src"),
+            ),
+            ("\x1b]9;9;/home/dev/other\x1b\\", Some(r"\\wsl.localhost\Ubuntu\home\dev\other")),
+            ("\x1b]7;\x07", None),
+        ] {
+            let expected = expected.map(PathBuf::from);
+            request.tap.as_mut().unwrap().offer(bytes.as_bytes());
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                session.drain_events(&Palette::default());
+                if session.reported_cwd == expected {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "cwd report was not drained: {bytes:?}, got {:?}",
+                    session.reported_cwd
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(session.working_directory, workspace);
+        }
+        assert_eq!(session.wsl_distro(), Some("Ubuntu"));
+    }
+
     /// A session with no PTY behind it, so an injected sequence is the only
     /// event there is to drain.  A real child has to be waited out first, and
     /// on Windows its ConPTY publishes a startup title of its own that would
@@ -2363,6 +2542,7 @@ mod tests {
             id: 0,
             title: title.to_string(),
             working_directory: None,
+            reported_cwd: None,
             kind,
             size,
             cell_size: (8.0, 16.0),
@@ -2376,6 +2556,7 @@ mod tests {
             last_report_cell: None,
             shell_pid: None,
             agent_cache: Cell::new(AgentCache::default()),
+            wsl_distro: None,
             wsl_probe: None,
             priority_job: None,
             notifier: None,
