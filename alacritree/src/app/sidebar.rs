@@ -112,7 +112,7 @@ impl AlacritreeApp {
         let live_branch = self
             .current_workspace
             .as_deref()
-            .and_then(|p| self.git_status.get(p))
+            .and_then(|p| self.git_panel.status.get(p))
             .and_then(|c| c.current_branch());
         let current_workspace = self.current_workspace.as_deref();
         // Skipped outright while the PR dimension is inert: `worktree_pr_passes`
@@ -467,7 +467,7 @@ impl AlacritreeApp {
         let any_pr_toggle = any_pr_toggle_active(&self.sidebar.filter, self.search_scope);
         let current_workspace = self.current_workspace.as_deref();
         let live_branch = current_workspace
-            .and_then(|p| self.git_status.get(p))
+            .and_then(|p| self.git_panel.status.get(p))
             .and_then(|cache| cache.current_branch());
         // The same path can be a worktree of two projects, and `PrCache` is
         // keyed by path alone, so a second poller would only invalidate the
