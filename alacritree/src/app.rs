@@ -29,10 +29,11 @@ use crate::git_nav::{self, GitSection, SectionCount};
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, GitStatus, StatusCache};
 use crate::panel_filter::{self, PanelFilter};
 use crate::path_style::PathStyle;
+use crate::pending_spawn::{Finished, PendingSpawns};
 use crate::pr_status::{self, PrCache, PrInfo, PrState};
 use crate::projects::{Project, Worktree, project_json};
 use crate::session::{
-    AttentionVerdict, Session, SessionActivity, SessionId, SessionKind, TermSize,
+    self, AttentionVerdict, Session, SessionActivity, SessionId, SessionKind, TermSize,
     poll_attention_debounce,
 };
 use crate::sidebar_nav::{self, SidebarRow};
@@ -564,6 +565,11 @@ pub struct AlacritreeApp {
     /// How much of the frame in progress went to painting the terminal grid,
     /// as opposed to the sidebars and everything else sharing it.
     grid_paint: std::time::Duration,
+    /// Geometry of the terminal pane as `terminal_view` last painted it.  A
+    /// session spawned into an empty workspace is born at this size rather
+    /// than at a constant, so a shell fast enough to print before the first
+    /// paint prints into the grid it will keep.
+    last_pane_geometry: Option<(TermSize, (f32, f32))>,
     /// In-flight background re-discoveries, keyed by project root.  Neither
     /// backend may block paint: wsl.exe takes seconds while the distro VM
     /// boots, and git2 takes tens of milliseconds on a project with many
@@ -574,6 +580,8 @@ pub struct AlacritreeApp {
     /// having it cancelled the instant `refresh_project` returns.  Cleared
     /// alongside `project_refreshes` as each result is adopted.
     project_refresh_jobs: HashMap<PathBuf, jobs::Job<()>>,
+    /// PTYs opened on a worker, adopted in `poll_pending_spawns`.
+    pending_spawns: PendingSpawns,
     /// Resolved absolute path of `delta` inside each WSL distro, so diff panes
     /// stop re-sourcing a login profile on every open.  Successes only: a miss
     /// is never stored, so installing delta mid-session is picked up later.
@@ -950,8 +958,10 @@ impl AlacritreeApp {
             frame_log: crate::frame_log::FrameLog::from_env(),
             phases: crate::frame_log::Phases::new(),
             grid_paint: std::time::Duration::ZERO,
+            last_pane_geometry: None,
             project_refreshes: Default::default(),
             project_refresh_jobs: HashMap::new(),
+            pending_spawns: Default::default(),
             wsl_delta_paths: HashMap::new(),
             pending_delta: HashMap::new(),
             liveness: Default::default(),
@@ -1172,6 +1182,87 @@ impl AlacritreeApp {
         });
     }
 
+    /// Push a session record and get its PTY opened: inline when the gate is
+    /// off, on the job pool when it is on.  The record exists before this
+    /// returns either way, so a caller can activate the tab without waiting
+    /// for a shell.  Callers own `active_session`; this owns `self.sessions`.
+    fn open_session(
+        &mut self,
+        session: Session,
+        request: session::OpenRequest,
+    ) -> std::io::Result<SessionId> {
+        let id = session.id;
+        self.sessions.push(session);
+
+        if !self.config.ui.async_session_spawn {
+            match session::open(request) {
+                Ok(attachment) => {
+                    let idx = self.sessions.iter().position(|s| s.id == id).expect("just pushed");
+                    self.sessions[idx].attach(attachment);
+                    return Ok(id);
+                },
+                Err(e) => {
+                    // The record went in before the open, so it comes back out
+                    // before the error does: with the gate off, a caller that
+                    // gets `Err` must see no trace of the session.
+                    self.sessions.retain(|s| s.id != id);
+                    return Err(e);
+                },
+            }
+        }
+
+        // Interactive: an empty pane is on screen until this lands.  The pool
+        // repaints once the job returns, so nothing here has to — without that
+        // the result would wait for whatever wakes the loop next, which under
+        // load is the shell's own first output seconds later.
+        let job = jobs::pool()
+            .spawn(jobs::Priority::Interactive, move |_blocking| session::open(request));
+        self.pending_spawns.start(id, job);
+        Ok(id)
+    }
+
+    /// Adopt every PTY that finished opening.  A session whose record is gone
+    /// was closed while it was opening: dropping the attachment shuts its
+    /// shell down rather than resurrecting the tab.
+    fn poll_pending_spawns(&mut self, ctx: &Context) {
+        for finished in self.pending_spawns.take_finished() {
+            match finished {
+                Finished::Opened(id, attachment, waiters) => {
+                    match self.sessions.iter().position(|s| s.id == id) {
+                        Some(idx) => {
+                            let started = Instant::now();
+                            self.sessions[idx].attach(attachment);
+                            crate::frame_log::spawn_phase(Some(id), "attach", started.elapsed());
+                            PendingSpawns::answer(waiters, Ok(json!({ "session_id": id })));
+                        },
+                        None => {
+                            drop(attachment);
+                            PendingSpawns::answer(
+                                waiters,
+                                Err("the session was closed while its shell was starting".into()),
+                            );
+                        },
+                    }
+                },
+                Finished::Failed(id, e, waiters) => {
+                    // The workspace comes off the record rather than off the
+                    // pending entry: `move_session_to` can re-key a session
+                    // while its PTY is opening.
+                    let ws = self
+                        .sessions
+                        .iter()
+                        .find(|s| s.id == id)
+                        .map(|s| s.working_directory.clone());
+                    if let Some(ws) = ws {
+                        self.close_session_with(ctx, id, CloseReason::SpawnFailed);
+                        self.report_spawn_failure(ctx, &ws, &e);
+                    }
+                    PendingSpawns::answer(waiters, Err(format!("failed to spawn shell: {e}")));
+                },
+            }
+        }
+    }
+
     fn spawn_session(
         &mut self,
         ctx: &Context,
@@ -1179,6 +1270,29 @@ impl AlacritreeApp {
     ) -> std::io::Result<SessionId> {
         let (shell, wsl_probe) = self.resolve_shell(&working_directory);
         self.spawn_session_with_shell(ctx, working_directory, shell, wsl_probe)
+    }
+
+    /// The geometry to open a PTY at, so it is born at the size it will keep.
+    /// Under the gate this matters: a session that opened at 80x24 and was
+    /// resized on attach makes a fast child print its first output into a grid
+    /// that is about to be reflowed under it.  Three tiers, most exact first:
+    /// the active session's own numbers when one exists; the terminal pane's
+    /// last painted size when it doesn't, which covers a respawn after
+    /// `close_session` removes the active entry before the replacement spawns;
+    /// 80x24 when neither is available, which only the constructor reaches,
+    /// since no frame has painted yet to leave a better number behind.  Never
+    /// `self.sessions.last()`, an arbitrary session possibly in another
+    /// workspace at a different pane size.
+    fn next_spawn_geometry(&self) -> (TermSize, (f32, f32)) {
+        let active = self.active_session_index().map(|idx| {
+            let session = &self.sessions[idx];
+            ActiveGeometry {
+                size: session.size,
+                cell_size: session.cell_size,
+                is_scratchpad: session.scratchpad.is_some(),
+            }
+        });
+        spawn_geometry(active, self.last_pane_geometry)
     }
 
     /// The one path every shell reaches, which is why the checkout guard and
@@ -1194,7 +1308,7 @@ impl AlacritreeApp {
     ) -> std::io::Result<SessionId> {
         if let Some(dir) = &working_directory {
             // A checkout git has forgotten is refused here rather than in
-            // `Session::spawn`, which can only see whether the directory
+            // `session::open`, which can only see whether the directory
             // exists — a half-finished `git worktree remove` leaves one that
             // does.  Refusing here is what keeps the greyed row's promise.
             if self.worktree_gone(dir) {
@@ -1212,17 +1326,17 @@ impl AlacritreeApp {
             // not lost work.
             self.sync_doppler_scopes(dir.clone());
         }
-        let session = Session::spawn(
+        let (size, cell_size) = self.next_spawn_geometry();
+        let (session, request) = Session::pending_shell(
             ctx.clone(),
             &self.config,
             working_directory.clone(),
-            TermSize::new(80, 24),
-            (8.0, 16.0),
+            size,
+            cell_size,
             shell,
             wsl_probe,
-        )?;
-        let id = session.id;
-        self.sessions.push(session);
+        );
+        let id = self.open_session(session, request)?;
         self.active_session.insert(working_directory, id);
         Ok(id)
     }
@@ -1324,10 +1438,11 @@ impl AlacritreeApp {
         self.spawn_session_with_shell(ctx, ws, shell, wsl_probe)
     }
 
-    /// Shell for a workspace; `None` means "no override" — `Session::spawn`
-    /// falls through to alacritty's config-driven shell with its
-    /// OS-guaranteed fallback.  The home tab (`None` workspace) has no
-    /// project or location, so only the default profile can apply there.
+    /// Shell for a workspace; `None` means "no override" —
+    /// `Session::pending_shell` falls through to alacritty's config-driven
+    /// shell with its OS-guaranteed fallback.  The home tab (`None`
+    /// workspace) has no project or location, so only the default profile can
+    /// apply there.
     fn resolve_shell(&self, workspace: &WorkspaceKey) -> (Option<Shell>, Option<WslProbe>) {
         let path = workspace.as_deref();
         let choice = path.and_then(|p| {
@@ -1419,6 +1534,10 @@ impl AlacritreeApp {
     }
 
     fn close_session(&mut self, ctx: &Context, id: SessionId) {
+        self.close_session_with(ctx, id, CloseReason::User);
+    }
+
+    fn close_session_with(&mut self, ctx: &Context, id: SessionId, reason: CloseReason) {
         let Some(idx) = self.sessions.iter().position(|s| s.id == id) else {
             return;
         };
@@ -1444,7 +1563,10 @@ impl AlacritreeApp {
         // recycles a shell in place (the last session is by design
         // unclosable), `navigate` falls back to the project main, then home.
         let main = workspace.as_deref().and_then(|p| project_main_for(&self.projects, p));
-        let verdict = close_fallback(&workspace, &self.current_workspace, &remaining, main);
+        let verdict = close_navigation(
+            reason,
+            close_fallback(&workspace, &self.current_workspace, &remaining, main),
+        );
         if verdict != CloseFallback::Stay
             && self.config.ui.last_session_close == LastSessionClose::Respawn
         {
@@ -1825,14 +1947,13 @@ impl AlacritreeApp {
                     );
                     return;
                 };
-                let session = &self.sessions[idx];
                 let text = file_drop::shell_payload(
                     &paths,
-                    session.wsl_distro(),
+                    self.sessions[idx].wsl_distro(),
                     &self.config.ui.drop.spelling,
                 );
                 if !text.is_empty() {
-                    paste::paste(session, &text, true);
+                    paste::paste(&mut self.sessions[idx], &text, true);
                 }
             },
             file_drop::Target::Scratchpad => {
@@ -3023,7 +3144,7 @@ impl AlacritreeApp {
         if let Some(editor) = self.sessions[idx].scratchpad.as_mut() {
             editor.insert_at_cursor(ctx, id, text);
         } else {
-            paste::paste(&self.sessions[idx], text, true);
+            paste::paste(&mut self.sessions[idx], text, true);
         }
     }
 
@@ -4062,9 +4183,15 @@ impl AlacritreeApp {
         }
         if let Some(ws) = spawn_shell_request.take() {
             // Spawning activates the workspace and the new session, matching
-            // Ctrl+T and worktree-creation's open-on-done.  A failed spawn
-            // hands the workspace back rather than stranding the user on one
-            // with no shell — the same reasoning as `activate_worktree`.
+            // Ctrl+T and worktree-creation's open-on-done.  An `Err` here
+            // arrived before the session record did — a checkout git has
+            // forgotten, or a PTY opened inline — and hands the workspace
+            // back rather than stranding the user on one with no shell, the
+            // same reasoning as `activate_worktree`.  A PTY opened on a
+            // worker fails after the record exists, so the switch stands and
+            // `poll_pending_spawns` leaves the pane on the "no session"
+            // placeholder: every workspace it could hand back to is one
+            // `ensure_active_session` would spawn into and fail identically.
             let previous = std::mem::replace(&mut self.current_workspace, ws.clone());
             match self.spawn_session(ctx, ws.clone()) {
                 Ok(_) => workspace_activated = true,
@@ -4552,20 +4679,20 @@ impl AlacritreeApp {
             "diff: {}",
             path_style::render(&req.file, self.config.ui.path_style.diff_title, None)
         );
-        match Session::spawn_command(
+        let (size, cell_size) = self.next_spawn_geometry();
+        let (session, request) = Session::pending_command(
             ctx.clone(),
             &self.config,
             Some(workspace.clone()),
-            TermSize::new(80, 24),
-            (8.0, 16.0),
+            size,
+            cell_size,
             program,
             args,
             title,
             SessionKind::Diff { key: new_key },
-        ) {
-            Ok(session) => {
-                let id = session.id;
-                self.sessions.push(session);
+        );
+        match self.open_session(session, request) {
+            Ok(id) => {
                 self.active_session.insert(Some(workspace), id);
             },
             Err(e) => {
@@ -4624,6 +4751,59 @@ impl AlacritreeApp {
             if let SessionKind::Diff { key } = &s.kind { Some(key.clone()) } else { None }
         })
     }
+}
+
+/// What the session on screen contributes to a spawn's geometry.
+struct ActiveGeometry {
+    size: TermSize,
+    cell_size: (f32, f32),
+    /// A scratchpad's size is fixed at construction: it takes the editor
+    /// branch, so the pane never resizes it.
+    is_scratchpad: bool,
+}
+
+/// Geometry a new PTY is born at, most exact source first: the active
+/// session's own numbers, then the terminal pane's last painted size, then
+/// the constant neither has anything to improve on.
+///
+/// A scratchpad drops out of the first tier, since its pinned size would
+/// otherwise shadow the pane geometry with a constant worse than the tier
+/// below it.
+fn spawn_geometry(
+    active: Option<ActiveGeometry>,
+    last_pane: Option<(TermSize, (f32, f32))>,
+) -> (TermSize, (f32, f32)) {
+    active
+        .filter(|active| !active.is_scratchpad)
+        .map(|active| (active.size, active.cell_size))
+        .or(last_pane)
+        .unwrap_or((TermSize::new(80, 24), (8.0, 16.0)))
+}
+
+/// What one session contributes to the GUI's own priority boost for a frame.
+struct SessionBoost {
+    /// The session's job holds a boost of its own.
+    raised: bool,
+    /// The session is the one on screen, with the window focused.
+    visible: bool,
+    /// The session's PTY is still opening.
+    pending: bool,
+}
+
+/// Whether this session is a reason for the GUI to stay boosted.  A session
+/// still opening its PTY has no job to raise yet but will have one within a
+/// frame or two, and counting it is what stops a spawn dropping the GUI to
+/// normal priority for the whole open and raising it again on attach.
+fn holds_self_boost(session: SessionBoost) -> bool {
+    session.raised || (session.visible && session.pending)
+}
+
+/// Whether a frame's sessions, taken together, are a reason for the GUI to
+/// stay boosted.  Folded rather than `any`, because the caller computes each
+/// `SessionBoost` by asking a session to raise or drop its own boost: every
+/// session has to be reached, whatever the sessions before it answered.
+fn frame_holds_self_boost(boosts: impl Iterator<Item = SessionBoost>) -> bool {
+    boosts.fold(false, |held, session| held | holds_self_boost(session))
 }
 
 /// git arguments (everything after `git`) for the requested diff — shared
@@ -4764,7 +4944,7 @@ fn profile_session_shell(profile: &crate::config::Profile) -> (Option<Shell>, Op
 
 /// `[terminal.shell] program = "wsl.exe"` gets the same shim as a wsl.exe
 /// profile; any other config shell (or none) spawns unchanged through
-/// `Session::spawn`'s own config-shell default.
+/// `Session::pending_shell`'s own config-shell default.
 fn config_session_shell(config: &crate::config::Config) -> (Option<Shell>, Option<WslProbe>) {
     match &config.shell {
         Some(s) => match shimmed_wsl_argv(&s.program, &s.args) {
@@ -6407,6 +6587,27 @@ enum CloseFallback {
     Home,
 }
 
+/// Why a session record is going away.  The distinction exists because
+/// neither half of a close, the respawn policy or the navigation, may apply
+/// to a session that never got a PTY.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CloseReason {
+    User,
+    SpawnFailed,
+}
+
+/// The verdict a close acts on.  A failed open stays put whatever the
+/// workspace's state says: every destination `close_fallback` can name is one
+/// `ensure_active_session` will spawn into, and that open fails the same way.
+/// Staying leaves the pane on the "no session" placeholder, which is what the
+/// workspace honestly holds.
+fn close_navigation(reason: CloseReason, verdict: CloseFallback) -> CloseFallback {
+    match reason {
+        CloseReason::User => verdict,
+        CloseReason::SpawnFailed => CloseFallback::Stay,
+    }
+}
+
 /// Which session a workspace switches to when the one at `removed_idx` is
 /// closed.  `sessions` is the list *after* removal; `removed_idx` indexes the
 /// list *before* it, so the first surviving sibling at or past it is the
@@ -7128,10 +7329,15 @@ impl AlacritreeApp {
         // no boost to give — the feature off, or a platform that has none —
         // answers false without a call of any kind.
         let target = visible_idx.filter(|_| focused);
-        let mut anything_raised = false;
-        for (idx, session) in self.sessions.iter().enumerate() {
-            anything_raised |= session.set_priority_boost(Some(idx) == target);
-        }
+        let anything_raised =
+            frame_holds_self_boost(self.sessions.iter().enumerate().map(|(idx, session)| {
+                let wanted = Some(idx) == target;
+                SessionBoost {
+                    raised: session.set_priority_boost(wanted),
+                    visible: wanted,
+                    pending: session.is_pending(),
+                }
+            }));
         // A boost covers every depth, so a focused tab running
         // `cargo build -j16` raises all sixteen compilers.  The GUI left at
         // normal would then lose to the tree it is drawing.
@@ -8525,6 +8731,13 @@ impl AlacritreeApp {
                     self.defer_project_add(ctx, path, reply_tx);
                     continue;
                 },
+                // The reply has to wait for the PTY: a client that creates a
+                // session in order to write to it would otherwise be told the
+                // id before anything can receive what it writes.
+                ipc::IpcRequest::CreateSession { workspace } => {
+                    self.defer_create_session(ctx, workspace, reply_tx);
+                    continue;
+                },
                 other => other,
             };
             let name = request.name();
@@ -8573,6 +8786,40 @@ impl AlacritreeApp {
         }
     }
 
+    fn defer_create_session(
+        &mut self,
+        ctx: &Context,
+        workspace: Option<PathBuf>,
+        reply_tx: mpsc::Sender<ipc::IpcResult>,
+    ) {
+        let workspace = match workspace {
+            None => None,
+            Some(p) => match self.known_worktree_path(&p) {
+                Some(known) => Some(known),
+                None => {
+                    let _ = reply_tx.send(Err(unknown_worktree(&p)));
+                    return;
+                },
+            },
+        };
+        let id = match self.spawn_session(ctx, workspace) {
+            Ok(id) => id,
+            // `defer_create_session` answers the client itself, so a failure
+            // the frame can still see has to be sent rather than returned.
+            Err(e) => {
+                let _ = reply_tx.send(Err(format!("failed to spawn shell: {e}")));
+                return;
+            },
+        };
+        // Nothing is opening for this id when the gate is off, since
+        // `spawn_session` attaches inline before returning: `watch` hands
+        // the channel straight back and it is answered the same way the
+        // gate-off path answers it.
+        if let Some(reply_tx) = self.pending_spawns.watch(id, reply_tx) {
+            let _ = reply_tx.send(Ok(json!({ "session_id": id })));
+        }
+    }
+
     fn handle_ipc_request(&mut self, ctx: &Context, request: ipc::IpcRequest) -> ipc::IpcResult {
         use ipc::IpcRequest as Req;
         match request {
@@ -8603,18 +8850,10 @@ impl AlacritreeApp {
                     Ok(json!({ "workspace": known }))
                 },
             },
-            Req::CreateSession { workspace } => {
-                let workspace = match workspace {
-                    None => None,
-                    Some(p) => {
-                        Some(self.known_worktree_path(&p).ok_or_else(|| unknown_worktree(&p))?)
-                    },
-                };
-                let id = self
-                    .spawn_session(ctx, workspace)
-                    .map_err(|e| format!("failed to spawn shell: {e}"))?;
-                Ok(json!({ "session_id": id }))
-            },
+            // Claimed by `process_ipc_calls` before dispatch: the reply is
+            // held until the session's PTY is live, which needs the reply
+            // channel this method does not have.
+            Req::CreateSession { .. } => Err("create_session was not deferred".to_string()),
             Req::CloseSession { session_id } => {
                 if !self.sessions.iter().any(|s| s.id == session_id) {
                     return Err(format!("no session with id {session_id}"));
@@ -8641,7 +8880,7 @@ impl AlacritreeApp {
                 if let Some(editor) = self.sessions[idx].scratchpad.as_mut() {
                     editor.insert_at_cursor(ctx, session_id, &text);
                 } else {
-                    let session = &self.sessions[idx];
+                    let session = &mut self.sessions[idx];
                     paste::on_terminal_input_start(session);
                     session.write(text.into_bytes());
                 }
@@ -8793,6 +9032,7 @@ impl eframe::App for AlacritreeApp {
             crash_log::record_reason(ExitReason::WindowClosed);
         }
         self.poll_project_refreshes();
+        self.poll_pending_spawns(ctx);
         // Unconditional: either sidebar can be hidden, and a drain hung off one
         // of them would strand every entry the other polled.
         self.pr_cache.drain_completed(ctx);
@@ -8923,6 +9163,7 @@ impl eframe::App for AlacritreeApp {
                         &mut self.detached_jobs,
                     );
                     self.grid_paint += started.elapsed();
+                    self.last_pane_geometry = Some((session.size, session.cell_size));
                     response
                 };
                 // egui fake-clicks the natively focused widget on Space/Enter,
@@ -9156,6 +9397,100 @@ mod tests {
             "git worktree remove {path}: fatal: '{path}' cannot be locked: filesystem error"
         );
         assert!(!refused_for_unsaved_work(&message));
+    }
+
+    #[test]
+    fn spawn_geometry_prefers_the_active_session_over_the_last_painted_pane() {
+        let active = Some(ActiveGeometry {
+            size: TermSize::new(120, 40),
+            cell_size: (9.0, 18.0),
+            is_scratchpad: false,
+        });
+        let last_pane = Some((TermSize::new(80, 24), (8.0, 16.0)));
+
+        let (size, cell_size) = spawn_geometry(active, last_pane);
+
+        assert_eq!((size.columns, size.screen_lines), (120, 40));
+        assert_eq!(cell_size, (9.0, 18.0));
+    }
+
+    #[test]
+    fn an_active_scratchpad_does_not_shadow_the_last_painted_pane() {
+        // The size every scratchpad keeps for its whole life.
+        let active = Some(ActiveGeometry {
+            size: TermSize::new(80, 24),
+            cell_size: (8.0, 16.0),
+            is_scratchpad: true,
+        });
+        let last_pane = Some((TermSize::new(120, 40), (9.0, 18.0)));
+
+        let (size, cell_size) = spawn_geometry(active, last_pane);
+
+        assert_eq!((size.columns, size.screen_lines), (120, 40));
+        assert_eq!(cell_size, (9.0, 18.0));
+    }
+
+    #[test]
+    fn spawn_geometry_falls_back_to_the_last_painted_pane_without_an_active_session() {
+        let last_pane = Some((TermSize::new(120, 40), (9.0, 18.0)));
+
+        let (size, cell_size) = spawn_geometry(None, last_pane);
+
+        assert_eq!((size.columns, size.screen_lines), (120, 40));
+        assert_eq!(cell_size, (9.0, 18.0));
+    }
+
+    #[test]
+    fn spawn_geometry_falls_back_to_80x24_before_anything_has_painted() {
+        let (size, cell_size) = spawn_geometry(None, None);
+
+        assert_eq!((size.columns, size.screen_lines), (80, 24));
+        assert_eq!(cell_size, (8.0, 16.0));
+    }
+
+    #[test]
+    fn the_visible_session_holds_the_self_boost_while_its_pty_is_still_opening() {
+        // Nothing to raise yet, so `set_priority_boost` answered false.
+        let visible = SessionBoost { raised: false, visible: true, pending: true };
+
+        assert!(holds_self_boost(visible));
+    }
+
+    #[test]
+    fn a_background_session_still_opening_its_pty_holds_no_self_boost() {
+        let background = SessionBoost { raised: false, visible: false, pending: true };
+
+        assert!(!holds_self_boost(background));
+    }
+
+    #[test]
+    fn a_session_whose_job_took_the_boost_holds_it_wherever_it_sits() {
+        let background = SessionBoost { raised: true, visible: false, pending: false };
+
+        assert!(holds_self_boost(background));
+    }
+
+    #[test]
+    fn a_frame_whose_visible_session_is_still_pending_leaves_the_self_boost_where_it_was() {
+        let frame = [
+            SessionBoost { raised: false, visible: false, pending: false },
+            // On screen, its PTY still opening: no job exists to answer for
+            // it, and the boost must survive the gap until one does.
+            SessionBoost { raised: false, visible: true, pending: true },
+            SessionBoost { raised: false, visible: false, pending: true },
+        ];
+
+        assert!(frame_holds_self_boost(frame.into_iter()));
+    }
+
+    #[test]
+    fn a_frame_of_idle_background_sessions_drops_the_self_boost() {
+        let frame = [
+            SessionBoost { raised: false, visible: false, pending: false },
+            SessionBoost { raised: false, visible: false, pending: true },
+        ];
+
+        assert!(!frame_holds_self_boost(frame.into_iter()));
     }
 
     #[test]
@@ -9878,6 +10213,19 @@ mod tests {
             deferred.verdict,
             CloseFallback::Activate(main),
             "the verdict is carried, not recomputed from whatever state remains"
+        );
+    }
+
+    /// A user's close navigates: away from an emptied workspace, or into a
+    /// replacement shell.  A failed open must do neither.  Wherever it
+    /// navigates to, `ensure_active_session` spawns into it, and that open
+    /// fails the same way.
+    #[test]
+    fn a_failed_spawn_neither_navigates_nor_respawns() {
+        assert_eq!(close_navigation(CloseReason::User, CloseFallback::Home), CloseFallback::Home);
+        assert_eq!(
+            close_navigation(CloseReason::SpawnFailed, CloseFallback::Home),
+            CloseFallback::Stay
         );
     }
 
