@@ -64,6 +64,7 @@ mod test_util;
 mod upstream;
 #[cfg(windows)]
 mod win_session;
+mod workspace;
 mod worktree;
 mod worktree_liveness;
 mod wsl;
