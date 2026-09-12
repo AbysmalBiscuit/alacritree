@@ -217,6 +217,108 @@ impl AlacritreeApp {
     }
 
     pub(super) fn show_project_sidebar(&mut self, ctx: &Context, panel_frame: Frame) -> egui::Rect {
+        let view = self.project_sidebar_view(ctx);
+        let theme = view.theme;
+        let mut requests = SidebarRequests::default();
+        let panel_resp = SidePanel::left("left_sidebar")
+            .resizable(true)
+            .default_width(240.0 * theme.ui_scale)
+            .min_width(180.0 * theme.ui_scale)
+            .frame(panel_frame)
+            .show(ctx, |ui| {
+                // Sidebar rows are click targets, not selectable prose; the
+                // default I-beam-and-select on labels is the wrong affordance.
+                ui.style_mut().interaction.selectable_labels = false;
+                apply_scrollbar_style(ui, self.config.ui.scrollbar);
+                ui.horizontal(|ui| {
+                    panel_header_filter_ui(
+                        ui,
+                        "Projects",
+                        &self.sidebar.filter,
+                        &self.config.ui.icons.search,
+                        &theme,
+                        self.sidebar.filter.toggles_apply(self.search_scope),
+                    );
+                    projects_header_buttons(ui, &view, &mut requests);
+                });
+                ui.separator();
+
+                ScrollArea::vertical().show(ui, |ui| {
+                    // Inter-group spacing is emitted above the group that
+                    // follows, never after the last one: trailing padding
+                    // makes the content measure taller than the rows on
+                    // screen, which shows a scrollbar with nothing to scroll
+                    // whenever the list otherwise fits the panel.
+                    let mut group_gap = 0.0_f32;
+                    if !view.filtering || view.membership.home {
+                        paint_home_group(
+                            ui,
+                            &view,
+                            self.current_workspace.is_none(),
+                            &mut requests,
+                        );
+                        group_gap = 2.0;
+                    }
+
+                    if self.projects.is_empty() {
+                        ui.add_space(std::mem::take(&mut group_gap));
+                        ui.label(
+                            RichText::new("Click + to add a project.")
+                                .color(theme.text_dim)
+                                .small(),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("Ctrl+B to toggle").small().color(theme.text_muted));
+                    } else if view.filtered_empty {
+                        ui.add_space(std::mem::take(&mut group_gap));
+                        ui.label(RichText::new("no matches").color(theme.text_dim).small());
+                    }
+
+                    for (idx, project) in self.projects.iter_mut().enumerate() {
+                        if view.filtering && !view.membership.projects.contains(&project.root) {
+                            continue;
+                        }
+                        ui.add_space(std::mem::take(&mut group_gap));
+                        paint_project_header(ui, &view, idx, project, &mut requests);
+                        if project.expanded || view.filtering {
+                            paint_worktrees(
+                                ui,
+                                &view,
+                                idx,
+                                project,
+                                self.current_workspace.as_deref(),
+                                &self.liveness,
+                                &mut requests,
+                            );
+                            group_gap = 4.0;
+                        }
+                    }
+                });
+            });
+
+        self.apply_sidebar_edits(ctx, &mut requests);
+        let workspace_activated = self.apply_sidebar_activations(ctx, &mut requests);
+        self.poll_worktree_liveness(ctx, view.probing, &requests.drawn_worktrees);
+        if self.config.ui.sidebar_click_focus {
+            // A click that picks a workspace or session means "go work
+            // there", so it focuses the terminal; other panel clicks focus
+            // the sidebar for filter typing.  Row activations fire on the
+            // release frame, after the press already focused the sidebar,
+            // which is why this can't fold into the press test below.
+            if workspace_activated {
+                self.focus_terminal();
+            } else if self.focus != PaneFocus::ProjectsSidebar
+                && pressed_on_panel(ctx, &panel_resp.response)
+            {
+                self.focus_sidebar();
+            }
+        }
+        panel_resp.response.rect
+    }
+
+    /// Everything the paint pass reads, gathered while `&self` helpers are
+    /// still callable: the panel closure borrows `projects` mutably.
+    fn project_sidebar_view(&mut self, ctx: &Context) -> SidebarView {
         // Only rows that actually paint are worth a liveness probe, and which
         // ones those are is not known until the tree, its filters and its
         // collapsed projects have all had their say.  Deciding *before* the
@@ -225,31 +327,6 @@ impl AlacritreeApp {
         let probing = self.config.ui.worktree_liveness
             && self.liveness_probe.is_none()
             && self.liveness.wants_probe(Instant::now());
-        let drawn_worktrees: std::cell::RefCell<Vec<PathBuf>> = Default::default();
-        let activate_request: std::cell::Cell<Option<PathBuf>> = std::cell::Cell::new(None);
-        let delete_request: std::cell::Cell<Option<PathBuf>> = std::cell::Cell::new(None);
-        let create_request: std::cell::Cell<Option<usize>> = std::cell::Cell::new(None);
-        let spawn_shell_request: std::cell::Cell<Option<WorkspaceKey>> = std::cell::Cell::new(None);
-        let spawn_profile_request: std::cell::Cell<Option<(PathBuf, String)>> =
-            std::cell::Cell::new(None);
-        let activate_session_request: std::cell::Cell<Option<(WorkspaceKey, SessionId)>> =
-            std::cell::Cell::new(None);
-        let close_session_request: std::cell::Cell<Option<SessionId>> = std::cell::Cell::new(None);
-        let attach_herdr_request: std::cell::Cell<Option<(WorkspaceKey, herdr::HerdrKey, String)>> =
-            std::cell::Cell::new(None);
-        let base_picker_request: std::cell::Cell<Option<PathBuf>> = std::cell::Cell::new(None);
-        // Drag-to-reorder: (dragged root, insert-before display index).
-        let reorder_request: std::cell::Cell<Option<(PathBuf, usize)>> = std::cell::Cell::new(None);
-        let mut add_project_clicked = false;
-        let mut reorder_toggled = false;
-        let mut refresh_idx: Option<usize> = None;
-        let mut remove_request: Option<ProjectRemoveState> = None;
-        let mut expand_toggled: Option<(PathBuf, bool)> = None;
-        let mut home_clicked = false;
-        let theme = self.theme;
-        let scrollbar = self.config.ui.scrollbar;
-        let reorder_mode = self.sidebar.reorder_mode;
-        let session_drag = self.session_drag;
         // The render pass cannot borrow `self.sessions`, so the dragged
         // session's own scope is resolved here: a row outside this range draws
         // no indicator and never becomes a drop.
@@ -258,15 +335,12 @@ impl AlacritreeApp {
                 let (_, range) = self.reorder_range(dragged.0)?;
                 Some((dragged.0, range))
             });
-        let session_drop_request: std::cell::Cell<Option<(SessionId, WorkspaceKey, usize)>> =
-            std::cell::Cell::new(None);
         let cursor_row = if self.focus == PaneFocus::ProjectsSidebar {
             self.sidebar.cursor.clone()
         } else {
             None
         };
         let cursor_moved = std::mem::take(&mut self.sidebar.cursor_moved);
-        let scrolls = |is_cursor: bool| is_cursor && cursor_moved;
 
         let filtering = self.sidebar.filter.is_filtering();
         let active_now = self.active_session.get(&self.current_workspace).copied();
@@ -303,75 +377,28 @@ impl AlacritreeApp {
         if follow_row.is_some() {
             self.last_followed = (self.current_workspace.clone(), active_now);
         }
-        // `Project`/`Worktree` rows carry a `PathBuf`; matching by reference
-        // here (mirroring the `cursor_row` matches below) keeps every scroll
-        // check on the paint path allocation-free, follow target or not.
-        let follows_home = follow_row == Some(SidebarRow::Home);
-        let follows_session = |id: SessionId| follow_row == Some(SidebarRow::Session(id));
-        let follows_project = |root: &Path| matches!(&follow_row, Some(SidebarRow::Project(r)) if r.as_path() == root);
-        let follows_worktree = |path: &Path| matches!(&follow_row, Some(SidebarRow::Worktree(p)) if p.as_path() == path);
 
-        // Membership for the active filter, resolved once so paint can skip
-        // non-surviving rows.  While filtering, matched projects render their
-        // matched worktrees regardless of `expanded` (display-only — the flag
-        // is never written).
-        let mut home_visible = true;
-        let mut visible_projects: HashSet<PathBuf> = HashSet::new();
-        let mut visible_worktrees: HashSet<PathBuf> = HashSet::new();
-        let mut visible_children: HashSet<SidebarRow> = HashSet::new();
-        if filtering {
-            home_visible = false;
-            for row in rows {
-                match row {
-                    SidebarRow::Home => home_visible = true,
-                    SidebarRow::Project(root) => {
-                        visible_projects.insert(root);
-                    },
-                    SidebarRow::Worktree(path) => {
-                        visible_worktrees.insert(path);
-                    },
-                    SidebarRow::Session(_) | SidebarRow::HerdrAgent(..) => {
-                        visible_children.insert(row);
-                    },
-                }
-            }
-        }
+        let membership = FilterMembership::of(filtering, rows);
         let filtered_empty = filtering
-            && !home_visible
-            && visible_projects.is_empty()
-            && visible_worktrees.is_empty();
+            && !membership.home
+            && membership.projects.is_empty()
+            && membership.worktrees.is_empty();
 
         // Snapshot attention + agent-glyph state up-front so the `iter_mut`
-        // over projects below isn't blocked from calling back into `&self`
-        // helpers.
+        // over projects in the paint pass isn't blocked from calling back
+        // into `&self` helpers.
         let mut listed = self.listed_workspace_rows();
         // The cursor can only reach a row the nav model listed, so paint keeps
         // exactly that set: a session the filter dropped would strand just
         // like an unlisted agent, so both are pruned by row membership here.
         if filtering {
             for entries in listed.values_mut() {
-                entries.retain(|entry| visible_children.contains(&entry.row()));
+                entries.retain(|entry| membership.children.contains(&entry.row()));
             }
         }
         let home_rows = self.workspace_rows(&None, &listed);
-        let worktree_rows: Vec<Vec<Vec<WorkspaceRowData>>> = self
-            .projects
-            .iter()
-            .map(|p| {
-                p.worktrees
-                    .iter()
-                    .map(|wt| self.workspace_rows(&Some(wt.path.clone()), &listed))
-                    .collect()
-            })
-            .collect();
-
-        let worktree_listed: Vec<Vec<bool>> = worktree_rows
-            .iter()
-            .map(|v| v.iter().map(|rows| WorkspaceRowData::any_session(rows)).collect())
-            .collect();
-
         // A rendered session list carries its own per-session status; repeating
-        // it on the parent row reads as noise — the same
+        // it on the parent row reads as noise, the same
         // rule the project row applies when expanded.  Aggregates therefore
         // apply only while the list is hidden (fewer than two sessions).
         let home_lists_sessions = WorkspaceRowData::any_session(&home_rows);
@@ -381,71 +408,55 @@ impl AlacritreeApp {
         } else {
             self.workspace_activity(&None)
         };
-        let project_attention: Vec<bool> =
-            self.projects.iter().map(|p| self.project_needs_attention(p)).collect();
-        let worktree_attention: Vec<Vec<bool>> = self
-            .projects
-            .iter()
-            .enumerate()
-            .map(|(p_idx, p)| {
-                p.worktrees
-                    .iter()
-                    .enumerate()
-                    .map(|(w_idx, wt)| {
-                        let listed = worktree_listed
-                            .get(p_idx)
-                            .and_then(|v| v.get(w_idx))
-                            .copied()
-                            .unwrap_or(false);
-                        !listed && self.workspace_needs_attention(&Some(wt.path.clone()))
-                    })
-                    .collect()
-            })
-            .collect();
-        let worktree_activity: Vec<Vec<SessionActivity>> = self
-            .projects
-            .iter()
-            .enumerate()
-            .map(|(p_idx, p)| {
-                p.worktrees
-                    .iter()
-                    .enumerate()
-                    .map(|(w_idx, wt)| {
-                        let listed = worktree_listed
-                            .get(p_idx)
-                            .and_then(|v| v.get(w_idx))
-                            .copied()
-                            .unwrap_or(false);
-                        if listed {
-                            SessionActivity::Shell
-                        } else {
-                            self.workspace_activity(&Some(wt.path.clone()))
-                        }
-                    })
-                    .collect()
-            })
-            .collect();
-        // Worktrees whose background removal is still running: their rows show
-        // a spinner instead of the delete/new-shell controls.
-        let deleting_paths: HashSet<PathBuf> =
-            self.pending_deletes.iter().map(|t| t.worktree_path.clone()).collect();
-        // Minimized creations, keyed by project index, rendered as spinner
-        // placeholder rows until the finished worktree shows up on refresh.
-        let creating: Vec<(usize, String)> =
-            self.pending_creates.iter().map(|c| (c.project_idx, c.branch.clone())).collect();
-        let distros = wsl::distros();
-        let icons = self.config.ui.icons.clone();
-        let profile_names: Vec<String> =
-            self.config.profiles.iter().map(|p| p.name.clone()).collect();
-        // Name + command pairs for the worktree row's "Open session" menu —
-        // the command is only ever shown as hover text, never painted.
-        let worktree_profiles: Vec<(String, String)> =
-            self.config.profiles.iter().map(|p| (p.name.clone(), profile_command(p))).collect();
-        let mut shell_override_changed: Option<PathBuf> = None;
-        let mut label_cleared: Option<PathBuf> = None;
-        let mut rename_request: Option<RenameState> = None;
-        // Polled up front: the panel closure borrows `projects` mutably, so the
-        // cache cannot be polled from inside it.
+        let projects = self.project_views(ctx, &listed);
+
+        SidebarView {
+            theme: self.theme,
+            icons: self.config.ui.icons.clone(),
+            probing,
+            reorder_mode: self.sidebar.reorder_mode,
+            session_drag: self.session_drag,
+            drag_range,
+            cursor_row,
+            cursor_moved,
+            follow_row,
+            filtering,
+            membership,
+            filtered_empty,
+            home_rows,
+            home_attention,
+            home_activity,
+            projects,
+            // Worktrees whose background removal is still running: their rows show
+            // a spinner instead of the delete/new-shell controls.
+            deleting_paths: self.pending_deletes.iter().map(|t| t.worktree_path.clone()).collect(),
+            // Minimized creations, keyed by project index, rendered as spinner
+            // placeholder rows until the finished worktree shows up on refresh.
+            creating: self
+                .pending_creates
+                .iter()
+                .map(|c| (c.project_idx, c.branch.clone()))
+                .collect(),
+            distros: wsl::distros(),
+            profile_names: self.config.profiles.iter().map(|p| p.name.clone()).collect(),
+            // Name + command pairs for the worktree row's "Open session" menu.
+            // The command is only ever shown as hover text, never painted.
+            worktree_profiles: self
+                .config
+                .profiles
+                .iter()
+                .map(|p| (p.name.clone(), profile_command(p)))
+                .collect(),
+        }
+    }
+
+    /// One entry per project, aligned with `projects`, each holding one entry
+    /// per worktree.
+    fn project_views(
+        &mut self,
+        ctx: &Context,
+        listed: &sidebar_nav::ListedRows,
+    ) -> Vec<ProjectView> {
         let pr_enabled = self.config.ui.pr_status;
         let any_pr_toggle = any_pr_toggle_active(&self.sidebar.filter, self.search_scope);
         let current_workspace = self.current_workspace.as_deref();
@@ -456,11 +467,16 @@ impl AlacritreeApp {
         // keyed by path alone, so a second poller would only invalidate the
         // first's lookup and burn a `gh` process every frame.
         let mut polled: HashMap<PathBuf, Option<PrInfo>> = HashMap::new();
-        let mut pr_infos: Vec<Vec<Option<PrInfo>>> = Vec::with_capacity(self.projects.len());
+        let mut views = Vec::with_capacity(self.projects.len());
         for project in &self.projects {
-            let mut rows = Vec::with_capacity(project.worktrees.len());
+            let mut worktrees = Vec::with_capacity(project.worktrees.len());
             for wt in &project.worktrees {
-                let info = resolve_pr_info(
+                let ws = Some(wt.path.clone());
+                let rows = self.workspace_rows(&ws, listed);
+                // Aggregates apply only while the session list is hidden, as
+                // on the home row.
+                let lists_sessions = WorkspaceRowData::any_session(&rows);
+                let pr = resolve_pr_info(
                     &mut polled,
                     &wt.path,
                     should_poll_pr(pr_enabled, project.expanded, any_pr_toggle),
@@ -470,674 +486,94 @@ impl AlacritreeApp {
                         self.pr_cache.poll(&wt.path, branch, ctx)
                     },
                 );
-                rows.push(info);
-            }
-            pr_infos.push(rows);
-        }
-        // Rendered up front: the panel closure borrows `projects` mutably, and
-        // substitution over short strings is microseconds, so no cache is kept.
-        // After `pr_infos` so `$pr` sees this frame's PR numbers.
-        let mut project_labels: Vec<String> = Vec::with_capacity(self.projects.len());
-        let mut worktree_labels: Vec<Vec<String>> = Vec::with_capacity(self.projects.len());
-        for (project, prs) in self.projects.iter().zip(&pr_infos) {
-            project_labels.push(self.row_labels.project_label(project));
-            let mut rows = Vec::with_capacity(project.worktrees.len());
-            for (wt, pr) in project.worktrees.iter().zip(prs) {
-                rows.push(self.row_labels.worktree_label(wt, pr.as_ref()));
-            }
-            worktree_labels.push(rows);
-        }
-
-        let panel_resp = SidePanel::left("left_sidebar")
-            .resizable(true)
-            .default_width(240.0 * theme.ui_scale)
-            .min_width(180.0 * theme.ui_scale)
-            .frame(panel_frame)
-            .show(ctx, |ui| {
-                // Sidebar rows are click targets, not selectable prose; the
-                // default I-beam-and-select on labels is the wrong affordance.
-                ui.style_mut().interaction.selectable_labels = false;
-                apply_scrollbar_style(ui, scrollbar);
-                ui.horizontal(|ui| {
-                    panel_header_filter_ui(
-                        ui,
-                        "Projects",
-                        &self.sidebar.filter,
-                        &self.config.ui.icons.search,
-                        &theme,
-                        self.sidebar.filter.toggles_apply(self.search_scope),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if icon_tooltip(
-                            styled_icon_button(
-                                ui,
-                                &icons.add_project,
-                                DEFAULT_ADD_ICON,
-                                theme.text_dim,
-                                &theme,
-                            ),
-                            "add project",
-                            theme.icon_tooltips,
-                        )
-                        .clicked()
-                        {
-                            add_project_clicked = true;
-                        }
-                        // Lit while active: the mode is only visible as grips
-                        // on the rows, so the button has to say it's on.
-                        let (color, hint) = if reorder_mode {
-                            (theme.accent, "done reordering")
-                        } else {
-                            (theme.text_dim, "reorder projects")
-                        };
-                        if icon_tooltip(
-                            styled_icon_button(ui, &icons.reorder, DEFAULT_REORDER_ICON, color, &theme),
-                            hint,
-                            theme.icon_tooltips,
-                        )
-                        .clicked()
-                        {
-                            reorder_toggled = true;
-                        }
-                    });
+                // Rendered up front: the panel closure borrows `projects` mutably, and
+                // substitution over short strings is microseconds, so no cache is kept.
+                // After `pr` so `$pr` sees this frame's PR number.
+                worktrees.push(WorktreeView {
+                    label: self.row_labels.worktree_label(wt, pr.as_ref()),
+                    attention: !lists_sessions && self.workspace_needs_attention(&ws),
+                    activity: if lists_sessions {
+                        SessionActivity::Shell
+                    } else {
+                        self.workspace_activity(&ws)
+                    },
+                    pr,
+                    rows,
                 });
-                ui.separator();
-
-                // `slot` carries a session row's display index and id; `None`
-                // is a workspace row.
-                let session_drop = |ui: &egui::Ui,
-                                    row_rect: egui::Rect,
-                                    ws: &WorkspaceKey,
-                                    slot: Option<(usize, SessionId)>| {
-                    let Some((dragged, range)) = drag_range.as_ref() else { return };
-                    // The dragged row's own edges are no-ops, so offering them
-                    // as targets would paint a drop that does nothing.
-                    if slot.is_some_and(|(_, id)| id == *dragged) {
-                        return;
-                    }
-                    if !range.contains(ws) {
-                        return;
-                    }
-                    let Some(pointer) = ui.input(|i| i.pointer.interact_pos()) else { return };
-                    if !row_rect.contains(pointer) {
-                        return;
-                    }
-                    let position = match slot {
-                        // A session row: the half the pointer is in decides.
-                        Some((idx, _)) => {
-                            if draw_drop_indicator(ui, row_rect, pointer, &theme) {
-                                idx
-                            } else {
-                                idx + 1
-                            }
-                        },
-                        // A workspace row: its sessions start under it, so a
-                        // drop here means the front of that workspace.  This is
-                        // the only way to reach a workspace listing no session
-                        // rows — an empty one, or a single-session one below the
-                        // display threshold.
-                        None => {
-                            ui.painter().hline(
-                                row_rect.x_range(),
-                                row_rect.bottom(),
-                                drop_indicator_stroke(&theme),
-                            );
-                            0
-                        },
-                    };
-                    if ui.input(|i| i.pointer.any_released()) {
-                        session_drop_request.set(Some((*dragged, ws.clone(), position)));
-                        egui::DragAndDrop::clear_payload(ui.ctx());
-                    }
-                };
-
-                ScrollArea::vertical().show(ui, |ui| {
-                    // Inter-group spacing is emitted above the group that
-                    // follows, never after the last one: trailing padding
-                    // makes the content measure taller than the rows on
-                    // screen, which shows a scrollbar with nothing to scroll
-                    // whenever the list otherwise fits the panel.
-                    let mut group_gap = 0.0_f32;
-                    if !filtering || home_visible {
-                        let home_is_cursor = matches!(&cursor_row, Some(SidebarRow::Home));
-                        let home_action = home_row(
-                            ui,
-                            self.current_workspace.is_none(),
-                            home_is_cursor,
-                            scrolls(home_is_cursor) || follows_home,
-                            home_attention,
-                            home_activity,
-                            &icons,
-                            &theme,
-                        );
-                        if home_action.activate {
-                            home_clicked = true;
-                        }
-                        if home_action.spawn {
-                            spawn_shell_request.set(Some(None));
-                        }
-                        session_drop(ui, home_action.rect, &None, None);
-                        // Only rows a reorder can move take a drop slot, and
-                        // the slot index counts those alone: a herdr pane's
-                        // place is herdr's to decide, so it is neither a drag
-                        // subject nor a landing.
-                        let mut slot = 0usize;
-                        for row in &home_rows {
-                            match row {
-                                WorkspaceRowData::Session(row) => {
-                                    let is_cursor = matches!(
-                                        &cursor_row,
-                                        Some(SidebarRow::Session(id)) if *id == row.id
-                                    );
-                                    let scroll = scrolls(is_cursor) || follows_session(row.id);
-                                    let movable = row.managed.is_none();
-                                    let act = session_row(
-                                        ui,
-                                        row,
-                                        is_cursor,
-                                        scroll,
-                                        session_drag && movable,
-                                        &icons,
-                                        &theme,
-                                    );
-                                    if act.activate {
-                                        activate_session_request.set(Some((None, row.id)));
-                                    }
-                                    if act.close {
-                                        close_session_request.set(Some(row.id));
-                                    }
-                                    if movable {
-                                        session_drop(ui, act.rect, &None, Some((slot, row.id)));
-                                        slot += 1;
-                                    }
-                                },
-                                WorkspaceRowData::Herdr(row) => {
-                                    let is_cursor = matches!(
-                                        &cursor_row,
-                                        Some(SidebarRow::HerdrAgent(side, id))
-                                            if *side == row.side && *id == row.terminal_id
-                                    );
-                                    let scroll = scrolls(is_cursor);
-                                    let act =
-                                        herdr_row(ui, row, is_cursor, scroll, &icons, &theme);
-                                    if act.attach {
-                                        attach_herdr_request.set(Some((
-                                            None,
-                                            herdr::HerdrKey {
-                                                side: row.side.clone(),
-                                                terminal_id: row.terminal_id.clone(),
-                                            },
-                                            row.pane_id.clone(),
-                                        )));
-                                    }
-                                },
-                            }
-                        }
-                        group_gap = 2.0;
-                    }
-
-                    if self.projects.is_empty() {
-                        ui.add_space(std::mem::take(&mut group_gap));
-                        ui.label(
-                            RichText::new("Click + to add a project.")
-                                .color(theme.text_dim)
-                                .small(),
-                        );
-                        ui.add_space(4.0);
-                        ui.label(RichText::new("Ctrl+B to toggle").small().color(theme.text_muted));
-                    } else if filtered_empty {
-                        ui.add_space(std::mem::take(&mut group_gap));
-                        ui.label(RichText::new("no matches").color(theme.text_dim).small());
-                    }
-
-                    for (idx, project) in self.projects.iter_mut().enumerate() {
-                        if filtering && !visible_projects.contains(&project.root) {
-                            continue;
-                        }
-                        ui.add_space(std::mem::take(&mut group_gap));
-                        let proj_attention = project_attention.get(idx).copied().unwrap_or(false);
-                        // Bubble attention up to the project row only when the
-                        // project is collapsed — once expanded, the actual
-                        // worktree rows already show the dot, and doubling it
-                        // on the parent reads as noise.
-                        let show_proj_dot = proj_attention && !project.expanded;
-                        // Cloned out before the row closures borrow `project`
-                        // mutably: the trailing closure needs them for the
-                        // remove-confirmation prompt.
-                        let project_root = project.root.clone();
-                        let project_name = project.display_name().to_string();
-                        let mut name_resp: Option<egui::Response> = None;
-                        let row_rect = row_with_trailing(
-                            ui,
-                            |ui| {
-                                ui.spacing_mut().item_spacing.x = ICON_CLUSTER_SPACING;
-                                if reorder_mode {
-                                    drag_handle(ui, &theme)
-                                        .dnd_set_drag_payload(DraggedProject(project.root.clone()));
-                                }
-                                let (arrow_style, arrow_default, arrow_hint) = if project.expanded {
-                                    (
-                                        &icons.project_expanded,
-                                        DEFAULT_PROJECT_EXPANDED_ICON,
-                                        "collapse project",
-                                    )
-                                } else {
-                                    (
-                                        &icons.project_collapsed,
-                                        DEFAULT_PROJECT_COLLAPSED_ICON,
-                                        "expand project",
-                                    )
-                                };
-                                if icon_tooltip(
-                                    styled_icon_button(
-                                        ui,
-                                        arrow_style,
-                                        arrow_default,
-                                        theme.text_dim,
-                                        &theme,
-                                    ),
-                                    arrow_hint,
-                                    theme.icon_tooltips,
-                                )
-                                .clicked()
-                                {
-                                    project.expanded = !project.expanded;
-                                    expand_toggled = Some((project.root.clone(), project.expanded));
-                                }
-                                let name = project_labels
-                                    .get(idx)
-                                    .map(String::as_str)
-                                    .unwrap_or(project.display_name());
-                                let (resp, galley) = truncating_label(
-                                    ui,
-                                    RichText::new(name).strong().small().color(theme.text),
-                                    theme.text,
-                                    egui::Sense::click(),
-                                );
-                                name_resp = Some(name_tooltip(
-                                    resp,
-                                    name,
-                                    galley.elided,
-                                    theme.sidebar_tooltips,
-                                ));
-                            },
-                            |ui| {
-                                if icon_tooltip(
-                                    styled_icon_button(
-                                        ui,
-                                        &icons.remove_project,
-                                        DEFAULT_CLOSE_ICON,
-                                        theme.text_muted,
-                                        &theme,
-                                    ),
-                                    "remove from sidebar",
-                                    theme.icon_tooltips,
-                                )
-                                .clicked()
-                                {
-                                    remove_request = Some(ProjectRemoveState {
-                                        root: project_root.clone(),
-                                        name: project_name.clone(),
-                                    });
-                                }
-                                if icon_tooltip(
-                                    styled_icon_button(
-                                        ui,
-                                        &icons.refresh,
-                                        DEFAULT_REFRESH_ICON,
-                                        theme.text_muted,
-                                        &theme,
-                                    ),
-                                    "refresh worktrees",
-                                    theme.icon_tooltips,
-                                )
-                                .clicked()
-                                {
-                                    refresh_idx = Some(idx);
-                                }
-                                if icon_tooltip(
-                                    styled_icon_button(
-                                        ui,
-                                        &icons.new_worktree,
-                                        DEFAULT_ADD_ICON,
-                                        theme.text_muted,
-                                        &theme,
-                                    ),
-                                    "create new worktree",
-                                    theme.icon_tooltips,
-                                )
-                                .clicked()
-                                {
-                                    create_request.set(Some(idx));
-                                }
-                                if show_proj_dot {
-                                    icon_tooltip(
-                                        attention_dot(ui, &theme),
-                                        ATTENTION_HINT,
-                                        theme.icon_tooltips,
-                                    );
-                                }
-                            },
-                        );
-                        let header_is_cursor =
-                            matches!(&cursor_row, Some(SidebarRow::Project(r)) if *r == project.root);
-                        let header_rect = egui::Rect::from_x_y_ranges(
-                            ui.max_rect().x_range(),
-                            row_rect.y_range(),
-                        );
-                        if header_is_cursor {
-                            paint_cursor_outline(ui, header_rect, &theme);
-                        }
-                        if scrolls(header_is_cursor) || follows_project(&project.root) {
-                            ui.scroll_to_rect(header_rect, theme.scroll_align);
-                        }
-
-                        // Drop target for a reorder drag.  Detected against the
-                        // raw payload rather than a `dnd_drop_zone` widget so no
-                        // extra hover-sensing rect steals the row buttons' own
-                        // hover highlight.
-                        if let Some(dragged) =
-                            egui::DragAndDrop::payload::<DraggedProject>(ui.ctx())
-                        {
-                            let pointer = ui.input(|i| i.pointer.interact_pos());
-                            if let Some(pointer) = pointer
-                                .filter(|p| row_rect.contains(*p) && dragged.0 != project.root)
-                            {
-                                let before = draw_drop_indicator(ui, row_rect, pointer, &theme);
-                                if ui.input(|i| i.pointer.any_released()) {
-                                    let insert_before = if before { idx } else { idx + 1 };
-                                    reorder_request.set(Some((dragged.0.clone(), insert_before)));
-                                    egui::DragAndDrop::clear_payload(ui.ctx());
-                                }
-                            }
-                        }
-
-                        // Right-click: rename the project, and choose which
-                        // shell its sessions use.
-                        if let Some(resp) = name_resp {
-                            resp.context_menu(|ui| {
-                                if ui.button("Rename…").clicked() {
-                                    rename_request = Some(RenameState {
-                                        root: project.root.clone(),
-                                        label: project.display_name().to_string(),
-                                    });
-                                    ui.close_menu();
-                                }
-                                if project.label.is_some() && ui.button("Reset name").clicked() {
-                                    project.label = None;
-                                    label_cleared = Some(project.root.clone());
-                                    ui.close_menu();
-                                }
-                                // The shell picker is hidden when there is
-                                // nothing to choose (no distros, no profiles)
-                                // so minimal setups see only the rename.
-                                if !distros.is_empty() || !profile_names.is_empty() {
-                                    ui.separator();
-                                    ui.label(
-                                        RichText::new("Open in…").color(theme.text_muted).small(),
-                                    );
-                                    let mark =
-                                        |selected: bool| if selected { "• " } else { "   " };
-                                    let auto = project.shell_override.is_none();
-                                    if ui
-                                        .button(format!("{}Auto (by location)", mark(auto)))
-                                        .clicked()
-                                    {
-                                        project.shell_override = None;
-                                        shell_override_changed = Some(project.root.clone());
-                                        ui.close_menu();
-                                    }
-                                    let win = matches!(
-                                        project.shell_override,
-                                        Some(ShellChoice::Windows)
-                                    );
-                                    if ui.button(format!("{}Windows shell", mark(win))).clicked() {
-                                        project.shell_override = Some(ShellChoice::Windows);
-                                        shell_override_changed = Some(project.root.clone());
-                                        ui.close_menu();
-                                    }
-                                    for distro in &distros {
-                                        let selected = matches!(
-                                            &project.shell_override,
-                                            Some(ShellChoice::Wsl(name)) if name == &distro.name
-                                        );
-                                        if ui
-                                            .button(format!(
-                                                "{}WSL ({})",
-                                                mark(selected),
-                                                distro.name
-                                            ))
-                                            .clicked()
-                                        {
-                                            project.shell_override =
-                                                Some(ShellChoice::Wsl(distro.name.clone()));
-                                            shell_override_changed = Some(project.root.clone());
-                                            ui.close_menu();
-                                        }
-                                    }
-                                    for name in &profile_names {
-                                        let selected = matches!(
-                                            &project.shell_override,
-                                            Some(ShellChoice::Profile(n)) if n == name
-                                        );
-                                        if ui
-                                            .button(format!("{}Profile: {}", mark(selected), name))
-                                            .clicked()
-                                        {
-                                            project.shell_override =
-                                                Some(ShellChoice::Profile(name.clone()));
-                                            shell_override_changed = Some(project.root.clone());
-                                            ui.close_menu();
-                                        }
-                                    }
-                                }
-                            });
-                        }
-
-                        if project.expanded || filtering {
-                            for (wt_idx, wt) in project.worktrees.iter().enumerate() {
-                                if filtering && !visible_worktrees.contains(&wt.path) {
-                                    continue;
-                                }
-                                let is_active = self.current_workspace.as_deref() == Some(&wt.path);
-                                let wt_attention = worktree_attention
-                                    .get(idx)
-                                    .and_then(|v| v.get(wt_idx))
-                                    .copied()
-                                    .unwrap_or(false);
-                                let wt_activity = worktree_activity
-                                    .get(idx)
-                                    .and_then(|v| v.get(wt_idx))
-                                    .copied()
-                                    .unwrap_or_default();
-                                let is_cursor = matches!(
-                                    &cursor_row,
-                                    Some(SidebarRow::Worktree(p)) if *p == wt.path
-                                );
-                                let wt_scroll = scrolls(is_cursor) || follows_worktree(&wt.path);
-                                let is_deleting = deleting_paths.contains(&wt.path);
-                                // A `\\wsl.localhost\` stat boots the distro's
-                                // 9P server, so probing one would restart a VM
-                                // the user had shut down and hold it resident
-                                // for as long as its worktrees are listed.
-                                // WSL rows keep discovery's word.
-                                if probing
-                                    && matches!(
-                                        wsl::classify(&wt.path),
-                                        wsl::Location::Windows(_)
-                                    )
-                                {
-                                    drawn_worktrees.borrow_mut().push(wt.path.clone());
-                                }
-                                let action = worktree_row(
-                                    ui,
-                                    wt,
-                                    self.liveness.missing(&wt.path),
-                                    worktree_labels
-                                        .get(idx)
-                                        .and_then(|v| v.get(wt_idx))
-                                        .map(String::as_str)
-                                        .unwrap_or(&wt.name),
-                                    pr_infos
-                                        .get(idx)
-                                        .and_then(|v| v.get(wt_idx))
-                                        .and_then(Option::as_ref),
-                                    is_active,
-                                    is_cursor,
-                                    wt_scroll,
-                                    wt_attention,
-                                    wt_activity,
-                                    is_deleting,
-                                    &worktree_profiles,
-                                    &icons,
-                                    &theme,
-                                );
-                                if action.activate {
-                                    activate_request.set(Some(wt.path.clone()));
-                                }
-                                if action.delete {
-                                    delete_request.set(Some(wt.path.clone()));
-                                }
-                                if action.spawn {
-                                    spawn_shell_request.set(Some(Some(wt.path.clone())));
-                                }
-                                if action.set_base {
-                                    base_picker_request.set(Some(wt.path.clone()));
-                                }
-                                if let Some(name) = action.spawn_profile {
-                                    spawn_profile_request.set(Some((wt.path.clone(), name)));
-                                }
-                                session_drop(ui, action.rect, &Some(wt.path.clone()), None);
-                                let listed_rows = worktree_rows
-                                    .get(idx)
-                                    .and_then(|v| v.get(wt_idx))
-                                    .map(Vec::as_slice)
-                                    .unwrap_or(&[]);
-                                let mut slot = 0usize;
-                                for row in listed_rows {
-                                    match row {
-                                        WorkspaceRowData::Session(row) => {
-                                            let is_cursor = matches!(
-                                                &cursor_row,
-                                                Some(SidebarRow::Session(id)) if *id == row.id
-                                            );
-                                            let scroll =
-                                                scrolls(is_cursor) || follows_session(row.id);
-                                            let movable = row.managed.is_none();
-                                            let act = session_row(
-                                                ui,
-                                                row,
-                                                is_cursor,
-                                                scroll,
-                                                session_drag && movable,
-                                                &icons,
-                                                &theme,
-                                            );
-                                            if act.activate {
-                                                activate_session_request
-                                                    .set(Some((Some(wt.path.clone()), row.id)));
-                                            }
-                                            if act.close {
-                                                close_session_request.set(Some(row.id));
-                                            }
-                                            if movable {
-                                                session_drop(
-                                                    ui,
-                                                    act.rect,
-                                                    &Some(wt.path.clone()),
-                                                    Some((slot, row.id)),
-                                                );
-                                                slot += 1;
-                                            }
-                                        },
-                                        WorkspaceRowData::Herdr(row) => {
-                                            let is_cursor = matches!(
-                                                &cursor_row,
-                                                Some(SidebarRow::HerdrAgent(side, id))
-                                                    if *side == row.side
-                                                        && *id == row.terminal_id
-                                            );
-                                            let scroll = scrolls(is_cursor);
-                                            let act = herdr_row(
-                                                ui, row, is_cursor, scroll, &icons, &theme,
-                                            );
-                                            if act.attach {
-                                                attach_herdr_request.set(Some((
-                                                    Some(wt.path.clone()),
-                                                    herdr::HerdrKey {
-                                                        side: row.side.clone(),
-                                                        terminal_id: row.terminal_id.clone(),
-                                                    },
-                                                    row.pane_id.clone(),
-                                                )));
-                                            }
-                                        },
-                                    }
-                                }
-                            }
-                            for (_, branch) in creating.iter().filter(|(pi, _)| *pi == idx) {
-                                creating_row(ui, branch, &icons, &theme);
-                            }
-                            group_gap = 4.0;
-                        }
-                    }
-                });
+            }
+            views.push(ProjectView {
+                label: self.row_labels.project_label(project),
+                attention: self.project_needs_attention(project),
+                worktrees,
             });
+        }
+        views
+    }
 
-        if add_project_clicked {
+    /// Applies what the paint pass recorded other than activations: project
+    /// edits, session drops, and the dialogs a row opens.  A pointer release
+    /// clicks one widget, so at most one of these fires per frame and their
+    /// order is free.
+    fn apply_sidebar_edits(&mut self, ctx: &Context, requests: &mut SidebarRequests) {
+        if requests.add_project {
             self.add_project_via_dialog(ctx);
         }
-        if reorder_toggled {
+        if requests.reorder_toggled {
             self.sidebar.reorder_mode = !self.sidebar.reorder_mode;
         }
-        if let Some(idx) = refresh_idx {
+        if let Some(idx) = requests.refresh {
             self.refresh_project(ctx, idx);
         }
-        if let Some(req) = remove_request {
+        if let Some(req) = requests.remove.take() {
             self.pending_project_remove = Some(req);
         }
-        if let Some((root, insert_before)) = reorder_request.take() {
+        if let Some((root, insert_before)) = requests.reorder.take() {
             self.move_project(&root, insert_before);
         }
-        if let Some((id, workspace, position)) = session_drop_request.take() {
+        if let Some((id, workspace, position)) = requests.session_drop.take() {
             self.apply_session_drop(id, workspace, position);
         }
-        if let Some((root, expanded)) = expand_toggled {
+        if let Some((root, expanded)) = requests.expand_toggled.take() {
             state::mutate(|s| {
                 if let Some(p) = s.projects.iter_mut().find(|p| p.root == root) {
                     p.expanded = expanded;
                 }
             });
         }
-        if let Some(root) = shell_override_changed {
+        if let Some(root) = requests.shell_override_changed.take() {
             self.persist_project(&root);
         }
-        if let Some(root) = label_cleared {
+        if let Some(root) = requests.label_cleared.take() {
             self.persist_project_label(&root);
         }
-        if rename_request.is_some() {
-            self.pending_rename = rename_request;
+        if requests.rename.is_some() {
+            self.pending_rename = requests.rename.take();
         }
-        let mut workspace_activated = false;
-        if home_clicked {
-            self.activate_home(ctx);
-            workspace_activated = true;
-        }
-        if let Some(path) = activate_request.take() {
-            self.activate_worktree(ctx, &path);
-            workspace_activated = true;
-        }
-        if let Some(path) = base_picker_request.take() {
+        if let Some(path) = requests.base_picker.take() {
             self.open_base_branch_picker(path);
         }
-        if let Some(path) = delete_request.take() {
+        if let Some(path) = requests.delete.take() {
             self.request_worktree_delete(&path);
         }
-        if let Some(idx) = create_request.take() {
+        if let Some(idx) = requests.create {
             self.pending_create =
                 Some(CreateState::Prompt { project_idx: idx, branch: String::new(), error: None });
         }
-        if let Some((ws, id)) = activate_session_request.take() {
+    }
+
+    /// Applies the clicks that act on a workspace or session, and reports
+    /// whether one of them activated a workspace.
+    fn apply_sidebar_activations(&mut self, ctx: &Context, requests: &mut SidebarRequests) -> bool {
+        let mut workspace_activated = false;
+        if requests.home {
+            self.activate_home(ctx);
+            workspace_activated = true;
+        }
+        if let Some(path) = requests.activate.take() {
+            self.activate_worktree(ctx, &path);
+            workspace_activated = true;
+        }
+        if let Some((ws, id)) = requests.activate_session.take() {
             // A stale id (session reaped this frame) self-heals next frame:
             // active_session_index() misses and adopt_active_session picks
             // an existing shell, or the empty-workspace placeholder shows.
@@ -1145,11 +581,11 @@ impl AlacritreeApp {
             self.active_session.insert(ws, id);
             workspace_activated = true;
         }
-        if let Some(id) = close_session_request.take() {
+        if let Some(id) = requests.close_session {
             self.request_close_session(ctx, id);
         }
-        if let Some((ws, key, pane_id)) = attach_herdr_request.take() {
-            // Switches first, same as `spawn_shell_request` below: a refusal
+        if let Some((ws, key, pane_id)) = requests.attach_herdr.take() {
+            // Switches first, same as `spawn_shell` below: a refusal
             // is only visible if the workspace it happened in is on screen.
             let previous = std::mem::replace(&mut self.current_workspace, ws.clone());
             let unlisted = unlisted_pane_target(&key, &pane_id);
@@ -1159,11 +595,11 @@ impl AlacritreeApp {
                 self.current_workspace = previous;
             }
         }
-        if let Some(ws) = spawn_shell_request.take() {
+        if let Some(ws) = requests.spawn_shell.take() {
             // Spawning activates the workspace and the new session, matching
             // Ctrl+T and worktree-creation's open-on-done.  An `Err` here
-            // arrived before the session record did — a checkout git has
-            // forgotten, or a PTY opened inline — and hands the workspace
+            // arrived before the session record did, from a checkout git has
+            // forgotten or a PTY opened inline, and hands the workspace
             // back rather than stranding the user on one with no shell, the
             // same reasoning as `activate_worktree`.  A PTY opened on a
             // worker fails after the record exists, so the switch stands and
@@ -1179,9 +615,9 @@ impl AlacritreeApp {
                 },
             }
         }
-        if let Some((path, name)) = spawn_profile_request.take() {
+        if let Some((path, name)) = requests.spawn_profile.take() {
             // Same activate-on-success and stale-row-recovery shape as
-            // `spawn_shell_request`: a stale worktree row's `+` reaches
+            // `spawn_shell`: a stale worktree row's `+` reaches
             // `report_spawn_failure` today, and a profile picked from the
             // same row's menu must un-grey it the same way.
             let ws = Some(path);
@@ -1194,23 +630,633 @@ impl AlacritreeApp {
                 },
             }
         }
-        self.poll_worktree_liveness(ctx, probing, &drawn_worktrees.into_inner());
-        if self.config.ui.sidebar_click_focus {
-            // A click that picks a workspace or session means "go work
-            // there", so it focuses the terminal; other panel clicks focus
-            // the sidebar for filter typing.  Row activations fire on the
-            // release frame, after the press already focused the sidebar,
-            // which is why this can't fold into the press test below.
-            if workspace_activated {
-                self.focus_terminal();
-            } else if self.focus != PaneFocus::ProjectsSidebar
-                && pressed_on_panel(ctx, &panel_resp.response)
-            {
-                self.focus_sidebar();
+        workspace_activated
+    }
+}
+
+/// What the projects sidebar paints from, owned so the panel closure can
+/// borrow `projects` mutably alongside it.
+struct SidebarView {
+    theme: Theme,
+    icons: Icons,
+    probing: bool,
+    reorder_mode: bool,
+    session_drag: bool,
+    /// The dragged session and the workspaces it may land in.
+    drag_range: Option<(SessionId, Vec<WorkspaceKey>)>,
+    cursor_row: Option<SidebarRow>,
+    cursor_moved: bool,
+    follow_row: Option<SidebarRow>,
+    filtering: bool,
+    membership: FilterMembership,
+    filtered_empty: bool,
+    home_rows: Vec<WorkspaceRowData>,
+    home_attention: bool,
+    home_activity: SessionActivity,
+    projects: Vec<ProjectView>,
+    deleting_paths: HashSet<PathBuf>,
+    creating: Vec<(usize, String)>,
+    distros: Vec<wsl::WslDistro>,
+    profile_names: Vec<String>,
+    worktree_profiles: Vec<(String, String)>,
+}
+
+impl SidebarView {
+    fn scrolls(&self, is_cursor: bool) -> bool {
+        is_cursor && self.cursor_moved
+    }
+
+    fn follows_home(&self) -> bool {
+        self.follow_row == Some(SidebarRow::Home)
+    }
+
+    fn follows_session(&self, id: SessionId) -> bool {
+        self.follow_row == Some(SidebarRow::Session(id))
+    }
+
+    // `Project`/`Worktree` rows carry a `PathBuf`; matching by reference
+    // here (mirroring the `cursor_row` matches) keeps every scroll
+    // check on the paint path allocation-free, follow target or not.
+    fn follows_project(&self, root: &Path) -> bool {
+        matches!(&self.follow_row, Some(SidebarRow::Project(r)) if r.as_path() == root)
+    }
+
+    fn follows_worktree(&self, path: &Path) -> bool {
+        matches!(&self.follow_row, Some(SidebarRow::Worktree(p)) if p.as_path() == path)
+    }
+}
+
+/// Membership for the active filter, resolved once so paint can skip
+/// non-surviving rows.  While filtering, matched projects render their
+/// matched worktrees regardless of `expanded`.  That is display-only, and
+/// the flag is never written.
+#[derive(Default)]
+struct FilterMembership {
+    home: bool,
+    projects: HashSet<PathBuf>,
+    worktrees: HashSet<PathBuf>,
+    children: HashSet<SidebarRow>,
+}
+
+impl FilterMembership {
+    fn of(filtering: bool, rows: Vec<SidebarRow>) -> Self {
+        let mut membership = Self { home: true, ..Self::default() };
+        if filtering {
+            membership.home = false;
+            for row in rows {
+                match row {
+                    SidebarRow::Home => membership.home = true,
+                    SidebarRow::Project(root) => {
+                        membership.projects.insert(root);
+                    },
+                    SidebarRow::Worktree(path) => {
+                        membership.worktrees.insert(path);
+                    },
+                    SidebarRow::Session(_) | SidebarRow::HerdrAgent(..) => {
+                        membership.children.insert(row);
+                    },
+                }
             }
         }
-        panel_resp.response.rect
+        membership
     }
+}
+
+struct ProjectView {
+    label: String,
+    attention: bool,
+    worktrees: Vec<WorktreeView>,
+}
+
+struct WorktreeView {
+    label: String,
+    pr: Option<PrInfo>,
+    rows: Vec<WorkspaceRowData>,
+    attention: bool,
+    activity: SessionActivity,
+}
+
+/// What the paint pass asks for, applied once the panel closure has released
+/// its borrows.
+#[derive(Default)]
+struct SidebarRequests {
+    add_project: bool,
+    reorder_toggled: bool,
+    refresh: Option<usize>,
+    remove: Option<ProjectRemoveState>,
+    expand_toggled: Option<(PathBuf, bool)>,
+    shell_override_changed: Option<PathBuf>,
+    label_cleared: Option<PathBuf>,
+    rename: Option<RenameState>,
+    /// Drag-to-reorder: (dragged root, insert-before display index).
+    reorder: Option<(PathBuf, usize)>,
+    session_drop: Option<(SessionId, WorkspaceKey, usize)>,
+    home: bool,
+    activate: Option<PathBuf>,
+    delete: Option<PathBuf>,
+    create: Option<usize>,
+    base_picker: Option<PathBuf>,
+    spawn_shell: Option<WorkspaceKey>,
+    spawn_profile: Option<(PathBuf, String)>,
+    activate_session: Option<(WorkspaceKey, SessionId)>,
+    close_session: Option<SessionId>,
+    attach_herdr: Option<(WorkspaceKey, herdr::HerdrKey, String)>,
+    /// Worktree rows painted on a probe frame, the only ones worth probing.
+    drawn_worktrees: Vec<PathBuf>,
+}
+
+fn projects_header_buttons(ui: &mut egui::Ui, view: &SidebarView, requests: &mut SidebarRequests) {
+    let theme = &view.theme;
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if icon_tooltip(
+            styled_icon_button(
+                ui,
+                &view.icons.add_project,
+                DEFAULT_ADD_ICON,
+                theme.text_dim,
+                theme,
+            ),
+            "add project",
+            theme.icon_tooltips,
+        )
+        .clicked()
+        {
+            requests.add_project = true;
+        }
+        // Lit while active: the mode is only visible as grips
+        // on the rows, so the button has to say it's on.
+        let (color, hint) = if view.reorder_mode {
+            (theme.accent, "done reordering")
+        } else {
+            (theme.text_dim, "reorder projects")
+        };
+        if icon_tooltip(
+            styled_icon_button(ui, &view.icons.reorder, DEFAULT_REORDER_ICON, color, theme),
+            hint,
+            theme.icon_tooltips,
+        )
+        .clicked()
+        {
+            requests.reorder_toggled = true;
+        }
+    });
+}
+
+/// Offers `row_rect` as a landing for the session being dragged, and records
+/// the drop on release.  `slot` carries a session row's display index and id;
+/// `None` is a workspace row.
+fn session_drop_target(
+    ui: &egui::Ui,
+    view: &SidebarView,
+    row_rect: egui::Rect,
+    ws: &WorkspaceKey,
+    slot: Option<(usize, SessionId)>,
+    requests: &mut SidebarRequests,
+) {
+    let Some((dragged, range)) = view.drag_range.as_ref() else { return };
+    // The dragged row's own edges are no-ops, so offering them
+    // as targets would paint a drop that does nothing.
+    if slot.is_some_and(|(_, id)| id == *dragged) {
+        return;
+    }
+    if !range.contains(ws) {
+        return;
+    }
+    let Some(pointer) = ui.input(|i| i.pointer.interact_pos()) else { return };
+    if !row_rect.contains(pointer) {
+        return;
+    }
+    let position = match slot {
+        // A session row: the half the pointer is in decides.
+        Some((idx, _)) => {
+            if draw_drop_indicator(ui, row_rect, pointer, &view.theme) {
+                idx
+            } else {
+                idx + 1
+            }
+        },
+        // A workspace row: its sessions start under it, so a
+        // drop here means the front of that workspace.  This is
+        // the only way to reach a workspace listing no session
+        // rows, either an empty one or a single-session one below
+        // the display threshold.
+        None => {
+            ui.painter().hline(
+                row_rect.x_range(),
+                row_rect.bottom(),
+                drop_indicator_stroke(&view.theme),
+            );
+            0
+        },
+    };
+    if ui.input(|i| i.pointer.any_released()) {
+        requests.session_drop = Some((*dragged, ws.clone(), position));
+        egui::DragAndDrop::clear_payload(ui.ctx());
+    }
+}
+
+fn paint_home_group(
+    ui: &mut egui::Ui,
+    view: &SidebarView,
+    is_active: bool,
+    requests: &mut SidebarRequests,
+) {
+    let is_cursor = matches!(&view.cursor_row, Some(SidebarRow::Home));
+    let action = home_row(
+        ui,
+        is_active,
+        is_cursor,
+        view.scrolls(is_cursor) || view.follows_home(),
+        view.home_attention,
+        view.home_activity,
+        &view.icons,
+        &view.theme,
+    );
+    if action.activate {
+        requests.home = true;
+    }
+    if action.spawn {
+        requests.spawn_shell = Some(None);
+    }
+    session_drop_target(ui, view, action.rect, &None, None, requests);
+    paint_workspace_children(ui, view, &view.home_rows, &None, requests);
+}
+
+/// The session and herdr rows listed under the workspace `ws`.
+fn paint_workspace_children(
+    ui: &mut egui::Ui,
+    view: &SidebarView,
+    rows: &[WorkspaceRowData],
+    ws: &WorkspaceKey,
+    requests: &mut SidebarRequests,
+) {
+    // Only rows a reorder can move take a drop slot, and
+    // the slot index counts those alone: a herdr pane's
+    // place is herdr's to decide, so it is neither a drag
+    // subject nor a landing.
+    let mut slot = 0usize;
+    for row in rows {
+        match row {
+            WorkspaceRowData::Session(row) => {
+                let is_cursor =
+                    matches!(&view.cursor_row, Some(SidebarRow::Session(id)) if *id == row.id);
+                let scroll = view.scrolls(is_cursor) || view.follows_session(row.id);
+                let movable = row.managed.is_none();
+                let act = session_row(
+                    ui,
+                    row,
+                    is_cursor,
+                    scroll,
+                    view.session_drag && movable,
+                    &view.icons,
+                    &view.theme,
+                );
+                if act.activate {
+                    requests.activate_session = Some((ws.clone(), row.id));
+                }
+                if act.close {
+                    requests.close_session = Some(row.id);
+                }
+                if movable {
+                    session_drop_target(ui, view, act.rect, ws, Some((slot, row.id)), requests);
+                    slot += 1;
+                }
+            },
+            WorkspaceRowData::Herdr(row) => {
+                let is_cursor = matches!(
+                    &view.cursor_row,
+                    Some(SidebarRow::HerdrAgent(side, id))
+                        if *side == row.side && *id == row.terminal_id
+                );
+                let scroll = view.scrolls(is_cursor);
+                let act = herdr_row(ui, row, is_cursor, scroll, &view.icons, &view.theme);
+                if act.attach {
+                    requests.attach_herdr = Some((
+                        ws.clone(),
+                        herdr::HerdrKey {
+                            side: row.side.clone(),
+                            terminal_id: row.terminal_id.clone(),
+                        },
+                        row.pane_id.clone(),
+                    ));
+                }
+            },
+        }
+    }
+}
+
+/// The project's own row: its controls, cursor, reorder drop and context menu.
+fn paint_project_header(
+    ui: &mut egui::Ui,
+    view: &SidebarView,
+    idx: usize,
+    project: &mut Project,
+    requests: &mut SidebarRequests,
+) {
+    let theme = &view.theme;
+    let proj_attention = view.projects.get(idx).is_some_and(|p| p.attention);
+    // Bubble attention up to the project row only when the
+    // project is collapsed.  Once expanded, the actual
+    // worktree rows already show the dot, and doubling it
+    // on the parent reads as noise.
+    let show_proj_dot = proj_attention && !project.expanded;
+    // Cloned out before the row closures borrow `project`
+    // mutably: the trailing closure needs them for the
+    // remove-confirmation prompt.
+    let project_root = project.root.clone();
+    let project_name = project.display_name().to_string();
+    let mut expand_clicked = false;
+    let mut name_resp: Option<egui::Response> = None;
+    let row_rect = row_with_trailing(
+        ui,
+        |ui| {
+            let (clicked, resp) = project_row_title(ui, view, idx, project);
+            expand_clicked = clicked;
+            name_resp = Some(resp);
+        },
+        |ui| {
+            project_row_controls(
+                ui,
+                view,
+                idx,
+                &project_root,
+                &project_name,
+                show_proj_dot,
+                requests,
+            )
+        },
+    );
+    if expand_clicked {
+        project.expanded = !project.expanded;
+        requests.expand_toggled = Some((project.root.clone(), project.expanded));
+    }
+    let header_is_cursor =
+        matches!(&view.cursor_row, Some(SidebarRow::Project(r)) if *r == project.root);
+    let header_rect = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), row_rect.y_range());
+    if header_is_cursor {
+        paint_cursor_outline(ui, header_rect, theme);
+    }
+    if view.scrolls(header_is_cursor) || view.follows_project(&project.root) {
+        ui.scroll_to_rect(header_rect, theme.scroll_align);
+    }
+
+    // Drop target for a reorder drag.  Detected against the
+    // raw payload rather than a `dnd_drop_zone` widget so no
+    // extra hover-sensing rect steals the row buttons' own
+    // hover highlight.
+    if let Some(dragged) = egui::DragAndDrop::payload::<DraggedProject>(ui.ctx()) {
+        let pointer = ui.input(|i| i.pointer.interact_pos());
+        if let Some(pointer) =
+            pointer.filter(|p| row_rect.contains(*p) && dragged.0 != project.root)
+        {
+            let before = draw_drop_indicator(ui, row_rect, pointer, theme);
+            if ui.input(|i| i.pointer.any_released()) {
+                let insert_before = if before { idx } else { idx + 1 };
+                requests.reorder = Some((dragged.0.clone(), insert_before));
+                egui::DragAndDrop::clear_payload(ui.ctx());
+            }
+        }
+    }
+
+    // Right-click: rename the project, and choose which
+    // shell its sessions use.
+    if let Some(resp) = name_resp {
+        resp.context_menu(|ui| project_context_menu(ui, view, project, requests));
+    }
+}
+
+/// The project row's grip, expand arrow and name.  Reports whether the arrow
+/// was clicked, with the name's response for the context menu.
+fn project_row_title(
+    ui: &mut egui::Ui,
+    view: &SidebarView,
+    idx: usize,
+    project: &Project,
+) -> (bool, egui::Response) {
+    let theme = &view.theme;
+    let icons = &view.icons;
+    ui.spacing_mut().item_spacing.x = ICON_CLUSTER_SPACING;
+    if view.reorder_mode {
+        drag_handle(ui, theme).dnd_set_drag_payload(DraggedProject(project.root.clone()));
+    }
+    let (arrow_style, arrow_default, arrow_hint) = if project.expanded {
+        (&icons.project_expanded, DEFAULT_PROJECT_EXPANDED_ICON, "collapse project")
+    } else {
+        (&icons.project_collapsed, DEFAULT_PROJECT_COLLAPSED_ICON, "expand project")
+    };
+    let expand_clicked = icon_tooltip(
+        styled_icon_button(ui, arrow_style, arrow_default, theme.text_dim, theme),
+        arrow_hint,
+        theme.icon_tooltips,
+    )
+    .clicked();
+    let name = view.projects.get(idx).map_or(project.display_name(), |p| p.label.as_str());
+    let (resp, galley) = truncating_label(
+        ui,
+        RichText::new(name).strong().small().color(theme.text),
+        theme.text,
+        egui::Sense::click(),
+    );
+    (expand_clicked, name_tooltip(resp, name, galley.elided, theme.sidebar_tooltips))
+}
+
+/// The project row's trailing buttons: remove, refresh, new worktree, and the
+/// attention dot.
+fn project_row_controls(
+    ui: &mut egui::Ui,
+    view: &SidebarView,
+    idx: usize,
+    root: &Path,
+    name: &str,
+    show_attention: bool,
+    requests: &mut SidebarRequests,
+) {
+    let theme = &view.theme;
+    let icons = &view.icons;
+    if icon_tooltip(
+        styled_icon_button(ui, &icons.remove_project, DEFAULT_CLOSE_ICON, theme.text_muted, theme),
+        "remove from sidebar",
+        theme.icon_tooltips,
+    )
+    .clicked()
+    {
+        requests.remove =
+            Some(ProjectRemoveState { root: root.to_path_buf(), name: name.to_string() });
+    }
+    if icon_tooltip(
+        styled_icon_button(ui, &icons.refresh, DEFAULT_REFRESH_ICON, theme.text_muted, theme),
+        "refresh worktrees",
+        theme.icon_tooltips,
+    )
+    .clicked()
+    {
+        requests.refresh = Some(idx);
+    }
+    if icon_tooltip(
+        styled_icon_button(ui, &icons.new_worktree, DEFAULT_ADD_ICON, theme.text_muted, theme),
+        "create new worktree",
+        theme.icon_tooltips,
+    )
+    .clicked()
+    {
+        requests.create = Some(idx);
+    }
+    if show_attention {
+        icon_tooltip(attention_dot(ui, theme), ATTENTION_HINT, theme.icon_tooltips);
+    }
+}
+
+fn project_context_menu(
+    ui: &mut egui::Ui,
+    view: &SidebarView,
+    project: &mut Project,
+    requests: &mut SidebarRequests,
+) {
+    if ui.button("Rename\u{2026}").clicked() {
+        requests.rename = Some(RenameState {
+            root: project.root.clone(),
+            label: project.display_name().to_string(),
+        });
+        ui.close_menu();
+    }
+    if project.label.is_some() && ui.button("Reset name").clicked() {
+        project.label = None;
+        requests.label_cleared = Some(project.root.clone());
+        ui.close_menu();
+    }
+    // The shell picker is hidden when there is
+    // nothing to choose (no distros, no profiles)
+    // so minimal setups see only the rename.
+    if !view.distros.is_empty() || !view.profile_names.is_empty() {
+        ui.separator();
+        ui.label(RichText::new("Open in\u{2026}").color(view.theme.text_muted).small());
+        shell_override_menu(ui, view, project, requests);
+    }
+}
+
+/// The shell choices: automatic, the Windows shell, each WSL distro and each
+/// profile, with the current override marked.
+fn shell_override_menu(
+    ui: &mut egui::Ui,
+    view: &SidebarView,
+    project: &mut Project,
+    requests: &mut SidebarRequests,
+) {
+    let mark = |selected: bool| if selected { "• " } else { "   " };
+    let auto = project.shell_override.is_none();
+    if ui.button(format!("{}Auto (by location)", mark(auto))).clicked() {
+        project.shell_override = None;
+        requests.shell_override_changed = Some(project.root.clone());
+        ui.close_menu();
+    }
+    let win = matches!(project.shell_override, Some(ShellChoice::Windows));
+    if ui.button(format!("{}Windows shell", mark(win))).clicked() {
+        project.shell_override = Some(ShellChoice::Windows);
+        requests.shell_override_changed = Some(project.root.clone());
+        ui.close_menu();
+    }
+    for distro in &view.distros {
+        let selected = matches!(
+            &project.shell_override,
+            Some(ShellChoice::Wsl(name)) if name == &distro.name
+        );
+        if ui.button(format!("{}WSL ({})", mark(selected), distro.name)).clicked() {
+            project.shell_override = Some(ShellChoice::Wsl(distro.name.clone()));
+            requests.shell_override_changed = Some(project.root.clone());
+            ui.close_menu();
+        }
+    }
+    for name in &view.profile_names {
+        let selected = matches!(
+            &project.shell_override,
+            Some(ShellChoice::Profile(n)) if n == name
+        );
+        if ui.button(format!("{}Profile: {}", mark(selected), name)).clicked() {
+            project.shell_override = Some(ShellChoice::Profile(name.clone()));
+            requests.shell_override_changed = Some(project.root.clone());
+            ui.close_menu();
+        }
+    }
+}
+
+/// The worktree rows under an expanded or filter-matched project, then the
+/// placeholders for its minimized creations.
+fn paint_worktrees(
+    ui: &mut egui::Ui,
+    view: &SidebarView,
+    idx: usize,
+    project: &Project,
+    current_workspace: Option<&Path>,
+    liveness: &worktree_liveness::LivenessCache,
+    requests: &mut SidebarRequests,
+) {
+    let states = view.projects.get(idx).map_or(&[][..], |p| p.worktrees.as_slice());
+    for (wt, state) in project.worktrees.iter().zip(states) {
+        if view.filtering && !view.membership.worktrees.contains(&wt.path) {
+            continue;
+        }
+        let is_active = current_workspace == Some(&wt.path);
+        paint_worktree(ui, view, wt, state, is_active, liveness.missing(&wt.path), requests);
+    }
+    for (_, branch) in view.creating.iter().filter(|(pi, _)| *pi == idx) {
+        creating_row(ui, branch, &view.icons, &view.theme);
+    }
+}
+
+fn paint_worktree(
+    ui: &mut egui::Ui,
+    view: &SidebarView,
+    wt: &Worktree,
+    state: &WorktreeView,
+    is_active: bool,
+    missing: Option<bool>,
+    requests: &mut SidebarRequests,
+) {
+    let is_cursor = matches!(&view.cursor_row, Some(SidebarRow::Worktree(p)) if *p == wt.path);
+    let scroll = view.scrolls(is_cursor) || view.follows_worktree(&wt.path);
+    let is_deleting = view.deleting_paths.contains(&wt.path);
+    // A `\\wsl.localhost\` stat boots the distro's
+    // 9P server, so probing one would restart a VM
+    // the user had shut down and hold it resident
+    // for as long as its worktrees are listed.
+    // WSL rows keep discovery's word.
+    if view.probing && matches!(wsl::classify(&wt.path), wsl::Location::Windows(_)) {
+        requests.drawn_worktrees.push(wt.path.clone());
+    }
+    let action = worktree_row(
+        ui,
+        wt,
+        missing,
+        &state.label,
+        state.pr.as_ref(),
+        is_active,
+        is_cursor,
+        scroll,
+        state.attention,
+        state.activity,
+        is_deleting,
+        &view.worktree_profiles,
+        &view.icons,
+        &view.theme,
+    );
+    if action.activate {
+        requests.activate = Some(wt.path.clone());
+    }
+    if action.delete {
+        requests.delete = Some(wt.path.clone());
+    }
+    if action.spawn {
+        requests.spawn_shell = Some(Some(wt.path.clone()));
+    }
+    if action.set_base {
+        requests.base_picker = Some(wt.path.clone());
+    }
+    if let Some(name) = action.spawn_profile {
+        requests.spawn_profile = Some((wt.path.clone(), name));
+    }
+    let ws = Some(wt.path.clone());
+    session_drop_target(ui, view, action.rect, &ws, None, requests);
+    paint_workspace_children(ui, view, &state.rows, &ws, requests);
 }
 
 pub(super) struct HomeAction {
