@@ -161,7 +161,7 @@ impl AlacritreeApp {
     /// toggles union (`m`: Modified/Renamed, `d`: Deleted, `u`: Untracked/Added).
     /// Conflicted rows and the branch-diff section are handled by `visible_rows`.
     fn filtered_git_rows(&mut self, status: &GitStatus) -> git_nav::GitRows {
-        let apply = self.git_panel.filter.toggles_apply(self.search_scope);
+        let apply = self.git_panel.filter.toggles_apply(self.sidebar_focus_state.search_scope);
         let m = apply && self.git_panel.filter.is_toggled('m');
         let d = apply && self.git_panel.filter.is_toggled('d');
         let u = apply && self.git_panel.filter.is_toggled('u');
@@ -285,7 +285,7 @@ impl AlacritreeApp {
                         &self.git_panel.filter,
                         &self.config.ui.icons.search,
                         &theme,
-                        self.git_panel.filter.toggles_apply(self.search_scope),
+                        self.git_panel.filter.toggles_apply(self.sidebar_focus_state.search_scope),
                     );
                 });
                 ui.separator();

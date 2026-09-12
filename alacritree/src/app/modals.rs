@@ -445,7 +445,7 @@ impl AlacritreeApp {
                 None => CloseFallback::Home,
             };
             if defers_close_navigation(self.config.ui.sidebar_focus) {
-                self.sidebar_deferred_close = Some(DeferredClose {
+                self.sidebar_focus_state.deferred_close = Some(DeferredClose {
                     verdict,
                     removed_worktree: Some(req.worktree_path.clone()),
                 });
