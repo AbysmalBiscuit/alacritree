@@ -3,7 +3,8 @@
 checkout and the `docs/specs-and-plans` branch.
 
 Both sides hold files git ignores: the `.local.*` instructions and config at
-the repository root, and everything under `docs/superpowers/`.  The branch is
+the repository root, the repository's own agent skills under `.agents/`, and
+everything under `docs/superpowers/`.  The branch is
 the one place they are tracked, so a second machine can fetch them; the main
 checkout is where they are read and written.  Nothing about that arrangement
 tells git to carry a change from one side to the other, which is what this
@@ -47,6 +48,7 @@ earlier steps.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 import subprocess
@@ -57,6 +59,19 @@ from pathlib import Path
 BRANCH = "docs/specs-and-plans"
 
 WORKING_DOCS = ("docs/superpowers/specs", "docs/superpowers/plans")
+
+#: The repository's own agent skills and scripts.  Unlike the working docs
+#: this is a whole tree of arbitrary files rather than a flat folder of
+#: Markdown, so it is enumerated rather than listed.
+AGENTS = ".agents"
+
+#: Junk the enumeration must not carry between checkouts.
+AGENTS_SKIP = ("__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache")
+
+#: `.claude/<name>` in every worktree points at `.agents/<name>`, so an agent
+#: reaches the repository's skills through the path its harness already looks
+#: in and there is still one copy of them.
+LINKED = ("skills", "scripts")
 
 #: The instruction files every worktree carries its own copy of.  `devkit
 #: issue setup` seeds them from `worktree_include` when the worktree is cut,
@@ -213,11 +228,78 @@ def stale_instructions(main: Path, trees: list[tuple[Path, str]]) -> list[Copy]:
     return stale
 
 
+@dataclass(frozen=True)
+class Link:
+    """One `.claude/<name>` to point at the `.agents/<name>` that owns it."""
+
+    relative: str
+    target: Path
+    path: Path
+    origin: str
+
+
+def missing_links(main: Path, trees: list[tuple[Path, str]]) -> list[Link]:
+    """Worktrees whose `.claude` does not yet reach the agent tree.
+
+    A worktree with no `.agents` of its own borrows the main checkout's, so
+    the skills have one copy however many worktrees read them.  Anything
+    already sitting at the path is left alone: a real directory there is
+    someone's doing, and replacing it would delete whatever it holds.
+    """
+    wanted: list[Link] = []
+    for tree, origin in trees:
+        owner = tree if (tree / AGENTS).is_dir() else main
+        for name in LINKED:
+            target, path = owner / AGENTS / name, tree / ".claude" / name
+            if not target.is_dir():
+                continue
+            if path.exists() and path.resolve() == target.resolve():
+                continue
+            if path.exists():
+                print(f"  skip    {path} is in the way of a link to {target}")
+                continue
+            wanted.append(Link(f".claude/{name}", target, path, origin))
+    return wanted
+
+
+def make_link(link: Link) -> None:
+    """Point `link.path` at `link.target`, by junction where symlinks need rights.
+
+    Windows refuses `os.symlink` outside developer mode or an elevated shell,
+    but a directory junction needs neither and resolves the same for readers.
+    """
+    link.path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.symlink(link.target, link.path, target_is_directory=True)
+        return
+    except OSError:
+        if os.name != "nt":
+            raise
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link.path), str(link.target)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        sys.exit(f"could not link {link.path} to {link.target}:\n{result.stdout}{result.stderr}")
+
+
 def copy_into(source: Path, target: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     # `copy2` carries the modification time across, so the next run sees two
     # files that agree rather than one that looks newer for having been copied.
     shutil.copy2(source, target)
+
+
+def agent_files(main: Path, branch: Path) -> list[str]:
+    """Every file under `.agents` that either side holds."""
+    found: set[str] = set()
+    for root in (main, branch):
+        for path in (root / AGENTS).rglob("*"):
+            relative = path.relative_to(root)
+            if path.is_file() and not set(relative.parts) & set(AGENTS_SKIP):
+                found.add(relative.as_posix())
+    return sorted(found)
 
 
 def tracked_files(main: Path, branch: Path) -> list[str]:
@@ -228,7 +310,7 @@ def tracked_files(main: Path, branch: Path) -> list[str]:
         for root in (main, branch):
             found.update(path.name for path in (root / directory).glob("*.md"))
         names.extend(f"{directory}/{name}" for name in sorted(found))
-    return names
+    return names + agent_files(main, branch)
 
 
 def content(path: Path) -> bytes:
@@ -297,6 +379,24 @@ def payload_subject(scope: str, kind: str, description: str, moves: list[Move]) 
     return f"{kind}({scope}): {verb} {description}"
 
 
+def agent_group(relative: str) -> str:
+    """Which commit a `.agents` file belongs in.
+
+    A skill is one change however many files it spans, so
+    `.agents/skills/rebase-propagate-alacritree/scripts/run.py` groups with the
+    `SKILL.md` beside it rather than with the other scripts.
+    """
+    parts = Path(relative).parts
+    return "/".join(parts[1:3]) if len(parts) > 2 else parts[1]
+
+
+def agents_subject(group: str, moves: list[Move]) -> str:
+    verb = "add" if all(move.created for move in moves) else "update"
+    kind, _, name = group.partition("/")
+    what = f"the {name.replace('-', ' ')} skill" if kind == "skills" and name else f"the agent {kind}"
+    return f"chore(agents): {verb} {what}"
+
+
 def docs_subject(slug: str, moves: list[Move]) -> str:
     kinds = [
         label
@@ -319,6 +419,13 @@ def commits(moves: list[Move]) -> list[tuple[str, list[Move]]]:
         claimed = [pending.pop(name) for name in group if name in pending]
         if claimed:
             grouped.append((payload_subject(scope, kind, description, claimed), claimed))
+
+    by_group: dict[str, list[Move]] = {}
+    for name in [n for n in pending if n.startswith(f"{AGENTS}/")]:
+        by_group.setdefault(agent_group(name), []).append(pending.pop(name))
+    for group in sorted(by_group):
+        claimed = sorted(by_group[group], key=lambda move: move.relative)
+        grouped.append((agents_subject(group, claimed), claimed))
 
     by_topic: dict[str, list[Move]] = {}
     for move in pending.values():
@@ -515,6 +622,20 @@ def main() -> int:
         if not args.dry_run:
             for instruction in stale:
                 copy_into(instruction.source, instruction.target)
+            acted = True
+        print()
+
+    # Last, because a worktree that just received `.agents` for the first time
+    # has nothing to link until the moves above have landed.
+    links = missing_links(main_checkout, [(main_checkout, "main"), (branch, BRANCH), *trees])
+    if links:
+        for name in LINKED:
+            count = sum(1 for link in links if link.relative == f".claude/{name}")
+            if count:
+                print(f"  link -> .claude/{name}  ({count} worktree{'s' if count > 1 else ''})")
+        if not args.dry_run:
+            for link in links:
+                make_link(link)
             acted = True
         print()
 
