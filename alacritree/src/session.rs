@@ -19,7 +19,7 @@ use alacritty_terminal::vte::ansi::{Processor, Rgb, StdSyncHandler};
 use crate::clipboard::Target;
 use crate::config::{Config, HoldExitedSessions, Palette};
 use crate::wsl_helper::{self, WslProbe};
-use crate::{colors, herdr, scratchpad};
+use crate::{colors, herdr, osc_tap, scratchpad};
 
 #[derive(Clone)]
 pub struct EventProxy {
@@ -248,6 +248,7 @@ pub struct Session {
     pub cell_size: (f32, f32),
     pub term: Arc<FairMutex<Term<EventProxy>>>,
     pub events: mpsc::Receiver<TermEvent>,
+    pub osc_events: Option<mpsc::Receiver<osc_tap::OscEvent>>,
     pub scratchpad: Option<scratchpad::Editor>,
     /// Latched attention flag, cleared when the user views this session.
     pub needs_attention: bool,
@@ -1203,6 +1204,7 @@ pub struct OpenRequest {
     proxy: EventProxy,
     boost: bool,
     reap: bool,
+    tap: Option<crate::pty_tee::TapHandle>,
 }
 
 /// The half of a session that only exists once its PTY does.  Applied by
@@ -1245,7 +1247,8 @@ impl Drop for Attachment {
 /// it must be callable from a thread that holds no `Session`.
 pub fn open(request: OpenRequest) -> std::io::Result<Attachment> {
     let started = std::time::Instant::now();
-    let OpenRequest { id, window_id, pty_options, window_size, term, proxy, boost, reap } = request;
+    let OpenRequest { id, window_id, pty_options, window_size, term, proxy, boost, reap, tap } =
+        request;
 
     ensure_working_directory(pty_options.working_directory.as_deref())?;
 
@@ -1268,6 +1271,8 @@ pub fn open(request: OpenRequest) -> std::io::Result<Attachment> {
 
     #[cfg(windows)]
     let pty = crate::pty_rearm::RearmingPty::new(pty);
+
+    let pty = crate::pty_tee::TeePty::new(pty, tap);
 
     let event_loop = EventLoop::new(term, proxy, pty, pty_options.drain_on_exit, false)?;
     let sender = event_loop.channel();
@@ -1313,6 +1318,7 @@ impl Session {
             cell_size,
             term,
             events,
+            osc_events: None,
             scratchpad: Some(editor),
             needs_attention: false,
             pending_attention: None,
@@ -1446,6 +1452,20 @@ impl Session {
         let pty_cwd = pty_working_directory(working_directory.clone(), config);
         let window_size = window_size(size, cell_size);
 
+        let shell_platform = if wsl_probe.is_some() || cfg!(unix) {
+            osc_tap::ShellPlatform::Unix
+        } else {
+            osc_tap::ShellPlatform::Windows
+        };
+        let policy = osc_tap::TapPolicy {
+            vt: config.vt,
+            hostname: osc_tap::local_hostname().to_string(),
+            shell: shell_platform,
+        };
+        let (tap, osc_events) = match osc_tap::spawn(policy, ctx.clone()) {
+            Some((tap, receiver)) => (Some(tap), Some(receiver)),
+            None => (None, None),
+        };
         let (proxy, events) = EventProxy::new(ctx);
 
         let term = Term::new(term_config(config), &size, proxy.clone());
@@ -1488,6 +1508,7 @@ impl Session {
             cell_size,
             term: term.clone(),
             events,
+            osc_events,
             scratchpad: None,
             needs_attention: false,
             pending_attention: None,
@@ -1516,6 +1537,7 @@ impl Session {
             proxy,
             boost: config.ui.focus_priority_boost,
             reap: config.ui.reap_descendants_on_close,
+            tap,
         };
 
         (session, request)
@@ -1622,6 +1644,12 @@ impl Session {
                     }
                 },
             }
+        }
+        if let Some(receiver) = self.osc_events.take() {
+            while let Ok(event) = receiver.try_recv() {
+                let _ = event;
+            }
+            self.osc_events = Some(receiver);
         }
         outcome
     }
@@ -2340,6 +2368,7 @@ mod tests {
             cell_size: (8.0, 16.0),
             term,
             events,
+            osc_events: None,
             scratchpad: None,
             needs_attention: false,
             pending_attention: None,

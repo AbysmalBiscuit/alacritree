@@ -7,6 +7,8 @@
 
 use std::sync::OnceLock;
 
+use alacritty_terminal::vte;
+
 use crate::config::VtConfig;
 
 /// What the shell on the other end of the PTY spells a path like.  A WSL
@@ -252,6 +254,166 @@ fn cursor_icon(name: &str) -> Option<egui::CursorIcon> {
     })
 }
 
+/// How many bytes one sequence may occupy before the parser is reset.
+pub const MAX_PENDING: usize = 1 << 20;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanState {
+    Ground,
+    Escape,
+    Osc,
+}
+
+enum Destination {
+    Channel {
+        tx: std::sync::mpsc::Sender<OscEvent>,
+        ctx: egui::Context,
+    },
+    #[cfg(test)]
+    Collected(Vec<OscEvent>),
+}
+
+pub struct Sink {
+    policy: TapPolicy,
+    destination: Destination,
+    pending: usize,
+    scan_state: ScanState,
+}
+
+impl Sink {
+    fn channel(
+        policy: TapPolicy,
+        tx: std::sync::mpsc::Sender<OscEvent>,
+        ctx: egui::Context,
+    ) -> Self {
+        Self {
+            policy,
+            destination: Destination::Channel { tx, ctx },
+            pending: 0,
+            scan_state: ScanState::Ground,
+        }
+    }
+
+    #[cfg(test)]
+    fn collecting(policy: TapPolicy) -> Self {
+        Self {
+            policy,
+            destination: Destination::Collected(Vec::new()),
+            pending: 0,
+            scan_state: ScanState::Ground,
+        }
+    }
+
+    #[cfg(test)]
+    fn take(&mut self) -> Vec<OscEvent> {
+        match &mut self.destination {
+            Destination::Collected(events) => std::mem::take(events),
+            Destination::Channel { .. } => unreachable!("collecting sink only"),
+        }
+    }
+
+    fn reset_pending(&mut self) {
+        self.pending = 0;
+        self.scan_state = ScanState::Ground;
+    }
+
+    fn scan(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            match self.scan_state {
+                ScanState::Ground => {
+                    if byte == 0x1b {
+                        self.scan_state = ScanState::Escape;
+                    }
+                },
+                ScanState::Escape => match byte {
+                    0x5d => {
+                        self.pending = 0;
+                        self.scan_state = ScanState::Osc;
+                    },
+                    0x1b => {},
+                    0x18 | 0x1a => self.scan_state = ScanState::Ground,
+                    0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f..=0xff => {},
+                    _ => self.scan_state = ScanState::Ground,
+                },
+                ScanState::Osc => match byte {
+                    0x07 | 0x18 | 0x1a => self.reset_pending(),
+                    0x1b => {
+                        self.pending = 0;
+                        self.scan_state = ScanState::Escape;
+                    },
+                    _ => self.pending = self.pending.saturating_add(1),
+                },
+            }
+        }
+    }
+
+    fn emit(&mut self, event: OscEvent) {
+        match &mut self.destination {
+            Destination::Channel { tx, ctx } => {
+                if tx.send(event).is_ok() {
+                    ctx.request_repaint();
+                }
+            },
+            #[cfg(test)]
+            Destination::Collected(events) => events.push(event),
+        }
+    }
+}
+
+impl vte::Perform for Sink {
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        self.pending = 0;
+        if let Some(event) = classify(params, &self.policy) {
+            self.emit(event);
+        }
+    }
+}
+
+/// Feeds one chunk, resetting first when the stream had a hole in it.
+pub fn feed(parser: &mut vte::Parser, sink: &mut Sink, chunk: &crate::pty_tee::Chunk) {
+    if chunk.gap_before {
+        *parser = vte::Parser::new();
+        sink.reset_pending();
+    }
+    parser.advance(sink, &chunk.bytes);
+    sink.scan(&chunk.bytes);
+    if sink.pending > MAX_PENDING {
+        *parser = vte::Parser::new();
+        sink.reset_pending();
+    }
+}
+
+/// Starts the parser thread for a session when any OSC feature is enabled.
+pub fn spawn(
+    policy: TapPolicy,
+    ctx: egui::Context,
+) -> Option<(crate::pty_tee::TapHandle, std::sync::mpsc::Receiver<OscEvent>)> {
+    if !policy.vt.any_enabled() {
+        return None;
+    }
+
+    let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel(crate::pty_tee::QUEUE_DEPTH);
+    let (pool_tx, pool_rx) = std::sync::mpsc::channel();
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+
+    let started = std::thread::Builder::new().name("alacritree-osc-tap".into()).spawn(move || {
+        let mut parser = vte::Parser::new();
+        let mut sink = Sink::channel(policy, event_tx, ctx);
+        while let Ok(chunk) = chunk_rx.recv() {
+            feed(&mut parser, &mut sink, &chunk);
+            let _ = pool_tx.send(chunk.bytes);
+        }
+    });
+
+    match started {
+        Ok(_) => Some((crate::pty_tee::TapHandle::new(chunk_tx, pool_rx), event_rx)),
+        Err(error) => {
+            log::debug!("osc tap thread did not start: {error}");
+            None
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,5 +568,79 @@ mod tests {
         p.vt.report_cwd = false;
         let owned: Vec<&[u8]> = vec![b"7", b"file:///home/dev"];
         assert_eq!(classify(&owned, &p), None);
+    }
+
+    fn chunk(bytes: &[u8], gap_before: bool) -> crate::pty_tee::Chunk {
+        crate::pty_tee::Chunk { bytes: bytes.to_vec(), gap_before }
+    }
+
+    #[test]
+    fn a_sequence_split_across_chunks_still_dispatches() {
+        let mut parser = vte::Parser::new();
+        let mut sink = Sink::collecting(policy(ShellPlatform::Unix));
+
+        feed(&mut parser, &mut sink, &chunk(b"\x1b]7;file:///home/", false));
+        assert!(sink.take().is_empty(), "nothing is complete yet");
+
+        feed(&mut parser, &mut sink, &chunk(b"dev/src\x1b\\", false));
+        assert_eq!(sink.take(), vec![OscEvent::Cwd(Some("/home/dev/src".into()))]);
+    }
+
+    #[test]
+    fn ordinary_output_before_a_split_sequence_does_not_reset_the_parser() {
+        let mut parser = vte::Parser::new();
+        let mut sink = Sink::collecting(policy(ShellPlatform::Unix));
+        let mut prefix = vec![b'x'; MAX_PENDING + 1];
+        prefix.extend_from_slice(b"\x1b]7;file:///home/");
+
+        feed(&mut parser, &mut sink, &chunk(&prefix, false));
+        assert!(sink.take().is_empty(), "nothing is complete yet");
+
+        feed(&mut parser, &mut sink, &chunk(b"dev/src\x1b\\", false));
+        assert_eq!(sink.take(), vec![OscEvent::Cwd(Some("/home/dev/src".into()))]);
+    }
+
+    #[test]
+    fn osc_terminations_reset_the_pending_byte_bound() {
+        for terminator in [0x07, 0x18, 0x1a, 0x1b] {
+            let mut parser = vte::Parser::new();
+            let mut sink = Sink::collecting(policy(ShellPlatform::Unix));
+            let mut prefix = b"\x1b]0;ignored".to_vec();
+            prefix.push(terminator);
+            prefix.extend(vec![b'x'; MAX_PENDING + 1]);
+            prefix.extend_from_slice(b"\x1b]7;file:///home/");
+
+            feed(&mut parser, &mut sink, &chunk(&prefix, false));
+            assert!(sink.take().is_empty(), "nothing is complete yet");
+
+            feed(&mut parser, &mut sink, &chunk(b"dev/src\x1b\\", false));
+            assert_eq!(sink.take(), vec![OscEvent::Cwd(Some("/home/dev/src".into()))]);
+        }
+    }
+
+    #[test]
+    fn a_gap_discards_the_sequence_it_interrupted() {
+        let mut parser = vte::Parser::new();
+        let mut sink = Sink::collecting(policy(ShellPlatform::Unix));
+
+        feed(&mut parser, &mut sink, &chunk(b"\x1b]7;file:///home/", false));
+        feed(&mut parser, &mut sink, &chunk(b"dev/src\x1b\\", true));
+        assert!(sink.take().is_empty(), "a hole in the stream must not be framed across");
+
+        feed(&mut parser, &mut sink, &chunk(b"\x1b]7;file:///tmp\x1b\\", false));
+        assert_eq!(sink.take(), vec![OscEvent::Cwd(Some("/tmp".into()))]);
+    }
+
+    #[test]
+    fn an_unterminated_sequence_does_not_grow_without_bound() {
+        let mut parser = vte::Parser::new();
+        let mut sink = Sink::collecting(policy(ShellPlatform::Unix));
+
+        feed(&mut parser, &mut sink, &chunk(b"\x1b]7;", false));
+        let flood = vec![b'x'; MAX_PENDING + 1];
+        feed(&mut parser, &mut sink, &chunk(&flood, false));
+
+        feed(&mut parser, &mut sink, &chunk(b"\x1b]7;file:///tmp\x1b\\", false));
+        assert_eq!(sink.take(), vec![OscEvent::Cwd(Some("/tmp".into()))]);
     }
 }
