@@ -40,6 +40,8 @@ When that fails, the live commit usually carries the same subject at a new hash,
 git -C <worktree> rebase --onto origin/<base> <recorded base> <branch>
 ```
 
+The middle argument has to be a real ancestor of the branch. When it is not, git does not error: it falls back to the merge base and queues the whole divergent history, which looks like a conflict in the code and is really a conflict in the arguments. Once a PR in the stack merges, `/rebase-propagate-alacritree` does this for every open branch at once and checks that first.
+
 `devkit issue status` lists what exists, `devkit issue end` removes a finished worktree.
 
 ## Running commands
@@ -160,6 +162,12 @@ Features I plan to work are tracked via GitHub issues on my fork: `https://githu
 Never propose to upstream features for vendored crates. This is an AI/vibe coded project, so nothing will be upstreamed to vendored crates. The only upstreaming PRs that we will do are to Arnaud's fork (`alacritree`).
 
 ## Agent skills
+
+### Repository skills
+
+`.agents/skills/` holds the skills this repository ships to its own agents, and every worktree reaches them at `.claude/skills/` through a link `sync.local.py` makes. They ride on `docs/specs-and-plans` with the other untracked local files.
+
+`/rebase-propagate-alacritree` replays the whole open `[n]` stack onto `upstream/master` after a PR merges and pushes every branch to the fork.
 
 ### Issue tracker
 
