@@ -2289,3 +2289,1692 @@ pub(super) fn activity_json(activity: SessionActivity) -> Value {
         }),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::command_palette::PaletteItem;
+    use crate::test_util::titled_herdr_agent as titled;
+
+    const LIVE: SessionFocus = SessionFocus { scratchpad: false, exited: false };
+    const EXITED: SessionFocus = SessionFocus { scratchpad: false, exited: true };
+    const SCRATCHPAD: SessionFocus = SessionFocus { scratchpad: true, exited: false };
+
+    /// The multiplexer resolves the directory where it runs, so a WSL side is
+    /// handed the distro's own spelling of the workspace and never the
+    /// Windows path the sidebar holds.
+    #[cfg(windows)]
+    #[test]
+    fn a_new_pane_opens_in_the_workspace_spelled_for_its_own_side() {
+        let workspace = PathBuf::from(r"\\wsl.localhost\ubuntu\home\dev\repo");
+        assert_eq!(
+            multiplexer_cwd(&herdr::Side::Wsl("ubuntu".into()), Some(&workspace)),
+            Ok(Some("/home/dev/repo".to_string()))
+        );
+        assert_eq!(
+            multiplexer_cwd(&herdr::Side::Native, Some(&workspace)),
+            Ok(Some(workspace.display().to_string()))
+        );
+    }
+
+    /// The home workspace names no directory, so herdr picks its own default
+    /// rather than being handed an empty path.
+    #[test]
+    fn a_new_pane_in_the_home_workspace_names_no_directory() {
+        assert_eq!(multiplexer_cwd(&herdr::Side::Native, None), Ok(None));
+        assert_eq!(multiplexer_cwd(&herdr::Side::Wsl("ubuntu".into()), None), Ok(None));
+    }
+
+    /// The "workspaces" depth never reaches a child, whatever the query:
+    /// `child_matches` is not built, so `current_project_rows` feeds
+    /// `sidebar_nav::filtered_rows` a `None` child predicate and a query
+    /// naming a session matches only that session's workspace.
+    #[test]
+    fn search_reaches_children_stays_false_at_the_workspaces_default() {
+        assert!(!search_reaches_children(SearchDepth::Workspaces, false));
+        assert!(!search_reaches_children(SearchDepth::Workspaces, true));
+    }
+
+    /// The "sessions" depth resolves child names for a non-empty query, so a
+    /// session or agent row can match by its own name rather than only
+    /// through its workspace.
+    #[test]
+    fn search_reaches_children_only_with_sessions_depth_and_a_live_query() {
+        assert!(search_reaches_children(SearchDepth::Sessions, false));
+        assert!(!search_reaches_children(SearchDepth::Sessions, true));
+    }
+
+    #[test]
+    fn dirty_warning_stays_quiet_for_a_known_clean_unforced_tree() {
+        let clean = DirtyCounts::default();
+        assert_eq!(dirty_warning(Some(&clean), false, false), None);
+    }
+
+    #[test]
+    fn dirty_warning_distinguishes_checking_from_unavailable() {
+        let checking = dirty_warning(None, false, true).expect("still checking");
+        assert!(checking.to_lowercase().contains("checking"));
+        let unavailable = dirty_warning(None, false, false).expect("probe failed or was skipped");
+        assert!(!unavailable.to_lowercase().contains("checking"));
+    }
+
+    #[test]
+    fn refused_for_unsaved_work_matches_a_real_git_refusal() {
+        let message = "git worktree remove ../wt1: fatal: '../wt1' contains modified or untracked \
+                       files, use --force to delete it";
+        assert!(refused_for_unsaved_work(message));
+    }
+
+    #[test]
+    fn refused_for_unsaved_work_ignores_unrelated_failures() {
+        assert!(!refused_for_unsaved_work(
+            "git worktree remove ../wt1: fatal: '../wt1' is a main working tree"
+        ));
+    }
+
+    /// A worktree path that happens to contain the matched phrase must not
+    /// turn an unrelated failure into a false "needs --force" prompt --
+    /// `refused_for_unsaved_work` only reads the text after the closing
+    /// quote of the path, never the quoted path itself.
+    #[test]
+    fn refused_for_unsaved_work_is_not_fooled_by_a_path_spelling_out_the_phrase() {
+        let path = "../is dirty, use --force to delete it";
+        let message = format!(
+            "git worktree remove {path}: fatal: '{path}' cannot be locked: filesystem error"
+        );
+        assert!(!refused_for_unsaved_work(&message));
+    }
+
+    #[test]
+    fn spawn_geometry_prefers_the_active_session_over_the_last_painted_pane() {
+        let active = Some(ActiveGeometry {
+            size: TermSize::new(120, 40),
+            cell_size: (9.0, 18.0),
+            is_scratchpad: false,
+        });
+        let last_pane = Some((TermSize::new(80, 24), (8.0, 16.0)));
+
+        let (size, cell_size) = spawn_geometry(active, last_pane);
+
+        assert_eq!((size.columns, size.screen_lines), (120, 40));
+        assert_eq!(cell_size, (9.0, 18.0));
+    }
+
+    #[test]
+    fn an_active_scratchpad_does_not_shadow_the_last_painted_pane() {
+        // The size every scratchpad keeps for its whole life.
+        let active = Some(ActiveGeometry {
+            size: TermSize::new(80, 24),
+            cell_size: (8.0, 16.0),
+            is_scratchpad: true,
+        });
+        let last_pane = Some((TermSize::new(120, 40), (9.0, 18.0)));
+
+        let (size, cell_size) = spawn_geometry(active, last_pane);
+
+        assert_eq!((size.columns, size.screen_lines), (120, 40));
+        assert_eq!(cell_size, (9.0, 18.0));
+    }
+
+    #[test]
+    fn spawn_geometry_falls_back_to_the_last_painted_pane_without_an_active_session() {
+        let last_pane = Some((TermSize::new(120, 40), (9.0, 18.0)));
+
+        let (size, cell_size) = spawn_geometry(None, last_pane);
+
+        assert_eq!((size.columns, size.screen_lines), (120, 40));
+        assert_eq!(cell_size, (9.0, 18.0));
+    }
+
+    #[test]
+    fn spawn_geometry_falls_back_to_80x24_before_anything_has_painted() {
+        let (size, cell_size) = spawn_geometry(None, None);
+
+        assert_eq!((size.columns, size.screen_lines), (80, 24));
+        assert_eq!(cell_size, (8.0, 16.0));
+    }
+
+    #[test]
+    fn the_visible_session_holds_the_self_boost_while_its_pty_is_still_opening() {
+        // Nothing to raise yet, so `set_priority_boost` answered false.
+        let visible = SessionBoost { raised: false, visible: true, pending: true };
+
+        assert!(holds_self_boost(visible));
+    }
+
+    #[test]
+    fn a_background_session_still_opening_its_pty_holds_no_self_boost() {
+        let background = SessionBoost { raised: false, visible: false, pending: true };
+
+        assert!(!holds_self_boost(background));
+    }
+
+    #[test]
+    fn a_session_whose_job_took_the_boost_holds_it_wherever_it_sits() {
+        let background = SessionBoost { raised: true, visible: false, pending: false };
+
+        assert!(holds_self_boost(background));
+    }
+
+    #[test]
+    fn a_frame_whose_visible_session_is_still_pending_leaves_the_self_boost_where_it_was() {
+        let frame = [
+            SessionBoost { raised: false, visible: false, pending: false },
+            // On screen, its PTY still opening: no job exists to answer for
+            // it, and the boost must survive the gap until one does.
+            SessionBoost { raised: false, visible: true, pending: true },
+            SessionBoost { raised: false, visible: false, pending: true },
+        ];
+
+        assert!(frame_holds_self_boost(frame.into_iter()));
+    }
+
+    #[test]
+    fn a_frame_of_idle_background_sessions_drops_the_self_boost() {
+        let frame =
+            [SessionBoost { raised: false, visible: false, pending: false }, SessionBoost {
+                raised: false,
+                visible: false,
+                pending: true,
+            }];
+
+        assert!(!frame_holds_self_boost(frame.into_iter()));
+    }
+
+    #[test]
+    fn a_grey_worktree_only_stays_in_the_workspace_ring_while_it_holds_sessions() {
+        let wt = Worktree {
+            name: "gone".into(),
+            path: PathBuf::from("/repo-worktrees/gone"),
+            branch: Some("feature".into()),
+            is_main: false,
+            prunable: false,
+            upstream: None,
+        };
+
+        assert!(!worktree_is_switchable(&wt, Some(true), false));
+        assert!(worktree_is_switchable(&wt, Some(true), true));
+    }
+
+    #[test]
+    fn a_main_checkout_never_looks_prunable_from_the_row_probe() {
+        let wt = Worktree {
+            name: "main".into(),
+            path: PathBuf::from("/plain-project"),
+            branch: None,
+            is_main: true,
+            prunable: false,
+            upstream: None,
+        };
+
+        assert!(!worktree_looks_gone(&wt, Some(true)));
+    }
+
+    /// Apply `walk_swaps` to a concrete list, with `indices` standing in for
+    /// the absolute slots one workspace occupies inside the session vector.
+    fn walked(items: &[&str], indices: &[usize], j: usize, position: usize) -> Vec<String> {
+        let mut v: Vec<String> = items.iter().map(|s| s.to_string()).collect();
+        for (a, b) in walk_swaps(indices, j, position) {
+            v.swap(a, b);
+        }
+        v
+    }
+
+    #[test]
+    fn the_sentinel_sees_a_same_workspace_session_switch() {
+        let written =
+            SidebarFocusWrite { cursor: Some(SidebarRow::Home), workspace: None, active: Some(1) };
+        let written = Some(written);
+
+        // The reconciler's own values still stand.
+        assert!(!sidebar_focus_overtaken(&written, Some(&SidebarRow::Home), &None, Some(1)));
+
+        // Any action that switches sessions without leaving the workspace —
+        // SelectNextTab, SelectNextSession, SelectTab(n) — changes neither the
+        // cursor nor the workspace, only the active session.
+        assert!(sidebar_focus_overtaken(&written, Some(&SidebarRow::Home), &None, Some(2)));
+
+        // A different workspace, and a different cursor, each count too.
+        assert!(sidebar_focus_overtaken(
+            &written,
+            Some(&SidebarRow::Home),
+            &Some(PathBuf::from("/a/wt1")),
+            Some(1),
+        ));
+        assert!(sidebar_focus_overtaken(
+            &written,
+            Some(&SidebarRow::Project(PathBuf::from("/a"))),
+            &None,
+            Some(1),
+        ));
+
+        // Nothing written yet cannot have been overtaken.
+        assert!(!sidebar_focus_overtaken(&None, Some(&SidebarRow::Home), &None, Some(1)));
+    }
+
+    #[test]
+    fn move_target_is_a_no_op_when_position_is_unchanged() {
+        // Dropping above your own row, or just below it, changes nothing.
+        assert_eq!(move_target(3, 1, 1), None);
+        assert_eq!(move_target(3, 1, 2), None);
+        // Dropping onto yourself.
+        assert_eq!(move_target(3, 0, 0), None);
+        // A stale source index (list shrank mid-drag) is ignored.
+        assert_eq!(move_target(2, 5, 0), None);
+    }
+
+    #[test]
+    fn walk_swaps_moves_within_a_contiguous_workspace() {
+        assert_eq!(walked(&["a", "b", "c"], &[0, 1, 2], 0, 2), vec!["b", "c", "a"]);
+        assert_eq!(walked(&["a", "b", "c"], &[0, 1, 2], 2, 0), vec!["c", "a", "b"]);
+    }
+
+    #[test]
+    fn walk_swaps_leaves_interleaved_workspaces_in_place() {
+        // Slots 0 and 2 belong to one workspace, slot 1 to another; moving the
+        // first workspace's second session to the front must not disturb it.
+        assert_eq!(walked(&["a", "x", "b"], &[0, 2], 1, 0), vec!["b", "x", "a"]);
+    }
+
+    #[test]
+    fn walk_swaps_is_empty_when_nothing_moves() {
+        assert!(walk_swaps(&[0, 1, 2], 1, 1).is_empty());
+        // A position past the end clamps to the last slot, which is a no-op
+        // for the element already there.
+        assert!(walk_swaps(&[0, 1, 2], 2, 9).is_empty());
+    }
+
+    #[test]
+    fn a_cross_workspace_drop_takes_the_display_slot_as_the_position() {
+        // The session is not in that workspace's list yet, so nothing shifts
+        // down and every slot passes through — including the two the same
+        // workspace answers differently, which is what tells the branches
+        // apart.
+        assert_eq!(drop_position(false, 3, 1, 2), Some(2));
+        assert_eq!(drop_position(false, 3, 1, 3), Some(3));
+        // A drop onto the front of a workspace whose rows are all below it.
+        assert_eq!(drop_position(false, 0, 0, 0), Some(0));
+    }
+
+    #[test]
+    fn walk_swaps_places_an_arrival_at_the_stated_position() {
+        // Arriving from another workspace, the display slot is the position:
+        // nothing was removed from this list first, so there is no off-by-one.
+        assert_eq!(walk_swaps(&[0, 1, 2], 2, 0), vec![(1, 2), (0, 1)]);
+    }
+
+    #[test]
+    fn reorder_subject_prefers_the_cursored_session() {
+        assert_eq!(
+            reorder_subject(true, Some(&SidebarRow::Session(7)), || None, |_| None, || Some(3)),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn reorder_subject_takes_a_workspace_rows_active_session() {
+        // The landing after a cross-workspace step: the session paints no row
+        // yet, so the cursor sits on the worktree it arrived in.
+        let row = SidebarRow::Worktree(PathBuf::from("/b"));
+        assert_eq!(
+            reorder_subject(
+                true,
+                Some(&row),
+                || None,
+                |p| (p == Path::new("/b")).then_some(9),
+                || Some(3)
+            ),
+            Some(9)
+        );
+        assert_eq!(
+            reorder_subject(true, Some(&SidebarRow::Home), || Some(4), |_| None, || Some(3)),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn reorder_subject_falls_back_to_the_session_on_screen() {
+        // Terminal focused: the cursor is ignored entirely.
+        assert_eq!(
+            reorder_subject(false, Some(&SidebarRow::Session(7)), || None, |_| None, || Some(3)),
+            Some(3)
+        );
+        // Sidebar focused on a project header, which owns no session.
+        let row = SidebarRow::Project(PathBuf::from("/a"));
+        assert_eq!(reorder_subject(true, Some(&row), || None, |_| None, || Some(3)), Some(3));
+        // And an empty workspace row falls through rather than refusing.
+        let row = SidebarRow::Worktree(PathBuf::from("/b"));
+        assert_eq!(reorder_subject(true, Some(&row), || None, |_| None, || Some(3)), Some(3));
+    }
+
+    fn entries(ids: &[SessionId]) -> Vec<sidebar_nav::WorkspaceEntry> {
+        ids.iter().copied().map(sidebar_nav::WorkspaceEntry::Session).collect()
+    }
+
+    #[test]
+    fn workspace_entries_keep_shell_sessions_in_spawn_order() {
+        assert_eq!(workspace_entries(&[1, 3], Vec::new(), false), entries(&[1, 3]));
+    }
+
+    #[test]
+    fn profile_menu_label_numbers_from_one() {
+        assert_eq!(profile_menu_label(1, "WSL"), "1. WSL");
+        assert_eq!(profile_menu_label(2, "cmd"), "2. cmd");
+    }
+
+    #[test]
+    fn base_branch_precedence_is_override_then_pr_then_default() {
+        let f = effective_base_branch;
+        assert_eq!(f(Some("develop"), Some("main"), Some("master")), Some("develop".into()));
+        assert_eq!(f(None, Some("main"), Some("master")), Some("main".into()));
+        assert_eq!(f(None, None, Some("master")), Some("master".into()));
+        assert_eq!(f(None, None, None), None);
+    }
+
+    #[test]
+    fn picker_filter_is_a_case_insensitive_contains() {
+        let branches =
+            vec!["main".to_string(), "develop".to_string(), "origin/develop".to_string()];
+        assert_eq!(filter_branches(&branches, ""), branches);
+        assert_eq!(filter_branches(&branches, "DEV"), vec!["develop", "origin/develop"]);
+        assert!(filter_branches(&branches, "zz").is_empty());
+    }
+
+    #[test]
+    fn picker_cursor_seeds_the_first_match_on_a_non_empty_query_change() {
+        // Typing a query that matches something jumps past Auto to the first
+        // match, so Enter applies that match instead of Auto.
+        assert_eq!(picker_cursor(true, false, 0, 3), 1);
+        // A query with no matches has nothing to land on but Auto.
+        assert_eq!(picker_cursor(true, false, 0, 0), 0);
+        // Clearing the query back to empty returns the cursor to Auto.
+        assert_eq!(picker_cursor(true, true, 5, 3), 0);
+        // No query change this frame: clamp the previous cursor to the
+        // (possibly shrunk) filtered length instead of reseeding it.
+        assert_eq!(picker_cursor(false, false, 5, 3), 3);
+        assert_eq!(picker_cursor(false, false, 2, 3), 2);
+    }
+
+    #[test]
+    fn the_status_hint_names_the_agent_and_what_it_is_doing() {
+        assert_eq!(agent_hint(LiveState::Idle, Some("claude")), "claude is running");
+        assert_eq!(agent_hint(LiveState::Working, Some("codex")), "codex is working");
+        assert_eq!(agent_hint(LiveState::Blocked, Some("claude")), "claude is waiting for you");
+        assert_eq!(agent_hint(LiveState::Blocked, None), "agent is waiting for you");
+    }
+
+    /// A shell session has no state axis to mark. The sidebar draws its own
+    /// icon here instead of a status mark, and the palette leaves the slot
+    /// empty, so both must read this as "no mark" rather than picking one.
+    #[test]
+    fn session_status_mark_picks_none_for_a_shell() {
+        let status =
+            RowStatus { attention: false, activity: SessionActivity::Shell, managed: None };
+        assert!(session_status_mark(&status).is_none());
+    }
+
+    /// The palette paints the identical mark and hover the sidebar would for
+    /// a local agent, whichever of the three live states it is in.
+    #[test]
+    fn session_status_mark_picks_each_live_state_for_a_local_agent() {
+        for live in [LiveState::Idle, LiveState::Working, LiveState::Blocked] {
+            let activity = SessionActivity::agent(Some("claude"), live);
+            let status = RowStatus { attention: false, activity, managed: None };
+            let (mark, hint) = session_status_mark(&status).expect("an agent always has a mark");
+            assert_eq!(mark, SessionMark::Agent(live));
+            assert_eq!(hint, agent_hint(live, Some("claude")));
+        }
+    }
+
+    /// A herdr pane with no agent in it reports no state, so the harness rung
+    /// of the ladder is empty and a plain shell in one carries no mark at all.
+    /// The palette reads `managed.mark` directly while the sidebar goes
+    /// through the ladder, so the two only agree while both answer "none"
+    /// here.
+    #[test]
+    fn session_status_mark_leaves_an_agentless_pane_unmarked() {
+        let managed = Managed::herdr(
+            &herdr::Side::Native,
+            &herdr::Settings::default(),
+            AttachMode::Agent,
+            Some(&shell_pane()),
+        );
+        assert_eq!(managed.mark, None);
+        let status = RowStatus {
+            attention: false,
+            activity: SessionActivity::Shell,
+            managed: Some(&managed),
+        };
+        assert!(session_status_mark(&status).is_none());
+    }
+
+    /// A pane herdr reports no agent in can still be running one alacritree's
+    /// own title heuristic recognises.  The harness rung is empty, so the
+    /// ladder falls through to the live axis rather than stopping at a
+    /// managed row the way it did while every listed pane had a state.
+    #[test]
+    fn an_agentless_pane_falls_through_to_the_local_agent_reading() {
+        let managed = Managed::herdr(
+            &herdr::Side::Native,
+            &herdr::Settings::default(),
+            AttachMode::Agent,
+            Some(&shell_pane()),
+        );
+        let activity = SessionActivity::agent(Some("claude"), LiveState::Working);
+        assert_eq!(herdr_backed_activity(activity, None), activity);
+        let status = RowStatus { attention: false, activity, managed: Some(&managed) };
+        let (mark, hint) = session_status_mark(&status).expect("the live axis still has one");
+        assert_eq!(mark, SessionMark::Agent(LiveState::Working));
+        assert_eq!(hint, agent_hint(LiveState::Working, Some("claude")));
+    }
+
+    #[test]
+    fn an_attached_herdr_session_takes_herdrs_live_state() {
+        let claude = SessionActivity::agent(Some("claude"), LiveState::Idle);
+
+        // Not attached to herdr: nothing overrides the session's own reading.
+        assert_eq!(herdr_backed_activity(claude, None), claude);
+
+        // herdr sees the approval dialog no title heuristic can.
+        assert_eq!(
+            herdr_backed_activity(claude, Some(herdr::Status::Blocked)),
+            SessionActivity::agent(Some("claude"), LiveState::Blocked)
+        );
+
+        // An attached pane holds an agent even when the process probe missed
+        // one, so the gate closes on herdr's word alone.
+        assert_eq!(
+            herdr_backed_activity(SessionActivity::Shell, Some(herdr::Status::Working)),
+            SessionActivity::agent(None, LiveState::Working)
+        );
+
+        // `unknown` is herdr declining to say, not a claim of idleness: the
+        // session keeps whatever it already knew.
+        let working = SessionActivity::agent(Some("claude"), LiveState::Working);
+        assert_eq!(herdr_backed_activity(working, Some(herdr::Status::Unknown)), working);
+    }
+
+    /// herdr distinguishes four live states and says so on its own panes.
+    /// Collapsing any pair onto one mark would make the sidebar say less
+    /// about a pane than the window it came from.
+    #[test]
+    fn herdr_marks_keep_its_four_states_apart() {
+        for set in [herdr::Indicators::Dots, herdr::Indicators::Symbols] {
+            let marks: Vec<HarnessMark> = [
+                herdr::Status::Blocked,
+                herdr::Status::Working,
+                herdr::Status::Done,
+                herdr::Status::Idle,
+            ]
+            .into_iter()
+            .map(|status| herdr_mark(status, set))
+            .collect();
+            for (i, a) in marks.iter().enumerate() {
+                for b in &marks[i + 1..] {
+                    assert_ne!(a, b, "{set:?} draws two states the same");
+                }
+            }
+        }
+    }
+
+    /// Taken from herdr's own `state_icon_symbol`, so a pane carries one mark
+    /// whether it is read in herdr or in the sidebar.
+    #[test]
+    fn herdr_marks_are_the_ones_herdr_paints() {
+        let dots = |status| herdr_mark(status, herdr::Indicators::Dots).glyph;
+        assert_eq!(dots(herdr::Status::Blocked), "●");
+        assert_eq!(dots(herdr::Status::Working), "●");
+        assert_eq!(dots(herdr::Status::Done), "●");
+        assert_eq!(dots(herdr::Status::Idle), "○");
+
+        let symbols = |status| herdr_mark(status, herdr::Indicators::Symbols).glyph;
+        assert_eq!(symbols(herdr::Status::Blocked), "×");
+        assert_eq!(symbols(herdr::Status::Working), "◐");
+        assert_eq!(symbols(herdr::Status::Done), "✓");
+        assert_eq!(symbols(herdr::Status::Idle), "○");
+    }
+
+    /// A status alacritree does not recognise is herdr declining to say, and
+    /// the row says that rather than claiming the agent is idle.
+    #[test]
+    fn an_unknown_herdr_status_is_drawn_as_no_reading() {
+        for set in [herdr::Indicators::Dots, herdr::Indicators::Symbols] {
+            let mark = herdr_mark(herdr::Status::Unknown, set);
+            assert_eq!(mark.glyph, "·");
+            assert_eq!(mark.tone, StateTone::Unclear);
+        }
+    }
+
+    /// A herdr pane running a plain shell.  herdr names no agent in it, so
+    /// the only thing it can be called is the title it set itself.
+    fn shell_pane() -> herdr::Agent {
+        herdr::Agent { status: None, ..titled(None, Some("~/G/g/alacritree")) }
+    }
+
+    /// A shell pane has no kind to fall back to, and six characters of a
+    /// terminal id name nothing a user would recognise.
+    #[test]
+    fn an_agentless_pane_is_named_by_its_title() {
+        assert_eq!(herdr_display_name(&shell_pane()), RowName::plain("~/G/g/alacritree".into()));
+    }
+
+    /// `unknown` is herdr's word for an agent it cannot classify, so a shell
+    /// wearing it would claim an agent is there.
+    #[test]
+    fn an_agentless_pane_claims_no_status() {
+        let agent = shell_pane();
+        let content = herdr_palette_content(
+            agent.title.clone(),
+            &agent,
+            Some("alacritree / master"),
+            "◆",
+            PathStyle::Fish,
+            None,
+        );
+        assert_eq!(
+            (content.primary, content.subtitle, content.secondary),
+            ("~/G/g/alacritree".into(), "◆ alacritree / master".into(), "herdr · shell".into(),)
+        );
+    }
+
+    /// The pane is still herdr's, which is what the row's mark says; the
+    /// state is the part there is nothing to report.  Every `herdr agent`
+    /// subcommand resolves its target through the agent registry, so the
+    /// attach shares herdr's view even on a side that attaches directly.
+    #[test]
+    fn an_agentless_pane_paints_no_state_and_shares_the_view() {
+        let row = HerdrRowData::from_agent(
+            &shell_pane(),
+            &herdr::Side::Wsl("d".into()),
+            &herdr::Settings::default(),
+            AttachMode::Agent,
+        );
+        assert_eq!(row.managed.mark, None);
+        assert!(row.managed.shared_view);
+        assert_eq!(managed_tooltip(&row.managed), r#"herdr, shared view, "~/G/g/alacritree"."#);
+    }
+
+    #[test]
+    fn herdr_display_name_keeps_a_short_terminal_id_whole() {
+        // `saturating_sub(6)` exists precisely for ids shorter than the tail
+        // it takes; a plain `- 6` would panic on this one.
+        let agent = herdr::Agent {
+            terminal_id: "t1".into(),
+            pane_id: "w1:p1".into(),
+            tab_id: Some("w1:t1".into()),
+            kind: None,
+            title: None,
+            status: Some(herdr::Status::Idle),
+            focused: false,
+            cwd: None,
+            foreground_cwd: None,
+        };
+        assert_eq!(herdr_display_name(&agent), RowName::plain("t1".into()));
+    }
+
+    /// The filter matches what the row paints, so a query naming the category
+    /// in front of an identity finds the row that shows both.
+    #[test]
+    fn search_text_carries_the_context_behind_the_identity() {
+        let name = RowName { text: "primary".into(), context: Some("claude".into()) };
+        assert_eq!(name.search_text(), "primary claude");
+    }
+
+    /// A row whose identity is already its category paints one word, so the
+    /// filter searches one word rather than the same word twice.
+    #[test]
+    fn search_text_of_a_plain_name_is_the_name() {
+        assert_eq!(RowName::plain("claude".into()).search_text(), "claude");
+    }
+
+    /// The row never compares its title against its own path, so a title that
+    /// reads like a directory is named no differently than one that does
+    /// not — the workspace label still keeps the line under it.
+    #[test]
+    fn native_titles_naming_their_directory_keep_the_workspace_label() {
+        let content = native_palette_content(
+            "/repo/feature".into(),
+            "◆ renamed / main".into(),
+            Some("claude"),
+            Some("idle"),
+            "shell",
+        );
+        assert_eq!(content.primary, "/repo/feature");
+        assert_eq!(content.subtitle, "◆ renamed / main");
+    }
+
+    /// Nothing but the workspace label is left to name a titleless row, and
+    /// once it takes the first line the second would only repeat it.
+    #[test]
+    fn a_titleless_native_row_is_named_by_its_workspace() {
+        let content =
+            native_palette_content(String::new(), "renamed / main".into(), None, None, "shell");
+        assert_eq!((content.primary, content.subtitle), ("renamed / main".into(), String::new()));
+    }
+
+    #[test]
+    fn native_home_titles_reach_palette_items() {
+        let content = native_palette_content(
+            "claude".into(),
+            "Home".into(),
+            Some("claude"),
+            Some("idle"),
+            "shell",
+        );
+        let item = PaletteItem::session(
+            1,
+            content.primary,
+            content.subtitle,
+            content.secondary,
+            "hover".into(),
+            Some("claude"),
+            None,
+            false,
+        );
+        assert_eq!(item.primary, "claude");
+        assert_eq!(item.subtitle.as_deref(), Some("Home"));
+        assert_eq!(item.secondary, "claude · idle");
+    }
+
+    /// The kind is spelled out even when the title already carries it: two
+    /// rows in one state must read the same, and one repeated word is a
+    /// cheaper price than a column that changes shape per row.
+    #[test]
+    fn the_middle_column_spells_the_kind_out_beside_a_title_that_shares_it() {
+        assert_eq!(session_middle(None, Some("claude"), Some("idle"), "shell"), "claude · idle");
+    }
+
+    /// A lead with nothing after it still names itself rather than falling
+    /// through to the fallback: the row is herdr-backed whatever else is
+    /// unknown about it.
+    #[test]
+    fn a_lead_survives_an_otherwise_empty_middle_column() {
+        assert_eq!(session_middle(Some("herdr"), None, None, "shell"), "herdr · shell");
+    }
+
+    /// A shell row reports whether a job holds the terminal, which is the one
+    /// thing about a shell worth reading off a list.  A kind with no
+    /// foreground job of its own reports nothing rather than a state it
+    /// cannot observe.
+    #[test]
+    fn only_a_plain_shell_reports_a_busy_state() {
+        assert_eq!(shell_state_for(&SessionKind::Shell, true), Some("busy"));
+        assert_eq!(shell_state_for(&SessionKind::Shell, false), Some("idle"));
+        assert_eq!(shell_state_for(&SessionKind::Scratchpad { path: PathBuf::new() }, true), None);
+        assert_eq!(shell_state_for(&SessionKind::Diff { key: "k".into() }, true), None);
+    }
+
+    #[test]
+    fn native_shells_keep_a_shell_middle_cell() {
+        let content = native_palette_content("terminal".into(), "Home".into(), None, None, "shell");
+        assert_eq!(content.secondary, "shell");
+    }
+
+    /// Every scratchpad row carries the same one-word title, so the workspace
+    /// label under it is what tells one from another.
+    #[test]
+    fn a_scratchpad_reads_its_kind_over_its_workspace() {
+        let content = native_palette_content(
+            "scratchpad".into(),
+            "◆ renamed / main".into(),
+            Some("scratchpad"),
+            None,
+            "shell",
+        );
+        assert_eq!(content.primary, "scratchpad");
+        assert_eq!(content.subtitle, "◆ renamed / main");
+        assert_eq!(content.secondary, "scratchpad");
+    }
+
+    /// The click switched workspace before handing the gesture over, so a
+    /// failure puts the user back where the click found them.
+    #[test]
+    fn a_failed_attach_hands_back_the_workspace_it_switched_from() {
+        let switched_to = Some(PathBuf::from("/code/wt"));
+        let previous = Some(PathBuf::from("/code/other"));
+        assert_eq!(
+            workspace_after_failed_attach(&switched_to, &switched_to, previous.clone()),
+            previous
+        );
+    }
+
+    /// The home tab is a workspace like any other, so an attach launched from
+    /// it is restored to it rather than read as nothing to go back to.
+    #[test]
+    fn a_failed_attach_restores_the_home_tab() {
+        let switched_to = Some(PathBuf::from("/code/wt"));
+        assert_eq!(workspace_after_failed_attach(&switched_to, &switched_to, None), None);
+    }
+
+    /// herdr answers frames after the click, and a switch made in between is
+    /// the user's own: restoring over it would pull them out of a workspace
+    /// they chose.
+    #[test]
+    fn a_failed_attach_leaves_a_workspace_the_user_moved_to_alone() {
+        let current = Some(PathBuf::from("/code/elsewhere"));
+        let switched_to = Some(PathBuf::from("/code/wt"));
+        assert_eq!(workspace_after_failed_attach(&current, &switched_to, None), current);
+    }
+
+    /// A session alacritree still holds open after herdr stopped listing its
+    /// pane has no state and no name left to report, but it is still herdr's
+    /// and the user still has to know how to leave it.
+    #[test]
+    fn an_unlisted_pane_still_says_how_to_leave() {
+        let settings =
+            herdr::Settings { detach: Some("Ctrl+B q".into()), ..herdr::Settings::default() };
+        let managed =
+            Managed::herdr(&herdr::Side::Wsl("d".into()), &settings, AttachMode::Agent, None);
+        assert_eq!(managed_tooltip(&managed), "herdr. (detach with `Ctrl+B q`)");
+    }
+
+    /// Ending a herdr-managed session ends the attach and leaves the pane
+    /// running, so the control cannot call itself a close.
+    #[test]
+    fn the_close_control_is_a_detach_on_a_managed_row() {
+        assert_eq!(close_button_hint(true), "detach session");
+        assert_eq!(close_button_hint(false), "close session");
+    }
+
+    #[test]
+    fn workspace_entries_apply_the_two_row_threshold() {
+        assert!(workspace_entries(&[], Vec::new(), false).is_empty());
+        assert!(workspace_entries(&[1], Vec::new(), false).is_empty());
+        assert_eq!(workspace_entries(&[1, 3], Vec::new(), false), entries(&[1, 3]));
+    }
+
+    #[test]
+    fn workspace_entries_always_flag_lists_single_sessions() {
+        assert_eq!(workspace_entries(&[1], Vec::new(), true), entries(&[1]));
+        assert!(workspace_entries(&[], Vec::new(), true).is_empty());
+    }
+
+    #[test]
+    fn fallback_goes_home_from_home() {
+        assert_eq!(close_fallback(&None, &None, &[], None), CloseFallback::Home);
+    }
+
+    #[test]
+    fn a_deferred_verdict_survives_instead_of_being_re_derived() {
+        // `close_fallback` is the only thing that knows to hop to the project's
+        // main checkout; a generic "spawn something" fallback would strand
+        // last_session_close = "navigate" in the workspace that just emptied.
+        let main = PathBuf::from("/p/main");
+        let removed = Some(PathBuf::from("/p/feature"));
+        let remaining = vec![(Some(main.clone()), 1)];
+
+        let verdict = close_fallback(&removed, &removed, &remaining, Some(main.clone()));
+        assert_eq!(verdict, CloseFallback::Activate(main.clone()));
+
+        let deferred = DeferredClose { verdict, removed_worktree: None };
+        assert_eq!(
+            deferred.verdict,
+            CloseFallback::Activate(main),
+            "the verdict is carried, not recomputed from whatever state remains"
+        );
+    }
+
+    /// A user's close navigates: away from an emptied workspace, or into a
+    /// replacement shell.  A failed open must do neither.  Wherever it
+    /// navigates to, `ensure_active_session` spawns into it, and that open
+    /// fails the same way.
+    #[test]
+    fn a_failed_spawn_neither_navigates_nor_respawns() {
+        assert_eq!(close_navigation(CloseReason::User, CloseFallback::Home), CloseFallback::Home);
+        assert_eq!(
+            close_navigation(CloseReason::SpawnFailed, CloseFallback::Home),
+            CloseFallback::Stay
+        );
+    }
+
+    #[test]
+    fn only_follow_defers_close_navigation() {
+        use crate::config::SidebarFocus;
+
+        assert!(defers_close_navigation(SidebarFocus::Follow));
+        assert!(!defers_close_navigation(SidebarFocus::Preserve));
+    }
+
+    /// Keyboard-originated `focus_move` with both panels open.
+    fn mv(focus: PaneFocus, dir: FocusDir, tui_running: bool) -> FocusMove {
+        focus_move(focus, dir, true, true, ActionOrigin::Keyboard, tui_running)
+    }
+
+    #[test]
+    fn focus_moves_between_open_panels() {
+        assert_eq!(
+            mv(PaneFocus::Terminal, FocusDir::Left, false),
+            FocusMove::Focus(PaneFocus::ProjectsSidebar)
+        );
+        assert_eq!(
+            mv(PaneFocus::Terminal, FocusDir::Right, false),
+            FocusMove::Focus(PaneFocus::GitSidebar)
+        );
+        assert_eq!(
+            mv(PaneFocus::ProjectsSidebar, FocusDir::Right, false),
+            FocusMove::Focus(PaneFocus::Terminal)
+        );
+        assert_eq!(
+            mv(PaneFocus::GitSidebar, FocusDir::Left, false),
+            FocusMove::Focus(PaneFocus::Terminal)
+        );
+    }
+
+    #[test]
+    fn focus_stops_at_the_outer_edges() {
+        assert_eq!(mv(PaneFocus::ProjectsSidebar, FocusDir::Left, false), FocusMove::Nothing);
+        assert_eq!(mv(PaneFocus::GitSidebar, FocusDir::Right, false), FocusMove::Nothing);
+    }
+
+    #[test]
+    fn focus_never_moves_toward_a_closed_panel() {
+        assert_eq!(
+            focus_move(
+                PaneFocus::Terminal,
+                FocusDir::Left,
+                false,
+                true,
+                ActionOrigin::Keyboard,
+                false
+            ),
+            FocusMove::Nothing
+        );
+        assert_eq!(
+            focus_move(
+                PaneFocus::Terminal,
+                FocusDir::Right,
+                true,
+                false,
+                ActionOrigin::Keyboard,
+                false
+            ),
+            FocusMove::Nothing
+        );
+    }
+
+    #[test]
+    fn running_tui_keeps_the_key() {
+        assert_eq!(mv(PaneFocus::Terminal, FocusDir::Left, true), FocusMove::Passthrough);
+        assert_eq!(mv(PaneFocus::Terminal, FocusDir::Right, true), FocusMove::Passthrough);
+    }
+
+    /// A palette-dispatched Focus Left/Right is a binding stand-in, so a
+    /// running TUI must see the same passthrough a real keypress would.
+    #[test]
+    fn palette_origin_keeps_the_key_for_a_running_tui() {
+        assert_eq!(
+            focus_move(
+                PaneFocus::Terminal,
+                FocusDir::Left,
+                true,
+                true,
+                ActionOrigin::Palette,
+                true
+            ),
+            FocusMove::Passthrough
+        );
+    }
+
+    #[test]
+    fn sidebars_never_pass_through() {
+        assert_eq!(
+            mv(PaneFocus::ProjectsSidebar, FocusDir::Right, true),
+            FocusMove::Focus(PaneFocus::Terminal)
+        );
+    }
+
+    /// An IPC move is the inner program saying it is out of windows —
+    /// passthrough would bounce the key straight back to it.
+    #[test]
+    fn ipc_moves_never_pass_through() {
+        assert_eq!(
+            focus_move(PaneFocus::Terminal, FocusDir::Left, true, true, ActionOrigin::Ipc, true),
+            FocusMove::Focus(PaneFocus::ProjectsSidebar)
+        );
+        assert_eq!(
+            focus_move(PaneFocus::Terminal, FocusDir::Left, false, true, ActionOrigin::Ipc, true),
+            FocusMove::Nothing
+        );
+    }
+
+    /// The terminal owning focus over a live session, which is what every
+    /// scope test that does not say otherwise means.
+    fn scope() -> BindingScope {
+        BindingScope::default()
+    }
+
+    /// The mapping the filter chain cannot check for itself: which pane owns
+    /// focus, and whether the session on screen still has a child.
+    #[test]
+    fn binding_scope_reads_focus_and_the_session_on_screen() {
+        let terminal = |active| binding_scope(PaneFocus::Terminal, false, active);
+
+        assert!(terminal(Some(EXITED)).exited_session_focused);
+        assert!(!terminal(Some(LIVE)).exited_session_focused);
+        assert!(!terminal(None).exited_session_focused);
+        assert!(terminal(Some(SCRATCHPAD)).scratchpad_focused);
+        assert!(!terminal(Some(LIVE)).scratchpad_focused);
+
+        let sidebar = binding_scope(PaneFocus::ProjectsSidebar, false, Some(EXITED));
+        assert!(sidebar.sidebar_focused);
+        assert!(!sidebar.git_focused);
+        assert!(
+            !sidebar.exited_session_focused,
+            "a session's chord is the terminal's, not the sidebar's"
+        );
+
+        let git = binding_scope(PaneFocus::GitSidebar, false, Some(EXITED));
+        assert!(git.git_focused);
+        assert!(!git.sidebar_focused);
+        assert!(!git.exited_session_focused);
+    }
+
+    /// The palette owns every key while it is up, so no scope is live under it.
+    #[test]
+    fn an_open_palette_leaves_no_scope_active() {
+        for focus in [PaneFocus::Terminal, PaneFocus::ProjectsSidebar, PaneFocus::GitSidebar] {
+            let scope = binding_scope(focus, true, Some(EXITED));
+            assert!(!scope.sidebar_focused, "{focus:?}");
+            assert!(!scope.git_focused, "{focus:?}");
+            assert!(!scope.scratchpad_focused, "{focus:?}");
+            assert!(!scope.exited_session_focused, "{focus:?}");
+        }
+    }
+
+    #[test]
+    fn projects_filter_action_valid_when_projects_sidebar_focused() {
+        let action = BindingAction::Named(NamedAction::ToggleSessionsFilter);
+        assert!(valid_for_focus(&action, BindingScope { sidebar_focused: true, ..scope() }));
+    }
+
+    #[test]
+    fn projects_filter_action_rejected_when_git_sidebar_focused() {
+        let action = BindingAction::Named(NamedAction::ToggleSessionsFilter);
+        assert!(!valid_for_focus(&action, BindingScope { git_focused: true, ..scope() }));
+    }
+
+    #[test]
+    fn git_filter_action_valid_when_git_sidebar_focused() {
+        let action = BindingAction::Named(NamedAction::ToggleModifiedFilter);
+        assert!(valid_for_focus(&action, BindingScope { git_focused: true, ..scope() }));
+    }
+
+    #[test]
+    fn git_filter_action_rejected_when_projects_sidebar_focused() {
+        let action = BindingAction::Named(NamedAction::ToggleModifiedFilter);
+        assert!(!valid_for_focus(&action, BindingScope { sidebar_focused: true, ..scope() }));
+    }
+
+    #[test]
+    fn both_sidebar_filters_rejected_when_terminal_focused() {
+        let projects_action = BindingAction::Named(NamedAction::ToggleSessionsFilter);
+        let git_action = BindingAction::Named(NamedAction::ToggleModifiedFilter);
+        assert!(!valid_for_focus(&projects_action, scope()));
+        assert!(!valid_for_focus(&git_action, scope()));
+    }
+
+    /// `ScrollPageUp` is unscoped by pane focus, so only the scratchpad
+    /// editor stealing it back (via `terminal_only`) should block it.
+    #[test]
+    fn terminal_only_action_yields_to_the_scratchpad_editor() {
+        let action = BindingAction::Named(NamedAction::ScrollPageUp);
+        assert!(!valid_for_focus(&action, BindingScope { scratchpad_focused: true, ..scope() }));
+        assert!(valid_for_focus(&action, scope()));
+    }
+
+    /// The one that decides whether the terminal stays usable: `Enter` is the
+    /// default trigger for `CloseExitedSession`, and bindings are consumed
+    /// ahead of `event_to_bytes`, so dispatching anything here would take the
+    /// key away from every shell prompt in the app.
+    #[test]
+    fn a_live_session_keeps_its_enter() {
+        let bindings = crate::bindings::parse_bindings(Vec::new());
+        let matched =
+            crate::bindings::all_matches(&bindings, egui::Key::Enter, egui::Modifiers::NONE);
+        assert!(
+            matched
+                .iter()
+                .any(|a| matches!(a, BindingAction::Named(NamedAction::CloseExitedSession))),
+            "Enter must still reach the exited-session binding"
+        );
+        assert!(
+            dispatched_actions(matched, scope()).is_empty(),
+            "a live session's Enter must fall through to the PTY"
+        );
+    }
+
+    /// Once the child is gone the same press closes the session instead.
+    #[test]
+    fn an_exited_session_dispatches_enter_to_the_close_action() {
+        let bindings = crate::bindings::parse_bindings(Vec::new());
+        let matched =
+            crate::bindings::all_matches(&bindings, egui::Key::Enter, egui::Modifiers::NONE);
+        let scope = BindingScope { exited_session_focused: true, ..scope() };
+        let dispatched = dispatched_actions(matched, scope);
+        assert_eq!(dispatched.len(), 1, "{dispatched:?}");
+        assert!(
+            matches!(dispatched[0], BindingAction::Named(NamedAction::CloseExitedSession)),
+            "{dispatched:?}"
+        );
+    }
+
+    #[test]
+    fn a_wide_search_stands_down_the_project_toggles() {
+        // Toggled on, workspace fails both: excluded while the toggles apply,
+        // included once a wide search stands them down.
+        assert!(!project_toggles_pass(true, true, false, true, false));
+        assert!(project_toggles_pass(false, true, false, true, false));
+    }
+
+    #[test]
+    fn sessions_filter_counts_a_detached_agent_bucketed_under_home() {
+        let listed =
+            sidebar_nav::ListedRows::from([(None, vec![sidebar_nav::WorkspaceEntry::Agent(
+                herdr::Side::Native,
+                "term_home".to_string(),
+            )])]);
+        assert!(sessions_filter_passes(&[], &listed, &None, true));
+    }
+
+    #[test]
+    fn a_wide_search_stands_down_the_git_toggles() {
+        // Toggled on for "modified" only, an untracked row fails while the
+        // toggle applies and passes once a wide search stands it down.
+        assert!(!git_toggles_pass(true, false, false, ChangeKind::Untracked));
+        assert!(git_toggles_pass(false, false, false, ChangeKind::Untracked));
+    }
+
+    #[test]
+    fn a_pr_toggle_alone_makes_any_toggle_active() {
+        assert!(!any_project_toggle_active(false, false, false));
+        assert!(any_project_toggle_active(false, false, true));
+    }
+
+    #[test]
+    fn worktree_pr_passes_is_inert_without_a_pr_toggle() {
+        let path = PathBuf::from("/worktree");
+        let mut pr_matches = HashMap::new();
+        pr_matches.insert(path.clone(), false);
+        assert!(worktree_pr_passes(false, &pr_matches, &path));
+    }
+
+    #[test]
+    fn worktree_pr_passes_follows_the_map_once_a_pr_toggle_is_active() {
+        let path = PathBuf::from("/worktree");
+        let mut pr_matches = HashMap::new();
+        pr_matches.insert(path.clone(), true);
+        assert!(worktree_pr_passes(true, &pr_matches, &path));
+        pr_matches.insert(path.clone(), false);
+        assert!(!worktree_pr_passes(true, &pr_matches, &path));
+    }
+
+    #[test]
+    fn worktree_pr_passes_excludes_a_worktree_missing_from_the_map() {
+        let path = PathBuf::from("/worktree");
+        let pr_matches: HashMap<PathBuf, bool> = HashMap::new();
+        assert!(!worktree_pr_passes(true, &pr_matches, &path));
+    }
+
+    fn req(file: &str, source: DiffSource) -> DiffRequest {
+        DiffRequest { file: file.to_string(), source }
+    }
+
+    #[test]
+    fn diff_args_staged() {
+        let args = diff_args(&req("a.rs", DiffSource::Staged));
+        assert_eq!(args, vec!["diff", "--cached", "--", "a.rs"]);
+    }
+
+    #[test]
+    fn diff_args_worktree() {
+        let args = diff_args(&req("a.rs", DiffSource::Worktree));
+        assert_eq!(args, vec!["diff", "--", "a.rs"]);
+    }
+
+    #[test]
+    fn diff_args_untracked() {
+        let args = diff_args(&req("a.rs", DiffSource::Untracked));
+        assert_eq!(args, vec!["diff", "--no-index", "--", "/dev/null", "a.rs"]);
+    }
+
+    #[test]
+    fn diff_args_branch() {
+        let args = diff_args(&req("a.rs", DiffSource::Branch { base: "main".to_string() }));
+        assert_eq!(args, vec!["diff", "main...", "--", "a.rs"]);
+    }
+
+    #[test]
+    fn diff_command_uses_given_delta_program() {
+        let (program, args) = build_diff_command("delta", &req("a.rs", DiffSource::Staged));
+        assert_eq!(program, "git");
+        assert_eq!(args[0], "-c");
+        assert_eq!(args[1], "core.pager=delta --paging=always");
+        assert_eq!(&args[2..], diff_args(&req("a.rs", DiffSource::Staged)).as_slice());
+    }
+
+    #[test]
+    fn diff_command_honors_delta_override_path() {
+        let (_, args) =
+            build_diff_command(r"C:\tools\delta.exe", &req("a.rs", DiffSource::Worktree));
+        assert_eq!(args[1], r"core.pager=C:\tools\delta.exe --paging=always");
+    }
+
+    #[test]
+    fn wsl_diff_direct_uses_resolved_delta_and_keeps_pager_open() {
+        let (program, args) = build_wsl_diff_command_direct(
+            "kali-linux",
+            Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj"),
+            &req("a.rs", DiffSource::Staged),
+            "/home/lev/.cargo/bin/delta",
+        );
+        assert_eq!(program, "wsl.exe");
+        assert_eq!(args[..8], [
+            "-d",
+            "kali-linux",
+            "--cd",
+            r"\\wsl.localhost\kali-linux\home\lev\proj",
+            "--exec",
+            "sh",
+            "-c",
+            r#"export LESS="${LESS-R}"; exec git -c "core.pager=/home/lev/.cargo/bin/delta --paging=always" "$@""#,
+        ]);
+        assert_eq!(args[8], "sh");
+        assert_eq!(&args[9..], diff_args(&req("a.rs", DiffSource::Staged)).as_slice());
+    }
+
+    #[test]
+    fn wsl_diff_login_resolves_shell_and_keeps_pager_open() {
+        let (program, args) = build_wsl_diff_command_login(
+            "kali-linux",
+            Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj"),
+            &req("a.rs", DiffSource::Staged),
+        );
+        assert_eq!(program, "wsl.exe");
+        assert_eq!(args[..7], [
+            "-d",
+            "kali-linux",
+            "--cd",
+            r"\\wsl.localhost\kali-linux\home\lev\proj",
+            "--exec",
+            "sh",
+            "-c"
+        ]);
+        let script = &args[7];
+        assert!(script.contains("getent passwd"), "resolves login shell: {script}");
+        // The LESS export lives inside the login shell's script so a LESS
+        // sourced from the profile still wins.
+        assert!(
+            script.contains(
+                r#"-lc 'export LESS="${LESS-R}"; exec git -c "core.pager=delta --paging=always" "$@"'"#
+            ),
+            "keeps pager open after profile sourcing: {script}"
+        );
+        assert_eq!(args[8], "sh");
+        assert_eq!(&args[9..], diff_args(&req("a.rs", DiffSource::Staged)).as_slice());
+    }
+
+    #[test]
+    fn ui_text_px_defaults_to_terminal_derivation() {
+        let font = crate::config::FontConfig::default();
+        let (normal, heading) = ui_text_px(&font, &crate::config::UiFont::default());
+        assert_eq!(normal, font.ui_normal_px());
+        assert_eq!(heading, font.ui_heading_px());
+    }
+
+    #[test]
+    fn ui_text_px_overrides_from_ui_font_size() {
+        let font = crate::config::FontConfig::default();
+        let ui = crate::config::UiFont { size: Some(12.0), ..Default::default() };
+        let (normal, heading) = ui_text_px(&font, &ui);
+        assert_eq!(normal, 16.0); // 12 pt × 96/72
+        assert_eq!(
+            heading,
+            16.0 * (crate::config::FontConfig::UI_HEADING_RATIO
+                / crate::config::FontConfig::UI_NORMAL_RATIO)
+        );
+    }
+
+    #[test]
+    fn owning_worktree_matches_exact_and_descendant_paths() {
+        let wts = vec![PathBuf::from("C:/w/feat-a"), PathBuf::from("C:/w/feat-b")];
+        assert_eq!(
+            owning_worktree(&wts, Path::new("C:/w/feat-a")),
+            Some(PathBuf::from("C:/w/feat-a"))
+        );
+        assert_eq!(
+            owning_worktree(&wts, Path::new("C:/w/feat-b/src/deep")),
+            Some(PathBuf::from("C:/w/feat-b"))
+        );
+        assert_eq!(owning_worktree(&wts, Path::new("C:/elsewhere")), None);
+    }
+
+    /// A worktree checked out inside another checkout's subtree (e.g. under the
+    /// main repo) must resolve to the inner worktree, not the enclosing one.
+    #[test]
+    fn owning_worktree_prefers_the_longest_prefix() {
+        let wts = vec![PathBuf::from("C:/repo"), PathBuf::from("C:/repo/wt/inner")];
+        assert_eq!(
+            owning_worktree(&wts, Path::new("C:/repo/wt/inner/src")),
+            Some(PathBuf::from("C:/repo/wt/inner"))
+        );
+    }
+
+    /// The on-screen session keeps being watched: the view follows it to the
+    /// target workspace.
+    #[test]
+    fn moving_the_on_screen_session_follows_it() {
+        let out = plan_move(true, true, None, false);
+        assert!(out.follow);
+        assert!(out.claim_target);
+        assert!(matches!(out.source, SourceRepair::Remove));
+    }
+
+    /// A background move is silent — no focus stealing — and only claims the
+    /// target's active slot when the target had none.
+    #[test]
+    fn a_background_move_never_steals_focus() {
+        let out = plan_move(false, false, None, true);
+        assert!(!out.follow);
+        assert!(!out.claim_target, "the target's own active session stays");
+        assert!(matches!(out.source, SourceRepair::Keep));
+
+        let out = plan_move(false, false, None, false);
+        assert!(!out.follow);
+        assert!(out.claim_target, "an empty target adopts the arrival");
+    }
+
+    /// Moving the source workspace's active-but-not-on-screen session promotes
+    /// the next remaining session there, the way closing it would.
+    #[test]
+    fn the_source_workspace_repairs_its_active_session() {
+        let out = plan_move(true, false, Some(9), false);
+        assert!(matches!(out.source, SourceRepair::Set(9)));
+        assert!(!out.follow);
+
+        let out = plan_move(true, false, None, false);
+        assert!(matches!(out.source, SourceRepair::Remove), "no session left to promote");
+    }
+
+    #[test]
+    fn set_base_branch_targets_the_cursored_worktree_when_sidebar_focused() {
+        let wt = PathBuf::from("C:/repo/wt");
+        let none = |_id: SessionId| -> Option<WorkspaceKey> { None };
+        let cursor = SidebarRow::Worktree(wt.clone());
+        assert_eq!(
+            base_branch_target(true, Some(&cursor), none, &Some(PathBuf::from("C:/other"))),
+            Some(wt)
+        );
+    }
+
+    #[test]
+    fn set_base_branch_ignores_home_and_project_rows() {
+        let none = |_id: SessionId| -> Option<WorkspaceKey> { None };
+        assert_eq!(base_branch_target(true, Some(&SidebarRow::Home), none, &None), None);
+        let cursor = SidebarRow::Project(PathBuf::from("C:/repo"));
+        let none2 = |_id: SessionId| -> Option<WorkspaceKey> { None };
+        assert_eq!(base_branch_target(true, Some(&cursor), none2, &None), None);
+    }
+
+    #[test]
+    fn set_base_branch_falls_back_to_the_current_worktree() {
+        let wt = PathBuf::from("C:/repo/wt");
+        let none = |_id: SessionId| -> Option<WorkspaceKey> { None };
+        assert_eq!(base_branch_target(false, None, none, &Some(wt.clone())), Some(wt));
+        let none2 = |_id: SessionId| -> Option<WorkspaceKey> { None };
+        assert_eq!(base_branch_target(false, None, none2, &None), None, "home has no base branch");
+    }
+
+    /// The job's spans, as `path_label` itself builds them via `zed_spans`,
+    /// must reassemble into exactly what `render` produces, so the emphasis
+    /// only changes how the text looks, never what it says.
+    #[test]
+    fn the_zed_job_spells_the_same_text_as_render() {
+        for (path, home) in [
+            ("path/to/file.txt", None),
+            ("/a/b/c.txt", None),
+            ("f.txt", None),
+            ("/f.txt", None),
+            ("/home/lev/Git/x/y.rs", Some("/home/lev")),
+        ] {
+            let parts = crate::path_style::split(path, PathStyle::Zed, home);
+            let spans = zed_spans(&parts).concat();
+            assert_eq!(spans, crate::path_style::render(path, PathStyle::Zed, home), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn snapshot_parents_agree_with_the_row_model() {
+        use crate::sidebar_focus::Parent;
+        use crate::sidebar_nav::{self, SidebarRow};
+
+        // Two projects, one collapsed, with sessions under the expanded one.
+        let projects = vec![
+            sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2"]),
+            sidebar_nav::tests::project("/b", false, &["/b/wt1"]),
+        ];
+        let live =
+            vec![(None, 1), (Some(PathBuf::from("/a/wt1")), 2), (Some(PathBuf::from("/a/wt1")), 3)];
+        let listed = sidebar_nav::tests::sessions_only(HashMap::from([
+            (None, vec![1]),
+            (Some(PathBuf::from("/a/wt1")), vec![2, 3]),
+        ]));
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let snapshot =
+            build_sidebar_snapshot(&projects, &live, &listed, &rows, None, Default::default());
+
+        for row in &rows {
+            let id = snapshot.find(row).expect("every projected row is in the model");
+            let arena_parent = match snapshot.parent(id) {
+                Parent::Root => None,
+                Parent::Node(p) => Some(snapshot.row(p).clone()),
+                Parent::Detached => panic!("a projected row is never detached: {row:?}"),
+            };
+            assert_eq!(
+                arena_parent,
+                sidebar_nav::left_target(&rows, row),
+                "arena parent must agree with the row model for {row:?}"
+            );
+        }
+
+        // The collapsed project's worktree is in the model but not projected.
+        let hidden = snapshot
+            .find(&SidebarRow::Worktree(PathBuf::from("/b/wt1")))
+            .expect("collapsed worktrees stay in the model");
+        assert!(!snapshot.is_projected(hidden));
+    }
+
+    #[test]
+    fn a_session_below_the_listing_threshold_is_still_in_the_model() {
+        use crate::sidebar_nav::{self, SidebarRow};
+
+        let projects = vec![sidebar_nav::tests::project("/a", true, &["/a/wt1"])];
+        // One live session in the worktree.  The real rule needs two before it
+        // lists any, so this one is live but unprojected.
+        let live = vec![(Some(PathBuf::from("/a/wt1")), 7)];
+        let listed = {
+            let mut l = sidebar_nav::ListedRows::new();
+            let entries = workspace_entries(&[7], Vec::new(), false);
+            assert!(entries.is_empty(), "the threshold rule must actually drop this session");
+            if !entries.is_empty() {
+                l.insert(Some(PathBuf::from("/a/wt1")), entries);
+            }
+            l
+        };
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let snapshot =
+            build_sidebar_snapshot(&projects, &live, &listed, &rows, None, Default::default());
+
+        let id = snapshot
+            .find(&SidebarRow::Session(7))
+            .expect("a live session is in the model whatever the listing threshold says");
+        assert!(!snapshot.is_projected(id), "but it is not a navigable row");
+    }
+
+    #[test]
+    fn a_session_whose_project_is_gone_is_detached_not_deleted() {
+        use crate::sidebar_focus::Parent;
+        use crate::sidebar_nav::{self, SidebarRow};
+
+        // `remove_project` drops the project but keeps its sessions running.
+        let projects: Vec<crate::projects::Project> = vec![];
+        let live = vec![(Some(PathBuf::from("/orphan/wt1")), 5)];
+        let listed = sidebar_nav::ListedRows::new();
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let snapshot =
+            build_sidebar_snapshot(&projects, &live, &listed, &rows, None, Default::default());
+
+        let id = snapshot.find(&SidebarRow::Session(5)).expect("the session is still running");
+        assert_eq!(
+            snapshot.parent(id),
+            Parent::Detached,
+            "an orphan must not become a sibling of Home"
+        );
+    }
+
+    #[test]
+    fn a_worktree_being_deleted_reads_as_gone_immediately() {
+        use crate::sidebar_nav::{self, SidebarRow};
+
+        let projects = vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2"])];
+        let listed = sidebar_nav::ListedRows::new();
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let doomed = PathBuf::from("/a/wt2");
+        let snapshot = build_sidebar_snapshot(
+            &projects,
+            &[],
+            &listed,
+            &rows,
+            Some(doomed.as_path()),
+            Default::default(),
+        );
+
+        assert_eq!(
+            snapshot.find(&SidebarRow::Worktree(doomed)),
+            None,
+            "the async git delete has not finished, but the row must not read as present"
+        );
+        assert!(snapshot.find(&SidebarRow::Worktree(PathBuf::from("/a/wt1"))).is_some());
+    }
+
+    /// The rows below a worktree being deleted must stay navigable.
+    ///
+    /// The projection is built before the deletion is known, so it still
+    /// lists the doomed worktree.  The builder consumes that projection in
+    /// lockstep, so skipping the worktree without stepping the index leaves
+    /// it parked on a row nothing will ever match again — every later node
+    /// reads as unprojected, and the cursor repair treats an unprojected row
+    /// as one that has gone away.
+    #[test]
+    fn rows_below_a_deleted_worktree_stay_navigable() {
+        use crate::sidebar_nav::{self, SidebarRow};
+
+        let projects =
+            vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2", "/a/wt3"])];
+        let listed = sidebar_nav::ListedRows::new();
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let doomed = PathBuf::from("/a/wt2");
+        let snapshot = build_sidebar_snapshot(
+            &projects,
+            &[],
+            &listed,
+            &rows,
+            Some(doomed.as_path()),
+            Default::default(),
+        );
+
+        let below = snapshot
+            .find(&SidebarRow::Worktree(PathBuf::from("/a/wt3")))
+            .expect("the worktree below the deleted one is still in the tree");
+        assert!(
+            snapshot.is_projected(below),
+            "a row below the one being deleted must still be navigable"
+        );
+    }
+
+    /// A checkout the liveness cache calls gone offers no workspace, so the
+    /// agent working in it matches nothing and lists under Home.  Matched to
+    /// the removed worktree instead, its row's Enter could only refuse.
+    #[test]
+    fn a_gone_worktree_offers_no_workspace_to_an_agent() {
+        use crate::sidebar_nav;
+
+        let projects = vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2"])];
+        let gone = PathBuf::from("/a/wt2");
+        let workspaces = herdr_workspaces(&projects, |path| Some(path == gone));
+        assert_eq!(workspaces, vec![PathBuf::from("/a/wt1")]);
+
+        let agent = herdr::Agent {
+            terminal_id: "t1".into(),
+            pane_id: "w1:p1".into(),
+            tab_id: Some("w1:t1".into()),
+            kind: None,
+            title: None,
+            status: Some(herdr::Status::Idle),
+            focused: false,
+            cwd: Some(gone.to_string_lossy().into_owned()),
+            foreground_cwd: None,
+        };
+        assert_eq!(
+            herdr::match_workspace(&agent, &herdr::Side::Native, &workspaces),
+            None,
+            "an agent under a removed checkout falls back to Home"
+        );
+    }
+
+    /// The lockstep walk follows the listing, not the session vector.
+    ///
+    /// Attaching to the second pane first leaves the two sessions in the
+    /// opposite order to herdr's, and a walk that trusted the vector would
+    /// push them the wrong way round, match neither against the projection
+    /// and trip its own assert.
+    #[test]
+    fn the_snapshot_walk_follows_the_listing_not_the_session_vector() {
+        use crate::sidebar_nav::{self, SidebarRow};
+
+        let projects = vec![sidebar_nav::tests::project("/a", true, &["/a/wt1"])];
+        let wt = Some(PathBuf::from("/a/wt1"));
+        // Attached in the order 9 then 4; herdr lists the panes 4 then 9.
+        let live = vec![(wt.clone(), 9), (wt.clone(), 4)];
+        let listed = sidebar_nav::ListedRows::from([(wt.clone(), vec![
+            sidebar_nav::WorkspaceEntry::Session(4),
+            sidebar_nav::WorkspaceEntry::Session(9),
+        ])]);
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let snapshot =
+            build_sidebar_snapshot(&projects, &live, &listed, &rows, None, Default::default());
+
+        assert_eq!(rows, vec![
+            SidebarRow::Home,
+            SidebarRow::Project(PathBuf::from("/a")),
+            SidebarRow::Worktree(PathBuf::from("/a/wt1")),
+            SidebarRow::Session(4),
+            SidebarRow::Session(9),
+        ]);
+        for row in &rows {
+            let id = snapshot.find(row).expect("every projected row is in the model");
+            assert!(snapshot.is_projected(id), "{row:?} must stay navigable");
+        }
+    }
+
+    /// Dispatch cannot catch a wrong pairing: `toggle` drops an identity the
+    /// panel does not allow, and an action with no arm falls through to the
+    /// scroll handler.  Swapping two identities here is otherwise invisible.
+    #[test]
+    fn the_projects_filter_actions_map_to_their_identities() {
+        for (action, identity) in [
+            (NamedAction::ToggleSessionsFilter, Some('s')),
+            (NamedAction::ToggleDetachedSessionsFilter, None),
+            (NamedAction::ToggleAttentionFilter, Some('a')),
+            (NamedAction::TogglePrOpenFilter, Some('o')),
+            (NamedAction::TogglePrDraftFilter, Some('d')),
+            (NamedAction::TogglePrMergedFilter, Some('m')),
+            (NamedAction::TogglePrClosedFilter, Some('c')),
+            (NamedAction::ClearProjectFilters, None),
+            (NamedAction::ToggleModifiedFilter, None),
+            (NamedAction::ToggleDeletedFilter, None),
+            (NamedAction::ToggleUntrackedFilter, None),
+            (NamedAction::ToggleSearchScope, None),
+            (NamedAction::RefreshPrStatus, None),
+            (NamedAction::Paste, None),
+        ] {
+            assert_eq!(project_filter_identity(action), identity, "{action:?}");
+            if let Some(key) = identity {
+                assert!(
+                    project_filter_toggles(true).contains(&key),
+                    "{action:?} maps to {key}, which the panel would drop"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_pr_identities_exist_only_when_polling_does() {
+        assert_eq!(project_filter_toggles(false), &['s', 'a']);
+        assert_eq!(project_filter_toggles(true), &['s', 'a', 'o', 'd', 'm', 'c']);
+    }
+
+    /// Guards the staging dependency: the four PR actions already dispatch to
+    /// `project_filter.toggle`, and `toggle` silently ignores an identity the
+    /// filter does not allow — so a narrow slice here makes them dead keys.
+    #[test]
+    fn the_pr_actions_reach_a_configured_projects_filter() {
+        let mut f = PanelFilter::new(project_filter_toggles(true));
+        for key in ['o', 'd', 'm', 'c'] {
+            f.toggle(key);
+            assert!(f.is_toggled(key), "{key} must be a live identity");
+        }
+    }
+
+    #[test]
+    fn any_pr_toggle_active_ignores_the_non_pr_identities() {
+        let mut f = PanelFilter::new(project_filter_toggles(true));
+        assert!(!any_pr_toggle_active(&f, SearchScope::Filtered));
+        f.toggle('s');
+        assert!(
+            !any_pr_toggle_active(&f, SearchScope::Filtered),
+            "a session toggle is not a PR toggle"
+        );
+        f.toggle('o');
+        assert!(any_pr_toggle_active(&f, SearchScope::Filtered));
+    }
+
+    /// A search under `All` stands the toggles down for row selection, so the
+    /// PR dimension narrows nothing — polling collapsed projects for it and
+    /// rebuilding on every banked result would both be pure cost.
+    #[test]
+    fn a_stood_down_pr_toggle_does_not_read_as_active() {
+        let mut f = PanelFilter::new(project_filter_toggles(true));
+        f.toggle('o');
+        f.on_text("/");
+        f.on_text("a");
+
+        assert!(any_pr_toggle_active(&f, SearchScope::Filtered));
+        assert!(!any_pr_toggle_active(&f, SearchScope::All));
+    }
+
+    /// The reconciler must not churn for users who never touch a PR filter:
+    /// every banked result would otherwise rebuild the row set.
+    #[test]
+    fn the_generation_reaches_the_reconciler_only_while_filtering() {
+        assert_eq!(pr_generation_for(7, false), 0);
+        assert_eq!(pr_generation_for(7, true), 7);
+    }
+
+    #[test]
+    fn a_pr_filter_reaches_into_collapsed_projects() {
+        assert!(!should_poll_pr(true, false, false), "collapsed and unfiltered: no lookup");
+        assert!(should_poll_pr(true, false, true), "a PR filter must see collapsed rows");
+        assert!(should_poll_pr(true, true, false));
+        assert!(!should_poll_pr(false, true, true), "disabled means never");
+    }
+
+    #[test]
+    fn the_palette_never_asks_for_a_negative_width() {
+        assert!(palette_content_width(1.0, 10.0) >= 0.0);
+    }
+
+    /// A window wide enough keeps the fixed grid, so the columns line up exactly
+    /// where they always have.
+    #[test]
+    fn wide_columns_keep_the_fixed_grid() {
+        let cols = PaletteColumns::new(1.0, 760.0);
+        assert_eq!(cols.action, 200.0);
+        assert_eq!(cols.keys, 180.0);
+        let mark = ROW_STATUS_ICON_W + PALETTE_MARK_GAP;
+        assert_eq!(cols.desc, 760.0 - 2.0 * 10.0 - mark - 2.0 * 14.0 - 380.0);
+        assert!(!cols.narrow, "a wide palette ellipsizes its columns rather than wrapping them");
+    }
+
+    #[test]
+    fn only_a_cut_column_offers_its_full_text_on_hover() {
+        assert_eq!(elided_hover(&[(false, "Copy"), (false, "Copy"), (false, "Ctrl+C")]), None);
+        assert_eq!(
+            elided_hover(&[
+                (false, "Increase the font size"),
+                (true, "IncreaseFontSize"),
+                (true, "Ctrl+Plus, Ctrl+="),
+            ]),
+            Some("IncreaseFontSize\nCtrl+Plus, Ctrl+=".to_string())
+        );
+    }
+}
