@@ -914,6 +914,10 @@ pub fn term_config(config: &Config) -> TermConfig {
         scrolling_history: config.scrolling.history,
         default_cursor_style: config.cursor_style(),
         semantic_escape_chars: config.selection.semantic_escape_chars.clone(),
+        // `Term` refuses an OSC 52 read before an event is ever emitted
+        // unless this carries the user's choice.  Upstream's default refuses
+        // it, and so does ours.
+        osc52: config.osc52,
         // `Term` drops every kitty keyboard request — push, pop, and the
         // support query — unless this is set, so without it an app never gets
         // to enable the protocol and modified keys stay legacy.  alacritty
