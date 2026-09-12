@@ -36,7 +36,9 @@ SCRATCH = Path("../alacritree-worktrees/.rebase-propagate")
 #: PR titles end in the stack position: `perf(jobs): bound the pool [6]`.
 MARKER = re.compile(r"\[(\d+)\]\s*$")
 
-TERMINAL = ("PROPAGATED", "NOTHING-TO-DO", "PLAN", "DIRTY", "ERROR")
+#: Statuses that end the run for good, and so retire its state file.  A dry
+#: run reports on a stopped run rather than ending it, so PLAN is not one.
+TERMINAL = ("PROPAGATED", "NOTHING-TO-DO", "DIRTY", "ERROR")
 
 
 def say(text: str = "") -> None:
@@ -64,6 +66,22 @@ def git(*args: str, cwd: Path | None = None) -> str:
 
 def git_ok(*args: str, cwd: Path | None = None) -> bool:
     return run("git", *args, cwd=cwd)[0] == 0
+
+
+def rebasing(tree: Path) -> str:
+    """The branch a stopped rebase in `tree` holds, if one is stopped there.
+
+    A worktree mid-rebase is detached, so `git worktree list` records no branch
+    for it and the branch reads as checked out nowhere.  The rebase still owns
+    it, and its `head-name` is the only place that says so.
+    """
+    for state in ("rebase-merge", "rebase-apply"):
+        head = Path(git("-C", str(tree), "rev-parse", "--git-path", f"{state}/head-name"))
+        if not head.exists():
+            continue
+        ref = head.read_text(encoding="utf-8").strip()
+        return ref.removeprefix("refs/heads/") if ref.startswith("refs/heads/") else ""
+    return ""
 
 
 def upstream_repo(root: Path) -> str:
@@ -206,12 +224,18 @@ class Run:
     def locate(self) -> None:
         """Find each branch's worktree, and the tips this run reasons from."""
         checkouts: dict[str, Path] = {}
+        trees: list[Path] = []
         path: Path | None = None
         for line in git("-C", str(self.root), "worktree", "list", "--porcelain").splitlines():
             if line.startswith("worktree "):
                 path = Path(line[len("worktree "):])
+                trees.append(path)
             elif line.startswith("branch refs/heads/") and path is not None:
                 checkouts[line[len("branch refs/heads/"):]] = path
+        for tree in (t for t in trees if t not in checkouts.values()):
+            name = rebasing(tree)
+            if name:
+                checkouts.setdefault(name, tree)
         for b in self.stack:
             b.worktree = checkouts.get(b.name)
             code, tip = run("git", "-C", str(self.root), "rev-parse", "--verify", f"{FORK}/{b.name}")
