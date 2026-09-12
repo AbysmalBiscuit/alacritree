@@ -79,6 +79,9 @@ fn handle_at(state_path: &Path, request: &IpcRequest) -> IpcResult {
         | IpcRequest::SendText { .. }
         | IpcRequest::ReadScreen { .. }
         | IpcRequest::MoveSession { .. }
+        | IpcRequest::ListMultiplexerPanes
+        | IpcRequest::AttachMultiplexerPane { .. }
+        | IpcRequest::CreateMultiplexerPane { .. }
         | IpcRequest::RunAction { .. } => Err("alacritree is not running".to_string()),
     }
 }

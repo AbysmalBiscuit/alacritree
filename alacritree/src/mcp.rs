@@ -130,8 +130,36 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "list_sessions",
-            "description": "List tabs across all workspaces: id, title, workspace path (null = the home workspace), kind (shell, diff, or scratchpad editor), grid size, whether it is its workspace's active tab, and whether it flagged for attention (bell / agent finished).",
+            "description": "List tabs across all workspaces: id, title, workspace path (null = the home workspace), kind (shell, diff, or scratchpad editor), grid size, whether it is its workspace's active tab, whether it flagged for attention (bell / agent finished), the agent's name and live state when one runs in it, whether a session with no multiplexer looks busy, and the multiplexer (if any) hosting it.",
             "inputSchema": { "type": "object", "properties": {} },
+        },
+        {
+            "name": "list_multiplexer_panes",
+            "description": "List every pane of the terminal multiplexer alacritree has detected (herdr), on every side it reaches, whether or not a session is attached to one. Each entry carries the multiplexer block naming the pane (side and terminal_id), the pane's agent kind, title and live status, whether the multiplexer's own window is showing it, the workspace its working directory matches, and the id of the alacritree session holding it (null when none is). Unattached panes appear here and nowhere else.",
+            "inputSchema": { "type": "object", "properties": {} },
+        },
+        {
+            "name": "attach_multiplexer_pane",
+            "description": "Open an alacritree session on a multiplexer pane from list_multiplexer_panes, exactly as clicking its sidebar row does, and return the session id once the session can be read. A pane a session already holds returns that session rather than opening a second one. side and terminal_id both come from the pane's multiplexer block; the pane id is not a target, since it changes when a pane moves.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "side": { "type": "string", "description": "\"native\" or \"wsl:<distro>\", from list_multiplexer_panes." },
+                    "terminal_id": { "type": "string", "description": "Terminal id from list_multiplexer_panes." },
+                },
+                "required": ["side", "terminal_id"],
+            },
+        },
+        {
+            "name": "create_multiplexer_pane",
+            "description": "Open a new pane in the terminal multiplexer (herdr) and an alacritree session on it, and return the session id once the session can be read. Omit side to use the one the active session's pane belongs to, which is what a machine reaching only one herdr server always wants; a machine reaching several must name it when no herdr session is focused. Omit workspace to open the pane in the focused workspace.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "side": { "type": "string", "description": "\"native\" or \"wsl:<distro>\", from list_multiplexer_panes." },
+                    "workspace": { "type": "string", "description": "Worktree path from list_projects; omit for the focused workspace." },
+                },
+            },
         },
         {
             "name": "select_workspace",
@@ -307,6 +335,9 @@ mod tests {
         vec![
             IpcRequest::ListProjects,
             IpcRequest::ListSessions,
+            IpcRequest::ListMultiplexerPanes,
+            IpcRequest::AttachMultiplexerPane { side: "native".into(), terminal_id: "t1".into() },
+            IpcRequest::CreateMultiplexerPane { side: None, workspace: None },
             IpcRequest::SelectWorkspace { path: None },
             IpcRequest::CreateSession { workspace: None },
             IpcRequest::CloseSession { session_id: 1 },
@@ -328,6 +359,9 @@ mod tests {
         match request {
             IpcRequest::ListProjects => "list_projects",
             IpcRequest::ListSessions => "list_sessions",
+            IpcRequest::ListMultiplexerPanes => "list_multiplexer_panes",
+            IpcRequest::AttachMultiplexerPane { .. } => "attach_multiplexer_pane",
+            IpcRequest::CreateMultiplexerPane { .. } => "create_multiplexer_pane",
             IpcRequest::SelectWorkspace { .. } => "select_workspace",
             IpcRequest::CreateSession { .. } => "create_session",
             IpcRequest::CloseSession { .. } => "close_session",

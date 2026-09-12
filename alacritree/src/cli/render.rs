@@ -18,6 +18,10 @@ pub fn human(request: &IpcRequest, value: &Value) {
             println!("removed {}", text(&value["removed"]));
         },
         IpcRequest::ListSessions => sessions(value),
+        IpcRequest::ListMultiplexerPanes => multiplexer_panes(value),
+        IpcRequest::AttachMultiplexerPane { .. } | IpcRequest::CreateMultiplexerPane { .. } => {
+            println!("session {}", text(&value["session_id"]));
+        },
         IpcRequest::CreateSession { .. } => {
             println!("session {}", text(&value["session_id"]));
         },
@@ -79,7 +83,43 @@ fn sessions(value: &Value) {
         let active = if s["is_active_tab"].as_bool().unwrap_or(false) { "*" } else { " " };
         let attention = if s["needs_attention"].as_bool().unwrap_or(false) { " (!)" } else { "" };
         let workspace = s["workspace"].as_str().unwrap_or("home");
-        println!("{active} {}  {}  {workspace}{attention}", text(&s["id"]), text(&s["title"]));
+        let state = match s["agent"]["state"].as_str() {
+            Some(state) => format!("  [{state}]"),
+            None => String::new(),
+        };
+        let via = match s["multiplexer"]["name"].as_str() {
+            Some(name) => format!("  via {name}"),
+            None => String::new(),
+        };
+        println!(
+            "{active} {}  {}  {workspace}{state}{via}{attention}",
+            text(&s["id"]),
+            text(&s["title"])
+        );
+    }
+}
+
+fn multiplexer_panes(value: &Value) {
+    let panes = array(&value["panes"]);
+    if panes.is_empty() {
+        println!("no multiplexer panes");
+        return;
+    }
+    for p in panes {
+        // Side and terminal id lead because together they are what an attach
+        // takes; the rest of the line is there to recognise the pane.
+        let held = if p["session_id"].is_null() { " " } else { "*" };
+        let name = p["title"].as_str().or_else(|| p["kind"].as_str()).unwrap_or("");
+        let status = match p["status"].as_str() {
+            Some(status) => format!("  [{status}]"),
+            None => String::new(),
+        };
+        let workspace = p["workspace"].as_str().unwrap_or("home");
+        println!(
+            "{held} {}  {}  {name}{status}  {workspace}",
+            text(&p["multiplexer"]["side"]),
+            text(&p["multiplexer"]["terminal_id"])
+        );
     }
 }
 
@@ -155,8 +195,48 @@ mod tests {
             IpcRequest::GitStatus { path: "/repo".into() },
             IpcRequest::ReadScreen { session_id: 1, scrollback_lines: 0 },
             IpcRequest::ReadScratchpad { workspace: Some("home".into()) },
+            IpcRequest::ListMultiplexerPanes,
         ] {
             human(&request, &serde_json::json!({}));
         }
+    }
+
+    /// A pane nothing is attached to is the whole reason for the listing, and
+    /// it carries neither a session id nor a status.
+    #[test]
+    fn a_pane_line_survives_an_unattached_pane_with_no_agent() {
+        human(
+            &IpcRequest::ListMultiplexerPanes,
+            &serde_json::json!({
+                "panes": [{
+                    "multiplexer": { "name": "herdr", "side": "wsl:ubuntu", "terminal_id": "t1" },
+                    "kind": serde_json::Value::Null,
+                    "title": serde_json::Value::Null,
+                    "status": serde_json::Value::Null,
+                    "focused": false,
+                    "workspace": serde_json::Value::Null,
+                    "session_id": serde_json::Value::Null,
+                }]
+            }),
+        );
+    }
+
+    #[test]
+    fn a_session_line_names_its_agent_state_and_multiplexer() {
+        human(
+            &IpcRequest::ListSessions,
+            &serde_json::json!({
+                "sessions": [{
+                    "id": 1,
+                    "title": "claude",
+                    "workspace": "/repo",
+                    "is_active_tab": true,
+                    "needs_attention": false,
+                    "agent": { "name": "claude", "state": "working" },
+                    "busy": serde_json::Value::Null,
+                    "multiplexer": { "name": "herdr", "side": "native", "terminal_id": "t1" },
+                }]
+            }),
+        );
     }
 }

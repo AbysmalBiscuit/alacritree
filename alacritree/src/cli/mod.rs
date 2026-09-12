@@ -99,6 +99,13 @@ enum Command {
         command: SessionCommand,
     },
 
+    /// Panes of the terminal multiplexer alacritree has detected.  Needs a
+    /// running alacritree.
+    Multiplexer {
+        #[command(subcommand)]
+        command: MultiplexerCommand,
+    },
+
     /// The focused workspace.  Needs a running alacritree.
     Workspace {
         #[command(subcommand)]
@@ -226,6 +233,30 @@ enum SessionCommand {
         session_id: u64,
         /// A path inside the target worktree (e.g. `.`).
         path: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum MultiplexerCommand {
+    /// List every detected pane, attached or not.
+    List,
+    /// Open a session on a detected pane, as clicking its sidebar row does.
+    Attach {
+        /// `native`, or `wsl:<distro>`, as `multiplexer list` reports it.
+        side: String,
+        /// Terminal id from `multiplexer list`.  Not the pane id, which
+        /// changes when a pane moves between workspaces.
+        terminal_id: String,
+    },
+    /// Open a new pane in the multiplexer and a session on it.
+    Create {
+        /// `native`, or `wsl:<distro>`.  Omit to use the side the active
+        /// session's pane belongs to.
+        #[arg(long)]
+        side: Option<String>,
+        /// Worktree path; omit for the focused workspace.
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<PathBuf>,
     },
 }
 
@@ -416,6 +447,15 @@ fn to_request(command: Command) -> IpcRequest {
             },
             SessionCommand::Move { session_id, path } => {
                 IpcRequest::MoveSession { session_id, path: absolute(path) }
+            },
+        },
+        Command::Multiplexer { command } => match command {
+            MultiplexerCommand::List => IpcRequest::ListMultiplexerPanes,
+            MultiplexerCommand::Attach { side, terminal_id } => {
+                IpcRequest::AttachMultiplexerPane { side, terminal_id }
+            },
+            MultiplexerCommand::Create { side, workspace } => {
+                IpcRequest::CreateMultiplexerPane { side, workspace: workspace.map(absolute) }
             },
         },
         Command::Workspace { command } => match command {

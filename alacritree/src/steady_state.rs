@@ -1,10 +1,10 @@
-//! Cost gate for the sidebar reconciler's per-frame path.
+//! Cost gate for the paths that run on every frame.
 //!
-//! The reconciler runs on every frame with no setting that disables it, so
-//! "an unchanged frame allocates nothing" is a property the app depends on
-//! rather than a target to aim at.  A counting allocator is the only way to
-//! observe it: a timing threshold on a shared runner is either flaky or too
-//! loose to detect anything.
+//! They run whatever the user is doing, and the sidebar reconciler runs with
+//! no setting that disables it at all, so "an unchanged frame allocates
+//! nothing" is a property the app depends on rather than a target to aim at.
+//! A counting allocator is the only way to observe it: a timing threshold on
+//! a shared runner is either flaky or too loose to detect anything.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -90,30 +90,43 @@ mod tests {
             .collect()
     }
 
-    fn sessions(count: usize) -> Vec<(Option<std::path::PathBuf>, u64)> {
+    /// Sessions carrying the titles a live query makes the compare walk.  An
+    /// empty title compares without allocating whatever `matches` does with
+    /// it, so a fixture full of them cannot tell a borrowed comparison from
+    /// one that copies each title first.
+    fn sessions(count: usize) -> Vec<(Option<std::path::PathBuf>, u64, String)> {
         (0..count)
             .map(|i| {
                 (
                     Some(std::path::PathBuf::from(format!("/home/user/code/p0/worktree-{i}"))),
                     i as u64,
+                    format!("nvim src/worktree-{i}.rs"),
                 )
             })
             .collect()
     }
 
     fn inputs<'a>(
-        s: &'a [(Option<std::path::PathBuf>, u64)],
+        s: &'a [(Option<std::path::PathBuf>, u64, String)],
     ) -> impl Iterator<Item = SessionInput<'a>> {
-        s.iter().map(|(ws, id)| SessionInput { workspace: ws, id: *id, attention: false })
+        s.iter().map(|(ws, id, title)| SessionInput {
+            workspace: ws,
+            id: *id,
+            attention: false,
+            title,
+        })
     }
 
+    /// A live query that every title matches exercises the per-title compare
+    /// with no toggle filtering narrowing anything on top of it.
     #[test]
-    fn an_unchanged_frame_allocates_nothing() {
+    fn an_unchanged_frame_with_a_matching_query_allocates_nothing() {
         let projects = tree(10, 5);
         let live = sessions(150);
         let ui = UiInputs {
             session_rows_always: false,
-            query: "",
+            sessions_filter_counts_detached: false,
+            query: "worktree",
             toggles: 0,
             toggles_apply: true,
             pr_generation: 0,
@@ -134,12 +147,15 @@ mod tests {
         );
     }
 
+    /// Toggle filters plus a query that only some titles match exercise the
+    /// narrower projection on top of the per-title compare.
     #[test]
-    fn an_unchanged_filtering_frame_allocates_nothing() {
+    fn an_unchanged_frame_with_toggle_filters_and_a_narrow_query_allocates_nothing() {
         let projects = tree(10, 5);
         let live = sessions(150);
         let ui = UiInputs {
             session_rows_always: false,
+            sessions_filter_counts_detached: false,
             query: "worktree-3",
             toggles: 0b11,
             toggles_apply: true,
@@ -172,12 +188,53 @@ mod tests {
         );
     }
 
+    /// Every mode but `always` discards whatever the trail records, and the
+    /// mode is read once at startup, so those users must pay nothing for it.
+    #[test]
+    fn a_mode_that_ignores_the_trail_allocates_nothing() {
+        use std::time::Instant;
+
+        use crate::config::FollowFocus;
+        use crate::herdr;
+
+        let panes = herdr::Listing::Panes.parse(
+            r#"{"result":{"panes":[
+                {"terminal_id":"t1","pane_id":"w1:p1","tab_id":"w1:t1","focused":true}
+            ]}}"#,
+        );
+        let caches =
+            vec![herdr::EndpointCache::for_test(herdr::Side::Native, panes, Instant::now())];
+
+        for follow in [FollowFocus::Herdr, FollowFocus::Off] {
+            let mut sync = herdr::HerdrViewSync::default();
+            let (action, counts) = measure(|| {
+                sync.next(herdr::ViewInputs {
+                    active: Some((1, None, false)),
+                    follow,
+                    caches: &caches,
+                    attentive: true,
+                    busy: false,
+                    now: Instant::now(),
+                    last_direct_input: None,
+                })
+            });
+
+            assert!(action.is_none(), "mode {follow:?} acted on the trail");
+            assert_eq!(
+                counts.allocs, 0,
+                "mode {follow:?} allocated {} times ({} bytes) recording a trail it discards",
+                counts.allocs, counts.bytes
+            );
+        }
+    }
+
     #[test]
     fn the_compare_is_linear_in_the_tree_size() {
         let small = tree(10, 5);
         let big = tree(50, 10);
         let ui = UiInputs {
             session_rows_always: false,
+            sessions_filter_counts_detached: false,
             query: "",
             toggles: 0,
             toggles_apply: true,
@@ -217,7 +274,8 @@ mod tests {
             let live = sessions(s);
             let ui = UiInputs {
                 session_rows_always: false,
-                query: "",
+                sessions_filter_counts_detached: false,
+                query: "worktree",
                 toggles: 0,
                 toggles_apply: true,
                 pr_generation: 0,

@@ -119,6 +119,29 @@ pub enum IpcRequest {
         project_root: PathBuf,
         branch: String,
     },
+    /// Every pane the multiplexer integration has detected, whether or not a
+    /// session is attached to one.  A caller reaches an unattached pane no
+    /// other way: `ListSessions` describes only what alacritree already
+    /// holds.
+    ListMultiplexerPanes,
+    /// Open a session on a detected multiplexer pane, the way clicking its
+    /// sidebar row does.  `side` and `terminal_id` are what
+    /// `ListMultiplexerPanes` reports.  The pane id is deliberately not the
+    /// target: it is positional and changes when a pane moves.
+    AttachMultiplexerPane {
+        side: String,
+        terminal_id: String,
+    },
+    /// Open a new pane in the multiplexer and a session on it.  `side` and
+    /// `workspace` both default: an omitted side picks the one the active
+    /// session already belongs to, and an omitted workspace opens the pane
+    /// in the focused one.
+    CreateMultiplexerPane {
+        #[serde(default)]
+        side: Option<String>,
+        #[serde(default)]
+        workspace: Option<PathBuf>,
+    },
     /// Run a named key-binding action (`FocusLeft`, `ToggleLeftSidebar`, …)
     /// as if its key had been pressed.  `bindings::parse_action` defines the
     /// accepted names, so every action a key can be bound to is reachable
@@ -148,6 +171,9 @@ impl IpcRequest {
             Self::RenameProject { .. } => "RenameProject",
             Self::GitStatus { .. } => "GitStatus",
             Self::CreateWorktree { .. } => "CreateWorktree",
+            Self::ListMultiplexerPanes => "ListMultiplexerPanes",
+            Self::AttachMultiplexerPane { .. } => "AttachMultiplexerPane",
+            Self::CreateMultiplexerPane { .. } => "CreateMultiplexerPane",
             Self::RunAction { .. } => "RunAction",
         }
     }

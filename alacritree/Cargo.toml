@@ -62,6 +62,13 @@ clap_complete = "4"
 # reads, so the published schema cannot drift from what the parser accepts.
 schemars = "1.2"
 nucleo-matcher = "0.3"
+# One trait call in `app.rs` reaches whichever multiplexer owns the pane, so
+# a second one is a new variant rather than a new branch at every call site.
+# Static dispatch: the enum carries no vtable.
+enum_dispatch = "0.3"
+# Spells a multiplexer's name for the wire and reads it back, off the same
+# enum the dispatch uses, so the two cannot disagree.
+strum = { version = "0.26", features = ["derive"] }
 
 [dev-dependencies]
 # Throwaway repos and state files for worktree, prune, and persistence tests.
@@ -156,8 +163,15 @@ objc2-user-notifications = { version = "0.3", default-features = false, features
 
 [target.'cfg(windows)'.dev-dependencies]
 # Share-mode constants for tests that hold a file the way the loader holds a
-# running exe image: writes denied, rename allowed.
-windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+# running exe image: writes denied, rename allowed. The UI features are the
+# foreground check and the synthetic input the end-to-end suite needs, which
+# no CLI surface can produce.
+windows-sys = { version = "0.59", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
 
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3.0.2"

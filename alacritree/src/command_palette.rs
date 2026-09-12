@@ -18,7 +18,19 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 use crate::app::WorkspaceKey;
 use crate::bindings::{BindingAction, KeyBinding, NamedAction, bindable_actions};
+use crate::herdr::HerdrKey;
 use crate::session::SessionId;
+
+/// A herdr agent no session holds, and where attaching to it lands.  The
+/// workspace rides along because the listing already resolved it: looking it
+/// up again would go through `herdr_row_workspace`, whose outer `None` means
+/// "listed nowhere" — a state the palette can reach and the sidebar cannot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HerdrAttach {
+    pub key: HerdrKey,
+    pub pane_id: String,
+    pub workspace: WorkspaceKey,
+}
 
 /// What activating a palette row does. Each arm is resolved by
 /// `run_palette_action` in `app.rs`, which already owns the machinery it needs.
@@ -34,6 +46,9 @@ pub enum PaletteAction {
     CreateWorktree(PathBuf),
     /// Spawn a `[[ui.profiles]]` entry by name into the current workspace.
     SpawnProfile(String),
+    /// Attach to a herdr agent no session holds, in the workspace its working
+    /// directory matched.
+    AttachHerdrAgent(HerdrAttach),
 }
 
 /// The heading a row files under. Grouping keeps the list readable now that a
@@ -49,6 +64,7 @@ pub enum PaletteSection {
     Window,
     Profiles,
     OpenSessions,
+    HerdrSessions,
     SwitchWorkspace,
     NewWorktree,
 }
@@ -65,6 +81,7 @@ impl PaletteSection {
             Self::Window => "Window & application",
             Self::Profiles => "Shell profiles",
             Self::OpenSessions => "Open sessions",
+            Self::HerdrSessions => "Herdr sessions",
             Self::SwitchWorkspace => "Switch workspace",
             Self::NewWorktree => "New worktree",
         }
@@ -80,7 +97,9 @@ fn section_of(a: NamedAction) -> PaletteSection {
         ScrollPageUp | ScrollPageDown | ScrollHalfPageUp | ScrollHalfPageDown => Scrollback,
         ScrollLineUp | ScrollLineDown | ScrollToTop | ScrollToBottom => Scrollback,
         ClearHistory => Scrollback,
-        SpawnNewInstance | SpawnProfile(_) | CloseSession => Sessions,
+        SpawnNewInstance | SpawnProfile(_) | CloseSession | CloseExitedSession
+        | NewMultiplexerPane => Sessions,
+        AttachAllMultiplexerPanes | DetachAllMultiplexerPanes => Sessions,
         SelectNextTab | SelectPreviousTab | SelectTab(_) | SelectLastTab => Sessions,
         SelectNextSession | SelectPreviousSession => Sessions,
         ToggleSessionRows | ToggleSessionTabs | ToggleSessionDrag => Sessions,
@@ -93,7 +112,8 @@ fn section_of(a: NamedAction) -> PaletteSection {
         FocusProjectsSidebar | FocusGitSidebar | FocusTerminal => Sidebar,
         FocusLeft | FocusRight => Sidebar,
         SidebarSearchConfirm | SidebarSearchCancel | SidebarSearchCancelToTerminal => Sidebar,
-        ToggleSessionsFilter | ToggleAttentionFilter | ClearProjectFilters => Filters,
+        ToggleSessionsFilter | ToggleDetachedSessionsFilter => Filters,
+        ToggleAttentionFilter | ClearProjectFilters => Filters,
         TogglePrOpenFilter | TogglePrDraftFilter => Filters,
         TogglePrMergedFilter | TogglePrClosedFilter => Filters,
         ToggleModifiedFilter | ToggleDeletedFilter => Filters,
@@ -111,7 +131,9 @@ pub struct PaletteItem {
     pub section: PaletteSection,
     pub keys: String,
     pub primary: String,
+    pub subtitle: Option<String>,
     pub secondary: String,
+    pub hover: Option<String>,
     search: String,
 }
 
@@ -124,21 +146,34 @@ impl PaletteItem {
         secondary: String,
     ) -> Self {
         let search = format!("{primary} {secondary} {keys}");
-        Self { action, section, keys, primary, secondary, search }
+        Self { action, section, keys, primary, subtitle: None, secondary, hover: None, search }
     }
 
     fn action(a: NamedAction, keys: String) -> Self {
         Self::new(PaletteAction::Run(a), section_of(a), keys, a.description(), a.config_name())
     }
 
-    pub fn session(id: SessionId, primary: String, secondary: String) -> Self {
-        Self::new(
-            PaletteAction::ActivateSession(id),
-            PaletteSection::OpenSessions,
-            String::new(),
+    pub fn session(
+        id: SessionId,
+        primary: String,
+        subtitle: String,
+        secondary: String,
+        hover: String,
+        agent_kind: Option<&str>,
+        pane_id: Option<&str>,
+        is_herdr: bool,
+    ) -> Self {
+        let search = session_search(&primary, &subtitle, &secondary, agent_kind, pane_id, is_herdr);
+        Self {
+            action: PaletteAction::ActivateSession(id),
+            section: PaletteSection::OpenSessions,
+            keys: String::new(),
             primary,
+            subtitle: Some(subtitle),
             secondary,
-        )
+            hover: Some(hover),
+            search,
+        }
     }
 
     pub fn workspace(ws: WorkspaceKey, primary: String, secondary: String) -> Self {
@@ -179,6 +214,61 @@ impl PaletteItem {
         }
         item
     }
+
+    /// A herdr pane available to attach to, filed apart from open sessions.
+    pub fn herdr_agent(
+        attach: HerdrAttach,
+        primary: String,
+        subtitle: String,
+        secondary: String,
+        hover: String,
+        agent_kind: Option<&str>,
+    ) -> Self {
+        let search = session_search(
+            &primary,
+            &subtitle,
+            &secondary,
+            agent_kind,
+            Some(&attach.pane_id),
+            true,
+        );
+        Self {
+            action: PaletteAction::AttachHerdrAgent(attach),
+            section: PaletteSection::HerdrSessions,
+            keys: String::new(),
+            primary,
+            subtitle: Some(subtitle),
+            secondary,
+            hover: Some(hover),
+            search,
+        }
+    }
+}
+
+/// `pane_id` is folded in unpainted: a generic herdr row's second line is
+/// just the glyph, so duplicate rows with the same title, cwd and status
+/// would otherwise be findable by neither sight nor search.
+fn session_search(
+    primary: &str,
+    subtitle: &str,
+    secondary: &str,
+    agent_kind: Option<&str>,
+    pane_id: Option<&str>,
+    is_herdr: bool,
+) -> String {
+    let mut search = format!("{primary} {subtitle} {secondary}");
+    if let Some(agent_kind) = agent_kind {
+        search.push(' ');
+        search.push_str(agent_kind);
+    }
+    if let Some(pane_id) = pane_id {
+        search.push(' ');
+        search.push_str(pane_id);
+    }
+    if is_herdr {
+        search.push_str(" herdr");
+    }
+    search
 }
 
 /// Rows the palette must not offer to run: unbinds, the pass-through marker,
@@ -420,6 +510,24 @@ mod tests {
     }
 
     #[test]
+    fn palette_lists_the_new_multiplexer_pane_action_among_sessions() {
+        let items = action_items(&parse_bindings(vec![]));
+        let row = find(&items, "NewMultiplexerPane").expect("NewMultiplexerPane missing");
+        assert_eq!(row.section, PaletteSection::Sessions);
+        assert!(row.keys.is_empty(), "NewMultiplexerPane ships with no default key");
+    }
+
+    #[test]
+    fn palette_lists_the_whole_set_multiplexer_actions_among_sessions() {
+        let items = action_items(&parse_bindings(vec![]));
+        for name in ["AttachAllMultiplexerPanes", "DetachAllMultiplexerPanes"] {
+            let row = find(&items, name).unwrap_or_else(|| panic!("{name} missing"));
+            assert_eq!(row.section, PaletteSection::Sessions);
+            assert!(row.keys.is_empty(), "{name} ships with no default key");
+        }
+    }
+
+    #[test]
     fn palette_lists_the_sidebar_search_actions() {
         let items = action_items(&parse_bindings(vec![]));
         for name in ["SidebarSearchConfirm", "SidebarSearchCancel", "SidebarSearchCancelToTerminal"]
@@ -549,6 +657,7 @@ mod tests {
         let items = action_items(&parse_bindings(vec![]));
         for name in [
             "ToggleSessionsFilter",
+            "ToggleDetachedSessionsFilter",
             "ToggleAttentionFilter",
             "TogglePrOpenFilter",
             "TogglePrDraftFilter",
@@ -630,6 +739,107 @@ mod tests {
         let items = vec![item];
         let mut palette = CommandPalette::new();
         palette.query_mut().push_str("SpawnProfile2");
+        assert_eq!(palette.rank(&items), vec![0]);
+    }
+
+    fn attach(id: &str) -> HerdrAttach {
+        HerdrAttach {
+            key: crate::herdr::HerdrKey {
+                side: crate::herdr::Side::Native,
+                terminal_id: id.into(),
+            },
+            pane_id: "w5:p1".into(),
+            workspace: None,
+        }
+    }
+
+    #[test]
+    fn typing_herdr_ranks_attached_and_unattached_rows() {
+        let items = vec![
+            PaletteItem::session(
+                1,
+                "fix the wrap bug".into(),
+                "Home".into(),
+                "working".into(),
+                "hover".into(),
+                Some("claude"),
+                None,
+                true,
+            ),
+            PaletteItem::herdr_agent(
+                attach("t1"),
+                "review the schema".into(),
+                "w1:p1".into(),
+                "idle".into(),
+                "hover".into(),
+                Some("claude"),
+            ),
+            PaletteItem::session(
+                2,
+                "nvim config".into(),
+                "Home".into(),
+                "shell".into(),
+                "hover".into(),
+                None,
+                None,
+                false,
+            ),
+        ];
+        let mut palette = CommandPalette::new();
+        palette.query_mut().push_str("herdr");
+        let ranked = palette.rank(&items);
+        assert!(ranked.contains(&0), "the attached row is missing");
+        assert!(ranked.contains(&1), "the unattached row is missing");
+        assert!(!ranked.contains(&2), "a plain session row should not match");
+    }
+
+    #[test]
+    fn herdr_panes_have_their_own_section() {
+        let items = vec![
+            PaletteItem::session(
+                1,
+                "nvim".into(),
+                "Home".into(),
+                "shell".into(),
+                "hover".into(),
+                None,
+                None,
+                false,
+            ),
+            PaletteItem::herdr_agent(
+                attach("t1"),
+                "review".into(),
+                "w1:p1".into(),
+                "claude · idle".into(),
+                "hover".into(),
+                Some("claude"),
+            ),
+        ];
+        let mut palette = CommandPalette::new();
+        let ranked = palette.rank(&items);
+        let sections: Vec<PaletteSection> =
+            group(&items, &ranked).into_iter().map(|(s, _)| s).collect();
+        assert_eq!(sections, vec![PaletteSection::OpenSessions, PaletteSection::HerdrSessions]);
+        assert_eq!(items[1].section.title(), "Herdr sessions");
+    }
+
+    #[test]
+    fn session_search_excludes_tooltip_only_details() {
+        let items = vec![PaletteItem::session(
+            1,
+            "Claude Code".into(),
+            "project / main".into(),
+            "idle".into(),
+            "Terminal: term_123\nWorkspace: C:\\full\\private".into(),
+            Some("claude"),
+            None,
+            false,
+        )];
+        let mut palette = CommandPalette::new();
+        palette.query_mut().push_str("private");
+        assert!(palette.rank(&items).is_empty());
+        palette.clear_query();
+        palette.query_mut().push_str("project");
         assert_eq!(palette.rank(&items), vec![0]);
     }
 }
