@@ -10,6 +10,10 @@ use crate::{jobs, wsl};
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 
+/// Long enough that no healthy compute reaches it, short enough that a
+/// frozen panel is recorded while the process that froze it is still alive.
+const STALL_WARNING: Duration = Duration::from_secs(120);
+
 /// What the panel shows for a compute whose worker unwound.  The panic itself
 /// is logged from the pool; the row only needs to stop claiming knowledge it
 /// does not have.
@@ -177,6 +181,13 @@ struct Pending {
     /// the result that lands matches what the UI is currently asking for.
     hint: Option<String>,
     job: jobs::Job<GitStatus>,
+    /// When the compute was spawned, so a caller can tell a slow one from
+    /// one that will never answer.
+    started: Instant,
+    /// Set once the stall warning has been logged, so a frozen panel
+    /// repainting at monitor rate records the freeze once rather than on
+    /// every frame.
+    warned: bool,
 }
 
 impl StatusCache {
@@ -201,6 +212,14 @@ impl StatusCache {
     /// keystroke).
     pub fn last(&self) -> &GitStatus {
         &self.last
+    }
+
+    /// How long the in-flight compute has been running, or `None` when
+    /// nothing is in flight.  A compute that never returns pins `pending`,
+    /// and `poll` will not spawn another while it does, so the panel keeps
+    /// rendering whatever it last held.
+    pub fn stalled_for(&self) -> Option<Duration> {
+        self.pending.as_ref().map(|pending| pending.started.elapsed())
     }
 
     /// Whether a compute has landed and actually knows the tree. A cache
@@ -245,6 +264,26 @@ impl StatusCache {
             }
         }
 
+        // Nothing healthy takes this long: the resident transport caps a
+        // request and the fallback is a single wsl.exe round trip.  Past it
+        // the panel is frozen on a stale answer rather than waiting on a
+        // slow one, and that difference is invisible from outside.
+        if let Some(stalled) = self.stalled_for() {
+            if stalled > STALL_WARNING {
+                if let Some(pending) = self.pending.as_mut() {
+                    if !pending.warned {
+                        pending.warned = true;
+                        log::warn!(
+                            "git status for {} has been computing for {:.0}s; the panel is \
+                             showing a stale result",
+                            self.path.display(),
+                            stalled.as_secs_f64()
+                        );
+                    }
+                }
+            }
+        }
+
         let hint_changed = self.last_hint.as_deref() != default_branch_hint;
         let stale = self.last_refreshed.map_or(true, |when| when.elapsed() > REFRESH_INTERVAL);
         let needs_refresh = self.last_refreshed.is_none() || hint_changed || stale;
@@ -268,7 +307,7 @@ fn spawn_compute(path: PathBuf, hint: Option<String>, ctx: egui::Context) -> Pen
         ctx.request_repaint();
         status
     });
-    Pending { hint, job }
+    Pending { hint, job, started: Instant::now(), warned: false }
 }
 
 pub fn compute(
@@ -733,7 +772,7 @@ mod tests {
             .spawn(jobs::Priority::Background, |_: &jobs::Blocking| -> GitStatus {
                 panic!("boom")
             });
-        cache.pending = Some(Pending { hint: None, job });
+        cache.pending = Some(Pending { hint: None, job, started: Instant::now(), warned: false });
 
         let ctx = egui::Context::default();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -742,6 +781,45 @@ mod tests {
             assert!(Instant::now() < deadline, "pending was never cleared after the job failed");
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn a_compute_that_never_answers_is_reported_as_stalled() {
+        let mut cache = StatusCache::new(PathBuf::from("/nonexistent"));
+        assert_eq!(cache.stalled_for(), None, "nothing in flight yet");
+
+        // A gated worker rather than one that parks forever: the test drops
+        // the sender before returning, so the worker exits instead of
+        // costing one of the pool's fixed slots for the rest of the process.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let job = jobs::pool().spawn(
+            jobs::Priority::Background,
+            move |_: &jobs::Blocking| -> GitStatus {
+                let _ = release_rx.recv();
+                GitStatus::default()
+            },
+        );
+
+        // Backdated past STALL_WARNING rather than slept past it, so the
+        // warn-once assertions below need no sleep of their own.
+        let started = Instant::now()
+            .checked_sub(STALL_WARNING + Duration::from_secs(1))
+            .expect("the process has not been up for STALL_WARNING yet");
+        cache.pending = Some(Pending { hint: None, job, started, warned: false });
+
+        let stalled = cache.stalled_for().expect("a held compute is in flight");
+        assert!(stalled > STALL_WARNING);
+
+        let ctx = egui::Context::default();
+        let pending_warned =
+            |cache: &StatusCache| cache.pending.as_ref().expect("still in flight").warned;
+        assert!(!pending_warned(&cache), "not warned before the first poll");
+        let _ = cache.poll(None, &ctx);
+        assert!(pending_warned(&cache), "a stall past STALL_WARNING must be logged");
+        let _ = cache.poll(None, &ctx);
+        assert!(pending_warned(&cache), "the warning must not repeat on every frame");
+
+        let _ = release_tx.send(());
     }
 
     /// The regression this guards: a failure that leaves the cache looking
@@ -766,7 +844,7 @@ mod tests {
         }
 
         let mut cache = StatusCache::new(PathBuf::from("/doesnt/matter"));
-        cache.pending = Some(Pending { hint: None, job });
+        cache.pending = Some(Pending { hint: None, job, started: Instant::now(), warned: false });
         let ctx = egui::Context::default();
 
         let _ = cache.poll(None, &ctx);
