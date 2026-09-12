@@ -49,6 +49,7 @@ mod project_refresh;
 mod projects;
 #[cfg(windows)]
 mod pty_rearm;
+mod pty_tee;
 mod row_label;
 mod scratchpad;
 mod session;
