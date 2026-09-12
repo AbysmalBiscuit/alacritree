@@ -474,29 +474,32 @@ impl AlacritreeApp {
         }
     }
 
-    pub fn new(cc: &CreationContext<'_>, config: Config) -> Self {
+    fn configure_context(
+        ctx: &Context,
+        config: &Config,
+    ) -> (Vec<crate::fonts::ChainFace>, crate::fonts::FaceMetrics) {
         // A job's own closure cannot wake the loop when it unwinds, and the
         // failure it reports is only ever read from a frame.
-        let waker_ctx = cc.egui_ctx.clone();
+        let waker_ctx = ctx.clone();
         jobs::pool().set_waker(move || waker_ctx.request_repaint());
 
-        let theme = Theme::from_config(&config);
+        let theme = Theme::from_config(config);
 
         let (font_chain, face_metrics) =
-            crate::fonts::install_terminal_fonts(&cc.egui_ctx, &config.font, &config.ui_font);
+            crate::fonts::install_terminal_fonts(ctx, &config.font, &config.ui_font);
 
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = theme.terminal_bg;
         visuals.window_fill = theme.terminal_bg;
         visuals.extreme_bg_color = theme.terminal_bg;
-        cc.egui_ctx.set_visuals(visuals);
+        ctx.set_visuals(visuals);
 
         // Anchor every text style to the terminal font: titles (unmodified
         // labels) use `Body`/`Heading` at 100% of the grid's text size, and
         // every other UI label (`.small()`, buttons) drops to 80% via
         // `font_normal`.  Spacing knobs scale with the normal-text size so
         // paddings/widths track changes to `font.size`.
-        let mut style = (*cc.egui_ctx.style()).clone();
+        let mut style = (*ctx.style()).clone();
         let scale = theme.ui_scale;
         let heading_px = theme.font_heading;
         let normal_px = theme.font_normal;
@@ -524,18 +527,25 @@ impl AlacritreeApp {
         {
             style.debug.show_unaligned = false;
         }
-        cc.egui_ctx.set_style(style);
+        ctx.set_style(style);
 
         // Terminal IME hint — matches alacritty's set_ime_purpose.
-        cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::IMEPurpose(
+        ctx.send_viewport_cmd(egui::ViewportCommand::IMEPurpose(
             egui::viewport::IMEPurpose::Terminal,
         ));
 
         alacritty_terminal::tty::setup_env();
 
+        (font_chain, face_metrics)
+    }
+
+    fn start_ipc(
+        ctx: &Context,
+        enabled: bool,
+    ) -> (Option<ipc::SocketHandle>, Option<Receiver<ipc::AppCall>>) {
         // Before the first PTY spawn so children inherit ALACRITREE_SOCKET.
-        let (ipc_socket, ipc_rx) = if config.ipc_socket {
-            match ipc::spawn_listener(cc.egui_ctx.clone()) {
+        if enabled {
+            match ipc::spawn_listener(ctx.clone()) {
                 Ok((handle, rx)) => {
                     log::info!("IPC socket: {}", handle.path().display());
                     (Some(handle), Some(rx))
@@ -547,8 +557,10 @@ impl AlacritreeApp {
             }
         } else {
             (None, None)
-        };
+        }
+    }
 
+    fn load_projects(config: &Config) -> (state::PersistedState, Vec<Project>) {
         let persisted = state::load();
         let projects: Vec<Project> = persisted
             .projects
@@ -572,6 +584,14 @@ impl AlacritreeApp {
                 project
             })
             .collect();
+
+        (persisted, projects)
+    }
+
+    pub fn new(cc: &CreationContext<'_>, config: Config) -> Self {
+        let (font_chain, face_metrics) = Self::configure_context(&cc.egui_ctx, &config);
+        let (ipc_socket, ipc_rx) = Self::start_ipc(&cc.egui_ctx, config.ipc_socket);
+        let (persisted, projects) = Self::load_projects(&config);
 
         // Delegate installation and the permission prompt belong to startup:
         // deferring them to the first toast would drop that toast (macOS
@@ -4430,25 +4450,18 @@ fn is_direct_input(event: &egui::Event) -> bool {
     )
 }
 
-impl eframe::App for AlacritreeApp {
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        // This clear is the only thing painting a cell the grid leaves alone,
-        // so it has to carry the terminal's own background rather than the
-        // configured one.  eframe reads it before `update`, so a colour OSC 11
-        // moved this frame lands next frame; terminal output requests a repaint
-        // of its own, so the stale frame is replaced rather than left up.
-        let bg = self.grid_snapshot.default_bg(&self.config.palette);
-        // Deliberately not premultiplied, where alacritty's `renderer::clear`
-        // writes `(rgb * alpha, alpha)`.  `egui_glow::clear` hands these to
-        // `glClearColor` untouched and the compositor reads the framebuffer as
-        // premultiplied, so a translucent window carries its background at full
-        // strength; scaling it here would darken every `[window] opacity`
-        // already tuned against this.
-        let n = |c: u8| c as f32 / 255.0;
-        [n(bg.r()), n(bg.g()), n(bg.b()), self.config.window.opacity]
-    }
+type FrameStarted = Option<(Instant, Option<Duration>)>;
 
-    fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
+#[derive(Clone, Copy)]
+struct FramePaintView {
+    theme: Theme,
+    modal_open: bool,
+    sidebar_fill: Color32,
+    central_fill: Color32,
+}
+
+impl AlacritreeApp {
+    fn begin_update(&mut self, ctx: &Context) -> FrameStarted {
         let frame_started = self
             .frame_log
             .as_ref()
@@ -4471,6 +4484,10 @@ impl eframe::App for AlacritreeApp {
         if ctx.input(|i| i.viewport().close_requested()) {
             crash_log::record_reason(ExitReason::WindowClosed);
         }
+        frame_started
+    }
+
+    fn poll_update_jobs(&mut self, ctx: &Context) {
         self.poll_project_refreshes();
         self.poll_pending_spawns(ctx);
         self.poll_herdr_create(ctx);
@@ -4491,6 +4508,9 @@ impl eframe::App for AlacritreeApp {
             None => !job.failed(),
         });
         self.phases.mark("polls");
+    }
+
+    fn handle_update_input(&mut self, ctx: &Context) -> bool {
         let modal_open = self.is_modal_open();
         // Keys pressed mid-composition drive the IME's candidate window,
         // not the app — alacritty's key_input returns early the same way,
@@ -4518,6 +4538,10 @@ impl eframe::App for AlacritreeApp {
         self.phases.mark("session-events");
         self.reconcile_sidebar_focus(ctx);
         self.phases.mark("focus");
+        modal_open
+    }
+
+    fn frame_paint_view(&self, modal_open: bool) -> FramePaintView {
         let theme = self.theme;
         // GL clear is the sole source of the bg when opacity < 1; painting any
         // panel fill on top would compound the alpha through egui's blend.
@@ -4528,6 +4552,11 @@ impl eframe::App for AlacritreeApp {
         let terminal_bg = self.grid_snapshot.default_bg(&self.config.palette);
         let central_fill = if translucent { Color32::TRANSPARENT } else { terminal_bg };
 
+        FramePaintView { theme, modal_open, sidebar_fill, central_fill }
+    }
+
+    fn paint_sidebars(&mut self, ctx: &Context, view: FramePaintView) -> Option<egui::Rect> {
+        let FramePaintView { theme, modal_open, sidebar_fill, .. } = view;
         let panel_frame = Frame::default().fill(sidebar_fill).inner_margin(Margin::same(8));
 
         let mut sidebar_rect = None;
@@ -4554,6 +4583,16 @@ impl eframe::App for AlacritreeApp {
         }
         self.phases.mark("git-sidebar");
 
+        sidebar_rect
+    }
+
+    fn paint_central(
+        &mut self,
+        ctx: &Context,
+        view: FramePaintView,
+        sidebar_rect: Option<egui::Rect>,
+    ) {
+        let FramePaintView { theme, modal_open, central_fill, .. } = view;
         let central = egui::CentralPanel::default()
             .frame(Frame::default().fill(central_fill).inner_margin(Margin::same(0)))
             .show(ctx, |ui| {
@@ -4633,7 +4672,9 @@ impl eframe::App for AlacritreeApp {
             self.handle_dropped_files(ctx, &regions);
         }
         self.phases.mark("central");
+    }
 
+    fn paint_dialogs(&mut self, ctx: &Context, modal_open: bool) {
         if self.modals.pending_create.is_some() {
             self.show_create_dialog(ctx);
         }
@@ -4665,7 +4706,9 @@ impl eframe::App for AlacritreeApp {
             self.show_command_palette(ctx);
         }
         self.phases.mark("dialogs");
+    }
 
+    fn finish_update(&mut self, ctx: &Context, frame: &eframe::Frame, frame_started: FrameStarted) {
         self.reap_exited_sessions(ctx);
         // A shell that exited on its own is only removed here, after paint.
         // Without this pass its deferred verdict would wait for unrelated
@@ -4684,6 +4727,36 @@ impl eframe::App for AlacritreeApp {
                 echo: crate::frame_log::echo(),
             });
         }
+    }
+}
+
+impl eframe::App for AlacritreeApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        // This clear is the only thing painting a cell the grid leaves alone,
+        // so it has to carry the terminal's own background rather than the
+        // configured one.  eframe reads it before `update`, so a colour OSC 11
+        // moved this frame lands next frame; terminal output requests a repaint
+        // of its own, so the stale frame is replaced rather than left up.
+        let bg = self.grid_snapshot.default_bg(&self.config.palette);
+        // Deliberately not premultiplied, where alacritty's `renderer::clear`
+        // writes `(rgb * alpha, alpha)`.  `egui_glow::clear` hands these to
+        // `glClearColor` untouched and the compositor reads the framebuffer as
+        // premultiplied, so a translucent window carries its background at full
+        // strength; scaling it here would darken every `[window] opacity`
+        // already tuned against this.
+        let n = |c: u8| c as f32 / 255.0;
+        [n(bg.r()), n(bg.g()), n(bg.b()), self.config.window.opacity]
+    }
+
+    fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
+        let frame_started = self.begin_update(ctx);
+        self.poll_update_jobs(ctx);
+        let modal_open = self.handle_update_input(ctx);
+        let view = self.frame_paint_view(modal_open);
+        let sidebar_rect = self.paint_sidebars(ctx, view);
+        self.paint_central(ctx, view, sidebar_rect);
+        self.paint_dialogs(ctx, modal_open);
+        self.finish_update(ctx, frame, frame_started);
     }
 }
 

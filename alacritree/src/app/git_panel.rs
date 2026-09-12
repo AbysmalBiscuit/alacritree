@@ -55,6 +55,32 @@ impl GitPanel {
     }
 }
 
+struct GitSidebarView {
+    theme: Theme,
+    palette: crate::config::Palette,
+    path: PathBuf,
+    workspace_home: Option<String>,
+    status: GitStatus,
+    pr_info: Option<PrInfo>,
+    branch_base: Option<String>,
+    active_diff_key: Option<String>,
+    filtering: bool,
+    staged_count: SectionCount,
+    unstaged_count: SectionCount,
+    branch_count: SectionCount,
+    staged_visible: HashSet<String>,
+    unstaged_visible: HashSet<String>,
+    branch_visible: HashSet<String>,
+    cursor_row: Option<git_nav::GitRow>,
+    cursor_moved: bool,
+}
+
+#[derive(Default)]
+struct GitSidebarRequests {
+    diff: Option<DiffRequest>,
+    open_picker: Option<PathBuf>,
+}
+
 impl AlacritreeApp {
     /// Arrow/Enter/Escape navigation while the git sidebar owns keyboard
     /// focus.  Same event-drain shape as `handle_sidebar_nav`: consumes only
@@ -261,13 +287,115 @@ impl AlacritreeApp {
         state::mutate(|s| state::set_base_branch(s, &worktree, branch));
     }
 
-    pub(super) fn show_git_sidebar(&mut self, ctx: &Context, panel_frame: Frame) -> egui::Rect {
+    fn git_sidebar_view(&mut self, ctx: &Context) -> Option<GitSidebarView> {
         let theme = self.theme;
-        let scrollbar = self.config.ui.scrollbar;
         let palette = self.config.palette.clone();
         let active_diff_key = self.active_diff_key();
-        let diff_request: std::cell::Cell<Option<DiffRequest>> = std::cell::Cell::new(None);
-        let open_picker: std::cell::Cell<Option<PathBuf>> = std::cell::Cell::new(None);
+        let path = match self.active_session_path() {
+            Some(p) => p,
+            None => {
+                // No workspace, no rows: keep the cursor model from
+                // acting on stale rows left by a previous workspace.
+                self.git_panel.rows.clear();
+                self.git_panel.branch_base = None;
+                return None;
+            },
+        };
+        let workspace_home = self.workspace_home(&path);
+
+        let project_default = self.project_default_branch_for(&path);
+        let cache = self
+            .git_panel
+            .status
+            .entry(path.clone())
+            .or_insert_with(|| StatusCache::new(path.clone()));
+
+        // Use whatever branch the cache already knows to query the PR
+        // cache without waiting for a fresh compute — first frame may
+        // be `None`, which `pr_cache.poll` handles by returning early.
+        let cached_branch = cache.current_branch().map(str::to_string);
+        let pr_info = self.pr_cache.poll(&path, cached_branch.as_deref(), ctx);
+        let effective_default = effective_base_branch(
+            self.git_panel.base_branch_overrides.get(&path).map(String::as_str),
+            pr_info.as_ref().map(|p| p.base_branch.as_str()),
+            project_default.as_deref(),
+        );
+        // Single non-blocking poll: returns the last known status and
+        // kicks off a background refresh if stale or if the hint
+        // changed since the last completed compute.  Cloned so the
+        // `self.git_panel.status` borrow ends before the cursor repair below
+        // mutates other `self` fields.
+        let status = cache.poll(effective_default.as_deref(), ctx).clone();
+
+        // Prefer the resolved ref (e.g. `refs/remotes/origin/main`) so
+        // the cursor's Enter-to-diff matches the branch section's rows.
+        let git_branch_base =
+            status.default_branch_resolved.clone().or_else(|| status.default_branch.clone());
+        let filtering = self.git_panel.filter.is_filtering();
+        let filtered = self.filtered_git_rows(&status);
+        let staged_count = filtered.staged;
+        let unstaged_count = filtered.unstaged;
+        let branch_count = filtered.branch;
+        self.git_panel.rows = filtered.rows;
+        let mut staged_visible: HashSet<String> = HashSet::new();
+        let mut unstaged_visible: HashSet<String> = HashSet::new();
+        let mut branch_visible: HashSet<String> = HashSet::new();
+        for row in &self.git_panel.rows {
+            match row.section {
+                GitSection::Staged => &mut staged_visible,
+                GitSection::Unstaged => &mut unstaged_visible,
+                GitSection::Branch => &mut branch_visible,
+            }
+            .insert(row.path.clone());
+        }
+        self.git_panel.branch_base = git_branch_base.clone();
+        if self.focus == PaneFocus::GitSidebar {
+            let mut repaired =
+                git_nav::ensure_cursor(&self.git_panel.rows, self.git_panel.cursor.as_ref());
+            // An unseeded cursor lands on the row backing the open diff
+            // when there is one, so focusing the panel points at what
+            // the user is already looking at.
+            if self.git_panel.cursor.is_none() {
+                if let Some(active) = active_diff_key.as_deref() {
+                    if let Some(row) = self.git_panel.rows.iter().find(|r| {
+                        git_row_diff_request(r, git_branch_base.as_deref())
+                            .is_some_and(|req| diff_key(&req) == active)
+                    }) {
+                        repaired = Some(row.clone());
+                    }
+                }
+            }
+            self.git_panel.cursor = repaired;
+        }
+        let cursor_row =
+            if self.focus == PaneFocus::GitSidebar { self.git_panel.cursor.clone() } else { None };
+        let cursor_moved = std::mem::take(&mut self.git_panel.cursor_moved);
+
+        Some(GitSidebarView {
+            theme,
+            palette,
+            path,
+            workspace_home,
+            status,
+            pr_info,
+            branch_base: git_branch_base,
+            active_diff_key,
+            filtering,
+            staged_count,
+            unstaged_count,
+            branch_count,
+            staged_visible,
+            unstaged_visible,
+            branch_visible,
+            cursor_row,
+            cursor_moved,
+        })
+    }
+
+    pub(super) fn show_git_sidebar(&mut self, ctx: &Context, panel_frame: Frame) -> egui::Rect {
+        let view = self.git_sidebar_view(ctx);
+        let theme = self.theme;
+        let mut requests = GitSidebarRequests::default();
         let panel_resp = SidePanel::right("right_sidebar")
             .resizable(true)
             .default_width(300.0 * theme.ui_scale)
@@ -277,7 +405,7 @@ impl AlacritreeApp {
                 // Sidebar rows are click targets, not selectable prose; the
                 // default I-beam-and-select on labels is the wrong affordance.
                 ui.style_mut().interaction.selectable_labels = false;
-                apply_scrollbar_style(ui, scrollbar);
+                apply_scrollbar_style(ui, self.config.ui.scrollbar);
                 ui.horizontal(|ui| {
                     panel_header_filter_ui(
                         ui,
@@ -290,13 +418,9 @@ impl AlacritreeApp {
                 });
                 ui.separator();
 
-                let path = match self.active_session_path() {
-                    Some(p) => p,
+                match &view {
+                    Some(view) => paint_git_sidebar_status(ui, view, &mut requests),
                     None => {
-                        // No workspace, no rows: keep the cursor model from
-                        // acting on stale rows left by a previous workspace.
-                        self.git_panel.rows.clear();
-                        self.git_panel.branch_base = None;
                         ScrollArea::vertical().show(ui, |ui| {
                             ui.label(
                                 RichText::new("Open a worktree from the left sidebar.")
@@ -308,293 +432,10 @@ impl AlacritreeApp {
                                 RichText::new("Ctrl+G to toggle").small().color(theme.text_muted),
                             );
                         });
-                        return;
                     },
-                };
-                let workspace_home = self.workspace_home(&path);
-
-                let project_default = self.project_default_branch_for(&path);
-                let cache = self
-                    .git_panel
-                    .status
-                    .entry(path.clone())
-                    .or_insert_with(|| StatusCache::new(path.clone()));
-
-                // Use whatever branch the cache already knows to query the PR
-                // cache without waiting for a fresh compute — first frame may
-                // be `None`, which `pr_cache.poll` handles by returning early.
-                let cached_branch = cache.current_branch().map(str::to_string);
-                let pr_info = self.pr_cache.poll(&path, cached_branch.as_deref(), ctx);
-                let effective_default = effective_base_branch(
-                    self.git_panel.base_branch_overrides.get(&path).map(String::as_str),
-                    pr_info.as_ref().map(|p| p.base_branch.as_str()),
-                    project_default.as_deref(),
-                );
-                // Single non-blocking poll: returns the last known status and
-                // kicks off a background refresh if stale or if the hint
-                // changed since the last completed compute.  Cloned so the
-                // `self.git_panel.status` borrow ends before the cursor repair below
-                // mutates other `self` fields.
-                let status = cache.poll(effective_default.as_deref(), ctx).clone();
-
-                // Prefer the resolved ref (e.g. `refs/remotes/origin/main`) so
-                // the cursor's Enter-to-diff matches the branch section's rows.
-                let git_branch_base = status
-                    .default_branch_resolved
-                    .clone()
-                    .or_else(|| status.default_branch.clone());
-                let filtering = self.git_panel.filter.is_filtering();
-                let filtered = self.filtered_git_rows(&status);
-                let staged_count = filtered.staged;
-                let unstaged_count = filtered.unstaged;
-                let branch_count = filtered.branch;
-                self.git_panel.rows = filtered.rows;
-                let mut staged_visible: HashSet<String> = HashSet::new();
-                let mut unstaged_visible: HashSet<String> = HashSet::new();
-                let mut branch_visible: HashSet<String> = HashSet::new();
-                for row in &self.git_panel.rows {
-                    match row.section {
-                        GitSection::Staged => &mut staged_visible,
-                        GitSection::Unstaged => &mut unstaged_visible,
-                        GitSection::Branch => &mut branch_visible,
-                    }
-                    .insert(row.path.clone());
                 }
-                self.git_panel.branch_base = git_branch_base.clone();
-                if self.focus == PaneFocus::GitSidebar {
-                    let mut repaired = git_nav::ensure_cursor(
-                        &self.git_panel.rows,
-                        self.git_panel.cursor.as_ref(),
-                    );
-                    // An unseeded cursor lands on the row backing the open diff
-                    // when there is one, so focusing the panel points at what
-                    // the user is already looking at.
-                    if self.git_panel.cursor.is_none() {
-                        if let Some(active) = active_diff_key.as_deref() {
-                            if let Some(row) = self.git_panel.rows.iter().find(|r| {
-                                git_row_diff_request(r, git_branch_base.as_deref())
-                                    .is_some_and(|req| diff_key(&req) == active)
-                            }) {
-                                repaired = Some(row.clone());
-                            }
-                        }
-                    }
-                    self.git_panel.cursor = repaired;
-                }
-                let cursor_row = if self.focus == PaneFocus::GitSidebar {
-                    self.git_panel.cursor.clone()
-                } else {
-                    None
-                };
-                let cursor_moved = std::mem::take(&mut self.git_panel.cursor_moved);
-
-                ScrollArea::vertical().show(ui, |ui| {
-                    if let Some(err) = &status.error {
-                        ui.label(
-                            RichText::new(err).color(rgb_to_color32(palette.normal[1])).small(),
-                        );
-                        return;
-                    }
-
-                    path_header_label(
-                        ui,
-                        &wsl::display_path(&path),
-                        theme.text_muted,
-                        &theme,
-                        theme.path_style.git_header,
-                        workspace_home.as_deref(),
-                    );
-                    if let Some(branch) = &status.branch {
-                        // A greedy `truncate()` label in a plain `horizontal` row
-                        // consumes all the width, shoving any trailing widgets past
-                        // the panel edge. Since the right sidebar's `ScrollArea`
-                        // grows to fit its content, that overflow ratchets the whole
-                        // panel wider every frame until the full branch name fits.
-                        // Pin `vs <default>` to the right and let the current branch
-                        // truncate in the space that's left, so the row can't overflow.
-                        let default = status
-                            .default_branch
-                            .as_deref()
-                            .filter(|default| *default != branch.as_str());
-                        row_with_trailing(
-                            ui,
-                            |ui| {
-                                ui.label(RichText::new("on").color(theme.text_muted).small());
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(branch).color(theme.accent).small().strong(),
-                                    )
-                                    .truncate(),
-                                );
-                            },
-                            |ui| {
-                                if let Some(default) = default {
-                                    // right_to_left: default sits rightmost, `vs` to its left.
-                                    let resp = icon_tooltip(
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(default)
-                                                    .color(theme.text_dim)
-                                                    .small(),
-                                            )
-                                            .truncate()
-                                            .sense(egui::Sense::click()),
-                                        )
-                                        .on_hover_cursor(egui::CursorIcon::PointingHand),
-                                        "Set the branch this panel diffs against",
-                                        theme.icon_tooltips,
-                                    );
-                                    if resp.clicked() {
-                                        open_picker.set(Some(path.clone()));
-                                    }
-                                    ui.label(RichText::new("vs").color(theme.text_muted).small());
-                                }
-                            },
-                        );
-                    }
-                    let mut section_gap = 10.0_f32;
-
-                    section(
-                        ui,
-                        &theme,
-                        "Staged",
-                        staged_count,
-                        filtering,
-                        &mut section_gap,
-                        |ui| {
-                            for f in &status.staged {
-                                if !staged_visible.contains(&f.path) {
-                                    continue;
-                                }
-                                let req = DiffRequest {
-                                    file: f.path.clone(),
-                                    source: DiffSource::Staged,
-                                };
-                                let is_active = active_diff_key.as_deref() == Some(&diff_key(&req));
-                                let resp = file_row(ui, f, &theme, &palette, is_active);
-                                if resp.clicked() {
-                                    diff_request.set(Some(req));
-                                }
-                                paint_git_row_cursor(
-                                    ui,
-                                    &resp,
-                                    &cursor_row,
-                                    GitSection::Staged,
-                                    &f.path,
-                                    cursor_moved,
-                                    &theme,
-                                );
-                            }
-                        },
-                    );
-
-                    section(
-                        ui,
-                        &theme,
-                        "Unstaged",
-                        unstaged_count,
-                        filtering,
-                        &mut section_gap,
-                        |ui| {
-                            for f in &status.unstaged {
-                                if !unstaged_visible.contains(&f.path) {
-                                    continue;
-                                }
-                                let source = if f.kind == ChangeKind::Untracked {
-                                    DiffSource::Untracked
-                                } else {
-                                    DiffSource::Worktree
-                                };
-                                let req = DiffRequest { file: f.path.clone(), source };
-                                let is_active = active_diff_key.as_deref() == Some(&diff_key(&req));
-                                let resp = file_row(ui, f, &theme, &palette, is_active);
-                                if resp.clicked() {
-                                    diff_request.set(Some(req));
-                                }
-                                paint_git_row_cursor(
-                                    ui,
-                                    &resp,
-                                    &cursor_row,
-                                    GitSection::Unstaged,
-                                    &f.path,
-                                    cursor_moved,
-                                    &theme,
-                                );
-                            }
-                        },
-                    );
-
-                    if !status.branch_diff.is_empty() {
-                        let base_label = match &status.default_branch {
-                            Some(b) => format!("Changes vs {b}"),
-                            None => "Changes vs default".to_string(),
-                        };
-                        let base = git_branch_base.clone();
-                        let count_label = section_count_label(&branch_count, filtering);
-
-                        ui.add_space(std::mem::take(&mut section_gap));
-                        // Open-coded section header so the PR number can be a
-                        // hyperlink while the rest stays plain text.
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(&base_label).color(theme.text).strong().small());
-                            if let Some(pr) = &pr_info {
-                                ui.label(RichText::new("·").color(theme.text_muted).small());
-                                ui.hyperlink_to(
-                                    RichText::new(format!("PR #{}", pr.number))
-                                        .color(theme.accent)
-                                        .small()
-                                        .strong(),
-                                    &pr.url,
-                                );
-                            }
-                            ui.label(RichText::new(count_label).color(theme.text_muted).small());
-                        });
-                        ui.add_space(2.0);
-                        for stat in &status.branch_diff {
-                            if !branch_visible.contains(&stat.path) {
-                                continue;
-                            }
-                            let Some(base) = base.clone() else {
-                                let resp = branch_diff_row(ui, stat, &theme, &palette, false);
-                                paint_git_row_cursor(
-                                    ui,
-                                    &resp,
-                                    &cursor_row,
-                                    GitSection::Branch,
-                                    &stat.path,
-                                    cursor_moved,
-                                    &theme,
-                                );
-                                continue;
-                            };
-                            let req = DiffRequest {
-                                file: stat.path.clone(),
-                                source: DiffSource::Branch { base },
-                            };
-                            let is_active = active_diff_key.as_deref() == Some(&diff_key(&req));
-                            let resp = branch_diff_row(ui, stat, &theme, &palette, is_active);
-                            if resp.clicked() {
-                                diff_request.set(Some(req));
-                            }
-                            paint_git_row_cursor(
-                                ui,
-                                &resp,
-                                &cursor_row,
-                                GitSection::Branch,
-                                &stat.path,
-                                cursor_moved,
-                                &theme,
-                            );
-                        }
-                    }
-                });
             });
-        if let Some(req) = diff_request.take() {
-            self.open_diff(ctx, req);
-        }
-        if let Some(path) = open_picker.take() {
-            self.open_base_branch_picker(path);
-        }
+        self.apply_git_sidebar_requests(ctx, requests);
         if self.config.ui.sidebar_click_focus
             && self.focus != PaneFocus::GitSidebar
             && pressed_on_panel(ctx, &panel_resp.response)
@@ -602,6 +443,15 @@ impl AlacritreeApp {
             self.focus_git_sidebar();
         }
         panel_resp.response.rect
+    }
+
+    fn apply_git_sidebar_requests(&mut self, ctx: &Context, requests: GitSidebarRequests) {
+        if let Some(request) = requests.diff {
+            self.open_diff(ctx, request);
+        }
+        if let Some(path) = requests.open_picker {
+            self.open_base_branch_picker(path);
+        }
     }
 
     /// Clicking a sidebar row either opens, replaces, or closes the workspace's
@@ -724,6 +574,215 @@ impl AlacritreeApp {
     }
 }
 
+fn paint_git_sidebar_status(
+    ui: &mut egui::Ui,
+    view: &GitSidebarView,
+    requests: &mut GitSidebarRequests,
+) {
+    let theme = &view.theme;
+    let status = &view.status;
+    ScrollArea::vertical().show(ui, |ui| {
+        if let Some(err) = &status.error {
+            ui.label(RichText::new(err).color(rgb_to_color32(view.palette.normal[1])).small());
+            return;
+        }
+
+        path_header_label(
+            ui,
+            &wsl::display_path(&view.path),
+            theme.text_muted,
+            theme,
+            theme.path_style.git_header,
+            view.workspace_home.as_deref(),
+        );
+        paint_git_branch_header(ui, view, requests);
+        let mut section_gap = 10.0_f32;
+        paint_staged_section(ui, view, requests, &mut section_gap);
+        paint_unstaged_section(ui, view, requests, &mut section_gap);
+        paint_branch_section(ui, view, requests, &mut section_gap);
+    });
+}
+
+fn paint_git_branch_header(
+    ui: &mut egui::Ui,
+    view: &GitSidebarView,
+    requests: &mut GitSidebarRequests,
+) {
+    let theme = &view.theme;
+    let Some(branch) = &view.status.branch else { return };
+    // A greedy `truncate()` label in a plain `horizontal` row
+    // consumes all the width, shoving any trailing widgets past
+    // the panel edge. Since the right sidebar's `ScrollArea`
+    // grows to fit its content, that overflow ratchets the whole
+    // panel wider every frame until the full branch name fits.
+    // Pin `vs <default>` to the right and let the current branch
+    // truncate in the space that's left, so the row can't overflow.
+    let default =
+        view.status.default_branch.as_deref().filter(|default| *default != branch.as_str());
+    row_with_trailing(
+        ui,
+        |ui| {
+            ui.label(RichText::new("on").color(theme.text_muted).small());
+            ui.add(
+                egui::Label::new(RichText::new(branch).color(theme.accent).small().strong())
+                    .truncate(),
+            );
+        },
+        |ui| {
+            if let Some(default) = default {
+                // right_to_left: default sits rightmost, `vs` to its left.
+                let resp = icon_tooltip(
+                    ui.add(
+                        egui::Label::new(RichText::new(default).color(theme.text_dim).small())
+                            .truncate()
+                            .sense(egui::Sense::click()),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand),
+                    "Set the branch this panel diffs against",
+                    theme.icon_tooltips,
+                );
+                if resp.clicked() {
+                    requests.open_picker = Some(view.path.clone());
+                }
+                ui.label(RichText::new("vs").color(theme.text_muted).small());
+            }
+        },
+    );
+}
+
+fn paint_staged_section(
+    ui: &mut egui::Ui,
+    view: &GitSidebarView,
+    requests: &mut GitSidebarRequests,
+    section_gap: &mut f32,
+) {
+    section(ui, &view.theme, "Staged", &view.staged_count, view.filtering, section_gap, |ui| {
+        for file in &view.status.staged {
+            if !view.staged_visible.contains(&file.path) {
+                continue;
+            }
+            let request = DiffRequest { file: file.path.clone(), source: DiffSource::Staged };
+            let is_active = view.active_diff_key.as_deref() == Some(&diff_key(&request));
+            let response = file_row(ui, file, &view.theme, &view.palette, is_active);
+            if response.clicked() {
+                requests.diff = Some(request);
+            }
+            paint_git_row_cursor(
+                ui,
+                &response,
+                &view.cursor_row,
+                GitSection::Staged,
+                &file.path,
+                view.cursor_moved,
+                &view.theme,
+            );
+        }
+    });
+}
+
+fn paint_unstaged_section(
+    ui: &mut egui::Ui,
+    view: &GitSidebarView,
+    requests: &mut GitSidebarRequests,
+    section_gap: &mut f32,
+) {
+    section(ui, &view.theme, "Unstaged", &view.unstaged_count, view.filtering, section_gap, |ui| {
+        for file in &view.status.unstaged {
+            if !view.unstaged_visible.contains(&file.path) {
+                continue;
+            }
+            let source = if file.kind == ChangeKind::Untracked {
+                DiffSource::Untracked
+            } else {
+                DiffSource::Worktree
+            };
+            let request = DiffRequest { file: file.path.clone(), source };
+            let is_active = view.active_diff_key.as_deref() == Some(&diff_key(&request));
+            let response = file_row(ui, file, &view.theme, &view.palette, is_active);
+            if response.clicked() {
+                requests.diff = Some(request);
+            }
+            paint_git_row_cursor(
+                ui,
+                &response,
+                &view.cursor_row,
+                GitSection::Unstaged,
+                &file.path,
+                view.cursor_moved,
+                &view.theme,
+            );
+        }
+    });
+}
+
+fn paint_branch_section(
+    ui: &mut egui::Ui,
+    view: &GitSidebarView,
+    requests: &mut GitSidebarRequests,
+    section_gap: &mut f32,
+) {
+    if view.status.branch_diff.is_empty() {
+        return;
+    }
+    let base_label = match &view.status.default_branch {
+        Some(branch) => format!("Changes vs {branch}"),
+        None => "Changes vs default".to_string(),
+    };
+    let count_label = section_count_label(&view.branch_count, view.filtering);
+
+    ui.add_space(std::mem::take(section_gap));
+    // Open-coded section header so the PR number can be a
+    // hyperlink while the rest stays plain text.
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(&base_label).color(view.theme.text).strong().small());
+        if let Some(pr) = &view.pr_info {
+            ui.label(RichText::new("·").color(view.theme.text_muted).small());
+            ui.hyperlink_to(
+                RichText::new(format!("PR #{}", pr.number))
+                    .color(view.theme.accent)
+                    .small()
+                    .strong(),
+                &pr.url,
+            );
+        }
+        ui.label(RichText::new(count_label).color(view.theme.text_muted).small());
+    });
+    ui.add_space(2.0);
+    for stat in &view.status.branch_diff {
+        if !view.branch_visible.contains(&stat.path) {
+            continue;
+        }
+        let Some(base) = view.branch_base.clone() else {
+            let response = branch_diff_row(ui, stat, &view.theme, &view.palette, false);
+            paint_git_row_cursor(
+                ui,
+                &response,
+                &view.cursor_row,
+                GitSection::Branch,
+                &stat.path,
+                view.cursor_moved,
+                &view.theme,
+            );
+            continue;
+        };
+        let request = DiffRequest { file: stat.path.clone(), source: DiffSource::Branch { base } };
+        let is_active = view.active_diff_key.as_deref() == Some(&diff_key(&request));
+        let response = branch_diff_row(ui, stat, &view.theme, &view.palette, is_active);
+        if response.clicked() {
+            requests.diff = Some(request);
+        }
+        paint_git_row_cursor(
+            ui,
+            &response,
+            &view.cursor_row,
+            GitSection::Branch,
+            &stat.path,
+            view.cursor_moved,
+            &view.theme,
+        );
+    }
+}
+
 /// Render a collapsed-when-empty git section.
 ///
 /// Empty sections are skipped entirely — a placeholder glyph for "no files
@@ -738,7 +797,7 @@ fn section<R>(
     ui: &mut egui::Ui,
     theme: &Theme,
     title: &str,
-    count: SectionCount,
+    count: &SectionCount,
     filtering: bool,
     gap: &mut f32,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
@@ -747,7 +806,7 @@ fn section<R>(
         return;
     }
     ui.add_space(std::mem::take(gap));
-    let label = section_count_label(&count, filtering);
+    let label = section_count_label(count, filtering);
     ui.horizontal(|ui| {
         ui.label(RichText::new(title).color(theme.text).strong().small());
         ui.label(RichText::new(label).color(theme.text_muted).small());
