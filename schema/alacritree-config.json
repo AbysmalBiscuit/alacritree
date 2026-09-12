@@ -273,9 +273,17 @@
           "description": "Write an artifact when the process panics.  alacritree-only, so it\nbelongs in `alacritree.toml`.  Default `true`: a crash that leaves no\nrecord is the failure this exists to prevent.",
           "type": "boolean"
         },
+        "frame_log": {
+          "description": "Measure whole frames and report the period, CPU time, grid share and\nkeystroke echo every few seconds.  alacritree-only, so it belongs in\n`alacritree.toml`.  Default `false`.\n\n`ALACRITREE_FRAME_LOG` wins over this key both ways: `1` turns\nmeasurements on, `0` and the empty string turn them off.  The variable\nis the only switch available before the config is read.\n\nKeeps this session's log file for as long as it is on.  The report goes\nto the log stream, and a GUI-subsystem binary has no console.",
+          "type": "boolean"
+        },
         "gpu_timing": {
           "description": "Log what the GPU grid's paint callback costs: the wall time of\nissuing a frame, and the GPU's own time for the upload and each of\nthe three draws.  alacritree-only, so it belongs in\n`alacritree.toml`.  Default `false`; timer queries are cheap but not\nfree, and the line is only meaningful to someone reading it.  Needs\n`[ui] gpu_grid` and a GL 3.3 context.  Keeps this session's log file\nfor as long as it is on, since the report has nowhere else to go.",
           "type": "boolean"
+        },
+        "log_dir": {
+          "description": "Where crash artifacts and session logs are written.  alacritree-only,\nso it belongs in `alacritree.toml`.  A leading `~` expands to the home\ndirectory; a relative path is ignored.\n\nUnset writes to the machine-local state directory: `%LOCALAPPDATA%\\\nalacritree` on Windows, `$XDG_STATE_HOME/alacritree` or\n`~/.local/state/alacritree` elsewhere.  Logs stay out of the config\ndirectory, which on Windows roams between machines.\n\nSetting this moves no log already written, and a panic during config\nparsing still lands in the default directory: the crash hook is armed\nbefore this key can be read.",
+          "type": "string"
         },
         "persistent_logging": {
           "description": "Keep the log file after quitting.  Upstream's name and upstream's\ndefault (`false`).",
@@ -429,6 +437,10 @@
         "ipc_socket": {
           "description": "Offer the local socket that `alacritree <command>` and the MCP bridge\nconnect to.  Default `true`.",
           "type": "boolean"
+        },
+        "state_dir": {
+          "description": "Where alacritree keeps what it remembers between runs: `state.toml`\n(project roots, expanded rows, sidebar visibility, per-worktree base\nbranches) and the per-workspace scratchpad notes.  alacritree-only, so\nit belongs in `alacritree.toml`.  A leading `~` expands to the home\ndirectory; a relative path is ignored.\n\nUnset keeps the per-user config base, where these files have always\nlived: `%APPDATA%\\alacritree` on Windows, `$XDG_CONFIG_HOME/alacritree`\nor `~/.config/alacritree` elsewhere.\n\nSetting this moves nothing.  The old state and notes stay where they\nare and the new directory starts empty, so move the files across\nyourself if you want them.  Every alacritree on the machine needs the\nsame value: the CLI resolves this key the way the window does, so a\ncommand run against a different config reads a state file the window is\nnot writing.",
+          "type": "string"
         },
         "working_directory": {
           "description": "Directory sessions on the home tab start in; worktree tabs always start\nin their checkout.  A leading `~` expands to the home directory.  Unset\ninherits the launching process's directory.",

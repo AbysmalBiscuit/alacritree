@@ -52,6 +52,7 @@ mod session;
 mod sidebar_focus;
 mod sidebar_nav;
 mod stale_exe;
+mod startup_log;
 mod state;
 #[cfg(test)]
 mod steady_state;
@@ -138,19 +139,36 @@ fn main() -> eframe::Result<()> {
     // always goes to stderr, whether or not `persistent_logging` also tees it
     // to a file, leaving stdout to the reply.
     attach_parent_console();
-    if let Some(code) = cli::run(cli::Cli::parse()) {
+    let cli = cli::Cli::parse();
+    let config_dir = cli.config_dir.clone();
+    let log_file = cli.log_file.clone();
+    let options = cli.options.clone();
+    if let Some(code) = cli::run(cli) {
         std::process::exit(code);
     }
 
     // Only the GUI path records crashes.  Every subcommand exits before config
     // is read, so no gate could govern them, and `alacritree mcp` is a
     // long-lived loop that would write records nothing could disable.
-    let log_dir = logdir::log_dir();
-    if let Some(dir) = &log_dir {
+    let default_log_dir = logdir::log_dir();
+    if let Some(dir) = &default_log_dir {
         crash_log::install(dir, env!("CARGO_PKG_VERSION"));
     }
 
-    let config = config::load();
+    let (config, config_files) = config::load(config_dir.as_deref(), &options);
+
+    // `[debug] log_dir` cannot be known any earlier, so the hook above armed
+    // against the default directory and a panic in `config::load` lands there.
+    // Swapping now still precedes every artifact: `install` creates the
+    // directory but no file.
+    if let Some(dir) = &config.debug.log_dir {
+        crash_log::set_dir(dir);
+    }
+    let log_dir = config.debug.log_dir.clone().or(default_log_dir);
+
+    // Before the first session: the PTY threads read this without
+    // synchronizing against startup.
+    frame_log::set_enabled(config.debug.frame_log);
 
     // The gate defaults on so a panic in `config::load` above is still
     // recorded; that is the one case where `crash_log = false` leaves a file.
@@ -161,15 +179,31 @@ fn main() -> eframe::Result<()> {
     if let Some(dir) = &log_dir {
         logging::prune_session_logs(dir);
     }
-    // `gpu_timing` reports through the log stream, and a GUI-subsystem binary
-    // has no console for stderr to reach.  Asking for the report has to open
-    // the file it lands in, or it is written where nothing can read it.
-    if (config.debug.persistent_logging || config.debug.gpu_timing)
-        && let Some(dir) = &log_dir
-    {
-        *log_sink.lock().unwrap_or_else(|e| e.into_inner()) = logging::open_session_log(dir);
+    // `gpu_timing` and `frame_log` report through the log stream, and a
+    // GUI-subsystem binary has no console for stderr to reach.  Asking for a
+    // report has to open the file it lands in, or it is written where nothing
+    // can read it.  `--log-file` turns logging on by itself: a flag naming a
+    // file that then stays empty because a config key was off is the trap the
+    // flag exists to avoid.
+    let logging_to_file = log_file.is_some()
+        || config.debug.persistent_logging
+        || config.debug.gpu_timing
+        || frame_log::enabled();
+    if logging_to_file {
+        let opened = match &log_file {
+            Some(path) => logging::open_log_at(path),
+            None => log_dir.as_deref().and_then(logging::open_session_log),
+        };
+        *log_sink.lock().unwrap_or_else(|e| e.into_inner()) = opened;
     }
+    // After the sink rather than before it: everything logged while the sink is
+    // empty reaches stderr only, and a release build has no console for stderr
+    // to reach.
+    startup_log::emit(&config, &config_files, config_dir.as_deref(), logging_to_file);
 
+    if let Some(dir) = config.state_dir.clone() {
+        state::set_dir(dir);
+    }
     wsl::set_automount_root(config.wsl_automount_root.clone());
     wsl_helper::set_enabled(config.wsl_resident_helper);
     let translucent = config.window.opacity < 1.0;
