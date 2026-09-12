@@ -51,6 +51,7 @@ mod pty_rearm;
 mod row_label;
 mod scratchpad;
 mod session;
+mod shell_decision;
 mod sidebar_focus;
 mod sidebar_nav;
 mod stale_exe;
