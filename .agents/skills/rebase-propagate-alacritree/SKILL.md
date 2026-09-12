@@ -37,7 +37,7 @@ Local branches go stale. Several worktrees here hold pre-sweep copies that are b
 
 | `RPA-RESULT` | What to do |
 |---|---|
-| `PROPAGATED` | Done. Report the stack in one short table, flagging any branch whose patches the replay changed. Stop. |
+| `PROPAGATED` | The pushes landed, but the run is not finished. For any branch the output says the replay CHANGED patches on, or that it flattened merges on, run `git diff <old tip> <branch>` (the output prints both). Empty means the replay preserved the tree. Anything else is content the replay lost, and it needs repairing and re-pushing before you report. Then report the stack in one short table. |
 | `NOTHING-TO-DO` | Already current. Say so in one line and stop. |
 | `PLAN` | `--dry-run`. Report the plan and ask whether to run it for real. |
 | `CONFLICT` | The real work. See below. |

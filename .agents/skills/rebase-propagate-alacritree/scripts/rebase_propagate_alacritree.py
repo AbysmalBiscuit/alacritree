@@ -126,6 +126,8 @@ class Run:
     state: Path
     scratch: Path
     stack: list[Branch] = field(default_factory=list)
+    #: The merged PR the lowest open branch was cut from, if there is one.
+    below: dict | None = None
 
     def finish(self, status: str, code: int = 0) -> None:
         if status in TERMINAL:
@@ -172,12 +174,34 @@ class Run:
 
         bottom = self.stack[0]
         bottom.parent = f"{UPSTREAM}/{BASE}"
-        below = merged.get(bottom.marker - 1)
-        if below:
-            bottom.old_base = f"{FORK}/{below['headRefName']}"
-            bottom.note = f"cut below merged [{bottom.marker - 1}] #{below['number']}"
+        self.below = merged.get(bottom.marker - 1)
         for above, under in zip(self.stack[1:], self.stack):
             above.parent = under.name
+
+    def cut_below(self, below: dict, bottom: Branch) -> tuple[str, str]:
+        """The tip the merged PR's branch had when the branch above was cut.
+
+        GitHub deletes the head branch when it squash-merges, so the fork's
+        copy is usually gone by the time this runs.  The local branch often
+        disagrees too, because it was rebased after its child was cut from it.
+        Its reflog still holds every tip it ever had, and the one the child
+        actually descends from is the first that is an ancestor of it.
+        """
+        head = below["headRefName"]
+        found = f"merged [{bottom.marker - 1}] #{below['number']}"
+        candidates = [f"{FORK}/{head}", head]
+        candidates += [
+            line.split()[0]
+            for line in run("git", "-C", str(self.root), "reflog", "show", head)[1].splitlines()
+            if line.split()
+        ]
+        for rev in candidates:
+            if not git_ok("-C", str(self.root), "rev-parse", "--verify", f"{rev}^{{commit}}"):
+                continue
+            if git_ok("-C", str(self.root), "merge-base", "--is-ancestor", rev, bottom.ref):
+                where = "the fork" if rev.startswith(f"{FORK}/") else "locally" if rev == head else "in its reflog"
+                return rev, f"{found}, found {where}"
+        return "", f"{found}, but no tip of {head} is an ancestor of this branch"
 
     def locate(self) -> None:
         """Find each branch's worktree, and the tips this run reasons from."""
@@ -199,6 +223,10 @@ class Run:
             code, tip = run("git", "-C", str(self.root), "rev-parse", "--verify", b.name)
             b.create = code != 0
             b.old_tip = b.lease if b.create else tip
+        # After the refs are known, because the search asks what the bottom
+        # branch descends from.
+        if self.below:
+            self.stack[0].old_base, self.stack[0].note = self.cut_below(self.below, self.stack[0])
 
     # ------------------------------------------------------------ preflight
 
@@ -349,6 +377,18 @@ class Run:
                 say("refusing the rebase: git would replay the whole divergent history")
                 self.finish("BADBASE", 7)
 
+            # Rebase flattens merges, and a merge's conflict resolution lives
+            # nowhere but the merge commit, so name them before the replay.
+            merges = git(
+                "-C", str(self.root), "log", "--merges", "--format=%h %s",
+                f"{b.old_base}..{b.name}",
+            )
+            if merges:
+                say(f"[{b.marker}] {b.name}: flattening {len(merges.splitlines())} merge(s),")
+                say("      whose conflict resolutions the replay drops:")
+                for line in merges.splitlines():
+                    say(f"        {line}")
+
             say(f"[{b.marker}] {b.name}: --onto {b.parent} {b.old_base[:9]}")
             code, out = run(
                 "git", "rebase", "--onto", b.parent, b.old_base, b.name, cwd=b.worktree
@@ -493,10 +533,11 @@ def main() -> None:
 
     repo = upstream_repo(root)
     session.discover(repo)
+    session.locate()
+    # After the search, so an explicit answer overrides what it found.
     if args.old_base:
         session.stack[0].old_base = args.old_base
         session.stack[0].note = "cut below the commit given on the command line"
-    session.locate()
 
     say("")
     say("== stack ==")
