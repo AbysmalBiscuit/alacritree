@@ -429,10 +429,16 @@ impl AlacritreeApp {
             projects,
             // Worktrees whose background removal is still running: their rows show
             // a spinner instead of the delete/new-shell controls.
-            deleting_paths: self.pending_deletes.iter().map(|t| t.worktree_path.clone()).collect(),
+            deleting_paths: self
+                .modals
+                .pending_deletes
+                .iter()
+                .map(|t| t.worktree_path.clone())
+                .collect(),
             // Minimized creations, keyed by project index, rendered as spinner
             // placeholder rows until the finished worktree shows up on refresh.
             creating: self
+                .modals
                 .pending_creates
                 .iter()
                 .map(|c| (c.project_idx, c.branch.clone()))
@@ -525,7 +531,7 @@ impl AlacritreeApp {
             self.refresh_project(ctx, idx);
         }
         if let Some(req) = requests.remove.take() {
-            self.pending_project_remove = Some(req);
+            self.modals.pending_project_remove = Some(req);
         }
         if let Some((root, insert_before)) = requests.reorder.take() {
             self.move_project(&root, insert_before);
@@ -547,7 +553,7 @@ impl AlacritreeApp {
             self.persist_project_label(&root);
         }
         if requests.rename.is_some() {
-            self.pending_rename = requests.rename.take();
+            self.modals.pending_rename = requests.rename.take();
         }
         if let Some(path) = requests.base_picker.take() {
             self.open_base_branch_picker(path);
@@ -556,7 +562,7 @@ impl AlacritreeApp {
             self.request_worktree_delete(&path);
         }
         if let Some(idx) = requests.create {
-            self.pending_create =
+            self.modals.pending_create =
                 Some(CreateState::Prompt { project_idx: idx, branch: String::new(), error: None });
         }
     }
