@@ -36,7 +36,7 @@ use crate::session::{
     self, AttentionVerdict, Session, SessionActivity, SessionId, SessionKind, TermSize,
     poll_attention_debounce,
 };
-use crate::sidebar_nav::{self, SidebarRow};
+use crate::sidebar_nav::{self, SidebarRow, StepTarget};
 use crate::state::{self, PersistedProject};
 use crate::upstream::UpstreamState;
 use crate::worktree::{self as wt, CreateRequest, Progress};
@@ -463,6 +463,9 @@ pub struct AlacritreeApp {
     /// startup default; toggles flip these and are never persisted.
     session_rows_always: bool,
     session_tabs_always: bool,
+    /// Runtime copy of `[ui.session_reorder] drag`.  Like the display toggles
+    /// above, the config is only the startup default and nothing is persisted.
+    session_drag: bool,
     sidebar_cursor: Option<SidebarRow>,
     /// Reveals the project rows' drag grips.  A transient mode, not persisted:
     /// reordering is a rare, deliberate act, and a grip on every row the rest
@@ -727,6 +730,11 @@ struct BaseBranchPicker {
 #[derive(Clone)]
 struct DraggedProject(PathBuf);
 
+/// Drag-and-drop payload for reordering sessions.  Carries the id rather than
+/// a position so a spawn, close or reorder mid-drag can't retarget the drop.
+#[derive(Clone)]
+struct DraggedSession(SessionId);
+
 /// Which `git diff` flavor a sidebar click should open in delta.
 enum DiffSource {
     Staged,
@@ -903,6 +911,7 @@ impl AlacritreeApp {
             focus: PaneFocus::Terminal,
             session_rows_always: config.ui.session_display.sidebar_always,
             session_tabs_always: config.ui.session_display.tabs_always,
+            session_drag: config.ui.session_reorder.drag,
             sidebar_cursor: None,
             reorder_mode: false,
             sidebar_auto_shown: false,
@@ -1246,8 +1255,8 @@ impl AlacritreeApp {
                 },
                 Finished::Failed(id, e, waiters) => {
                     // The workspace comes off the record rather than off the
-                    // pending entry: `move_session_to` can re-key a session
-                    // while its PTY is opening.
+                    // pending entry: `move_session_to_key` can re-key a
+                    // session while its PTY is opening.
                     let ws = self
                         .sessions
                         .iter()
@@ -1678,10 +1687,14 @@ impl AlacritreeApp {
         });
     }
 
-    /// Re-home `id` to `target`'s workspace.  A re-keying only: the PTY, its
-    /// threads, and the scrollback are untouched — the session must survive
-    /// a move the same way it survives a workspace switch.
-    fn move_session_to(&mut self, id: SessionId, target: PathBuf) -> Result<WorkspaceKey, String> {
+    /// Re-key `id` to `target`, repairing both workspaces' active-session
+    /// entries and following the move with the view when the session was the
+    /// one on screen.
+    fn move_session_to_key(
+        &mut self,
+        id: SessionId,
+        target: WorkspaceKey,
+    ) -> Result<WorkspaceKey, String> {
         let idx = self
             .sessions
             .iter()
@@ -1690,8 +1703,13 @@ impl AlacritreeApp {
         if matches!(&self.sessions[idx].kind, SessionKind::Scratchpad { .. }) {
             return Err("scratchpads belong to their backing workspace and cannot be moved".into());
         }
+        // A workspace's diff pane is found by workspace plus kind, so a pane
+        // carried elsewhere becomes the one the next git click closes while
+        // the workspace it left opens a second.
+        if matches!(&self.sessions[idx].kind, SessionKind::Diff { .. }) {
+            return Err("diff panes belong to the workspace they were opened from".into());
+        }
         let source = self.sessions[idx].working_directory.clone();
-        let target: WorkspaceKey = Some(target);
         if source == target {
             return Ok(target);
         }
@@ -1772,6 +1790,139 @@ impl AlacritreeApp {
             .filter(|(_, s)| s.working_directory == *ws)
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// The workspaces a reorder may use: those the app is willing to switch
+    /// to, minus any whose delete is already running.  A session landing on a
+    /// spinner row is a session that delete is about to reap.
+    fn reorderable_workspaces(&self) -> Vec<WorkspaceKey> {
+        self.workspace_order()
+            .into_iter()
+            .filter(|ws| match ws {
+                None => true,
+                Some(path) => !self.pending_deletes.iter().any(|t| t.worktree_path == *path),
+            })
+            .collect()
+    }
+
+    /// The workspace a session sits in, and the workspaces a reorder may carry
+    /// it through.  A scratchpad or diff pane belongs to its workspace, so its
+    /// range is that workspace alone whatever the scope says — the keyboard and
+    /// the mouse both read the rule from here so neither can offer a landing
+    /// the move would refuse.
+    fn reorder_range(&self, id: SessionId) -> Option<(WorkspaceKey, Vec<WorkspaceKey>)> {
+        let idx = self.sessions.iter().position(|s| s.id == id)?;
+        let origin = self.sessions[idx].working_directory.clone();
+        if matches!(
+            &self.sessions[idx].kind,
+            SessionKind::Scratchpad { .. } | SessionKind::Diff { .. }
+        ) {
+            return Some((origin.clone(), vec![origin]));
+        }
+        let range = sidebar_nav::move_range(
+            &self.projects,
+            &self.reorderable_workspaces(),
+            &origin,
+            self.config.ui.session_reorder.scope,
+        );
+        Some((origin, range))
+    }
+
+    /// Walk `id` to `position` among its own workspace's sessions.
+    fn reorder_session_within_workspace(&mut self, id: SessionId, position: usize) {
+        let Some(abs) = self.sessions.iter().position(|s| s.id == id) else { return };
+        let ws = self.sessions[abs].working_directory.clone();
+        let indices = self.workspace_session_indices(&ws);
+        let Some(j) = indices.iter().position(|i| *i == abs) else { return };
+        for (a, b) in walk_swaps(&indices, j, position) {
+            self.sessions.swap(a, b);
+        }
+    }
+
+    /// Apply a decided move: change the workspace first when the target is a
+    /// different one, then walk the session to its position there.  Reports the
+    /// workspace the session actually ended up in, or `None` when the move was
+    /// refused and the session stayed where it was.
+    fn apply_session_move(&mut self, id: SessionId, target: StepTarget) -> Option<WorkspaceKey> {
+        let abs = self.sessions.iter().position(|s| s.id == id)?;
+        let landed_in = if self.sessions[abs].working_directory == target.workspace {
+            target.workspace
+        } else {
+            self.move_session_to_key(id, target.workspace).ok()?
+        };
+        self.reorder_session_within_workspace(id, target.position);
+        Some(landed_in)
+    }
+
+    /// Apply a mouse drop, whose slot arithmetic `drop_position` decides.
+    fn apply_session_drop(&mut self, id: SessionId, workspace: WorkspaceKey, insert_before: usize) {
+        let Some(abs) = self.sessions.iter().position(|s| s.id == id) else { return };
+        let same_workspace = self.sessions[abs].working_directory == workspace;
+        let indices = self.workspace_session_indices(&workspace);
+        let from = indices.iter().position(|i| *i == abs).unwrap_or(indices.len());
+        let Some(position) = drop_position(same_workspace, indices.len(), from, insert_before)
+        else {
+            return;
+        };
+        if same_workspace {
+            self.reorder_session_within_workspace(id, position);
+        } else {
+            let _ = self.apply_session_move(id, StepTarget { workspace, position });
+        }
+    }
+
+    /// One `MoveSessionUp` / `MoveSessionDown` press.  Every refusal is a
+    /// silent no-op: a clamped end, a boundary the scope forbids, a scratchpad
+    /// asked to leave its workspace.  None of those is a failure — each is a
+    /// move with nowhere to go.
+    fn step_session(&mut self, delta: i32) {
+        let sidebar_focused = self.focus == PaneFocus::ProjectsSidebar;
+        let Some(id) = reorder_subject(
+            sidebar_focused,
+            self.sidebar_cursor.as_ref(),
+            || self.active_session.get(&None).copied(),
+            |path| self.active_session.get(&Some(path.to_path_buf())).copied(),
+            || self.active_session_index().map(|idx| self.sessions[idx].id),
+        ) else {
+            return;
+        };
+        let Some(abs) = self.sessions.iter().position(|s| s.id == id) else { return };
+        let Some((origin, range)) = self.reorder_range(id) else { return };
+        let lens: Vec<usize> =
+            range.iter().map(|ws| self.workspace_session_indices(ws).len()).collect();
+        let indices = self.workspace_session_indices(&origin);
+        let Some(index) = indices.iter().position(|i| *i == abs) else { return };
+        let Some(target) = sidebar_nav::step_target(&range, &lens, &origin, index, delta) else {
+            return;
+        };
+        // Follow the landing the move reports, not the one it was asked for:
+        // expanding a project is persisted, so a refusal that still ran this
+        // would leave a trace of a move that never happened.
+        let Some(landed_in) = self.apply_session_move(id, target) else { return };
+        if sidebar_focused {
+            self.follow_moved_session(id, &landed_in);
+        }
+    }
+
+    /// Keep the sidebar pointed at the session a key just moved.
+    ///
+    /// The cursor key is unchanged across a move inside one workspace, so
+    /// neither `set_sidebar_cursor` nor the focus reconciler would notice the
+    /// row moved and scroll after it — this sets the one-shot itself.  A
+    /// landing inside a collapsed project expands it, because a cursor with no
+    /// painted row is the state the reconciler treats as a row that went away.
+    fn follow_moved_session(&mut self, id: SessionId, landed_in: &WorkspaceKey) {
+        self.sidebar_cursor = Some(SidebarRow::Session(id));
+        self.sidebar_cursor_moved = true;
+        let Some(path) = landed_in.as_deref() else { return };
+        let root = self
+            .projects
+            .iter()
+            .find(|p| p.worktrees.iter().any(|w| w.path == path))
+            .map(|p| p.root.clone());
+        if let Some(root) = root {
+            self.set_project_expanded(&root, true);
+        }
     }
 
     fn scratchpad_session_index(&self, ws: &WorkspaceKey) -> Option<usize> {
@@ -2921,6 +3072,11 @@ impl AlacritreeApp {
             BindingAction::Named(NamedAction::ToggleSessionTabs) => {
                 self.session_tabs_always = !self.session_tabs_always;
             },
+            BindingAction::Named(NamedAction::MoveSessionUp) => self.step_session(-1),
+            BindingAction::Named(NamedAction::MoveSessionDown) => self.step_session(1),
+            BindingAction::Named(NamedAction::ToggleSessionDrag) => {
+                self.session_drag = !self.session_drag;
+            },
             BindingAction::Named(NamedAction::SelectNextWorkspace) => {
                 self.cycle_workspaces(ctx, 1);
             },
@@ -3471,6 +3627,17 @@ impl AlacritreeApp {
         let theme = self.theme;
         let scrollbar = self.config.ui.scrollbar;
         let reorder_mode = self.reorder_mode;
+        let session_drag = self.session_drag;
+        // The render pass cannot borrow `self.sessions`, so the dragged
+        // session's own scope is resolved here: a row outside this range draws
+        // no indicator and never becomes a drop.
+        let drag_range: Option<(SessionId, Vec<WorkspaceKey>)> =
+            egui::DragAndDrop::payload::<DraggedSession>(ctx).and_then(|dragged| {
+                let (_, range) = self.reorder_range(dragged.0)?;
+                Some((dragged.0, range))
+            });
+        let session_drop_request: std::cell::Cell<Option<(SessionId, WorkspaceKey, usize)>> =
+            std::cell::Cell::new(None);
         let cursor_row = if self.focus == PaneFocus::ProjectsSidebar {
             self.sidebar_cursor.clone()
         } else {
@@ -3704,6 +3871,54 @@ impl AlacritreeApp {
                 });
                 ui.separator();
 
+                // `slot` carries a session row's display index and id; `None`
+                // is a workspace row.
+                let session_drop = |ui: &egui::Ui,
+                                    row_rect: egui::Rect,
+                                    ws: &WorkspaceKey,
+                                    slot: Option<(usize, SessionId)>| {
+                    let Some((dragged, range)) = drag_range.as_ref() else { return };
+                    // The dragged row's own edges are no-ops, so offering them
+                    // as targets would paint a drop that does nothing.
+                    if slot.is_some_and(|(_, id)| id == *dragged) {
+                        return;
+                    }
+                    if !range.contains(ws) {
+                        return;
+                    }
+                    let Some(pointer) = ui.input(|i| i.pointer.interact_pos()) else { return };
+                    if !row_rect.contains(pointer) {
+                        return;
+                    }
+                    let position = match slot {
+                        // A session row: the half the pointer is in decides.
+                        Some((idx, _)) => {
+                            if draw_drop_indicator(ui, row_rect, pointer, &theme) {
+                                idx
+                            } else {
+                                idx + 1
+                            }
+                        },
+                        // A workspace row: its sessions start under it, so a
+                        // drop here means the front of that workspace.  This is
+                        // the only way to reach a workspace listing no session
+                        // rows — an empty one, or a single-session one below the
+                        // display threshold.
+                        None => {
+                            ui.painter().hline(
+                                row_rect.x_range(),
+                                row_rect.bottom(),
+                                drop_indicator_stroke(&theme),
+                            );
+                            0
+                        },
+                    };
+                    if ui.input(|i| i.pointer.any_released()) {
+                        session_drop_request.set(Some((*dragged, ws.clone(), position)));
+                        egui::DragAndDrop::clear_payload(ui.ctx());
+                    }
+                };
+
                 ScrollArea::vertical().show(ui, |ui| {
                     // Inter-group spacing is emitted above the group that
                     // follows, never after the last one: trailing padding
@@ -3729,19 +3944,29 @@ impl AlacritreeApp {
                         if home_action.spawn {
                             spawn_shell_request.set(Some(None));
                         }
-                        for row in &home_session_rows {
+                        session_drop(ui, home_action.rect, &None, None);
+                        for (display_idx, row) in home_session_rows.iter().enumerate() {
                             let is_cursor = matches!(
                                 &cursor_row,
                                 Some(SidebarRow::Session(id)) if *id == row.id
                             );
                             let scroll = scrolls(is_cursor);
-                            let act = session_row(ui, row, is_cursor, scroll, &icons, &theme);
+                            let act = session_row(
+                                ui,
+                                row,
+                                is_cursor,
+                                scroll,
+                                session_drag,
+                                &icons,
+                                &theme,
+                            );
                             if act.activate {
                                 activate_session_request.set(Some((None, row.id)));
                             }
                             if act.close {
                                 close_session_request.set(Some(row.id));
                             }
+                            session_drop(ui, act.rect, &None, Some((display_idx, row.id)));
                         }
                         group_gap = 2.0;
                     }
@@ -3913,13 +4138,7 @@ impl AlacritreeApp {
                             if let Some(pointer) = pointer
                                 .filter(|p| row_rect.contains(*p) && dragged.0 != project.root)
                             {
-                                let before = pointer.y < row_rect.center().y;
-                                let y = if before { row_rect.top() } else { row_rect.bottom() };
-                                ui.painter().hline(
-                                    row_rect.x_range(),
-                                    y,
-                                    Stroke::new(2.0 * theme.ui_scale, theme.accent),
-                                );
+                                let before = draw_drop_indicator(ui, row_rect, pointer, &theme);
                                 if ui.input(|i| i.pointer.any_released()) {
                                     let insert_before = if before { idx } else { idx + 1 };
                                     reorder_request.set(Some((dragged.0.clone(), insert_before)));
@@ -4083,12 +4302,13 @@ impl AlacritreeApp {
                                 if let Some(name) = action.spawn_profile {
                                     spawn_profile_request.set(Some((wt.path.clone(), name)));
                                 }
+                                session_drop(ui, action.rect, &Some(wt.path.clone()), None);
                                 let session_rows = worktree_session_rows
                                     .get(idx)
                                     .and_then(|v| v.get(wt_idx))
                                     .map(Vec::as_slice)
                                     .unwrap_or(&[]);
-                                for row in session_rows {
+                                for (display_idx, row) in session_rows.iter().enumerate() {
                                     let is_cursor = matches!(
                                         &cursor_row,
                                         Some(SidebarRow::Session(id)) if *id == row.id
@@ -4099,6 +4319,7 @@ impl AlacritreeApp {
                                         row,
                                         is_cursor,
                                         scroll,
+                                        session_drag,
                                         &icons,
                                         &theme,
                                     );
@@ -4109,6 +4330,12 @@ impl AlacritreeApp {
                                     if act.close {
                                         close_session_request.set(Some(row.id));
                                     }
+                                    session_drop(
+                                        ui,
+                                        act.rect,
+                                        &Some(wt.path.clone()),
+                                        Some((display_idx, row.id)),
+                                    );
                                 }
                             }
                             for (_, branch) in creating.iter().filter(|(pi, _)| *pi == idx) {
@@ -4134,6 +4361,9 @@ impl AlacritreeApp {
         }
         if let Some((root, insert_before)) = reorder_request.take() {
             self.move_project(&root, insert_before);
+        }
+        if let Some((id, workspace, position)) = session_drop_request.take() {
+            self.apply_session_drop(id, workspace, position);
         }
         if let Some((root, expanded)) = expand_toggled {
             state::mutate(|s| {
@@ -6050,6 +6280,103 @@ fn move_target(len: usize, from: usize, insert_before: usize) -> Option<usize> {
     (to != from).then_some(to)
 }
 
+/// Position a session dropped before display slot `insert_before` should walk
+/// to.  Inside its own workspace the session is removed before it is inserted,
+/// so `move_target` compensates for the slots that shift down; coming from
+/// another workspace it is inserted into a list it is not in yet, where the
+/// display slot already is the position.
+fn drop_position(
+    same_workspace: bool,
+    len: usize,
+    from: usize,
+    insert_before: usize,
+) -> Option<usize> {
+    if same_workspace { move_target(len, from, insert_before) } else { Some(insert_before) }
+}
+
+/// The weight and colour every reorder drop line is drawn with, shared so the
+/// project and session drags cannot drift apart.
+fn drop_indicator_stroke(theme: &Theme) -> Stroke {
+    Stroke::new(2.0 * theme.ui_scale, theme.accent)
+}
+
+/// Paint the line a reorder drop would land on, at the row edge nearest the
+/// pointer, and report whether that edge is the top — which is what "insert
+/// before this row" means for both the project and the session drag.
+fn draw_drop_indicator(
+    ui: &egui::Ui,
+    row_rect: egui::Rect,
+    pointer: egui::Pos2,
+    theme: &Theme,
+) -> bool {
+    let before = pointer.y < row_rect.center().y;
+    let y = if before { row_rect.top() } else { row_rect.bottom() };
+    ui.painter().hline(row_rect.x_range(), y, drop_indicator_stroke(theme));
+    before
+}
+
+/// The neighbour swaps that walk the element at `indices[j]` to slot
+/// `position` of `indices`.
+///
+/// `indices` are the absolute positions one workspace occupies inside the
+/// session vector, which are not contiguous: swapping only across them keeps
+/// every other workspace's sessions at the index they were at.  Swapping is
+/// also what avoids a `Clone` bound on `Session`, which owns a PTY.
+fn walk_swaps(indices: &[usize], j: usize, position: usize) -> Vec<(usize, usize)> {
+    let mut swaps = Vec::new();
+    if indices.is_empty() || j >= indices.len() {
+        return swaps;
+    }
+    let position = position.min(indices.len() - 1);
+    let mut j = j;
+    while j > position {
+        swaps.push((indices[j - 1], indices[j]));
+        j -= 1;
+    }
+    while j < position {
+        swaps.push((indices[j], indices[j + 1]));
+        j += 1;
+    }
+    swaps
+}
+
+/// The session a reorder key acts on.
+///
+/// A cursored session wins, then the workspace the cursor is resting on lends
+/// its active session, and otherwise the session on screen moves.  The middle
+/// case is what makes a held key work across a workspace boundary: a session
+/// arriving alone in a workspace paints no row of its own, so the cursor
+/// climbs to that workspace's row, and the next press must still find it.
+///
+/// `CloseSession` has the same first-and-last shape; `DeleteSelected` reads
+/// the cursor whatever has focus, which is the wrong convention here — a key
+/// pressed at the terminal should move the terminal you are looking at.
+fn reorder_subject(
+    sidebar_focused: bool,
+    cursor: Option<&SidebarRow>,
+    home_active: impl Fn() -> Option<SessionId>,
+    worktree_active: impl Fn(&Path) -> Option<SessionId>,
+    on_screen: impl Fn() -> Option<SessionId>,
+) -> Option<SessionId> {
+    if sidebar_focused {
+        match cursor {
+            Some(SidebarRow::Session(id)) => return Some(*id),
+            Some(SidebarRow::Home) => {
+                if let Some(id) = home_active() {
+                    return Some(id);
+                }
+            },
+            Some(SidebarRow::Worktree(path)) => {
+                if let Some(id) = worktree_active(path) {
+                    return Some(id);
+                }
+            },
+            _ => {},
+        }
+    }
+    on_screen()
+}
+
 /// A grip that a project row can be dragged by to reorder it.  Drag-sensing
 /// only, so a plain click still falls through to the row's other controls.
 fn drag_handle(ui: &mut egui::Ui, theme: &Theme) -> egui::Response {
@@ -6303,6 +6630,8 @@ fn is_sidebar_nav_key(key: egui::Key) -> bool {
 struct HomeAction {
     activate: bool,
     spawn: bool,
+    /// Full-width row rect, for a drop target to test the pointer against.
+    rect: egui::Rect,
 }
 
 fn home_row(
@@ -6400,7 +6729,7 @@ fn home_row(
     if scroll_into_view {
         ui.scroll_to_rect(full_rect, None);
     }
-    HomeAction { activate: resp.clicked() && !spawn_clicked, spawn: spawn_clicked }
+    HomeAction { activate: resp.clicked() && !spawn_clicked, spawn: spawn_clicked, rect: full_rect }
 }
 
 struct WorktreeAction {
@@ -6410,6 +6739,8 @@ struct WorktreeAction {
     set_base: bool,
     /// Name of the profile picked from the row's "Open session" menu, if any.
     spawn_profile: Option<String>,
+    /// Full-width row rect, for a drop target to test the pointer against.
+    rect: egui::Rect,
 }
 
 /// Everything a sidebar session row needs, snapshotted before the panel
@@ -7174,6 +7505,7 @@ fn worktree_row(
         spawn: spawn_clicked,
         set_base: set_base_clicked,
         spawn_profile: spawn_profile_clicked,
+        rect: full_rect,
     }
 }
 
@@ -7192,13 +7524,19 @@ fn worktree_is_switchable(wt: &Worktree, missing: Option<bool>, has_sessions: bo
 struct SessionRowAction {
     activate: bool,
     close: bool,
+    /// Full-width row rect, for a drop target to test the pointer against.
+    rect: egui::Rect,
 }
 
+/// `draggable` makes the whole row the drag handle rather than adding a grip:
+/// a session row is a tab, where a project row's own controls are what a click
+/// there is usually for.
 fn session_row(
     ui: &mut egui::Ui,
     row: &SessionRowData,
     is_cursor: bool,
     scroll_into_view: bool,
+    draggable: bool,
     icons: &Icons,
     theme: &Theme,
 ) -> SessionRowAction {
@@ -7256,7 +7594,11 @@ fn session_row(
             );
         })
         .response
-        .interact(egui::Sense::click());
+        .interact(if draggable {
+            egui::Sense::click_and_drag()
+        } else {
+            egui::Sense::click()
+        });
     if let Some((rect, hint)) = status_hint {
         hints.add(rect, hint);
     }
@@ -7293,7 +7635,14 @@ fn session_row(
     if scroll_into_view {
         ui.scroll_to_rect(full_rect, None);
     }
-    SessionRowAction { activate: resp.clicked() && !close_clicked, close: close_clicked }
+    if draggable {
+        resp.dnd_set_drag_payload(DraggedSession(row.id));
+    }
+    SessionRowAction {
+        activate: resp.clicked() && !close_clicked,
+        close: close_clicked,
+        rect: full_rect,
+    }
 }
 
 impl AlacritreeApp {
@@ -8864,7 +9213,7 @@ impl AlacritreeApp {
             Req::MoveSession { session_id, path } => {
                 let target =
                     self.workspace_for_path(&path).ok_or_else(|| unknown_worktree(&path))?;
-                let workspace = self.move_session_to(session_id, target)?;
+                let workspace = self.move_session_to_key(session_id, Some(target))?;
                 // A silent re-grouping produces no PTY events, so nothing
                 // else would wake the next paint.
                 ctx.request_repaint();
@@ -9533,6 +9882,16 @@ mod tests {
         v
     }
 
+    /// Apply `walk_swaps` to a concrete list, with `indices` standing in for
+    /// the absolute slots one workspace occupies inside the session vector.
+    fn walked(items: &[&str], indices: &[usize], j: usize, position: usize) -> Vec<String> {
+        let mut v: Vec<String> = items.iter().map(|s| s.to_string()).collect();
+        for (a, b) in walk_swaps(indices, j, position) {
+            v.swap(a, b);
+        }
+        v
+    }
+
     fn key_ev(key: egui::Key, pressed: bool) -> egui::Event {
         egui::Event::Key {
             key,
@@ -9942,6 +10301,93 @@ mod tests {
         assert_eq!(move_target(3, 0, 0), None);
         // A stale source index (list shrank mid-drag) is ignored.
         assert_eq!(move_target(2, 5, 0), None);
+    }
+
+    #[test]
+    fn walk_swaps_moves_within_a_contiguous_workspace() {
+        assert_eq!(walked(&["a", "b", "c"], &[0, 1, 2], 0, 2), vec!["b", "c", "a"]);
+        assert_eq!(walked(&["a", "b", "c"], &[0, 1, 2], 2, 0), vec!["c", "a", "b"]);
+    }
+
+    #[test]
+    fn walk_swaps_leaves_interleaved_workspaces_in_place() {
+        // Slots 0 and 2 belong to one workspace, slot 1 to another; moving the
+        // first workspace's second session to the front must not disturb it.
+        assert_eq!(walked(&["a", "x", "b"], &[0, 2], 1, 0), vec!["b", "x", "a"]);
+    }
+
+    #[test]
+    fn walk_swaps_is_empty_when_nothing_moves() {
+        assert!(walk_swaps(&[0, 1, 2], 1, 1).is_empty());
+        // A position past the end clamps to the last slot, which is a no-op
+        // for the element already there.
+        assert!(walk_swaps(&[0, 1, 2], 2, 9).is_empty());
+    }
+
+    #[test]
+    fn a_same_workspace_drop_uses_the_move_target_arithmetic() {
+        // Dropping below your own row is a no-op, the same as for projects.
+        assert_eq!(drop_position(true, 3, 1, 2), None);
+        // Dropping onto the row below moves you past it.
+        assert_eq!(drop_position(true, 3, 1, 3), Some(2));
+        assert_eq!(moved(&["a", "b", "c"], 1, 3), vec!["a", "c", "b"]);
+    }
+
+    #[test]
+    fn a_cross_workspace_drop_takes_the_display_slot_as_the_position() {
+        // The session is not in that workspace's list yet, so nothing shifts
+        // down and every slot passes through — including the two the same
+        // workspace answers differently, which is what tells the branches
+        // apart.
+        assert_eq!(drop_position(false, 3, 1, 2), Some(2));
+        assert_eq!(drop_position(false, 3, 1, 3), Some(3));
+        // A drop onto the front of a workspace whose rows are all below it.
+        assert_eq!(drop_position(false, 0, 0, 0), Some(0));
+    }
+
+    #[test]
+    fn walk_swaps_places_an_arrival_at_the_stated_position() {
+        // Arriving from another workspace, the display slot is the position:
+        // nothing was removed from this list first, so there is no off-by-one.
+        assert_eq!(walk_swaps(&[0, 1, 2], 2, 0), vec![(1, 2), (0, 1)]);
+    }
+
+    #[test]
+    fn reorder_subject_prefers_the_cursored_session() {
+        assert_eq!(
+            reorder_subject(true, Some(&SidebarRow::Session(7)), || None, |_| None, || Some(3)),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn reorder_subject_takes_a_workspace_rows_active_session() {
+        // The landing after a cross-workspace step: the session paints no row
+        // yet, so the cursor sits on the worktree it arrived in.
+        let row = SidebarRow::Worktree(PathBuf::from("/b"));
+        assert_eq!(
+            reorder_subject(true, Some(&row), || None, |p| (p == Path::new("/b")).then_some(9), || Some(3)),
+            Some(9)
+        );
+        assert_eq!(
+            reorder_subject(true, Some(&SidebarRow::Home), || Some(4), |_| None, || Some(3)),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn reorder_subject_falls_back_to_the_session_on_screen() {
+        // Terminal focused: the cursor is ignored entirely.
+        assert_eq!(
+            reorder_subject(false, Some(&SidebarRow::Session(7)), || None, |_| None, || Some(3)),
+            Some(3)
+        );
+        // Sidebar focused on a project header, which owns no session.
+        let row = SidebarRow::Project(PathBuf::from("/a"));
+        assert_eq!(reorder_subject(true, Some(&row), || None, |_| None, || Some(3)), Some(3));
+        // And an empty workspace row falls through rather than refusing.
+        let row = SidebarRow::Worktree(PathBuf::from("/b"));
+        assert_eq!(reorder_subject(true, Some(&row), || None, |_| None, || Some(3)), Some(3));
     }
 
     #[test]
@@ -11538,7 +11984,7 @@ mod tests {
                 is_displayed: true,
             };
             let mut session = |ui: &mut egui::Ui| {
-                session_row(ui, &row, false, false, &icons, &theme);
+                session_row(ui, &row, false, false, false, &icons, &theme);
             };
             assert_eq!(
                 hint_painted_over(&mut session, "×", "close session"),
@@ -11633,7 +12079,7 @@ mod tests {
 
             let agent = session(false, SessionActivity::Agent(Some("claude")));
             let mut agent_row = |ui: &mut egui::Ui| {
-                session_row(ui, &agent, false, false, &icons, &theme);
+                session_row(ui, &agent, false, false, false, &icons, &theme);
             };
             assert_eq!(
                 hint_painted_over(&mut agent_row, DEFAULT_AGENT_ICON.as_str(), "claude is running",),
@@ -11648,7 +12094,7 @@ mod tests {
 
             let loading = session(false, SessionActivity::Loading(Some("claude")));
             let texts = texts_while_hovering_at(slot, WIDTH, |ui| {
-                session_row(ui, &loading, false, false, &icons, &theme);
+                session_row(ui, &loading, false, false, false, &icons, &theme);
             });
             assert_eq!(
                 texts.iter().flatten().any(|(text, _)| text == "claude is working"),
@@ -11658,7 +12104,7 @@ mod tests {
 
             let waiting = session(true, SessionActivity::Idle);
             let texts = texts_while_hovering_at(slot, WIDTH, |ui| {
-                session_row(ui, &waiting, false, false, &icons, &theme);
+                session_row(ui, &waiting, false, false, false, &icons, &theme);
             });
             assert_eq!(
                 texts.iter().flatten().any(|(text, _)| text == "needs attention"),
@@ -11960,7 +12406,7 @@ mod tests {
         };
 
         let texts = texts_while_hovering(140.0, |ui| {
-            session_row(ui, &row, false, false, &icons, &theme);
+            session_row(ui, &row, false, false, false, &icons, &theme);
         });
 
         assert!(
