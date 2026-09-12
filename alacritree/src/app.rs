@@ -41,6 +41,7 @@ use crate::session::{
 use crate::sidebar_nav::{self, SidebarRow, StepTarget};
 use crate::state::{self, PersistedProject};
 use crate::upstream::UpstreamState;
+use crate::workspace::WorkspaceKey;
 use crate::worktree::{self as wt, CreateRequest, Progress};
 use crate::wsl::{self, ShellChoice};
 use crate::wsl_helper::{self, WslProbe};
@@ -48,9 +49,6 @@ use crate::{
     clipboard_image, doppler, file_drop, herdr, ipc, jobs, paste, path_style, scratchpad,
     sidebar_focus, terminal_view, worktree_liveness,
 };
-
-/// `None` is the home workspace (sessions inherit `$PWD`); `Some` is a worktree path.
-pub type WorkspaceKey = Option<PathBuf>;
 
 /// Channel from notification-worker threads back to the app.  Set once by
 /// `AlacritreeApp::new`; each worker reads it to deliver the session the
