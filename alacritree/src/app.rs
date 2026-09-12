@@ -1163,26 +1163,7 @@ impl AlacritreeApp {
         };
         let workspace = self.sessions[idx].working_directory.clone();
         let herdr_key = self.sessions[idx].herdr_key.clone();
-        if let Some(key) = &herdr_key {
-            // A plain `retain` would drop a queued attach's waiters with it,
-            // leaving a parked client to time out rather than learn why.
-            let (removed, kept): (Vec<_>, Vec<_>) =
-                std::mem::take(&mut self.herdr.pending_herdr_attach)
-                    .into_iter()
-                    .partition(|pending| &pending.key == key);
-            self.herdr.pending_herdr_attach = kept;
-            for pending in removed {
-                for waiter in pending.waiters {
-                    let _ = waiter.send(Err("the session behind this pane was closed before the \
-                                             attach finished"
-                        .to_string()));
-                }
-            }
-        }
-        if self.herdr.herdr_view_focus.as_ref().is_some_and(|pending| pending.session == id) {
-            self.herdr.herdr_view_focus = None;
-        }
-        self.herdr.herdr_focused_view.closed(id, herdr_key.as_ref(), Instant::now());
+        self.herdr.close_session(id, herdr_key.as_ref());
         if self.modals.pending_session_close == Some(id) {
             self.modals.pending_session_close = None;
         }

@@ -25,6 +25,28 @@ impl HerdrGlue {
             endpoints: herdr::Endpoints::default(),
         }
     }
+
+    pub(super) fn close_session(&mut self, id: SessionId, herdr_key: Option<&herdr::HerdrKey>) {
+        if let Some(key) = herdr_key {
+            // A plain `retain` would drop a queued attach's waiters with it,
+            // leaving a parked client to time out rather than learn why.
+            let (removed, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_attach)
+                .into_iter()
+                .partition(|pending| &pending.key == key);
+            self.pending_attach = kept;
+            for pending in removed {
+                for waiter in pending.waiters {
+                    let _ = waiter.send(Err("the session behind this pane was closed before the \
+                                             attach finished"
+                        .to_string()));
+                }
+            }
+        }
+        if self.view_focus.as_ref().is_some_and(|pending| pending.session == id) {
+            self.view_focus = None;
+        }
+        self.focused_view.closed(id, herdr_key, Instant::now());
+    }
 }
 
 impl AlacritreeApp {
