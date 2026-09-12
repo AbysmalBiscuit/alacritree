@@ -38,6 +38,7 @@ mod mouse;
 mod multiplexer;
 #[cfg(target_os = "macos")]
 mod notify_macos;
+mod osc_tap;
 mod panel_filter;
 mod paste;
 mod path_style;
