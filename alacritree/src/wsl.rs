@@ -269,6 +269,46 @@ fn cli_distros(_blocking: &jobs::Blocking) -> Vec<WslDistro> {
     }
 }
 
+/// The distros whose VM is up right now, or `None` when `wsl.exe` could not
+/// be asked.  Unlike [`distros`], which reads the registry and describes what
+/// is *installed*, this spawns `wsl.exe`, so it takes a [`jobs::Blocking`] and
+/// the answer is deliberately not cached: a distro starts and stops while
+/// alacritree runs.  A listing that failed and a listing that came back empty
+/// are different answers — one says nothing, the other says nothing is
+/// running — so callers that act on emptiness need them apart.
+#[cfg(windows)]
+#[allow(clippy::disallowed_methods)] // Running wsl.exe is this function's job.
+pub fn running_distros(_blocking: &jobs::Blocking) -> Option<Vec<String>> {
+    let output = command_bare()
+        .args(["-l", "-q", "--running"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    match output {
+        Ok(o) if o.status.success() => Some(running_names(&o.stdout, &distros())),
+        _ => None,
+    }
+}
+
+/// No WSL here is an answer, not a failure.
+#[cfg(not(windows))]
+pub fn running_distros(_: &jobs::Blocking) -> Option<Vec<String>> {
+    Some(Vec::new())
+}
+
+/// Names from a `--running` listing, kept only where they name a registered
+/// distro.  With nothing running, wsl.exe prints a sentence in place of the
+/// list, and every line of that output otherwise reads as a distro name.
+#[cfg(any(windows, test))]
+fn running_names(stdout: &[u8], registered: &[WslDistro]) -> Vec<String> {
+    parse_distro_list(stdout)
+        .into_iter()
+        .map(|d| d.name)
+        .filter(|name| registered.iter().any(|d| d.name == *name))
+        .collect()
+}
+
 /// `wsl -l -q` lists the default distro first.  Output is UTF-8 when
 /// WSL_UTF8=1 is honored (WSL 0.64.0+); older versions emit UTF-16LE,
 /// detected by the NUL bytes ASCII names acquire in that encoding.
@@ -315,15 +355,24 @@ fn command_bare() -> Command {
 /// `--exec`: wsl.exe launches the distro's own default login shell, which
 /// is the contract — we never guess shells.
 pub fn shell_invocation(distro: &str, workdir: &Path) -> (String, Vec<String>) {
-    (
-        "wsl.exe".to_string(),
-        vec![
-            "-d".to_string(),
-            distro.to_string(),
-            "--cd".to_string(),
-            workdir.to_string_lossy().into_owned(),
-        ],
-    )
+    ("wsl.exe".to_string(), vec![
+        "-d".to_string(),
+        distro.to_string(),
+        "--cd".to_string(),
+        workdir.to_string_lossy().into_owned(),
+    ])
+}
+
+/// Program + args for `-d <distro> --exec <argv...>`, tuple-shaped like
+/// `shell_invocation` rather than a `Command` like `command`: this feeds a
+/// PTY spawn, which has no creation-flags concept of its own, while `command`
+/// feeds a child process spawned through `std::process`, where
+/// `CREATE_NO_WINDOW` and `WSL_UTF8` matter and would not survive a
+/// `(String, Vec<String>)` round trip.
+pub fn exec_invocation(distro: &str, argv: &[&str]) -> (String, Vec<String>) {
+    let mut args = vec!["-d".to_string(), distro.to_string(), "--exec".to_string()];
+    args.extend(argv.iter().map(|a| a.to_string()));
+    ("wsl.exe".to_string(), args)
 }
 
 /// Separates the outputs of the individual commands a batch script runs.
@@ -616,33 +665,30 @@ mod tests {
     #[test]
     fn classifies_wsl_localhost_unc() {
         let loc = classify(Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj"));
-        assert_eq!(
-            loc,
-            Location::Wsl {
-                distro: "kali-linux".to_string(),
-                linux_path: "/home/lev/proj".to_string(),
-            }
-        );
+        assert_eq!(loc, Location::Wsl {
+            distro: "kali-linux".to_string(),
+            linux_path: "/home/lev/proj".to_string(),
+        });
     }
 
     #[cfg(windows)]
     #[test]
     fn classifies_wsl_dollar_unc() {
         let loc = classify(Path::new(r"\\wsl$\Ubuntu\srv"));
-        assert_eq!(
-            loc,
-            Location::Wsl { distro: "Ubuntu".to_string(), linux_path: "/srv".to_string() }
-        );
+        assert_eq!(loc, Location::Wsl {
+            distro: "Ubuntu".to_string(),
+            linux_path: "/srv".to_string()
+        });
     }
 
     #[cfg(windows)]
     #[test]
     fn classifies_distro_root() {
         let loc = classify(Path::new(r"\\wsl.localhost\kali-linux"));
-        assert_eq!(
-            loc,
-            Location::Wsl { distro: "kali-linux".to_string(), linux_path: "/".to_string() }
-        );
+        assert_eq!(loc, Location::Wsl {
+            distro: "kali-linux".to_string(),
+            linux_path: "/".to_string()
+        });
     }
 
     #[cfg(windows)]
@@ -659,10 +705,10 @@ mod tests {
     #[test]
     fn classifies_verbatim_unc() {
         let loc = classify(Path::new(r"\\?\UNC\wsl.localhost\kali-linux\home\lev"));
-        assert_eq!(
-            loc,
-            Location::Wsl { distro: "kali-linux".to_string(), linux_path: "/home/lev".to_string() }
-        );
+        assert_eq!(loc, Location::Wsl {
+            distro: "kali-linux".to_string(),
+            linux_path: "/home/lev".to_string()
+        });
     }
 
     #[cfg(windows)]
@@ -776,14 +822,35 @@ mod tests {
     }
 
     #[test]
+    fn running_names_keeps_only_registered_distros() {
+        let registered =
+            vec![WslDistro { name: "kali-linux".to_string(), is_default: true }, WslDistro {
+                name: "Ubuntu".to_string(),
+                is_default: false,
+            }];
+        assert_eq!(running_names(b"Ubuntu\r\n", &registered), vec!["Ubuntu".to_string()]);
+    }
+
+    /// With nothing running, wsl.exe prints prose where the list would be.
+    #[test]
+    fn a_message_in_place_of_a_list_names_no_distro() {
+        let registered = vec![WslDistro { name: "kali-linux".to_string(), is_default: true }];
+        let out = b"There are no running distributions.\r\n";
+        assert!(running_names(out, &registered).is_empty());
+    }
+
+    #[test]
     fn command_builds_expected_argv() {
         let cmd = command("kali-linux", Some(Path::new(r"\\wsl.localhost\kali-linux\home")));
         let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         assert_eq!(cmd.get_program().to_string_lossy(), "wsl.exe");
-        assert_eq!(
-            args,
-            vec!["-d", "kali-linux", "--cd", r"\\wsl.localhost\kali-linux\home", "--exec"]
-        );
+        assert_eq!(args, vec![
+            "-d",
+            "kali-linux",
+            "--cd",
+            r"\\wsl.localhost\kali-linux\home",
+            "--exec"
+        ]);
     }
 
     #[test]
@@ -791,6 +858,13 @@ mod tests {
         let (program, args) = shell_invocation("kali-linux", Path::new(r"C:\proj"));
         assert_eq!(program, "wsl.exe");
         assert_eq!(args, vec!["-d", "kali-linux", "--cd", r"C:\proj"]);
+    }
+
+    #[test]
+    fn exec_invocation_builds_expected_argv() {
+        let (program, args) = exec_invocation("kali-linux", &["sh", "-lc", "herdr agent list"]);
+        assert_eq!(program, "wsl.exe");
+        assert_eq!(args, vec!["-d", "kali-linux", "--exec", "sh", "-lc", "herdr agent list"]);
     }
 
     #[test]
@@ -840,14 +914,11 @@ mod tests {
     #[test]
     fn reads_one_probe_line_per_program() {
         let stdout = b"/usr/bin/git\n\n/home/lev/.local/bin/gh\n";
-        assert_eq!(
-            parse_tool_paths(stdout, 3),
-            vec![
-                Some("/usr/bin/git".to_string()),
-                None,
-                Some("/home/lev/.local/bin/gh".to_string())
-            ]
-        );
+        assert_eq!(parse_tool_paths(stdout, 3), vec![
+            Some("/usr/bin/git".to_string()),
+            None,
+            Some("/home/lev/.local/bin/gh".to_string())
+        ]);
     }
 
     /// A truncated answer must not slide the surviving paths onto the names
@@ -855,10 +926,11 @@ mod tests {
     /// reporting neither.
     #[test]
     fn a_short_probe_answer_pads_rather_than_shifts() {
-        assert_eq!(
-            parse_tool_paths(b"/usr/bin/git\n", 3),
-            vec![Some("/usr/bin/git".to_string()), None, None]
-        );
+        assert_eq!(parse_tool_paths(b"/usr/bin/git\n", 3), vec![
+            Some("/usr/bin/git".to_string()),
+            None,
+            None
+        ]);
     }
 
     /// Live round trip against the default distro.  Requires WSL; run

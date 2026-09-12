@@ -167,7 +167,7 @@ fn climb(from_tree: &TreeSnapshot, next: &TreeSnapshot, from: NodeId) -> Option<
 fn follow_target(next: &TreeSnapshot, landing: &SidebarRow) -> Option<FollowTarget> {
     match landing {
         SidebarRow::Session(id) => Some(FollowTarget::Session(*id)),
-        SidebarRow::Project(_) => None,
+        SidebarRow::Project(_) | SidebarRow::HerdrAgent(..) => None,
         SidebarRow::Home | SidebarRow::Worktree(_) => {
             let id = next.find(landing)?;
             let has_session = next.nodes.iter().any(|node| {
@@ -313,6 +313,10 @@ pub struct UiInputs<'a> {
     /// moves every PR lookup key while nothing observed changes.
     pub active_workspace: Option<&'a Path>,
     pub active_branch: Option<&'a str>,
+    /// Advances when a herdr poll changes something a row draws.  Agent churn
+    /// no row shows deliberately does not move it, so an idle agent repainting
+    /// does not rebuild the tree.
+    pub herdr_generation: u64,
 }
 
 #[cfg(test)]
@@ -398,6 +402,7 @@ pub struct ObservedInputs {
     pr_generation: u64,
     active_workspace: Option<PathBuf>,
     active_branch: Option<String>,
+    herdr_generation: u64,
 }
 
 impl ObservedInputs {
@@ -433,6 +438,7 @@ impl ObservedInputs {
             pr_generation: ui.pr_generation,
             active_workspace: ui.active_workspace.map(Path::to_path_buf),
             active_branch: ui.active_branch.map(str::to_string),
+            herdr_generation: ui.herdr_generation,
         }
     }
 
@@ -457,6 +463,7 @@ impl ObservedInputs {
             || self.pr_generation != ui.pr_generation
             || self.active_workspace.as_deref() != ui.active_workspace
             || self.active_branch.as_deref() != ui.active_branch
+            || self.herdr_generation != ui.herdr_generation
         {
             return false;
         }
@@ -516,6 +523,7 @@ mod tests {
             pr_generation: 0,
             active_workspace: None,
             active_branch: None,
+            herdr_generation: 0,
         }
     }
 
@@ -535,6 +543,7 @@ mod tests {
             pr_generation,
             active_workspace,
             active_branch,
+            herdr_generation: 0,
         }
     }
 
@@ -562,6 +571,15 @@ mod tests {
                 "a changed input reported unchanged: {changed:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_herdr_generation_bump_invalidates_the_snapshot() {
+        let inputs = ObservedInputs::capture(&[], std::iter::empty(), ui("", 0));
+        let mut moved = ui("", 0);
+        moved.herdr_generation = 1;
+        assert!(inputs.matches(&[], std::iter::empty(), ui("", 0)));
+        assert!(!inputs.matches(&[], std::iter::empty(), moved));
     }
 
     #[test]
@@ -628,10 +646,10 @@ mod tests {
         let s = snapshot();
         let wt1 = s.find(&row_worktree("/a/wt1")).unwrap();
         let kids = s.children(Parent::Node(wt1));
-        assert_eq!(
-            kids.iter().map(|&id| s.row(id).clone()).collect::<Vec<_>>(),
-            vec![SidebarRow::Session(1), SidebarRow::Session(2)]
-        );
+        assert_eq!(kids.iter().map(|&id| s.row(id).clone()).collect::<Vec<_>>(), vec![
+            SidebarRow::Session(1),
+            SidebarRow::Session(2)
+        ]);
     }
 
     #[test]
@@ -657,19 +675,16 @@ mod tests {
         // Each UI input on its own.
         assert!(!base.matches(&[], [session(&HOME, 1, false)].into_iter(), ui("x", 0)));
         assert!(!base.matches(&[], [session(&HOME, 1, false)].into_iter(), ui("", 0b01)));
-        assert!(!base.matches(
-            &[],
-            [session(&HOME, 1, false)].into_iter(),
-            UiInputs {
-                session_rows_always: true,
-                query: "",
-                toggles: 0,
-                toggles_apply: true,
-                pr_generation: 0,
-                active_workspace: None,
-                active_branch: None,
-            },
-        ));
+        assert!(!base.matches(&[], [session(&HOME, 1, false)].into_iter(), UiInputs {
+            session_rows_always: true,
+            query: "",
+            toggles: 0,
+            toggles_apply: true,
+            pr_generation: 0,
+            active_workspace: None,
+            active_branch: None,
+            herdr_generation: 0,
+        },));
 
         // Each session input on its own: attention, id, count.
         assert!(!base.matches(&[], [session(&HOME, 1, true)].into_iter(), ui("", 0)));
