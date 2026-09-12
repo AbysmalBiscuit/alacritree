@@ -173,6 +173,16 @@ impl SystemFonts {
     }
 }
 
+/// How many faces to scan at once.  Four is where the measured curve
+/// flattens; the work is memory-bound, so more cores stop helping well
+/// before they run out.  The floor matters because rayon reads a thread
+/// count of zero as "choose automatically", so a caller that mapped an
+/// error to zero would get every logical CPU instead of the cap.
+#[cfg(not(unix))]
+fn worker_count(reported: usize) -> usize {
+    reported.clamp(1, 4)
+}
+
 /// Scan every system face's cmap, reusing ranges from `cache_path` for files
 /// whose size and mtime still match a prior scan.  `cache_path` is a
 /// parameter (rather than always `disk_cache::default_cache_path()`) so
@@ -183,51 +193,111 @@ fn scan_coverage(
     db: &fontdb::Database,
     cache_path: Option<&Path>,
 ) -> Vec<(coverage::Candidate, coverage::Coverage)> {
+    let workers = worker_count(std::thread::available_parallelism().map_or(1, |n| n.get()));
+    scan_coverage_with_workers(db, cache_path, workers).0
+}
+
+/// The scan proper, with the worker count injected so tests can compare a
+/// parallel run against a serial one.  Returns the candidate list and how
+/// many faces came from the cache.
+#[cfg(not(unix))]
+fn scan_coverage_with_workers(
+    db: &fontdb::Database,
+    cache_path: Option<&Path>,
+    workers: usize,
+) -> (Vec<(coverage::Candidate, coverage::Coverage)>, usize) {
+    use rayon::prelude::*;
+
     let started = std::time::Instant::now();
     let cache = cache_path.and_then(disk_cache::load).unwrap_or_default();
-    let mut stat_memo: HashMap<PathBuf, Option<(u64, u64)>> = HashMap::new();
-    let mut fresh_files: HashMap<String, disk_cache::CachedFile> = HashMap::new();
-    let mut scanned = Vec::new();
-    let mut hits = 0usize;
-    let mut any_fresh = false;
 
-    for face in db.faces() {
-        let (path, face_index) = match &face.source {
-            fontdb::Source::File(p) | fontdb::Source::SharedFile(p, _) => (p.clone(), face.index),
+    // Faces addressable by path, in database order.  A `.ttc` contributes
+    // several entries sharing one path.
+    let faces: Vec<(PathBuf, u32, &fontdb::FaceInfo)> = db
+        .faces()
+        .filter_map(|face| match &face.source {
             // Embedded faces aren't path-addressable by our loader.
-            fontdb::Source::Binary(_) => continue,
-        };
+            fontdb::Source::Binary(_) => None,
+            fontdb::Source::File(p) | fontdb::Source::SharedFile(p, _) => {
+                Some((p.clone(), face.index, face))
+            },
+        })
+        .collect();
+
+    // Stat once per distinct file, before the fan-out, so the parallel
+    // phase reads a finished map instead of contending on one.
+    let mut stat_memo: HashMap<PathBuf, Option<(u64, u64)>> = HashMap::new();
+    for (path, _, _) in &faces {
+        stat_memo.entry(path.clone()).or_insert_with(|| disk_cache::stat_file(path));
+    }
+
+    let scan_one = |(path, face_index, face): &(PathBuf, u32, &fontdb::FaceInfo)| {
         let path_key = path.to_string_lossy().into_owned();
-        let stat = *stat_memo.entry(path.clone()).or_insert_with(|| disk_cache::stat_file(&path));
+        let stat = stat_memo[path];
 
         let cached_ranges = stat.and_then(|(size, mtime_millis)| {
             let cached_file = cache.get(&path_key)?;
             (cached_file.size == size && cached_file.mtime_millis == mtime_millis)
-                .then(|| cached_file.faces.get(&face_index).cloned())
+                .then(|| cached_file.faces.get(face_index).cloned())
                 .flatten()
         });
 
-        let cov = match cached_ranges.and_then(coverage::Coverage::from_stored_ranges) {
-            Some(cov) => {
-                hits += 1;
-                cov
-            },
+        let (cov, from_cache) = match cached_ranges.and_then(coverage::Coverage::from_stored_ranges)
+        {
+            Some(cov) => (cov, true),
             None => {
-                any_fresh = true;
-                let Some(cov) = db
-                    .with_face_data(face.id, |data, index| {
-                        let parsed = ttf_parser::Face::parse(data, index).ok()?;
-                        cmap_coverage(&parsed)
-                    })
-                    .flatten()
-                else {
+                let parsed = db.with_face_data(face.id, |data, index| {
+                    let parsed = ttf_parser::Face::parse(data, index).ok()?;
+                    cmap_coverage(&parsed)
+                });
+                let Some(Some(cov)) = parsed else {
                     log::debug!("skipping unparseable font {}", path.display());
-                    continue;
+                    return None;
                 };
-                cov
+                (cov, false)
             },
         };
 
+        let family = face.families.first().map(|(name, _)| name.clone()).unwrap_or_default();
+        let candidate = coverage::Candidate {
+            path: path.clone(),
+            face_index: *face_index,
+            family,
+            weight: face.weight.0,
+            italic: face.style != fontdb::Style::Normal,
+            monospaced: face.monospaced,
+            bytes: stat.map_or(0, |(size, _)| size),
+        };
+        Some((path_key, *face_index, stat, candidate, cov, from_cache))
+    };
+
+    // `par_iter().collect()` preserves input order, so the scan stays
+    // deterministic with nothing carried or sorted to make it so.  A local
+    // pool rather than rayon's global one, which would keep its threads for
+    // the life of the process for a scan that runs once.
+    let scanned_faces: Vec<_> = match rayon::ThreadPoolBuilder::new().num_threads(workers).build() {
+        Ok(pool) => pool.install(|| faces.par_iter().filter_map(scan_one).collect()),
+        Err(err) => {
+            log::debug!("scanning fonts serially, thread pool unavailable: {err}");
+            faces.iter().filter_map(scan_one).collect()
+        },
+    };
+
+    // Accumulation stays serial.  One `CachedFile` holds every face of a
+    // collection, so folding per-worker fragments would have to merge those
+    // per-file maps or silently drop faces.  This is one pass over a list
+    // that is already built; parallelising it would buy nothing.
+    let mut fresh_files: HashMap<String, disk_cache::CachedFile> = HashMap::new();
+    let mut scanned = Vec::with_capacity(scanned_faces.len());
+    let mut hits = 0usize;
+    let mut any_fresh = false;
+
+    for (path_key, face_index, stat, candidate, cov, from_cache) in scanned_faces {
+        if from_cache {
+            hits += 1;
+        } else {
+            any_fresh = true;
+        }
         if let Some((size, mtime_millis)) = stat {
             fresh_files
                 .entry(path_key)
@@ -239,25 +309,15 @@ fn scan_coverage(
                 .faces
                 .insert(face_index, cov.ranges().to_vec());
         }
-
-        let family = face.families.first().map(|(name, _)| name.clone()).unwrap_or_default();
-        scanned.push((
-            coverage::Candidate {
-                path,
-                face_index,
-                family,
-                weight: face.weight.0,
-                italic: face.style != fontdb::Style::Normal,
-                monospaced: face.monospaced,
-                bytes: stat.map_or(0, |(size, _)| size),
-            },
-            cov,
-        ));
+        scanned.push((candidate, cov));
     }
 
-    // A cache that was absent or invalid produced zero hits, so every face
+    // A cache that was absent or invalid produced zero hits, so every face that parsed
     // above went through the fresh-parse branch and `any_fresh` is already
-    // true; no separate "was the cache valid" bookkeeping is needed.
+    // true; no separate "was the cache valid" bookkeeping is needed.  A face
+    // that fails to parse never reaches the loop, so a scan that is otherwise
+    // all hits writes nothing, and entries for fonts deleted since the last
+    // write survive until some face parses fresh.
     if any_fresh {
         if let Some(cache_path) = cache_path {
             disk_cache::write(cache_path, &fresh_files);
@@ -270,7 +330,7 @@ fn scan_coverage(
         started.elapsed().as_millis(),
         hits
     );
-    scanned
+    (scanned, hits)
 }
 
 /// Persists the coverage scan across launches, keyed by each font file's
@@ -1260,14 +1320,18 @@ fn gather_fallback_faces(
 #[cfg(not(unix))]
 fn cmap_coverage(face: &ttf_parser::Face) -> Option<coverage::Coverage> {
     let cmap = face.tables().cmap?;
-    let mut codepoints = Vec::new();
+    // A font's BMP and full subtables overlap heavily, so the per-subtable
+    // sets are unioned rather than concatenated.  `merge` coalesces
+    // overlapping and adjacent ranges, which concatenation would not.
+    let mut covered = coverage::Coverage::default();
     for subtable in cmap.subtables {
         if !subtable.is_unicode() {
             continue;
         }
-        subtable.codepoints(|cp| codepoints.push(cp));
+        let one = coverage::Coverage::from_ascending_walk(|emit| subtable.codepoints(emit));
+        covered.merge(&one);
     }
-    Some(coverage::Coverage::from_codepoints(codepoints))
+    Some(covered)
 }
 
 #[cfg(all(not(unix), test))]
@@ -2262,18 +2326,74 @@ mod tests {
 
     #[cfg(not(unix))]
     #[test]
-    fn coverage_cache_round_trips_across_scans() {
-        let cache_path = scratch_cache_path("round_trip");
+    fn worker_count_clamps_between_one_and_four() {
+        assert_eq!(worker_count(1), 1);
+        assert_eq!(worker_count(2), 2);
+        assert_eq!(worker_count(4), 4);
+        assert_eq!(worker_count(36), 4);
+        // `available_parallelism` cannot report zero, but a caller mapping an
+        // error to zero would reach rayon's "choose automatically" mode and
+        // escape the cap entirely.
+        assert_eq!(worker_count(0), 1);
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn a_parallel_scan_matches_a_serial_one_element_for_element() {
+        // Both runs pass `None`, so neither writes a cache the other could
+        // read back: a second scan against a populated cache takes the
+        // stored-ranges branch and parses no cmap at all.
+        let fonts = SystemFonts::with_cache_dir(None);
+        let (serial, _) = scan_coverage_with_workers(fonts.db(), None, 1);
+        let (parallel, _) = scan_coverage_with_workers(fonts.db(), None, 4);
+
+        assert_eq!(serial, parallel);
+        assert!(!serial.is_empty(), "no faces were scanned, so this proved nothing");
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn every_face_of_a_collection_file_is_a_cache_hit_on_the_second_scan() {
+        // A .ttc holds several faces behind one path, and they share one
+        // CachedFile.  Accumulating that per worker rather than serially would
+        // drop all but one worker's faces, and the only symptom would be that
+        // they reparse on every launch.
+        let cache_path = scratch_cache_path("collection_hits");
         std::fs::remove_file(&cache_path).ok();
 
         let cold_fonts = SystemFonts::with_cache_dir(None);
-        let cold = scan_coverage(cold_fonts.db(), Some(&cache_path));
-        assert!(cache_path.is_file());
+        let (cold, cold_hits) = scan_coverage_with_workers(cold_fonts.db(), Some(&cache_path), 4);
+        assert_eq!(cold_hits, 0, "a cold scan cannot hit the cache");
 
         let warm_fonts = SystemFonts::with_cache_dir(None);
-        let warm = scan_coverage(warm_fonts.db(), Some(&cache_path));
+        let (warm, warm_hits) = scan_coverage_with_workers(warm_fonts.db(), Some(&cache_path), 4);
 
         assert_eq!(cold, warm);
+
+        // Two faces of one path is the hazard this test exists for, so fail
+        // loudly on a machine that has no collection file rather than pass
+        // without exercising it.
+        let mut faces_per_path: HashMap<&PathBuf, usize> = HashMap::new();
+        for (candidate, _) in &warm {
+            *faces_per_path.entry(&candidate.path).or_default() += 1;
+        }
+        assert!(
+            faces_per_path.values().any(|&n| n > 1),
+            "no multi-face font file was scanned, so this proved nothing"
+        );
+
+        // Not every face can be cached: one whose file cannot be stat'd never
+        // reaches `fresh_files`, and one whose cmap emits a codepoint above
+        // U+10FFFF is rejected on the way back out of the cache.  Both are
+        // properties of the font set, not of the accumulation.
+        let cacheable = cold
+            .iter()
+            .filter(|(candidate, cov)| {
+                candidate.bytes > 0
+                    && coverage::Coverage::from_stored_ranges(cov.ranges().to_vec()).is_some()
+            })
+            .count();
+        assert_eq!(warm_hits, cacheable, "every cacheable face should come from the cache");
 
         std::fs::remove_file(&cache_path).ok();
     }
@@ -2549,6 +2669,42 @@ mod tests {
         assert!(is_mapped(&path), "face_coverage read the file instead of mapping it");
     }
 
+    /// The collect-and-sort construction, kept as an oracle for the fold.
+    /// If this and `cmap_coverage` ever disagree, the fold is wrong, not
+    /// this.
+    #[cfg(not(unix))]
+    fn cmap_coverage_by_sorting(face: &ttf_parser::Face) -> Option<coverage::Coverage> {
+        let cmap = face.tables().cmap?;
+        let mut codepoints = Vec::new();
+        for subtable in cmap.subtables {
+            if !subtable.is_unicode() {
+                continue;
+            }
+            subtable.codepoints(|cp| codepoints.push(cp));
+        }
+        Some(coverage::Coverage::from_codepoints(codepoints))
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn cmap_coverage_matches_the_sorting_implementation_on_every_system_face() {
+        let fonts = SystemFonts::with_cache_dir(None);
+        let db = fonts.db();
+        let mut compared = 0usize;
+        for face in db.faces() {
+            let both = db.with_face_data(face.id, |data, index| {
+                let parsed = ttf_parser::Face::parse(data, index).ok()?;
+                Some((cmap_coverage(&parsed), cmap_coverage_by_sorting(&parsed)))
+            });
+            let Some(Some((folded, sorted))) = both else {
+                continue;
+            };
+            assert_eq!(folded, sorted, "coverage differs for {:?}", face.source);
+            compared += 1;
+        }
+        assert!(compared > 0, "no system faces were parsed, so this proved nothing");
+    }
+
     /// Raw font units are in the hundreds; em fractions are not.  A face read
     /// without dividing by `units_per_em` passes every other test in this file
     /// and puts the underline several cells below the glyph.
@@ -2679,6 +2835,37 @@ mod coverage {
                 }
             }
             Self { ranges }
+        }
+
+        /// Build from a walk that emits codepoints in ascending order, folding
+        /// them into ranges as they arrive rather than sorting them afterwards.
+        ///
+        /// Every cmap format but 2 walks ascending in ttf-parser, and a
+        /// well-formed format 4/12/13 table does too, so this is the normal
+        /// path.  A walk that turns out not to be ascending is re-run
+        /// through `from_codepoints`, which is why `walk` is `Fn`: `codepoints`
+        /// has no early exit, so the first pass has to finish before the second
+        /// can start.
+        pub fn from_ascending_walk(walk: impl Fn(&mut dyn FnMut(u32))) -> Self {
+            let mut ranges: Vec<(u32, u32)> = Vec::new();
+            let mut ascending = true;
+            walk(&mut |cp| {
+                match ranges.last_mut() {
+                    Some((_, end)) if cp.checked_sub(1) == Some(*end) => *end = cp,
+                    // Equality counts: a repeat would otherwise push a range that
+                    // overlaps the one before it.  Rejecting `cp <= end` is also
+                    // what keeps `end` the maximum seen so far, which is what
+                    // makes this check total.
+                    Some((_, end)) if cp <= *end => ascending = false,
+                    _ => ranges.push((cp, cp)),
+                }
+            });
+            if ascending {
+                return Self { ranges };
+            }
+            let mut codepoints = Vec::new();
+            walk(&mut |cp| codepoints.push(cp));
+            Self::from_codepoints(codepoints)
         }
 
         /// Rebuild from ranges that were produced by `from_codepoints` and stored;
@@ -2932,6 +3119,65 @@ mod coverage {
             let mut a = Coverage::from_codepoints(vec![1, 2, 10]);
             a.merge(&Coverage::from_codepoints(vec![3, 4, 9]));
             assert_eq!(a, Coverage { ranges: vec![(1, 4), (9, 10)] });
+        }
+
+        #[test]
+        fn ascending_walk_folds_runs_into_ranges() {
+            let cov = Coverage::from_ascending_walk(|emit| {
+                for cp in [1u32, 2, 3, 10, 11, 50] {
+                    emit(cp);
+                }
+            });
+            assert_eq!(cov.ranges(), &[(1, 3), (10, 11), (50, 50)]);
+        }
+
+        #[test]
+        fn ascending_walk_matches_from_codepoints() {
+            let cps: Vec<u32> = (0..500).chain(1000..1200).chain([9000, 9001, 65535]).collect();
+            let folded = Coverage::from_ascending_walk(|emit| {
+                for &cp in &cps {
+                    emit(cp);
+                }
+            });
+            assert_eq!(folded, Coverage::from_codepoints(cps));
+        }
+
+        #[test]
+        fn ascending_walk_falls_back_when_a_codepoint_repeats() {
+            // A repeat is not a regression, but folding it blindly would push
+            // (5, 5) after a range already ending at 5 and produce an overlap.
+            let cov = Coverage::from_ascending_walk(|emit| {
+                for cp in [1u32, 2, 5, 5, 6] {
+                    emit(cp);
+                }
+            });
+            assert_eq!(cov.ranges(), &[(1, 2), (5, 6)]);
+        }
+
+        #[test]
+        fn ascending_walk_falls_back_when_the_walk_goes_backwards() {
+            let cov = Coverage::from_ascending_walk(|emit| {
+                for cp in [10u32, 11, 3, 4] {
+                    emit(cp);
+                }
+            });
+            assert_eq!(cov.ranges(), &[(3, 4), (10, 11)]);
+        }
+
+        #[test]
+        fn ascending_walk_handles_a_codepoint_at_the_top_of_the_range() {
+            // `end + 1` would overflow here; the fold compares the other way around.
+            let cov = Coverage::from_ascending_walk(|emit| {
+                emit(u32::MAX - 1);
+                emit(u32::MAX);
+            });
+            assert_eq!(cov.ranges(), &[(u32::MAX - 1, u32::MAX)]);
+        }
+
+        #[test]
+        fn ascending_walk_over_nothing_is_empty() {
+            let cov = Coverage::from_ascending_walk(|_emit| {});
+            assert_eq!(cov, Coverage::default());
         }
 
         #[test]
