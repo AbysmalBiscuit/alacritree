@@ -9696,6 +9696,14 @@ impl AlacritreeApp {
             for (target, text) in &outcome.clipboard {
                 clipboard::write(*target, text);
             }
+            // Match upstream by answering reads only from the focused visible session.
+            if focused && Some(idx) == visible_idx {
+                for (target, format) in &outcome.clipboard_reads {
+                    if let Some(text) = clipboard::read(*target) {
+                        self.sessions[idx].write(format(&text).into_bytes());
+                    }
+                }
+            }
             // The exit is the last thing the PTY will ever deliver, so a
             // session that survives it says here how to dismiss it — nothing
             // else on screen would.

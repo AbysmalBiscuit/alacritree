@@ -417,6 +417,10 @@ fn agent_name_by_cmdline(cmds: impl IntoIterator<Item = impl AsRef<str>>) -> Opt
     })
 }
 
+/// Builds the whole reply sequence from the clipboard's contents, carrying
+/// whatever prefix and terminator the request arrived with.
+pub type ClipboardFormatter = Arc<dyn Fn(&str) -> String + Send + Sync + 'static>;
+
 #[derive(Default)]
 pub struct DrainOutcome {
     /// Set if any event in this batch warrants flagging the session: BEL, or
@@ -426,6 +430,10 @@ pub struct DrainOutcome {
     /// written here so the drain — which runs once per frame for every session
     /// — stays free of OS clipboard access.
     pub clipboard: Vec<(Target, String)>,
+    /// OSC 52 read requests, answered by the caller for the same reason
+    /// copied text is written there: the drain runs once per frame for every
+    /// session and stays free of OS clipboard access.
+    pub clipboard_reads: Vec<(Target, ClipboardFormatter)>,
     /// Set on the batch that carried the child's exit.  It is the one moment a
     /// held session can be written to: the exit arrives after the child's last
     /// output, and every later frame would append the notice again.
@@ -1848,6 +1856,11 @@ fn apply_term_event(
         // acknowledgement, so dropping it leaves them reporting a successful
         // copy while the system clipboard keeps its previous contents.
         TermEvent::ClipboardStore(ty, text) => outcome.clipboard.push((clipboard_target(ty), text)),
+        // OSC 52 read.  `Term` only emits this once the config allows it, so
+        // reaching here means the user opted in.
+        TermEvent::ClipboardLoad(ty, format) => {
+            outcome.clipboard_reads.push((clipboard_target(ty), format))
+        },
         _ => {},
     }
     None
@@ -2289,6 +2302,24 @@ mod tests {
         apply_term_event(event, &mut title, false, &mut exit_status, &mut outcome);
 
         assert_eq!(outcome.clipboard, vec![(Target::Clipboard, "hello".to_owned())]);
+    }
+
+    #[test]
+    fn osc52_read_is_carried_out_for_the_caller_to_answer() {
+        let mut title = String::new();
+        let mut exit_status = None;
+        let mut outcome = DrainOutcome::default();
+        let event = TermEvent::ClipboardLoad(
+            ClipboardType::Clipboard,
+            Arc::new(|text: &str| format!("reply:{text}")),
+        );
+
+        apply_term_event(event, &mut title, false, &mut exit_status, &mut outcome);
+
+        assert_eq!(outcome.clipboard_reads.len(), 1);
+        let (target, format) = &outcome.clipboard_reads[0];
+        assert_eq!(*target, Target::Clipboard);
+        assert_eq!(format("hello"), "reply:hello");
     }
 
     /// A session with no PTY behind it, so an injected sequence is the only
