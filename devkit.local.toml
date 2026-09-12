@@ -87,6 +87,11 @@ run = ["cargo", "check", "-p", "alacritree"]
 description = "Run the alacritree tests with nextest"
 run = ["cargo", "nextest", "run", "-p", "alacritree", "--locked"]
 
+[tasks.e2e]
+description = "Run the opt-in herdr end-to-end suite against a throwaway server"
+run = ["cargo", "nextest", "run", "-p", "alacritree", "--locked",
+       "--test", "herdr_e2e", "--run-ignored", "ignored-only", "--test-threads", "1"]
+
 [tasks.build]
 description = "Build alacritree"
 run = ["cargo", "build", "-p", "alacritree", "--locked"]
