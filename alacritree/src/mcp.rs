@@ -1,7 +1,7 @@
 //! `alacritree mcp` — a Model Context Protocol server over stdio.
 //!
 //! Bridges MCP tool calls to a running alacritree instance through the IPC
-//! socket (see `ipc.rs`), so an LLM can inspect projects/worktrees, drive
+//! socket (see `ipc/protocol.rs`), so an LLM can inspect projects/worktrees, drive
 //! terminal sessions, and read their output.  Register it with e.g.
 //! `claude mcp add alacritree -- alacritree mcp`.  An MCP client launches this
 //! outside any session, so it usually has no `ALACRITREE_SOCKET` to inherit and
@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::ipc::{self, IpcRequest};
+use crate::ipc::protocol::{self, IpcRequest};
 
 pub fn run(socket: Option<PathBuf>) {
     let stdin = std::io::stdin();
@@ -97,7 +97,7 @@ fn tool_call_response(id: Value, params: Option<&Value>, socket: Option<&Path>) 
         Err(e) => return error_response(id, -32602, &format!("invalid tool call: {e}")),
     };
 
-    match ipc::send_request(socket, &request, timeout_for(&request)) {
+    match protocol::send_request(socket, &request, timeout_for(&request)) {
         Ok(value) => {
             let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
             result_response(id, json!({ "content": [{ "type": "text", "text": text }] }))

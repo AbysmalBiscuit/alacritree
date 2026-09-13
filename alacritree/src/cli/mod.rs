@@ -22,7 +22,7 @@ use std::time::Duration;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 
-use crate::ipc::{self, IpcRequest, SendError};
+use crate::ipc::protocol::{self, IpcRequest, SendError};
 
 /// Redistributing the embedded subset obliges us to carry its notice, and
 /// installation copies only the executable — so the text ships inside it.
@@ -471,7 +471,7 @@ fn dispatch(
     socket: Option<&Path>,
     config: ConfigSource<'_>,
 ) -> Result<serde_json::Value, SendError> {
-    match ipc::send_request(socket, request, timeout_for(request)) {
+    match protocol::send_request(socket, request, timeout_for(request)) {
         Err(SendError::NoInstance) => {
             // Serving the request ourselves means resolving `[general]
             // state_dir` the way the window does, or we answer from a file
@@ -807,7 +807,7 @@ mod tests {
     #[test]
     fn a_running_app_answers_instead_of_the_offline_path() {
         let (socket, requests) =
-            ipc::listen_for_test("cli-online", crate::repaint::Recorder::default())
+            crate::ipc::server::listen_for_test("cli-online", crate::repaint::Recorder::default())
                 .expect("listener");
 
         let app = std::thread::spawn(move || {
@@ -834,7 +834,7 @@ mod tests {
         let dead = std::env::temp_dir().join("alacritree-not-listening.sock");
 
         let result =
-            ipc::send_request(Some(&dead), &IpcRequest::ListProjects, Duration::from_secs(5));
+            protocol::send_request(Some(&dead), &IpcRequest::ListProjects, Duration::from_secs(5));
 
         assert_eq!(result, Err(SendError::NoInstance));
     }
