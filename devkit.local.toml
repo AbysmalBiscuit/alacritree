@@ -60,16 +60,7 @@ args = ["clippy"]
 reason = "Without --no-deps clippy lints the vendored crates, which are #![deny(clippy::all)] and cannot be edited here. Run `devkit run task clippy`."
 
 [hooks]
-# Doppler scopes are keyed by absolute path, so a fresh worktree matches none and
-# every `doppler run` that omits -p fails until someone runs setup by hand —
-# `bun run dev` included. Setup at the worktree root reads the repo's doppler.yaml
-# and writes a scope per mapped path. Idempotent.
 after_worktree_create = [
-    # The sidebar lists worktrees under the project they hang off, so the
-    # refresh names the checkout rather than `.`, which is the worktree that
-    # was just created and is not a project. The climb counts the slug's
-    # segments because a slug carrying a slash nests that much deeper, and it
-    # lands beside the checkout because `worktree_root` is its sibling.
     [
         "alacritree",
         "project",
@@ -81,9 +72,6 @@ after_worktree_create = [
         "add",
         "{{ worktree }}",
     ],
-    # `open` rather than `new`: a workspace comes with a shell tab already, and
-    # `new` with no agent named falls back to an interactive picker, which a
-    # hook running with no stdin cannot answer.
     [
         "{{ herdr_session }}",
         "open",
@@ -92,11 +80,6 @@ after_worktree_create = [
     ],
 ]
 
-# Herdr keeps a workspace per checkout, and nothing prunes the one belonging to a
-# worktree that is gone. Its shells stay put, so the kernel reports their cwd as
-# `<path> (deleted)`, which is the only handle left once git has pruned the
-# checkout: strip the marker and every pane at or under the path names the
-# workspace to close. A dead Herdr prints nothing and closes nothing.
 after_worktree_remove = [
     [
         "{{ herdr_session }}",
