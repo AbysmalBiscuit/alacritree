@@ -140,6 +140,13 @@ so the panel stays responsive even on large repos. A faster cheap path
 (`dirty_counts`) is used by the delete modal — it skips the branch-diff work
 and just counts what `git worktree remove` would reject.
 
+Clicking a file opens its diff in a pane, and clicking it again closes the
+pane. `[integrations.diff_viewer]` picks what that pane runs: delta by default,
+tuicr for a review whose comments agents can read, or a custom command. With
+`section_buttons = true` each section header also gets a button that opens the
+whole section at once; the `ReviewStaged`, `ReviewUnstaged` and `ReviewBranch`
+actions do the same from the palette or a key binding.
+
 ### Per-worktree base branch
 
 The git panel diffs each worktree against an automatically picked base: the

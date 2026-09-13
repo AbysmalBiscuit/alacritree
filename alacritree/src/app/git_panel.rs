@@ -3,7 +3,9 @@
 //! its rows open.
 
 use super::*;
-use crate::diff_viewer::{self, DiffRequest, DiffSource, Launch, Program, Target, diff_key};
+use crate::diff_viewer::{
+    self, DiffRequest, DiffSource, Launch, Program, Section, Target, diff_key,
+};
 use crate::tools::{self, Tool};
 
 /// The toggle identities the git panel accepts: modified, deleted, untracked.
@@ -62,6 +64,12 @@ struct GitSidebarView {
     staged_visible: HashSet<String>,
     unstaged_visible: HashSet<String>,
     branch_visible: HashSet<String>,
+    /// The section header button's label.
+    review_label: String,
+    /// The whole-section review each header offers, when enabled and available.
+    staged_review: Option<Target>,
+    unstaged_review: Option<Target>,
+    branch_review: Option<Target>,
     cursor_row: Option<git_nav::GitRow>,
     cursor_moved: bool,
 }
@@ -317,6 +325,17 @@ impl AlacritreeApp {
         // the cursor's Enter-to-diff matches the branch section's rows.
         let git_branch_base =
             status.default_branch_resolved.clone().or_else(|| status.default_branch.clone());
+        let diff_viewer = &self.config.integrations.diff_viewer;
+        let review = |section: Section| {
+            let target = Target::Section(section);
+            (diff_viewer.section_buttons && diff_viewer::opens(&diff_viewer.viewer, &target))
+                .then_some(target)
+        };
+        let staged_review = review(Section::Staged);
+        let unstaged_review = review(Section::Unstaged);
+        let branch_review =
+            git_branch_base.clone().and_then(|base| review(Section::Branch { base }));
+        let review_label = diff_viewer.button_icon.clone();
         let filtering = self.git_panel.filter.is_filtering();
         let filtered = self.filtered_git_rows(&status);
         let staged_count = filtered.staged;
@@ -372,6 +391,10 @@ impl AlacritreeApp {
             staged_visible,
             unstaged_visible,
             branch_visible,
+            review_label,
+            staged_review,
+            unstaged_review,
+            branch_review,
             cursor_row,
             cursor_moved,
         })
@@ -654,28 +677,41 @@ fn paint_staged_section(
     requests: &mut GitSidebarRequests,
     section_gap: &mut f32,
 ) {
-    section(ui, &view.theme, "Staged", &view.staged_count, view.filtering, section_gap, |ui| {
-        for file in &view.status.staged {
-            if !view.staged_visible.contains(&file.path) {
-                continue;
+    let review = ReviewButton::for_target(view, view.staged_review.as_ref());
+    let clicked = section(
+        ui,
+        &view.theme,
+        "Staged",
+        &view.staged_count,
+        view.filtering,
+        section_gap,
+        review,
+        |ui| {
+            for file in &view.status.staged {
+                if !view.staged_visible.contains(&file.path) {
+                    continue;
+                }
+                let request = DiffRequest { file: file.path.clone(), source: DiffSource::Staged };
+                let is_active = view.active_diff_key.as_deref() == Some(&diff_key(&request));
+                let response = file_row(ui, file, &view.theme, is_active);
+                if response.clicked() {
+                    requests.diff = Some(Target::Row(request));
+                }
+                paint_git_row_cursor(
+                    ui,
+                    &response,
+                    &view.cursor_row,
+                    GitSection::Staged,
+                    &file.path,
+                    view.cursor_moved,
+                    &view.theme,
+                );
             }
-            let request = DiffRequest { file: file.path.clone(), source: DiffSource::Staged };
-            let is_active = view.active_diff_key.as_deref() == Some(&diff_key(&request));
-            let response = file_row(ui, file, &view.theme, is_active);
-            if response.clicked() {
-                requests.diff = Some(Target::Row(request));
-            }
-            paint_git_row_cursor(
-                ui,
-                &response,
-                &view.cursor_row,
-                GitSection::Staged,
-                &file.path,
-                view.cursor_moved,
-                &view.theme,
-            );
-        }
-    });
+        },
+    );
+    if clicked {
+        requests.diff = view.staged_review.clone();
+    }
 }
 
 fn paint_unstaged_section(
@@ -684,29 +720,42 @@ fn paint_unstaged_section(
     requests: &mut GitSidebarRequests,
     section_gap: &mut f32,
 ) {
-    section(ui, &view.theme, "Unstaged", &view.unstaged_count, view.filtering, section_gap, |ui| {
-        for file in &view.status.unstaged {
-            if !view.unstaged_visible.contains(&file.path) {
-                continue;
+    let review = ReviewButton::for_target(view, view.unstaged_review.as_ref());
+    let clicked = section(
+        ui,
+        &view.theme,
+        "Unstaged",
+        &view.unstaged_count,
+        view.filtering,
+        section_gap,
+        review,
+        |ui| {
+            for file in &view.status.unstaged {
+                if !view.unstaged_visible.contains(&file.path) {
+                    continue;
+                }
+                let source = unstaged_diff_source(Some(file.kind));
+                let request = DiffRequest { file: file.path.clone(), source };
+                let is_active = view.active_diff_key.as_deref() == Some(&diff_key(&request));
+                let response = file_row(ui, file, &view.theme, is_active);
+                if response.clicked() {
+                    requests.diff = Some(Target::Row(request));
+                }
+                paint_git_row_cursor(
+                    ui,
+                    &response,
+                    &view.cursor_row,
+                    GitSection::Unstaged,
+                    &file.path,
+                    view.cursor_moved,
+                    &view.theme,
+                );
             }
-            let source = unstaged_diff_source(Some(file.kind));
-            let request = DiffRequest { file: file.path.clone(), source };
-            let is_active = view.active_diff_key.as_deref() == Some(&diff_key(&request));
-            let response = file_row(ui, file, &view.theme, is_active);
-            if response.clicked() {
-                requests.diff = Some(Target::Row(request));
-            }
-            paint_git_row_cursor(
-                ui,
-                &response,
-                &view.cursor_row,
-                GitSection::Unstaged,
-                &file.path,
-                view.cursor_moved,
-                &view.theme,
-            );
-        }
-    });
+        },
+    );
+    if clicked {
+        requests.diff = view.unstaged_review.clone();
+    }
 }
 
 fn paint_branch_section(
@@ -725,9 +774,8 @@ fn paint_branch_section(
     let count_label = section_count_label(&view.branch_count, view.filtering);
 
     ui.add_space(std::mem::take(section_gap));
-    // Open-coded section header so the PR number can be a
-    // hyperlink while the rest stays plain text.
-    ui.horizontal(|ui| {
+    let review = ReviewButton::for_target(view, view.branch_review.as_ref());
+    let clicked = section_header(ui, &view.theme, review, |ui| {
         ui.label(RichText::new(&base_label).color(view.theme.text).strong().small());
         if let Some(pr) = &view.pr_info {
             ui.label(RichText::new("·").color(view.theme.text_muted).small());
@@ -741,6 +789,9 @@ fn paint_branch_section(
         }
         ui.label(RichText::new(count_label).color(view.theme.text_muted).small());
     });
+    if clicked {
+        requests.diff = view.branch_review.clone();
+    }
     ui.add_space(2.0);
     for stat in &view.status.branch_diff {
         if !view.branch_visible.contains(&stat.path) {
@@ -777,7 +828,49 @@ fn paint_branch_section(
     }
 }
 
+struct ReviewButton<'a> {
+    label: &'a str,
+    active: bool,
+}
+
+impl<'a> ReviewButton<'a> {
+    fn for_target(view: &'a GitSidebarView, target: Option<&Target>) -> Option<Self> {
+        let target = target?;
+        let active = view.active_diff_key.as_deref() == Some(target.key().as_str());
+        Some(Self { label: &view.review_label, active })
+    }
+}
+
+fn section_header(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    review: Option<ReviewButton>,
+    leading: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    let Some(button) = review else {
+        ui.horizontal(leading);
+        return false;
+    };
+    let mut clicked = false;
+    row_with_trailing(ui, leading, |ui| {
+        let color = if button.active { theme.text } else { theme.text_muted };
+        let response = icon_tooltip(
+            ui.add(
+                egui::Label::new(RichText::new(button.label).color(color).small())
+                    .selectable(false)
+                    .sense(egui::Sense::click()),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand),
+            "Review this section in the diff viewer",
+            theme.icon_tooltips,
+        );
+        clicked = response.clicked();
+    });
+    clicked
+}
+
 /// Render a git section, skipping empty content and avoiding trailing spacing.
+#[allow(clippy::too_many_arguments)]
 fn section<R>(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -785,20 +878,22 @@ fn section<R>(
     count: &SectionCount,
     filtering: bool,
     gap: &mut f32,
+    review: Option<ReviewButton>,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
-) {
+) -> bool {
     if count.total == 0 {
-        return;
+        return false;
     }
     ui.add_space(std::mem::take(gap));
     let label = section_count_label(count, filtering);
-    ui.horizontal(|ui| {
+    let clicked = section_header(ui, theme, review, |ui| {
         ui.label(RichText::new(title).color(theme.text).strong().small());
         ui.label(RichText::new(label).color(theme.text_muted).small());
     });
     ui.add_space(2.0);
     add_contents(ui);
     *gap = 10.0;
+    clicked
 }
 
 pub(super) fn file_row(
@@ -1037,9 +1132,23 @@ impl AlacritreeApp {
                 // wait for whatever repaint happened to come next.
                 ctx.request_repaint();
             },
+            NamedAction::ReviewStaged | NamedAction::ReviewUnstaged | NamedAction::ReviewBranch => {
+                if let Some(section) = review_section(action, self.cached_branch_base().as_deref())
+                {
+                    self.open_diff(ctx, Target::Section(section));
+                }
+            },
             _ => return false,
         }
         true
+    }
+
+    /// The base resolved by the latest status, so ReviewBranch works while the
+    /// git sidebar is hidden.
+    fn cached_branch_base(&self) -> Option<String> {
+        let path = self.active_session_path()?;
+        let status = self.git_panel.status.get(&path)?.last();
+        status.default_branch_resolved.clone().or_else(|| status.default_branch.clone())
     }
 
     pub(super) fn dispatch_git_filter(&mut self, action: NamedAction) -> bool {
@@ -1057,6 +1166,16 @@ pub(super) fn git_filter_identity(action: NamedAction) -> Option<char> {
         NamedAction::ToggleModifiedFilter => Some('m'),
         NamedAction::ToggleDeletedFilter => Some('d'),
         NamedAction::ToggleUntrackedFilter => Some('u'),
+        _ => None,
+    }
+}
+
+/// The section a Review action opens. The branch section needs a known base.
+pub(super) fn review_section(action: NamedAction, base: Option<&str>) -> Option<Section> {
+    match action {
+        NamedAction::ReviewStaged => Some(Section::Staged),
+        NamedAction::ReviewUnstaged => Some(Section::Unstaged),
+        NamedAction::ReviewBranch => Some(Section::Branch { base: base?.to_string() }),
         _ => None,
     }
 }
@@ -1170,6 +1289,72 @@ fn paint_row_bg(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diff_viewer::{Section, Templates, Viewer};
+
+    #[test]
+    fn a_review_action_names_its_section_and_the_branch_needs_a_base() {
+        assert_eq!(review_section(NamedAction::ReviewStaged, None), Some(Section::Staged));
+        assert_eq!(review_section(NamedAction::ReviewUnstaged, None), Some(Section::Unstaged));
+        assert_eq!(review_section(NamedAction::ReviewBranch, None), None);
+        assert_eq!(
+            review_section(NamedAction::ReviewBranch, Some("main")),
+            Some(Section::Branch { base: "main".to_string() })
+        );
+        assert_eq!(review_section(NamedAction::Paste, Some("main")), None);
+    }
+
+    /// An app whose current workspace shows a diff pane under `key`. The
+    /// session is never spawned, so no viewer runs.
+    fn app_with_diff_pane(key: &str) -> AlacritreeApp {
+        let workspace = PathBuf::from("C:/repo/wt");
+        let (_, notify_rx) = std::sync::mpsc::channel();
+        let mut app = AlacritreeApp::from_parts(
+            Config::default(),
+            Theme::from_config(&Config::default()),
+            crate::state::PersistedState::default(),
+            Vec::new(),
+            (Vec::new(), crate::fonts::FaceMetrics::default()),
+            notify_rx,
+            (None, None),
+        );
+        app.config.ui.last_session_close = crate::config::LastSessionClose::Navigate;
+        let (session, _) = Session::pending_command(
+            Context::default(),
+            &app.config,
+            Some(workspace.clone()),
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            "git".to_string(),
+            Vec::new(),
+            "diff".to_string(),
+            SessionKind::Diff { key: key.to_string() },
+        );
+        app.sessions.push(session);
+        app.current_workspace = Some(workspace);
+        app
+    }
+
+    fn has_diff_pane(app: &AlacritreeApp) -> bool {
+        app.sessions.iter().any(|s| matches!(s.kind, SessionKind::Diff { .. }))
+    }
+
+    #[test]
+    fn choosing_the_open_section_again_closes_its_pane() {
+        let mut app = app_with_diff_pane("section:staged");
+        app.open_diff(&Context::default(), Target::Section(Section::Staged));
+        assert!(!has_diff_pane(&app));
+    }
+
+    #[test]
+    fn a_section_the_viewer_cannot_open_leaves_the_open_pane_alone() {
+        let mut app = app_with_diff_pane("staged:a.rs");
+        app.config.integrations.diff_viewer.viewer = Viewer::Direct {
+            program: Program::Custom { path: "difft".to_string(), wsl_path: None },
+            templates: Templates::default(),
+        };
+        app.open_diff(&Context::default(), Target::Section(Section::Staged));
+        assert!(has_diff_pane(&app));
+    }
 
     #[test]
     fn base_branch_precedence_is_override_then_pr_then_default() {
