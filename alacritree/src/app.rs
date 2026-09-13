@@ -12835,6 +12835,7 @@ mod tests {
         use super::*;
         use crate::osc_tap::OscEvent;
         use alacritty_terminal::event::Event as TermEvent;
+        use alacritty_terminal::term::ClipboardType;
 
         thread_local! {
             pub(crate) static TOASTS: std::cell::RefCell<Vec<String>> = const {
@@ -12900,6 +12901,32 @@ mod tests {
         }
 
         #[test]
+        fn osc52_reads_are_refused_when_the_session_is_unfocused_or_hidden() {
+            for (visibility, label) in [
+                (Visibility::VisibleAndUnfocused, "unfocused"),
+                (Visibility::Hidden, "hidden"),
+            ] {
+                let mut app = notification_app();
+                let answered = Arc::new(Mutex::new(false));
+                let answered_by_formatter = Arc::clone(&answered);
+                let formatter: session::ClipboardFormatter = Arc::new(move |_text| {
+                    *answered_by_formatter.lock().expect("formatter marker") = true;
+                    "reply".to_string()
+                });
+                app.term_tx
+                    .send(TermEvent::ClipboardLoad(ClipboardType::Clipboard, formatter))
+                    .expect("send clipboard request");
+
+                app.drain(visibility);
+
+                assert!(
+                    !*answered.lock().expect("formatter marker"),
+                    "a {label} session answered"
+                );
+            }
+        }
+
+        #[test]
         fn a_visible_session_keeps_notification_text_it_gets_no_toast_for() {
             let mut app = notification_app();
             app.deliver_notification("build failed", Visibility::VisibleAndFocused);
@@ -12910,7 +12937,7 @@ mod tests {
         }
 
         #[test]
-        fn notifications_to_a_latched_session_each_toast_after_debounce() {
+    fn notifications_to_a_latched_session_each_toast_after_debounce() {
             let mut app = notification_app();
             app.app.config.ui.attention_grace = Duration::from_secs(60);
             app.deliver_notification("build started", Visibility::Hidden);
@@ -13099,6 +13126,38 @@ mod tests {
             assert!(outcome.notifications.is_none());
             assert!(!outcome.attention);
             assert!(app.app.sessions[0].last_notification.is_some());
+        }
+    }
+
+    #[test]
+    fn session_notification_reaches_the_sidebar_hover_tooltip() {
+        let mut app = test_app();
+        app.sessions[0].last_notification = Some("build failed".to_string());
+
+        for (mode, want) in [
+            (SidebarTooltips::Off, false),
+            (SidebarTooltips::Elided, false),
+            (SidebarTooltips::Always, true),
+        ] {
+            app.config.ui.sidebar_tooltips = mode;
+            let theme = Theme::from_config(&app.config);
+            let listed = app.listed_workspace_rows();
+            let row = app
+                .workspace_rows(&None, &listed)
+                .into_iter()
+                .find_map(|row| match row {
+                    WorkspaceRowData::Session(row) => Some(row),
+                    WorkspaceRowData::Herdr(_) => None,
+                })
+                .expect("the test session row");
+
+            assert_eq!(row.last_notification.as_deref(), Some("build failed"));
+            let icons = crate::config::Icons::default();
+            let texts = texts_while_hovering(140.0, |ui| {
+                session_row(ui, &row, false, false, false, &icons, &theme);
+            });
+            let shown = texts.iter().flatten().any(|(text, _)| text == "shell\nbuild failed");
+            assert_eq!(shown, want, "{mode:?}: {texts:?}");
         }
     }
 

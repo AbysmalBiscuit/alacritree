@@ -2392,6 +2392,61 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn osc7_from_a_real_pty_updates_the_reported_cwd() {
+        let mut config = Config::default();
+        config.env.insert("TERM".to_string(), "xterm-256color".to_string());
+        config.vt.report_cwd = true;
+
+        let expected = std::env::temp_dir().join(format!("alacritree-osc7-{}", std::process::id()));
+        #[cfg(unix)]
+        let (program, args) = (
+            "/bin/sh".to_string(),
+            vec![
+                "-c".to_string(),
+                format!("printf '\\033]7;file://localhost{}\\007'; sleep 30", expected.display()),
+            ],
+        );
+        #[cfg(windows)]
+        let (program, args) = {
+            let url_path = expected.to_string_lossy().replace('\\', "/");
+            (
+                "powershell".to_string(),
+                vec![
+                    "-NoProfile".to_string(),
+                    "-Command".to_string(),
+                    format!(
+                        "[Console]::Out.Write([char]27 + ']7;file://localhost/{url_path}' + [char]7); Start-Sleep -Seconds 30"
+                    ),
+                ],
+            )
+        };
+
+        let mut session = Session::spawn_command(
+            egui::Context::default(),
+            &config,
+            std::env::current_dir().ok(),
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            program,
+            args,
+            "osc7 probe".to_string(),
+            SessionKind::Shell,
+        )
+        .expect("spawn OSC 7 probe");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            session.drain_events(&config.palette);
+            if session.reported_cwd.as_ref() == Some(&expected) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "OSC 7 was not drained: {:?}", session.reported_cwd);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// OSC 52 is how Claude Code, tmux and vim copy.  The sequence is
     /// fire-and-forget — the app reports a successful copy either way — so a
     /// dropped `ClipboardStore` shows up only as a stale paste later.  Drives
@@ -2412,6 +2467,29 @@ pub(crate) mod tests {
         apply_term_event(event, &mut title, false, &mut exit_status, &mut outcome);
 
         assert_eq!(outcome.clipboard, vec![(Target::Clipboard, "hello".to_owned())]);
+    }
+
+    #[test]
+    fn osc52_read_is_refused_by_default_before_the_drain() {
+        let config = Config::default();
+        let (session, _) = Session::pending_shell(
+            egui::Context::default(),
+            &config,
+            None,
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            None,
+            None,
+            None,
+        );
+
+        {
+            let mut term = session.term.lock();
+            Processor::<StdSyncHandler>::new().advance(&mut *term, b"\x1b]52;c;?\x07");
+        }
+
+        let outcome = session.drain_events(&config.palette);
+        assert!(outcome.clipboard_reads.is_empty());
     }
 
     #[test]
@@ -2830,6 +2908,29 @@ pub(crate) mod tests {
         assert!(outcome.attention);
         assert_eq!(exit_status, Some(status));
         assert_eq!(title, "diff: src/app.rs");
+    }
+
+    #[test]
+    fn child_exit_clears_osc_visual_state_without_clearing_other_state() {
+        let mut session = pty_less_probe(SessionKind::Shell, "shell");
+        session.progress = Some(osc_tap::Progress::Set(42));
+        session.pointer_shape = Some(egui::CursorIcon::Wait);
+        session.last_notification = Some("build failed".to_string());
+        session.needs_attention = true;
+        session.pending_attention = Some(Instant::now());
+
+        let (sender, receiver) = mpsc::channel();
+        session.events = receiver;
+        sender.send(TermEvent::ChildExit(clean_status())).unwrap();
+
+        let outcome = session.drain_events(&Palette::default());
+
+        assert!(outcome.exited);
+        assert_eq!(session.progress, None);
+        assert_eq!(session.pointer_shape, None);
+        assert_eq!(session.last_notification.as_deref(), Some("build failed"));
+        assert!(session.needs_attention);
+        assert!(session.pending_attention.is_some());
     }
 
     /// A refused herdr attach exits non-zero; an ordinary shell the user
