@@ -2189,14 +2189,8 @@ impl AlacritreeApp {
         };
         let helper_enabled = wsl_helper::enabled();
         let report_cwd = self.config.vt.report_cwd;
-        let default_distro = default_wsl_distro_for_argv(
-            &profile.program,
-            &profile.args,
-            helper_enabled,
-            report_cwd,
-        );
         let (shell, wsl_probe, wsl_distro) =
-            profile_session_shell(profile, helper_enabled, report_cwd, default_distro.as_deref());
+            profile_session_shell(profile, helper_enabled, report_cwd, None);
         self.spawn_session_with_shell(ctx, ws.clone(), ws, shell, wsl_probe, wsl_distro)
     }
 
@@ -2224,8 +2218,10 @@ impl AlacritreeApp {
         let helper_enabled = wsl_helper::enabled();
         let report_cwd = self.config.vt.report_cwd;
         let distros = wsl::distros();
-        let default_distro = distros.iter().find(|d| d.is_default).map(|d| d.name.clone());
-        let known: Vec<String> = distros.into_iter().map(|d| d.name).collect();
+        let default_distro = report_cwd
+            .then(|| distros.iter().find(|d| d.is_default).map(|d| d.name.as_str()))
+            .flatten();
+        let known: Vec<String> = distros.iter().map(|d| d.name.clone()).collect();
         match shell_decision(
             choice.as_ref(),
             location_distro.as_deref(),
@@ -2233,12 +2229,9 @@ impl AlacritreeApp {
             &self.config.profiles,
             self.config.default_profile.as_deref(),
         ) {
-            ShellDecision::ConfigShell => config_session_shell(
-                &self.config,
-                helper_enabled,
-                report_cwd,
-                default_distro.as_deref(),
-            ),
+            ShellDecision::ConfigShell => {
+                config_session_shell(&self.config, helper_enabled, report_cwd, default_distro)
+            },
             // A WSL decision comes from the project override or the actual
             // directory being launched, which may be a reported sibling path.
             ShellDecision::WslDistro(distro) => match directory.or(path) {
@@ -2246,12 +2239,9 @@ impl AlacritreeApp {
                 None => (None, None, None),
             },
             ShellDecision::Profile(name) => match self.config.profile(&name) {
-                Some(profile) => profile_session_shell(
-                    profile,
-                    helper_enabled,
-                    report_cwd,
-                    default_distro.as_deref(),
-                ),
+                Some(profile) => {
+                    profile_session_shell(profile, helper_enabled, report_cwd, default_distro)
+                },
                 None => (None, None, None),
             },
         }
@@ -6278,20 +6268,6 @@ fn wsl_session_shell(
     )
 }
 
-/// Resolve the default distro only for a recognized bare WSL launch.
-fn default_wsl_distro_for_argv(
-    program: &str,
-    args: &[String],
-    helper_enabled: bool,
-    report_cwd: bool,
-) -> Option<String> {
-    if !helper_enabled && !report_cwd {
-        return None;
-    }
-    let (_, distro) = wsl_helper::wrap_profile_argv(program, args, "")?;
-    distro.or_else(|| wsl::distros().into_iter().find(|d| d.is_default).map(|d| d.name))
-}
-
 /// Return the launch context for recognized WSL argv. Exotic argv stays raw
 /// and its distro stays unknown.
 fn wsl_argv_context(
@@ -6306,7 +6282,11 @@ fn wsl_argv_context(
     }
     let key = wsl_helper::new_probe_key();
     let (args, distro) = wsl_helper::wrap_profile_argv(program, args, &key)?;
-    let distro = distro.or_else(|| default_distro.map(str::to_owned))?;
+    let distro = distro.or_else(|| default_distro.map(str::to_owned)).or_else(|| {
+        (helper_enabled || report_cwd)
+            .then(|| wsl::distros().into_iter().find(|d| d.is_default).map(|d| d.name))
+            .flatten()
+    })?;
     if !helper_enabled {
         return Some((None, None, report_cwd.then_some(distro)));
     }

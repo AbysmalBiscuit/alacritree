@@ -1505,11 +1505,13 @@ impl Session {
     ) -> (Self, OpenRequest) {
         let pty_cwd = pty_working_directory(working_directory.clone(), config);
         let window_size = window_size(size, cell_size);
-        let wsl_distro = wsl_distro
-            .filter(|_| config.vt.report_cwd)
-            .or_else(|| wsl_probe.as_ref().map(|probe| probe.distro.clone()));
+        let wsl_distro = if config.vt.report_cwd {
+            wsl_distro.or_else(|| wsl_probe.as_ref().map(|probe| probe.distro.clone()))
+        } else {
+            None
+        };
 
-        let shell_platform = if wsl_distro.is_some() || cfg!(unix) {
+        let shell_platform = if wsl_distro.is_some() || wsl_probe.is_some() || cfg!(unix) {
             osc_tap::ShellPlatform::Unix
         } else {
             osc_tap::ShellPlatform::Windows
@@ -2446,6 +2448,8 @@ pub(crate) mod tests {
         for (report_cwd, expected) in [(false, None), (true, Some("Ubuntu"))] {
             let mut config = Config::default();
             config.vt.report_cwd = report_cwd;
+            let probe = (!report_cwd)
+                .then(|| WslProbe { distro: "Ubuntu".into(), key: "test-probe".into() });
             let (session, _) = Session::pending_shell(
                 egui::Context::default(),
                 &config,
@@ -2454,10 +2458,11 @@ pub(crate) mod tests {
                 (8.0, 16.0),
                 Some(Shell::new("wsl.exe".into(), Vec::new())),
                 Some("Ubuntu".into()),
-                None,
+                probe,
             );
 
             assert_eq!(session.wsl_distro(), expected);
+            assert_eq!(session.wsl_probe.is_some(), !report_cwd);
         }
     }
 
