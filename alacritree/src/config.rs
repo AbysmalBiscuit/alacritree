@@ -21,6 +21,7 @@ use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle, Rgb};
 use egui::Color32;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use strum::{EnumIter, IntoEnumIterator, IntoStaticStr};
 
 use crate::bindings::{self, KeyBinding};
 use crate::path_style::PathStyle;
@@ -354,7 +355,8 @@ pub struct Palette {
 /// When the sidebar's per-session `×` asks before killing the PTY.
 /// Confirmations otherwise exist only at worktree/app level, so the
 /// default keeps session close immediate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum ConfirmSessionClose {
     #[default]
     Never,
@@ -374,22 +376,11 @@ impl ConfirmSessionClose {
     }
 }
 
-fn parse_confirm_session_close(raw: &str) -> ConfirmSessionClose {
-    match raw {
-        "never" => ConfirmSessionClose::Never,
-        "busy" => ConfirmSessionClose::Busy,
-        "always" => ConfirmSessionClose::Always,
-        other => {
-            log::warn!("unknown ui.confirm_session_close value {other:?}, using \"never\"");
-            ConfirmSessionClose::default()
-        },
-    }
-}
-
 /// `[ui.drop] quote` as written in the config.  The five concrete modes are
 /// ported from wezterm's `quote_dropped_files` so an existing wezterm config
 /// carries over unchanged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum Quoting {
     /// Decide per session: a path headed into a distro is a POSIX shell word
     /// no matter what the host OS is.
@@ -446,21 +437,6 @@ impl ShellQuoting {
             },
             Self::WindowsAlwaysQuoted => format!("\"{path}\""),
         }
-    }
-}
-
-fn parse_quoting(raw: &str) -> Quoting {
-    match raw {
-        "auto" => Quoting::Auto,
-        "none" => Quoting::None,
-        "spaces_only" => Quoting::SpacesOnly,
-        "posix" => Quoting::Posix,
-        "windows" => Quoting::Windows,
-        "windows_always_quoted" => Quoting::WindowsAlwaysQuoted,
-        other => {
-            log::warn!("unknown ui.drop.quote value {other:?}, using \"auto\"");
-            Quoting::default()
-        },
     }
 }
 
@@ -554,7 +530,8 @@ pub struct IntegrationsConfig {
 }
 
 /// What opening a herdr agent row attaches to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum AttachMode {
     /// The agent's own pane.
     #[default]
@@ -563,22 +540,12 @@ pub enum AttachMode {
     Session,
 }
 
-fn parse_attach_mode(raw: &str) -> AttachMode {
-    match raw {
-        "agent" => AttachMode::Agent,
-        "session" => AttachMode::Session,
-        other => {
-            log::warn!("unknown integrations.herdr.attach value {other:?}, using \"agent\"");
-            AttachMode::default()
-        },
-    }
-}
-
 /// Whether a focus change made inside herdr may move alacritree, and from
 /// which sessions.  Following moves the keyboard, so the default is the
 /// narrower rule: only a session that is already showing herdr's view
 /// follows it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum FollowFocus {
     /// herdr never moves alacritree.  alacritree still tells herdr where to
     /// point when the user picks a row.
@@ -588,18 +555,6 @@ pub enum FollowFocus {
     Herdr,
     /// Follow from a native session too, on any reachable side.
     Always,
-}
-
-fn parse_follow_focus(raw: &str) -> FollowFocus {
-    match raw {
-        "off" => FollowFocus::Off,
-        "herdr" => FollowFocus::Herdr,
-        "always" => FollowFocus::Always,
-        other => {
-            log::warn!("unknown integrations.herdr.follow_focus value {other:?}, using \"herdr\"");
-            FollowFocus::default()
-        },
-    }
 }
 
 /// `[integrations.herdr]`: whether alacritree lists agents running under a
@@ -653,7 +608,8 @@ pub fn default_image_dir() -> PathBuf {
 }
 
 /// How the sidebar scroll areas draw their scrollbar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum ScrollbarStyle {
     /// egui's default: a thin bar overlaying the content edge, expanding on
     /// hover — which covers the icons at the right end of sidebar rows.
@@ -661,29 +617,6 @@ pub enum ScrollbarStyle {
     Floating,
     /// A reserved gutter right of the content; the bar never covers icons.
     Solid,
-}
-
-fn parse_scrollbar(raw: &str) -> ScrollbarStyle {
-    match raw {
-        "floating" => ScrollbarStyle::Floating,
-        "solid" => ScrollbarStyle::Solid,
-        other => {
-            log::warn!("unknown ui.scrollbar value {other:?}, using \"floating\"");
-            ScrollbarStyle::default()
-        },
-    }
-}
-
-fn parse_path_style(raw: &str) -> PathStyle {
-    match raw {
-        "full" => PathStyle::Full,
-        "fish" => PathStyle::Fish,
-        "zed" => PathStyle::Zed,
-        other => {
-            log::warn!("unknown ui.path_style value {other:?}, using \"full\"");
-            PathStyle::default()
-        },
-    }
 }
 
 fn text_emphasis(raw: &RawTextEmphasis) -> TextEmphasis {
@@ -795,7 +728,8 @@ baked_glyphs! {
 
 /// What happens when the on-screen workspace stops having sessions, whether a
 /// close or a worktree deletion took the last one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum LastSessionClose {
     /// Recycle a shell in place — the workspace always has a live session,
     /// so the last session is by design unclosable.
@@ -826,19 +760,6 @@ impl LastSessionClose {
     }
 }
 
-fn parse_last_session_close(raw: &str) -> LastSessionClose {
-    match raw {
-        "respawn" => LastSessionClose::Respawn,
-        "navigate" => LastSessionClose::Navigate,
-        "ring_global" => LastSessionClose::RingGlobal,
-        "ring_project" => LastSessionClose::RingProject,
-        other => {
-            log::warn!("unknown ui.last_session_close value {other:?}, using \"respawn\"");
-            LastSessionClose::default()
-        },
-    }
-}
-
 /// `[ui] hold_exited_sessions`: whether a session whose child has exited stays
 /// on screen instead of closing with it.
 ///
@@ -847,7 +768,8 @@ fn parse_last_session_close(raw: &str) -> LastSessionClose {
 /// that matters is a shell that died with a message worth reading, and holding
 /// every clean exit as well turns an ordinary `exit` into a screen the user has
 /// to dismiss.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum HoldExitedSessions {
     /// Close a session as soon as its child exits.
     #[default]
@@ -870,22 +792,11 @@ impl HoldExitedSessions {
     }
 }
 
-fn parse_hold_exited_sessions(raw: &str) -> HoldExitedSessions {
-    match raw {
-        "never" => HoldExitedSessions::Never,
-        "on_error" => HoldExitedSessions::OnError,
-        "always" => HoldExitedSessions::Always,
-        other => {
-            log::warn!("unknown ui.hold_exited_sessions value {other:?}, using \"never\"");
-            HoldExitedSessions::default()
-        },
-    }
-}
-
 /// How far the projects sidebar goes when the cursor's row stops being
 /// rendered.  Both values keep the cursor; they differ only in whether the
 /// terminal comes along.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum SidebarFocus {
     /// A filtered-out cursor climbs to its nearest visible ancestor and is
     /// restored when the filter widens; a removed cursor slides to a sibling
@@ -903,21 +814,11 @@ impl SidebarFocus {
     }
 }
 
-fn parse_sidebar_focus(raw: &str) -> SidebarFocus {
-    match raw {
-        "preserve" => SidebarFocus::Preserve,
-        "follow" => SidebarFocus::Follow,
-        other => {
-            log::warn!("unknown ui.sidebar_focus value {other:?}, using \"preserve\"");
-            SidebarFocus::default()
-        },
-    }
-}
-
 /// `[ui] sidebar_scroll_align`: where a row a sidebar scrolled to is parked.
 /// Governs both panels and both reasons to scroll, because it describes the
 /// resting position rather than what chose the row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum ScrollAlign {
     /// egui's minimal scroll: move just far enough to bring the row into
     /// view, which leaves it against whichever edge it entered from.
@@ -937,20 +838,10 @@ impl ScrollAlign {
     }
 }
 
-fn parse_scroll_align(raw: &str) -> ScrollAlign {
-    match raw {
-        "minimal" => ScrollAlign::Minimal,
-        "center" => ScrollAlign::Center,
-        other => {
-            log::warn!("unknown ui.sidebar_scroll_align value {other:?}, using \"minimal\"");
-            ScrollAlign::default()
-        },
-    }
-}
-
 /// `[ui] search_scope`: whether a fuzzy query is confined by the panel's active
 /// toggle filters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum SearchScope {
     /// A query narrows the rows the toggles already allow.
     #[default]
@@ -960,20 +851,10 @@ pub enum SearchScope {
     All,
 }
 
-fn parse_search_scope(raw: &str) -> SearchScope {
-    match raw {
-        "filtered" => SearchScope::Filtered,
-        "all" => SearchScope::All,
-        other => {
-            log::warn!("unknown ui.search_scope value {other:?}, using \"filtered\"");
-            SearchScope::default()
-        },
-    }
-}
-
 /// `[ui] search_depth`: how far a sidebar query reaches.  `search_scope`
 /// says what a query is confined by; this says how far down it descends.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum SearchDepth {
     /// Matches project and worktree names only.
     #[default]
@@ -982,22 +863,12 @@ pub enum SearchDepth {
     Sessions,
 }
 
-fn parse_search_depth(raw: &str) -> SearchDepth {
-    match raw {
-        "workspaces" => SearchDepth::Workspaces,
-        "sessions" => SearchDepth::Sessions,
-        other => {
-            log::warn!("unknown ui.search_depth value {other:?}, using \"workspaces\"");
-            SearchDepth::default()
-        },
-    }
-}
-
 /// `[ui.session_reorder] scope`: how far a session may travel when the user
 /// reorders it.  Widening it makes a reorder step able to change which
 /// workspace a session belongs to, which is why the default keeps a session
 /// inside the one it was spawned in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum ReorderScope {
     /// Only among the sessions of its own workspace.
     #[default]
@@ -1007,18 +878,6 @@ pub enum ReorderScope {
     Project,
     /// Home and every project's worktrees, in sidebar order.
     Anywhere,
-}
-
-fn parse_reorder_scope(raw: &str) -> ReorderScope {
-    match raw {
-        "workspace" => ReorderScope::Workspace,
-        "project" => ReorderScope::Project,
-        "anywhere" => ReorderScope::Anywhere,
-        other => {
-            log::warn!("unknown ui.session_reorder.scope value {other:?}, using \"workspace\"");
-            ReorderScope::default()
-        },
-    }
 }
 
 /// Whether session rows can be dragged, and how far a reorder may carry a
@@ -1033,7 +892,8 @@ pub struct SessionReorder {
 /// `[ui] sidebar_tooltips`: when a sidebar row offers its full name on hover.
 /// Governs both sidebars — a git panel row's path answers to it the same way a
 /// worktree or session name does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum SidebarTooltips {
     /// Never — a name the panel cut off stays cut off.
     Off,
@@ -1045,18 +905,6 @@ pub enum SidebarTooltips {
     /// has to wait out the delay again; offering one everywhere keeps a sweep
     /// down the list from stalling on the short names.
     Always,
-}
-
-fn parse_sidebar_tooltips(raw: &str) -> SidebarTooltips {
-    match raw {
-        "off" => SidebarTooltips::Off,
-        "elided" => SidebarTooltips::Elided,
-        "always" => SidebarTooltips::Always,
-        other => {
-            log::warn!("unknown ui.sidebar_tooltips value {other:?}, using \"elided\"");
-            SidebarTooltips::default()
-        },
-    }
 }
 
 /// Whether per-session UI (sidebar session rows, tab-strip segments) renders
@@ -1857,12 +1705,31 @@ pub fn json_schema() -> schemars::Schema {
 // JSON Schema.  Every field's doc comment becomes the hover text an editor
 // shows for that key; a field left undocumented is a key nobody can look up
 // without reading this file.
-//
-// Fields whose value is a closed set carry `#[schemars(extend("enum" = ...))]`
-// so an editor completes and checks the spellings.  Only keys with one
-// spelling per value get one: the cursor parser below accepts `"Block"` and
-// `"block"` alike, and an `enum` listing one of the pair would mark a working
-// config as an error.
+
+/// Lists every spelling of a closed-set key so an editor completes and checks
+/// them.  Only keys with one spelling per value take it: the cursor parser
+/// accepts `"Block"` and `"block"` alike, and an `enum` listing one of the pair
+/// would mark a working config as an error.
+fn closed_set_schema<T>(_: &mut schemars::SchemaGenerator) -> schemars::Schema
+where
+    T: IntoEnumIterator + Into<&'static str>,
+{
+    let values: Vec<&'static str> = T::iter().map(Into::into).collect();
+    schemars::json_schema!({ "type": "string", "enum": values })
+}
+
+/// A closed-set key is read as a plain string so a misspelled value warns and
+/// falls back to the default rather than rejecting the whole config.
+fn parse_closed_set<T>(key: &str, raw: &str) -> T
+where
+    T: IntoEnumIterator + Default + Copy + Into<&'static str>,
+{
+    T::iter().find(|value| raw == Into::<&str>::into(*value)).unwrap_or_else(|| {
+        let fallback: &'static str = T::default().into();
+        log::warn!("unknown {key} value {raw:?}, using {fallback:?}");
+        T::default()
+    })
+}
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
@@ -2655,7 +2522,7 @@ struct RawSessionReorder {
     drag: bool,
     /// How far a reorder may carry a session: "workspace" | "project" |
     /// "anywhere".
-    #[schemars(extend("enum" = ["workspace", "project", "anywhere"]))]
+    #[schemars(schema_with = "closed_set_schema::<ReorderScope>")]
     scope: String,
 }
 
@@ -2765,14 +2632,7 @@ struct RawUiDrop {
     scratchpad: bool,
     /// How a path is quoted for the shell that receives it.  The five concrete
     /// modes are wezterm's `quote_dropped_files` values.
-    #[schemars(extend("enum" = [
-        "auto",
-        "none",
-        "spaces_only",
-        "posix",
-        "windows",
-        "windows_always_quoted"
-    ]))]
+    #[schemars(schema_with = "closed_set_schema::<Quoting>")]
     quote: String,
     /// Rewrite a Windows path to its distro spelling when the session runs
     /// inside WSL.
@@ -2853,7 +2713,7 @@ struct RawHerdr {
     /// break.  Honoured per side: the native side of a Windows host always
     /// attaches to the session, because herdr implements no direct attach
     /// there.
-    #[schemars(extend("enum" = ["agent", "session"]))]
+    #[schemars(schema_with = "closed_set_schema::<AttachMode>")]
     attach: String,
     /// Whether a focus change made inside herdr moves alacritree to the
     /// matching session.
@@ -2862,7 +2722,7 @@ struct RawHerdr {
     /// is already showing herdr's view, which is what an unmodified config
     /// has always done.  "always" also moves it from a plain native session,
     /// on any reachable side, after a gap in typing.
-    #[schemars(extend("enum" = ["off", "herdr", "always"]))]
+    #[schemars(schema_with = "closed_set_schema::<FollowFocus>")]
     follow_focus: String,
 }
 
@@ -2886,8 +2746,8 @@ impl RawHerdr {
             poll_interval: Duration::from_millis(self.poll_interval_ms),
             show_unmatched: self.show_unmatched,
             show_panes: self.show_panes,
-            attach: parse_attach_mode(&self.attach),
-            follow_focus: parse_follow_focus(&self.follow_focus),
+            attach: parse_closed_set("integrations.herdr.attach", &self.attach),
+            follow_focus: parse_closed_set("integrations.herdr.follow_focus", &self.follow_focus),
         }
     }
 }
@@ -2915,7 +2775,7 @@ struct RawUi {
     attention_grace_ms: u64,
     /// When the sidebar × on a session row asks before killing the PTY:
     /// "never" | "busy" | "always".
-    #[schemars(extend("enum" = ["never", "busy", "always"]))]
+    #[schemars(schema_with = "closed_set_schema::<ConfirmSessionClose>")]
     confirm_session_close: String,
     /// Whether the sidebar × on a harness-managed row asks before detaching,
     /// and whether DetachAllMultiplexerPanes asks once for the whole batch.
@@ -2930,18 +2790,18 @@ struct RawUi {
     /// What happens when the on-screen workspace stops having sessions,
     /// whether a close or a worktree deletion took the last one:
     /// "respawn" | "navigate" | "ring_global" | "ring_project".
-    #[schemars(extend("enum" = ["respawn", "navigate", "ring_global", "ring_project"]))]
+    #[schemars(schema_with = "closed_set_schema::<LastSessionClose>")]
     last_session_close: String,
     /// Whether a session whose child has exited stays on screen instead of
     /// closing with it: "never" | "on_error" | "always".  A held session
     /// writes one line into its own grid naming the key that closes it.  A
     /// herdr attach that was refused is held whatever this says, since its
     /// refusal message is the only report of what happened.
-    #[schemars(extend("enum" = ["never", "on_error", "always"]))]
+    #[schemars(schema_with = "closed_set_schema::<HoldExitedSessions>")]
     hold_exited_sessions: String,
     /// How far the projects sidebar goes when the cursor's row stops being
     /// rendered: "preserve" | "follow".
-    #[schemars(extend("enum" = ["preserve", "follow"]))]
+    #[schemars(schema_with = "closed_set_schema::<SidebarFocus>")]
     sidebar_focus: String,
     /// Whether the projects sidebar scrolls to the session on screen whenever
     /// it changes — a cycling key, a click, the palette, an IPC request.
@@ -2950,20 +2810,20 @@ struct RawUi {
     /// Where a row the sidebar scrolled to is parked: "minimal" | "center".
     /// Under "center" every cursor step re-centres the list, and clicking a
     /// row near the panel edge scrolls it out from under the pointer.
-    #[schemars(extend("enum" = ["minimal", "center"]))]
+    #[schemars(schema_with = "closed_set_schema::<ScrollAlign>")]
     sidebar_scroll_align: String,
     /// Whether a fuzzy query is confined by the panel's active toggle filters:
     /// "filtered" | "all".
-    #[schemars(extend("enum" = ["filtered", "all"]))]
+    #[schemars(schema_with = "closed_set_schema::<SearchScope>")]
     search_scope: String,
     /// How far a sidebar query reaches: "workspaces" matches project and
     /// worktree names only; "sessions" also matches session titles and herdr
     /// agent names.
-    #[schemars(extend("enum" = ["workspaces", "sessions"]))]
+    #[schemars(schema_with = "closed_set_schema::<SearchDepth>")]
     search_depth: String,
     /// When a sidebar row spells its full name out on hover:
     /// "elided" | "always" | "off".
-    #[schemars(extend("enum" = ["elided", "always", "off"]))]
+    #[schemars(schema_with = "closed_set_schema::<SidebarTooltips>")]
     sidebar_tooltips: String,
     /// Whether a sidebar icon explains itself on hover.
     icon_tooltips: bool,
@@ -2980,7 +2840,7 @@ struct RawUi {
     /// Sidebar glyph overrides.
     icons: RawIcons,
     /// Sidebar scrollbar style: "floating" | "solid".
-    #[schemars(extend("enum" = ["floating", "solid"]))]
+    #[schemars(schema_with = "closed_set_schema::<ScrollbarStyle>")]
     scrollbar: String,
     /// Draw the terminal grid through an OpenGL paint callback instead of
     /// handing epaint a mesh.  It needs a GL 3 context and bypasses the
@@ -3104,13 +2964,13 @@ struct RawPathStyle {
     /// "full" | "fish" | "zed", per site.
     ///
     /// The diff pane's title.
-    #[schemars(extend("enum" = ["full", "fish", "zed"]))]
+    #[schemars(schema_with = "closed_set_schema::<PathStyle>")]
     diff_title: String,
     /// Paths in the git panel's file rows.
-    #[schemars(extend("enum" = ["full", "fish", "zed"]))]
+    #[schemars(schema_with = "closed_set_schema::<PathStyle>")]
     git_rows: String,
     /// The path in the git panel's header.
-    #[schemars(extend("enum" = ["full", "fish", "zed"]))]
+    #[schemars(schema_with = "closed_set_schema::<PathStyle>")]
     git_header: String,
     /// How the last path segment is emphasized.
     filename: RawTextEmphasis,
@@ -3294,17 +3154,29 @@ impl RawConfig {
             sidebar_attention: self.ui.sidebar_attention.map(|v| rgb_to_color32(v.0)),
             notifications: self.ui.notifications,
             attention_grace: Duration::from_millis(self.ui.attention_grace_ms),
-            confirm_session_close: parse_confirm_session_close(&self.ui.confirm_session_close),
+            confirm_session_close: parse_closed_set(
+                "ui.confirm_session_close",
+                &self.ui.confirm_session_close,
+            ),
             confirm_session_detach: self.ui.confirm_session_detach,
             sessions_filter_counts_detached: self.ui.sessions_filter_counts_detached,
-            last_session_close: parse_last_session_close(&self.ui.last_session_close),
-            hold_exited_sessions: parse_hold_exited_sessions(&self.ui.hold_exited_sessions),
-            sidebar_focus: parse_sidebar_focus(&self.ui.sidebar_focus),
+            last_session_close: parse_closed_set(
+                "ui.last_session_close",
+                &self.ui.last_session_close,
+            ),
+            hold_exited_sessions: parse_closed_set(
+                "ui.hold_exited_sessions",
+                &self.ui.hold_exited_sessions,
+            ),
+            sidebar_focus: parse_closed_set("ui.sidebar_focus", &self.ui.sidebar_focus),
             sidebar_follow_active: self.ui.sidebar_follow_active,
-            sidebar_scroll_align: parse_scroll_align(&self.ui.sidebar_scroll_align),
-            search_scope: parse_search_scope(&self.ui.search_scope),
-            search_depth: parse_search_depth(&self.ui.search_depth),
-            sidebar_tooltips: parse_sidebar_tooltips(&self.ui.sidebar_tooltips),
+            sidebar_scroll_align: parse_closed_set(
+                "ui.sidebar_scroll_align",
+                &self.ui.sidebar_scroll_align,
+            ),
+            search_scope: parse_closed_set("ui.search_scope", &self.ui.search_scope),
+            search_depth: parse_closed_set("ui.search_depth", &self.ui.search_depth),
+            sidebar_tooltips: parse_closed_set("ui.sidebar_tooltips", &self.ui.sidebar_tooltips),
             icon_tooltips: self.ui.icon_tooltips,
             session_display: SessionDisplay {
                 sidebar_always: self.ui.session_display.sidebar_always,
@@ -3313,7 +3185,7 @@ impl RawConfig {
             },
             session_reorder: SessionReorder {
                 drag: self.ui.session_reorder.drag,
-                scope: parse_reorder_scope(&self.ui.session_reorder.scope),
+                scope: parse_closed_set("ui.session_reorder.scope", &self.ui.session_reorder.scope),
             },
             gpu_grid: self.ui.gpu_grid,
             decorations: Decorations {
@@ -3345,7 +3217,7 @@ impl RawConfig {
                 color: self.ui.focus_outline.color.map(|v| rgb_to_color32(v.0)),
                 thickness: self.ui.focus_outline.thickness.max(0.5),
             },
-            scrollbar: parse_scrollbar(&self.ui.scrollbar),
+            scrollbar: parse_closed_set("ui.scrollbar", &self.ui.scrollbar),
             sidebar_click_focus: self.ui.sidebar_click_focus,
             focus_priority_boost: self.ui.focus_priority_boost,
             async_session_spawn: self.ui.async_session_spawn,
@@ -3354,9 +3226,9 @@ impl RawConfig {
             worktree_name: self.ui.worktree_name.clone().filter(|t| !t.trim().is_empty()),
             project_name: self.ui.project_name.clone().filter(|t| !t.trim().is_empty()),
             path_style: PathStyleConfig {
-                diff_title: parse_path_style(&self.ui.path_style.diff_title),
-                git_rows: parse_path_style(&self.ui.path_style.git_rows),
-                git_header: parse_path_style(&self.ui.path_style.git_header),
+                diff_title: parse_closed_set("ui.path_style", &self.ui.path_style.diff_title),
+                git_rows: parse_closed_set("ui.path_style", &self.ui.path_style.git_rows),
+                git_header: parse_closed_set("ui.path_style", &self.ui.path_style.git_header),
                 filename: text_emphasis(&self.ui.path_style.filename),
                 parent: text_emphasis(&self.ui.path_style.parent),
             },
@@ -3366,7 +3238,7 @@ impl RawConfig {
                 sidebar: self.ui.drop.sidebar,
                 scratchpad: self.ui.drop.scratchpad,
                 spelling: PathSpelling {
-                    quote: parse_quoting(&self.ui.drop.quote),
+                    quote: parse_closed_set("ui.drop.quote", &self.ui.drop.quote),
                     wsl_translate: self.ui.drop.wsl_translate,
                 },
                 highlight: self.ui.drop.highlight,
@@ -3880,13 +3752,19 @@ show_panes = true
             ("herdr", FollowFocus::Herdr),
             ("always", FollowFocus::Always),
         ] {
-            assert_eq!(parse_follow_focus(word), expected);
+            assert_eq!(
+                parse_closed_set::<FollowFocus>("integrations.herdr.follow_focus", word),
+                expected
+            );
         }
     }
 
     #[test]
     fn herdr_follow_focus_falls_back_on_an_unknown_word() {
-        assert_eq!(parse_follow_focus("sideways"), FollowFocus::Herdr);
+        assert_eq!(
+            parse_closed_set::<FollowFocus>("integrations.herdr.follow_focus", "sideways"),
+            FollowFocus::Herdr
+        );
     }
 
     #[test]
