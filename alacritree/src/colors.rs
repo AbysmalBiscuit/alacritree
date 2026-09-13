@@ -12,19 +12,37 @@ pub fn rgb_to_color32(rgb: Rgb) -> Color32 {
     Color32::from_rgb(rgb.r, rgb.g, rgb.b)
 }
 
-pub fn background(palette: &Palette) -> Color32 {
-    rgb_to_color32(palette.bg)
+/// The palette colours that no cell or escape sequence decides, converted
+/// once for the painters.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TerminalColors {
+    pub fg: Color32,
+    pub bg: Color32,
+    /// The configured cursor, or the foreground when none is set.
+    pub cursor: Color32,
+    pub cursor_fg: Option<Color32>,
+    pub selection_bg: Option<Color32>,
+    pub selection_fg: Option<Color32>,
+}
+
+impl TerminalColors {
+    pub fn new(palette: &Palette) -> Self {
+        Self {
+            fg: rgb_to_color32(palette.fg),
+            bg: rgb_to_color32(palette.bg),
+            cursor: rgb_to_color32(palette.cursor_bg.unwrap_or(palette.fg)),
+            cursor_fg: palette.cursor_fg.map(rgb_to_color32),
+            selection_bg: palette.selection_bg.map(rgb_to_color32),
+            selection_fg: palette.selection_fg.map(rgb_to_color32),
+        }
+    }
 }
 
 /// The terminal's own default background, which OSC 11 can move away from the
 /// configured one.  Everything painting behind the grid has to agree on this:
 /// the background pass draws no quad for a cell already carrying it.
-pub fn default_background(runtime: &Colors, palette: &Palette) -> Color32 {
-    rgb_to_color32(resolve_named_raw(NamedColor::Background, runtime, palette))
-}
-
-pub fn foreground(palette: &Palette) -> Color32 {
-    rgb_to_color32(palette.fg)
+pub fn default_background(runtime: &Colors, colors: &TerminalColors) -> Color32 {
+    runtime[NamedColor::Background].map_or(colors.bg, rgb_to_color32)
 }
 
 pub fn resolve(
