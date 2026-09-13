@@ -65,6 +65,10 @@ use herdr_glue::{
 };
 use modals::{BaseBranchPicker, CreateState, DeleteRequest, ProjectRemoveState, RenameState};
 use model::*;
+use sidebar::{
+    HerdrRowData, SessionRowData, WorkspaceRowData, any_pr_toggle_active, project_filter_toggles,
+    session_row_name,
+};
 
 #[derive(Clone, Copy)]
 struct FocusOutlineTheme {
@@ -4778,7 +4782,10 @@ mod tests {
     };
     use super::herdr_glue::{PendingHerdrAttach, PendingHerdrCreate};
     use super::modals::dirty_warning;
-    use super::sidebar::{home_row, session_row, upstream_badge, worktree_row};
+    use super::sidebar::{
+        RowName, herdr_display_name, home_row, session_row, session_row_title,
+        sessions_filter_passes, upstream_badge, worktree_row,
+    };
 
     fn herdr_lifecycle_app() -> AlacritreeApp {
         let mut config = Config::default();

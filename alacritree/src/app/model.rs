@@ -2,9 +2,7 @@
 //! so they can be read and tested without the render pass around them. Nothing
 //! here names an egui type: an item that paints belongs in the parent module.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 
 use alacritty_terminal::tty::Shell;
 
@@ -12,11 +10,7 @@ use serde_json::{Value, json};
 
 use crate::bindings::{BindingAction, KeyBinding, NamedAction};
 use crate::command_palette::{self};
-use crate::config::{
-    AttachMode, FontConfig, SearchDepth, SearchScope, SidebarFocus, UiFont, UiTheme,
-};
-use crate::multiplexer::{CreatedPane, Launch, PaneTarget};
-use crate::panel_filter::PanelFilter;
+use crate::config::{FontConfig, SidebarFocus, UiFont, UiTheme};
 use crate::path_style::PathStyle;
 use crate::projects::{Project, Worktree};
 use crate::session::{LiveState, SessionActivity, SessionId, SessionKind, TermSize};
@@ -24,7 +18,7 @@ use crate::sidebar_nav::{self, SidebarRow};
 use crate::workspace::WorkspaceKey;
 use crate::wsl::{self};
 use crate::wsl_helper::{self, WslProbe};
-use crate::{herdr, ipc, jobs, path_style};
+use crate::{herdr, path_style};
 
 use super::{HarnessMark, Managed, managed_tooltip};
 
@@ -199,118 +193,6 @@ pub(super) fn dispatched_actions(
         .filter(|a| !matches!(a, BindingAction::Named(n) if n.is_palette_scoped()))
         .collect()
 }
-
-/// Whether a workspace survives the projects panel's toggle dimension.
-pub(super) fn project_toggles_pass(
-    apply: bool,
-    toggle_sessions: bool,
-    has_sessions: bool,
-    toggle_attention: bool,
-    needs_attention: bool,
-) -> bool {
-    if !apply {
-        return true;
-    }
-    (!toggle_sessions || has_sessions) && (!toggle_attention || needs_attention)
-}
-
-/// Whether a workspace counts as occupied for the sessions toggle: it holds a
-/// live session, or — when `counts_detached` is set — a listed herdr agent
-/// nothing is attached to.  `session_workspaces` is the workspace of every
-/// live session; a folded lone shell (absent from `listed` below the row
-/// threshold, but still in `session_workspaces`) passes either way.
-pub(super) fn sessions_filter_passes(
-    session_workspaces: &[WorkspaceKey],
-    listed: &sidebar_nav::ListedRows,
-    key: &WorkspaceKey,
-    counts_detached: bool,
-) -> bool {
-    session_workspaces.contains(key)
-        || (counts_detached
-            && listed.get(key).is_some_and(|entries| {
-                entries.iter().any(|e| matches!(e, sidebar_nav::WorkspaceEntry::Agent(..)))
-            }))
-}
-
-/// The toggle identities the projects panel accepts.  The PR identities exist
-/// only when polling does, or every PR state would read as unknown and the
-/// filters could only ever empty the panel.
-pub(super) fn project_filter_toggles(pr_status: bool) -> &'static [char] {
-    if pr_status { &['s', 'a', 'o', 'd', 'm', 'c'] } else { &['s', 'a'] }
-}
-
-/// The projects-panel toggle a named action flips, or `None` for an action that
-/// is not one of its filters.  `PanelFilter::toggle` ignores an identity it does
-/// not allow and dispatch falls through on an unmatched action, so nothing at
-/// the call site can catch a wrong pairing — assert it here instead.
-pub(super) fn project_filter_identity(action: NamedAction) -> Option<char> {
-    match action {
-        NamedAction::ToggleSessionsFilter => Some('s'),
-        NamedAction::ToggleAttentionFilter => Some('a'),
-        NamedAction::TogglePrOpenFilter => Some('o'),
-        NamedAction::TogglePrDraftFilter => Some('d'),
-        NamedAction::TogglePrMergedFilter => Some('m'),
-        NamedAction::TogglePrClosedFilter => Some('c'),
-        _ => None,
-    }
-}
-
-/// Whether any toggle dimension narrows the projects panel this frame —
-/// session presence, attention, or PR state. `project_self` falls back to
-/// plain fuzzy matching only when this is false.
-pub(super) fn any_project_toggle_active(
-    toggle_sessions: bool,
-    toggle_attention: bool,
-    any_pr: bool,
-) -> bool {
-    toggle_sessions || toggle_attention || any_pr
-}
-
-/// Whether a worktree survives the projects panel's PR dimension. Inert
-/// when no PR toggle is active, so a worktree passes regardless of what
-/// `pr_matches` holds for it. Once a PR toggle is active, a worktree
-/// missing from `pr_matches` is excluded — its PR lookup hasn't landed.
-pub(super) fn worktree_pr_passes(
-    any_pr: bool,
-    pr_matches: &HashMap<PathBuf, bool>,
-    path: &Path,
-) -> bool {
-    !any_pr || pr_matches.get(path).copied().unwrap_or(false)
-}
-
-/// Whether `current_project_rows` resolves session and herdr-agent names for
-/// `child_matches` this frame.  `[ui] search_depth` at its "workspaces"
-/// default answers false unconditionally, so no child name is ever computed
-/// and a query costs what matching workspace names alone costs.
-pub(super) fn search_reaches_children(depth: SearchDepth, query_is_empty: bool) -> bool {
-    depth == SearchDepth::Sessions && !query_is_empty
-}
-
-/// Whether the projects panel is filtering on PR state this frame.  A toggle
-/// the scope has stood down narrows nothing, so it must not pull the cache
-/// generation into the reconciler or reach `gh` for a collapsed project.
-pub(super) fn any_pr_toggle_active(filter: &PanelFilter, scope: SearchScope) -> bool {
-    filter.toggles_apply(scope)
-        && ['o', 'd', 'm', 'c'].into_iter().any(|key| filter.is_toggled(key))
-}
-
-/// Whether this worktree's PR state is polled this frame.  Collapsed projects
-/// normally cost no `gh` processes, but a PR filter has to see every row or it
-/// would hide worktrees for want of a lookup it declined to start.
-pub(super) fn should_poll_pr(pr_enabled: bool, expanded: bool, any_pr_toggle: bool) -> bool {
-    pr_enabled && (expanded || any_pr_toggle)
-}
-
-/// Drag-and-drop payload for reordering the project list.  Carries the dragged
-/// project's root rather than its index so a background refresh that shifts the
-/// list mid-drag can't drop onto the wrong project.
-#[derive(Clone)]
-pub(super) struct DraggedProject(pub(super) PathBuf);
-
-/// Drag-and-drop payload for reordering sessions.  Carries the id rather than
-/// a position so a spawn, close or reorder mid-drag can't retarget the drop.
-#[derive(Clone)]
-pub(super) struct DraggedSession(pub(super) SessionId);
 
 pub(super) fn workspace_label_for(projects: &[Project], ws: &WorkspaceKey) -> String {
     let Some(path) = ws else {
@@ -770,94 +652,6 @@ pub(super) fn reorder_subject(
     on_screen()
 }
 
-/// Everything a sidebar session row needs, snapshotted before the panel
-/// closure so rendering doesn't borrow `self.sessions`.
-pub(super) struct SessionRowData {
-    pub(super) id: SessionId,
-    pub(super) name: RowName,
-    pub(super) needs_attention: bool,
-    pub(super) activity: SessionActivity,
-    /// This workspace's remembered active session (accent icon).
-    pub(super) is_active: bool,
-    /// Active *and* the workspace is current — the session on screen
-    /// (row background highlight).
-    pub(super) is_displayed: bool,
-    /// Set while this session is attached to a harness-managed pane, so an
-    /// attached agent's row still says where it lives and how to leave.
-    pub(super) managed: Option<Managed>,
-}
-
-/// One painted row under a workspace, in the order the sidebar draws them.
-/// Attaching turns a herdr row into a session row in place, so the two travel
-/// as one list rather than as two blocks that would reorder on attach.
-pub(super) enum WorkspaceRowData {
-    Session(SessionRowData),
-    Herdr(HerdrRowData),
-}
-
-impl WorkspaceRowData {
-    /// Whether any of `rows` is a session of alacritree's own.  The workspace
-    /// row shows aggregate attention and activity only while none is: with a
-    /// list on screen, repeating its summary above it reads as noise.
-    pub(super) fn any_session(rows: &[Self]) -> bool {
-        rows.iter().any(|row| matches!(row, Self::Session(_)))
-    }
-}
-
-/// Everything a sidebar herdr-agent row needs, snapshotted before the panel
-/// closure so rendering doesn't borrow `self.herdr.endpoints`.
-pub(super) struct HerdrRowData {
-    pub(super) side: herdr::Side,
-    pub(super) terminal_id: String,
-    pub(super) pane_id: String,
-    pub(super) name: RowName,
-    pub(super) managed: Managed,
-}
-
-impl HerdrRowData {
-    pub(super) fn from_agent(
-        agent: &herdr::Agent,
-        side: &herdr::Side,
-        settings: &herdr::Settings,
-        attach: AttachMode,
-    ) -> Self {
-        let name = herdr_display_name(agent);
-        Self {
-            side: side.clone(),
-            terminal_id: agent.terminal_id.clone(),
-            pane_id: agent.pane_id.clone(),
-            name,
-            managed: Managed::herdr(side, settings, attach, Some(agent)),
-        }
-    }
-}
-
-/// A row's name in two parts, ranked by weight rather than punctuation: the
-/// identity, and the category standing in front of it as context.  `context`
-/// is absent when the identity is already the category, so a row never spells
-/// one thing twice.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct RowName {
-    pub(super) text: String,
-    pub(super) context: Option<String>,
-}
-
-impl RowName {
-    pub(super) fn plain(text: String) -> Self {
-        Self { text, context: None }
-    }
-
-    /// What a text filter matches this row on.  Both parts, because the row
-    /// shows both, and the context only when the row spells it out: a query
-    /// naming a category an identity already carries must not match twice.
-    pub(super) fn search_text(self) -> String {
-        match self.context {
-            Some(context) => format!("{} {}", self.text, context),
-            None => self.text,
-        }
-    }
-}
-
 pub(super) struct PaletteSessionContent {
     pub(super) primary: String,
     pub(super) subtitle: String,
@@ -1001,32 +795,6 @@ pub(super) fn shell_state_for(kind: &SessionKind, busy: bool) -> Option<&'static
         SessionKind::Shell => Some(if busy { "busy" } else { "idle" }),
         SessionKind::Diff { .. } | SessionKind::Scratchpad { .. } => None,
     }
-}
-
-/// The name herdr reports for a pane, and `None` when it reports none.  The
-/// kind rides along as context unless it says the same thing as the title.
-/// What a titleless agent falls back to differs by row, so each caller says
-/// so itself rather than passing its answer through here.
-pub(super) fn herdr_row_name(agent: &herdr::Agent) -> Option<RowName> {
-    let title = agent.title.clone()?;
-    let context = agent.kind.clone().filter(|kind| *kind != title);
-    Some(RowName { text: title, context })
-}
-
-/// The sidebar row, the palette row and the text filter must all resolve an
-/// agent's name the same way, or the filter stops matching what the other two
-/// paint.  Falls back from herdr's title, to the agent's kind, to the last
-/// six characters of its terminal id — a listed row has nothing better than
-/// the terminal id's tail behind the kind, so the kind takes the name rather
-/// than standing in front of six characters nobody reads.
-pub(super) fn herdr_display_name(agent: &herdr::Agent) -> RowName {
-    herdr_row_name(agent).unwrap_or_else(|| {
-        RowName::plain(agent.kind.clone().unwrap_or_else(|| {
-            let id = &agent.terminal_id;
-            let skip = id.chars().count().saturating_sub(6);
-            id.chars().skip(skip).collect()
-        }))
-    })
 }
 
 /// Spawn-ordered ids of the sessions in `ws`, or empty below the list
@@ -1313,51 +1081,6 @@ pub(super) fn herdr_backed_activity(
     own.with_live(live)
 }
 
-/// Agent titles commonly lead with their own decorative mark. Once the row
-/// paints a semantic agent/loader status, retaining that mark beside it would
-/// reintroduce the vendor-specific icon set this status model replaces.
-/// What an attached session's row is called.  On Linux and WSL an attach is
-/// full passthrough, so the pane on screen is herdr's and the row names it
-/// the way herdr's own listed row would — attaching must not rename the row
-/// under the user.  A pane herdr reports no title for keeps the title its own
-/// PTY set, with the kind in front of it.
-pub(super) fn session_row_name(
-    pty_title: &str,
-    activity: SessionActivity,
-    agent: Option<&herdr::Agent>,
-) -> RowName {
-    let Some(agent) = agent else {
-        return RowName::plain(session_row_title(pty_title, activity));
-    };
-    herdr_row_name(agent).unwrap_or_else(|| RowName {
-        text: session_row_title(pty_title, activity),
-        context: agent.kind.clone(),
-    })
-}
-
-pub(super) fn session_row_title(title: &str, activity: SessionActivity) -> String {
-    if activity.is_agent() {
-        let trimmed = title.trim_start();
-        if let Some(first) = trimmed.chars().next() {
-            let rest = &trimmed[first.len_utf8()..];
-            if !first.is_ascii() && rest.chars().next().is_some_and(char::is_whitespace) {
-                let rest = rest.trim_start();
-                if !rest.is_empty() {
-                    return rest.to_string();
-                }
-            }
-        }
-    }
-    title.to_string()
-}
-
-/// The "index. name" label for a profile entry in the worktree row's "Open
-/// session" menu, 1-based to match `SpawnProfile1`..`SpawnProfile9` in the
-/// palette.
-pub(super) fn profile_menu_label(index: usize, name: &str) -> String {
-    format!("{index}. {name}")
-}
-
 /// The liveness cache corrects discovery for paint and navigation only. Keep
 /// this shared so a row that has just gone grey cannot remain a dead stop in
 /// the workspace ring. Main checkouts are never prune candidates, even when
@@ -1374,24 +1097,12 @@ pub(super) fn worktree_is_switchable(
     !worktree_looks_gone(wt, missing) || has_sessions
 }
 
-pub(super) struct HerdrRowAction {
-    pub(super) attach: bool,
-}
-
 /// Whether ending a session asks first.  A harness-managed one is a detach
 /// rather than a kill, so it answers to its own switch: the attach client is
 /// always running, which would make the busy question a close asks fire every
 /// time and warn about nothing.
 pub(super) fn close_needs_prompt(ui: &UiTheme, managed: bool, busy: bool) -> bool {
     if managed { ui.confirm_session_detach } else { ui.confirm_session_close.requires_prompt(busy) }
-}
-
-/// What the × on a session row does.  Ending a harness-managed session ends
-/// the attach client and nothing else — the pane keeps running under the
-/// harness, and the row it came from comes back — so calling that a close
-/// promises a destruction that does not happen.
-pub(super) fn close_button_hint(managed: bool) -> &'static str {
-    if managed { "detach session" } else { "close session" }
 }
 
 /// The known worktree that owns `path`: the longest worktree path that
@@ -1424,32 +1135,15 @@ pub(super) fn activity_json(activity: SessionActivity) -> Value {
 #[cfg(test)]
 mod tests {
     use super::super::focus::DeferredClose;
+    use super::super::sidebar::{HerdrRowData, RowName, herdr_display_name};
     use super::*;
     use crate::command_palette::PaletteItem;
+    use crate::config::AttachMode;
     use crate::test_util::titled_herdr_agent as titled;
 
     const LIVE: SessionFocus = SessionFocus { scratchpad: false, exited: false };
     const EXITED: SessionFocus = SessionFocus { scratchpad: false, exited: true };
     const SCRATCHPAD: SessionFocus = SessionFocus { scratchpad: true, exited: false };
-
-    /// The "workspaces" depth never reaches a child, whatever the query:
-    /// `child_matches` is not built, so `current_project_rows` feeds
-    /// `sidebar_nav::filtered_rows` a `None` child predicate and a query
-    /// naming a session matches only that session's workspace.
-    #[test]
-    fn search_reaches_children_stays_false_at_the_workspaces_default() {
-        assert!(!search_reaches_children(SearchDepth::Workspaces, false));
-        assert!(!search_reaches_children(SearchDepth::Workspaces, true));
-    }
-
-    /// The "sessions" depth resolves child names for a non-empty query, so a
-    /// session or agent row can match by its own name rather than only
-    /// through its workspace.
-    #[test]
-    fn search_reaches_children_only_with_sessions_depth_and_a_live_query() {
-        assert!(search_reaches_children(SearchDepth::Sessions, false));
-        assert!(!search_reaches_children(SearchDepth::Sessions, true));
-    }
 
     #[test]
     fn spawn_geometry_prefers_the_active_session_over_the_last_painted_pane() {
@@ -1691,12 +1385,6 @@ mod tests {
     }
 
     #[test]
-    fn profile_menu_label_numbers_from_one() {
-        assert_eq!(profile_menu_label(1, "WSL"), "1. WSL");
-        assert_eq!(profile_menu_label(2, "cmd"), "2. cmd");
-    }
-
-    #[test]
     fn the_status_hint_names_the_agent_and_what_it_is_doing() {
         assert_eq!(agent_hint(LiveState::Idle, Some("claude")), "claude is running");
         assert_eq!(agent_hint(LiveState::Working, Some("codex")), "codex is working");
@@ -1844,39 +1532,6 @@ mod tests {
         assert_eq!(managed_tooltip(&row.managed), r#"herdr, shared view, "~/G/g/alacritree"."#);
     }
 
-    #[test]
-    fn herdr_display_name_keeps_a_short_terminal_id_whole() {
-        // `saturating_sub(6)` exists precisely for ids shorter than the tail
-        // it takes; a plain `- 6` would panic on this one.
-        let agent = herdr::Agent {
-            terminal_id: "t1".into(),
-            pane_id: "w1:p1".into(),
-            tab_id: Some("w1:t1".into()),
-            kind: None,
-            title: None,
-            status: Some(herdr::Status::Idle),
-            focused: false,
-            cwd: None,
-            foreground_cwd: None,
-        };
-        assert_eq!(herdr_display_name(&agent), RowName::plain("t1".into()));
-    }
-
-    /// The filter matches what the row paints, so a query naming the category
-    /// in front of an identity finds the row that shows both.
-    #[test]
-    fn search_text_carries_the_context_behind_the_identity() {
-        let name = RowName { text: "primary".into(), context: Some("claude".into()) };
-        assert_eq!(name.search_text(), "primary claude");
-    }
-
-    /// A row whose identity is already its category paints one word, so the
-    /// filter searches one word rather than the same word twice.
-    #[test]
-    fn search_text_of_a_plain_name_is_the_name() {
-        assert_eq!(RowName::plain("claude".into()).search_text(), "claude");
-    }
-
     /// The row never compares its title against its own path, so a title that
     /// reads like a directory is named no differently than one that does
     /// not — the workspace label still keeps the line under it.
@@ -1974,14 +1629,6 @@ mod tests {
         assert_eq!(content.primary, "scratchpad");
         assert_eq!(content.subtitle, "◆ renamed / main");
         assert_eq!(content.secondary, "scratchpad");
-    }
-
-    /// Ending a herdr-managed session ends the attach and leaves the pane
-    /// running, so the control cannot call itself a close.
-    #[test]
-    fn the_close_control_is_a_detach_on_a_managed_row() {
-        assert_eq!(close_button_hint(true), "detach session");
-        assert_eq!(close_button_hint(false), "close session");
     }
 
     #[test]
@@ -2267,55 +1914,6 @@ mod tests {
     }
 
     #[test]
-    fn a_wide_search_stands_down_the_project_toggles() {
-        // Toggled on, workspace fails both: excluded while the toggles apply,
-        // included once a wide search stands them down.
-        assert!(!project_toggles_pass(true, true, false, true, false));
-        assert!(project_toggles_pass(false, true, false, true, false));
-    }
-
-    #[test]
-    fn sessions_filter_counts_a_detached_agent_bucketed_under_home() {
-        let listed =
-            sidebar_nav::ListedRows::from([(None, vec![sidebar_nav::WorkspaceEntry::Agent(
-                herdr::Side::Native,
-                "term_home".to_string(),
-            )])]);
-        assert!(sessions_filter_passes(&[], &listed, &None, true));
-    }
-
-    #[test]
-    fn a_pr_toggle_alone_makes_any_toggle_active() {
-        assert!(!any_project_toggle_active(false, false, false));
-        assert!(any_project_toggle_active(false, false, true));
-    }
-
-    #[test]
-    fn worktree_pr_passes_is_inert_without_a_pr_toggle() {
-        let path = PathBuf::from("/worktree");
-        let mut pr_matches = HashMap::new();
-        pr_matches.insert(path.clone(), false);
-        assert!(worktree_pr_passes(false, &pr_matches, &path));
-    }
-
-    #[test]
-    fn worktree_pr_passes_follows_the_map_once_a_pr_toggle_is_active() {
-        let path = PathBuf::from("/worktree");
-        let mut pr_matches = HashMap::new();
-        pr_matches.insert(path.clone(), true);
-        assert!(worktree_pr_passes(true, &pr_matches, &path));
-        pr_matches.insert(path.clone(), false);
-        assert!(!worktree_pr_passes(true, &pr_matches, &path));
-    }
-
-    #[test]
-    fn worktree_pr_passes_excludes_a_worktree_missing_from_the_map() {
-        let path = PathBuf::from("/worktree");
-        let pr_matches: HashMap<PathBuf, bool> = HashMap::new();
-        assert!(!worktree_pr_passes(true, &pr_matches, &path));
-    }
-
-    #[test]
     fn ui_text_px_defaults_to_terminal_derivation() {
         let font = crate::config::FontConfig::default();
         let (normal, heading) = ui_text_px(&font, &crate::config::UiFont::default());
@@ -2413,90 +2011,6 @@ mod tests {
             let spans = zed_spans(&parts).concat();
             assert_eq!(spans, crate::path_style::render(path, PathStyle::Zed, home), "{path:?}");
         }
-    }
-
-    /// Dispatch cannot catch a wrong pairing: `toggle` drops an identity the
-    /// panel does not allow, and an action with no arm falls through to the
-    /// scroll handler.  Swapping two identities here is otherwise invisible.
-    #[test]
-    fn the_projects_filter_actions_map_to_their_identities() {
-        for (action, identity) in [
-            (NamedAction::ToggleSessionsFilter, Some('s')),
-            (NamedAction::ToggleDetachedSessionsFilter, None),
-            (NamedAction::ToggleAttentionFilter, Some('a')),
-            (NamedAction::TogglePrOpenFilter, Some('o')),
-            (NamedAction::TogglePrDraftFilter, Some('d')),
-            (NamedAction::TogglePrMergedFilter, Some('m')),
-            (NamedAction::TogglePrClosedFilter, Some('c')),
-            (NamedAction::ClearProjectFilters, None),
-            (NamedAction::ToggleModifiedFilter, None),
-            (NamedAction::ToggleDeletedFilter, None),
-            (NamedAction::ToggleUntrackedFilter, None),
-            (NamedAction::ToggleSearchScope, None),
-            (NamedAction::RefreshPrStatus, None),
-            (NamedAction::Paste, None),
-        ] {
-            assert_eq!(project_filter_identity(action), identity, "{action:?}");
-            if let Some(key) = identity {
-                assert!(
-                    project_filter_toggles(true).contains(&key),
-                    "{action:?} maps to {key}, which the panel would drop"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn the_pr_identities_exist_only_when_polling_does() {
-        assert_eq!(project_filter_toggles(false), &['s', 'a']);
-        assert_eq!(project_filter_toggles(true), &['s', 'a', 'o', 'd', 'm', 'c']);
-    }
-
-    /// Guards the staging dependency: the four PR actions already dispatch to
-    /// `project_filter.toggle`, and `toggle` silently ignores an identity the
-    /// filter does not allow — so a narrow slice here makes them dead keys.
-    #[test]
-    fn the_pr_actions_reach_a_configured_projects_filter() {
-        let mut f = PanelFilter::new(project_filter_toggles(true));
-        for key in ['o', 'd', 'm', 'c'] {
-            f.toggle(key);
-            assert!(f.is_toggled(key), "{key} must be a live identity");
-        }
-    }
-
-    #[test]
-    fn any_pr_toggle_active_ignores_the_non_pr_identities() {
-        let mut f = PanelFilter::new(project_filter_toggles(true));
-        assert!(!any_pr_toggle_active(&f, SearchScope::Filtered));
-        f.toggle('s');
-        assert!(
-            !any_pr_toggle_active(&f, SearchScope::Filtered),
-            "a session toggle is not a PR toggle"
-        );
-        f.toggle('o');
-        assert!(any_pr_toggle_active(&f, SearchScope::Filtered));
-    }
-
-    /// A search under `All` stands the toggles down for row selection, so the
-    /// PR dimension narrows nothing — polling collapsed projects for it and
-    /// rebuilding on every banked result would both be pure cost.
-    #[test]
-    fn a_stood_down_pr_toggle_does_not_read_as_active() {
-        let mut f = PanelFilter::new(project_filter_toggles(true));
-        f.toggle('o');
-        f.on_text("/");
-        f.on_text("a");
-
-        assert!(any_pr_toggle_active(&f, SearchScope::Filtered));
-        assert!(!any_pr_toggle_active(&f, SearchScope::All));
-    }
-
-    #[test]
-    fn a_pr_filter_reaches_into_collapsed_projects() {
-        assert!(!should_poll_pr(true, false, false), "collapsed and unfiltered: no lookup");
-        assert!(should_poll_pr(true, false, true), "a PR filter must see collapsed rows");
-        assert!(should_poll_pr(true, true, false));
-        assert!(!should_poll_pr(false, true, true), "disabled means never");
     }
 
     #[test]
