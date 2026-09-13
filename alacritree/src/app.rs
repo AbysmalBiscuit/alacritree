@@ -634,6 +634,7 @@ pub struct AlacritreeApp {
     /// never persisted.
     palette: CommandPalette,
     sessions: Vec<Session>,
+    pending_notifications: HashMap<SessionId, String>,
     current_workspace: WorkspaceKey,
     active_session: HashMap<WorkspaceKey, SessionId>,
     projects: Vec<Project>,
@@ -1006,6 +1007,7 @@ impl AlacritreeApp {
             git_sidebar_auto_shown: false,
             palette: CommandPalette::new(),
             sessions: Vec::new(),
+            pending_notifications: HashMap::new(),
             current_workspace: None,
             active_session: HashMap::new(),
             projects,
@@ -2322,6 +2324,7 @@ impl AlacritreeApp {
         }
         let policy = self.config.ui.last_session_close;
         let ring = policy.rings().then(|| self.session_ring()).unwrap_or_default();
+        self.pending_notifications.remove(&id);
         self.sessions.remove(idx);
 
         let remaining: Vec<(WorkspaceKey, SessionId)> =
@@ -9770,6 +9773,7 @@ impl AlacritreeApp {
             // window still shows its grid, so its output still has to repaint.
             self.sessions[idx].set_visible(Some(idx) == visible_idx);
             let outcome = self.sessions[idx].drain_events(&self.config.palette);
+            let notification = outcome.notifications;
             // Ahead of the attention early-out: a background session copying
             // with OSC 52 still owns the clipboard.
             for (target, text) in &outcome.clipboard {
@@ -9797,28 +9801,36 @@ impl AlacritreeApp {
             if is_visible_to_user {
                 // Nothing pending survives the user already looking at it.
                 self.sessions[idx].pending_attention = None;
+                self.pending_notifications.remove(&self.sessions[idx].id);
                 continue;
             }
-            if outcome.attention && self.sessions[idx].pending_attention.is_none() {
+            if let Some(body) = notification {
+                self.pending_notifications.insert(self.sessions[idx].id, body);
+            }
+            if (outcome.attention
+                || self.pending_notifications.contains_key(&self.sessions[idx].id))
+                && self.sessions[idx].pending_attention.is_none()
+            {
                 self.sessions[idx].pending_attention = Some(Instant::now());
             }
             let Some(since) = self.sessions[idx].pending_attention else {
                 continue;
             };
             match poll_attention_debounce(since, Instant::now(), &self.sessions[idx].title, grace) {
-                AttentionVerdict::Cancel => self.sessions[idx].pending_attention = None,
+                AttentionVerdict::Cancel => {
+                    self.sessions[idx].pending_attention = None;
+                    self.pending_notifications.remove(&self.sessions[idx].id);
+                },
                 // A quiet PTY repaints nothing on its own, so the wake-up
                 // that decides the ping has to be scheduled here.
                 AttentionVerdict::Wait(remaining) => ctx.request_repaint_after(remaining),
                 AttentionVerdict::Fire => {
                     self.sessions[idx].pending_attention = None;
-                    // Only toast on the *transition* into needs_attention — otherwise
-                    // BEL + title-transition firing in the same idle cycle would
-                    // produce two toasts for the same "Claude is done" event.
                     let was_attending = self.sessions[idx].needs_attention;
                     self.sessions[idx].needs_attention = true;
-                    if !was_attending && self.config.ui.notifications {
-                        notify_attention(&self.sessions[idx], ctx);
+                    let notification = self.pending_notifications.remove(&self.sessions[idx].id);
+                    if (!was_attending || notification.is_some()) && self.config.ui.notifications {
+                        notify_attention(&self.sessions[idx], ctx, notification);
                     }
                 },
             }
@@ -12534,24 +12546,34 @@ fn latest_notification_click(rx: &Receiver<SessionId>) -> Option<SessionId> {
 /// Spawn a throwaway thread so the platform notifier's synchronous calls
 /// don't stall the egui paint loop.  The thread posts the session's id back
 /// through `NOTIFY_TX` when the user clicks the notification.
-fn notify_attention(session: &Session, ctx: &egui::Context) {
-    let where_label = session
-        .working_directory
-        .as_ref()
-        .and_then(|p| p.file_name())
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| session.title.clone());
-    let body = if where_label.is_empty() {
-        "Session is waiting for input".to_string()
-    } else {
-        format!("{where_label} is waiting for input")
-    };
-    let id = session.id;
-    let ctx = ctx.clone();
-    std::thread::Builder::new()
-        .name("alacritree-notify".into())
-        .spawn(move || notify_worker(body, id, ctx))
-        .ok();
+fn notify_attention(session: &Session, ctx: &egui::Context, body: Option<String>) {
+    let body = body.unwrap_or_else(|| {
+        let where_label = session
+            .working_directory
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| session.title.clone());
+        if where_label.is_empty() {
+            "Session is waiting for input".to_string()
+        } else {
+            format!("{where_label} is waiting for input")
+        }
+    });
+    #[cfg(test)]
+    {
+        let _ = ctx;
+        tests::notifications::TOASTS.with_borrow_mut(|bodies| bodies.push(body));
+    }
+    #[cfg(not(test))]
+    {
+        let id = session.id;
+        let ctx = ctx.clone();
+        std::thread::Builder::new()
+            .name("alacritree-notify".into())
+            .spawn(move || notify_worker(body, id, ctx))
+            .ok();
+    }
 }
 
 /// Deliver a clicked notification's session id to the UI thread.
@@ -12616,6 +12638,277 @@ fn notify_worker(body: String, id: SessionId, _ctx: egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    pub(super) mod notifications {
+        use super::*;
+        use crate::osc_tap::OscEvent;
+        use alacritty_terminal::event::Event as TermEvent;
+
+        thread_local! {
+            pub(crate) static TOASTS: std::cell::RefCell<Vec<String>> = const {
+                std::cell::RefCell::new(Vec::new())
+            };
+        }
+
+        enum Visibility {
+            VisibleAndFocused,
+            VisibleAndUnfocused,
+            Hidden,
+        }
+
+        struct NotificationApp {
+            app: AlacritreeApp,
+            ctx: Context,
+            osc_tx: mpsc::Sender<OscEvent>,
+            term_tx: mpsc::Sender<TermEvent>,
+        }
+
+        fn notification_app() -> NotificationApp {
+            TOASTS.with_borrow_mut(Vec::clear);
+            let mut app = test_app();
+            app.config.ui.notifications = true;
+            app.config.ui.attention_grace = Duration::ZERO;
+            let (osc_tx, osc_rx) = mpsc::channel();
+            let (term_tx, term_rx) = mpsc::channel();
+            app.sessions[0].osc_events = Some(osc_rx);
+            app.sessions[0].events = term_rx;
+            NotificationApp { app, ctx: Context::default(), osc_tx, term_tx }
+        }
+
+        impl NotificationApp {
+            fn drain(&mut self, visibility: Visibility) {
+                self.app.active_session.clear();
+                if !matches!(visibility, Visibility::Hidden) {
+                    self.app.set_active_in_current_workspace(self.app.sessions[0].id);
+                }
+                let mut input = egui::RawInput::default();
+                input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().focused =
+                    Some(!matches!(visibility, Visibility::VisibleAndUnfocused));
+                let _ = self.ctx.run(input, |ctx| self.app.process_session_events(ctx));
+            }
+
+            fn deliver_notification(&mut self, body: &str, visibility: Visibility) {
+                self.osc_tx.send(OscEvent::Notify(body.into())).unwrap();
+                self.drain(visibility);
+            }
+
+            fn deliver_bell(&mut self, visibility: Visibility) {
+                self.term_tx.send(TermEvent::Bell).unwrap();
+                self.drain(visibility);
+            }
+
+            fn toasts_fired(&self) -> usize {
+                TOASTS.with_borrow(Vec::len)
+            }
+
+            fn expire_attention_grace(&mut self) {
+                self.app.sessions[0].pending_attention =
+                    Some(Instant::now() - self.app.config.ui.attention_grace);
+            }
+        }
+
+        #[test]
+        fn a_visible_session_keeps_notification_text_it_gets_no_toast_for() {
+            let mut app = notification_app();
+            app.deliver_notification("build failed", Visibility::VisibleAndFocused);
+            assert_eq!(app.app.sessions[0].last_notification.as_deref(), Some("build failed"));
+            assert_eq!(app.toasts_fired(), 0);
+            assert!(!app.app.sessions[0].needs_attention);
+            assert!(app.app.sessions[0].pending_attention.is_none());
+        }
+
+        #[test]
+        fn notifications_to_a_latched_session_each_toast_after_debounce() {
+            let mut app = notification_app();
+            app.app.config.ui.attention_grace = Duration::from_secs(60);
+            app.deliver_notification("build started", Visibility::Hidden);
+            assert_eq!(app.toasts_fired(), 0);
+            app.expire_attention_grace();
+            app.drain(Visibility::Hidden);
+            assert!(app.app.sessions[0].needs_attention);
+            app.deliver_notification("build failed", Visibility::Hidden);
+            assert_eq!(app.toasts_fired(), 1);
+            app.expire_attention_grace();
+            app.drain(Visibility::Hidden);
+            assert_eq!(app.toasts_fired(), 2);
+            assert_eq!(app.app.sessions[0].last_notification.as_deref(), Some("build failed"));
+            TOASTS.with_borrow(|bodies| assert_eq!(bodies, &["build started", "build failed"]));
+        }
+
+        #[test]
+        fn a_notification_burst_coalesces_to_the_latest_body() {
+            let mut app = notification_app();
+            app.app.config.ui.attention_grace = Duration::from_secs(60);
+            for step in 0..100 {
+                app.osc_tx.send(OscEvent::Notify(format!("build step {step}"))).unwrap();
+            }
+            app.drain(Visibility::Hidden);
+            assert_eq!(app.toasts_fired(), 0);
+            assert!(app.app.sessions[0].pending_attention.is_some());
+            app.expire_attention_grace();
+            app.drain(Visibility::Hidden);
+            TOASTS.with_borrow(|bodies| assert_eq!(bodies, &["build step 99"]));
+            assert_eq!(app.app.sessions[0].last_notification.as_deref(), Some("build step 99"));
+            assert!(app.app.sessions[0].needs_attention);
+            assert!(app.app.sessions[0].pending_attention.is_none());
+        }
+
+        #[test]
+        fn a_busy_title_cancels_an_explicit_notification_during_grace() {
+            let mut app = notification_app();
+            app.app.config.ui.attention_grace = Duration::from_secs(60);
+            app.term_tx.send(TermEvent::Title("⠋ working".into())).unwrap();
+            app.deliver_notification("build failed", Visibility::Hidden);
+            assert_eq!(app.toasts_fired(), 0);
+            assert_eq!(app.app.sessions[0].last_notification.as_deref(), Some("build failed"));
+            assert!(!app.app.sessions[0].needs_attention);
+            assert!(app.app.sessions[0].pending_attention.is_none());
+        }
+
+        #[test]
+        fn generic_attention_after_viewing_a_notification_uses_a_fresh_body() {
+            let mut app = notification_app();
+            app.deliver_notification("old OSC body", Visibility::Hidden);
+            app.drain(Visibility::VisibleAndFocused);
+            app.app.sessions[0].working_directory = Some(PathBuf::from("workspace"));
+            app.deliver_bell(Visibility::Hidden);
+            app.drain(Visibility::VisibleAndFocused);
+            app.app.sessions[0].working_directory = None;
+            app.term_tx.send(TermEvent::Title("⠋ working".into())).unwrap();
+            app.term_tx.send(TermEvent::Title("ready".into())).unwrap();
+            app.drain(Visibility::Hidden);
+            TOASTS.with_borrow(|bodies| {
+                assert_eq!(bodies, &[
+                    "old OSC body",
+                    "workspace is waiting for input",
+                    "ready is waiting for input",
+                ]);
+            });
+            assert_eq!(app.app.sessions[0].last_notification.as_deref(), Some("old OSC body"));
+        }
+
+        #[test]
+        fn explicit_notifications_absorb_pending_generic_attention() {
+            let mut app = notification_app();
+            app.app.config.ui.attention_grace = Duration::from_secs(60);
+            app.deliver_bell(Visibility::Hidden);
+            assert!(app.app.sessions[0].pending_attention.is_some());
+            assert_eq!(app.toasts_fired(), 0);
+            app.osc_tx.send(OscEvent::Notify("build started".into())).unwrap();
+            app.osc_tx.send(OscEvent::Notify("build failed".into())).unwrap();
+            app.term_tx.send(TermEvent::Bell).unwrap();
+            app.drain(Visibility::Hidden);
+            assert_eq!(app.toasts_fired(), 0);
+            assert!(app.app.sessions[0].pending_attention.is_some());
+            app.expire_attention_grace();
+            app.drain(Visibility::Hidden);
+            TOASTS.with_borrow(|bodies| assert_eq!(bodies, &["build failed"]));
+            assert!(app.app.sessions[0].needs_attention);
+            app.app.config.ui.attention_grace = Duration::ZERO;
+            app.deliver_bell(Visibility::Hidden);
+            assert_eq!(app.toasts_fired(), 1);
+        }
+
+        #[test]
+        fn generic_bells_and_titles_still_debounce_and_coalesce() {
+            let mut app = notification_app();
+            let grace = Duration::from_secs(60);
+            app.app.config.ui.attention_grace = grace;
+            app.deliver_bell(Visibility::Hidden);
+            app.deliver_bell(Visibility::Hidden);
+            app.term_tx.send(TermEvent::Title("⠋ working".into())).unwrap();
+            app.term_tx.send(TermEvent::Title("ready".into())).unwrap();
+            app.drain(Visibility::Hidden);
+            assert_eq!(app.toasts_fired(), 0);
+            app.app.sessions[0].pending_attention = Some(Instant::now() - grace);
+            app.drain(Visibility::Hidden);
+            assert_eq!(app.toasts_fired(), 1);
+            app.deliver_bell(Visibility::Hidden);
+            app.app.sessions[0].pending_attention = Some(Instant::now() - grace);
+            app.drain(Visibility::Hidden);
+            assert_eq!(app.toasts_fired(), 1);
+        }
+
+        #[test]
+        fn a_visible_session_discards_a_pending_notification() {
+            let mut app = notification_app();
+            app.app.config.ui.attention_grace = Duration::from_secs(60);
+            app.deliver_notification("build failed", Visibility::Hidden);
+            assert!(app.app.sessions[0].pending_attention.is_some());
+            app.drain(Visibility::VisibleAndFocused);
+            app.drain(Visibility::Hidden);
+            assert_eq!(app.toasts_fired(), 0);
+            assert_eq!(app.app.sessions[0].last_notification.as_deref(), Some("build failed"));
+            assert!(!app.app.sessions[0].needs_attention);
+            assert!(app.app.sessions[0].pending_attention.is_none());
+        }
+
+        #[test]
+        fn two_bells_to_a_latched_session_still_toast_once() {
+            let mut app = notification_app();
+            app.app.sessions[0].working_directory = Some(PathBuf::from("workspace"));
+            app.deliver_bell(Visibility::Hidden);
+            app.deliver_bell(Visibility::Hidden);
+            assert_eq!(app.toasts_fired(), 1);
+            TOASTS.with_borrow(|bodies| assert_eq!(bodies, &["workspace is waiting for input"]));
+        }
+
+        #[test]
+        fn a_title_transition_after_a_bell_retains_the_latch() {
+            let mut app = notification_app();
+            app.deliver_bell(Visibility::Hidden);
+            app.term_tx.send(TermEvent::Title("⠋ working".into())).unwrap();
+            app.term_tx.send(TermEvent::Title("ready".into())).unwrap();
+            app.drain(Visibility::Hidden);
+            assert_eq!(app.toasts_fired(), 1);
+        }
+
+        #[test]
+        fn notification_config_suppresses_toasts_but_keeps_text_and_attention() {
+            let mut app = notification_app();
+            app.app.config.ui.notifications = false;
+            app.deliver_notification("build failed", Visibility::Hidden);
+            app.deliver_notification("retry failed", Visibility::Hidden);
+            assert_eq!(app.toasts_fired(), 0);
+            assert_eq!(app.app.sessions[0].last_notification.as_deref(), Some("retry failed"));
+            assert!(app.app.sessions[0].needs_attention);
+        }
+
+        #[test]
+        fn a_visible_unfocused_session_toasts() {
+            let mut app = notification_app();
+            app.deliver_notification("build failed", Visibility::VisibleAndUnfocused);
+            assert_eq!(app.toasts_fired(), 1);
+        }
+
+        #[test]
+        fn notification_drain_bounds_utf8_and_preserves_other_outcomes() {
+            let mut app = notification_app();
+            for (body, expected) in [
+                ("a".repeat(512), "a".repeat(512)),
+                ("a".repeat(513), "a".repeat(512)),
+                (format!("{}éz", "a".repeat(511)), "a".repeat(511)),
+                (format!("{}éz", "a".repeat(510)), format!("{}é", "a".repeat(510))),
+                ("🦀".repeat(129), "🦀".repeat(128)),
+            ] {
+                app.osc_tx.send(OscEvent::Notify(body)).unwrap();
+                let outcome = app.app.sessions[0].drain_events(&app.app.config.palette);
+                assert_eq!(outcome.notifications.as_deref(), Some(expected.as_str()));
+                assert_eq!(
+                    app.app.sessions[0].last_notification.as_deref(),
+                    Some(expected.as_str())
+                );
+                assert!(!outcome.attention);
+                assert!(outcome.clipboard.is_empty());
+                assert!(outcome.clipboard_reads.is_empty());
+                assert!(!outcome.exited);
+            }
+            let outcome = app.app.sessions[0].drain_events(&app.app.config.palette);
+            assert!(outcome.notifications.is_none());
+            assert!(!outcome.attention);
+            assert!(app.app.sessions[0].last_notification.is_some());
+        }
+    }
 
     fn herdr_lifecycle_app() -> AlacritreeApp {
         let mut config = Config::default();

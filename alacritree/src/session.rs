@@ -262,6 +262,8 @@ pub struct Session {
     /// When a not-yet-surfaced attention trigger arrived.  `None` once it
     /// fires, cancels, or the user views the session.
     pub pending_attention: Option<Instant>,
+    /// Most recent notification body, stored before visibility filtering.
+    pub last_notification: Option<String>,
     /// Sub-cell wheel residue (logical points), retained across frames so that
     /// trackpad pixel-deltas accumulate into whole-line scrolls instead of
     /// being dropped when each frame's delta is smaller than a cell.
@@ -456,6 +458,8 @@ pub struct DrainOutcome {
     /// Set if any event in this batch warrants flagging the session: BEL, or
     /// a title transitioning out of a spinner state.
     pub attention: bool,
+    /// Newest explicit OSC 9 or OSC 777 notification body in this drain.
+    pub notifications: Option<String>,
     /// Text the app copied with OSC 52.  Carried out to the caller rather than
     /// written here so the drain — which runs once per frame for every session
     /// — stays free of OS clipboard access.
@@ -468,6 +472,16 @@ pub struct DrainOutcome {
     /// held session can be written to: the exit arrives after the child's last
     /// output, and every later frame would append the notice again.
     pub exited: bool,
+}
+
+/// Bound retained text to what a platform notification can reasonably display.
+fn truncate_notification(mut body: String) -> String {
+    const LIMIT: usize = 512;
+    if body.len() > LIMIT {
+        let cut = body.char_indices().map(|(i, _)| i).take_while(|i| *i <= LIMIT).last();
+        body.truncate(cut.unwrap_or(0));
+    }
+    body
 }
 
 /// Bytes answering an OSC colour query, or `None` when the query has no
@@ -1352,6 +1366,7 @@ impl Session {
             scratchpad: Some(editor),
             needs_attention: false,
             pending_attention: None,
+            last_notification: None,
             accumulated_scroll: (0.0, 0.0),
             last_report_cell: None,
             shell_pid: None,
@@ -1550,6 +1565,7 @@ impl Session {
             scratchpad: None,
             needs_attention: false,
             pending_attention: None,
+            last_notification: None,
             accumulated_scroll: (0.0, 0.0),
             last_report_cell: None,
             shell_pid: None,
@@ -1691,6 +1707,11 @@ impl Session {
                         let distro = self.wsl_distro().map(str::to_string);
                         self.reported_cwd =
                             path.and_then(|path| resolve_reported_cwd(&path, distro.as_deref()));
+                    },
+                    osc_tap::OscEvent::Notify(body) => {
+                        let body = truncate_notification(body);
+                        self.last_notification = Some(body.clone());
+                        outcome.notifications = Some(body);
                     },
                     _ => {},
                 }
@@ -2441,7 +2462,6 @@ pub(crate) mod tests {
         assert_eq!(session.working_directory, None);
     }
 
-    #[test]
     fn reported_cwd_osc_bytes_reach_a_wsl_session_without_a_probe() {
         let mut config = Config::default();
         config.vt.report_cwd = true;
@@ -2552,6 +2572,7 @@ pub(crate) mod tests {
             scratchpad: None,
             needs_attention: false,
             pending_attention: None,
+            last_notification: None,
             accumulated_scroll: (0.0, 0.0),
             last_report_cell: None,
             shell_pid: None,
