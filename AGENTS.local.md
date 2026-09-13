@@ -159,9 +159,9 @@ Example for Claude Opus 5: `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com
 
 ## Opening PRs
 
-Whenever I ask to open a PR, or push open PR, etc. You need to push the branch to my fork/remote. The PR must be opened against upstream mathix420/Arnaud's repo.
+Whenever I ask to open a PR, or push open PR, etc. You need to push the branch to the upstream repo (mathix420/Arnaud's repo).
 
-The GitHub base is always `master`, even though the branch descends from the previous PR in the stack rather than from `master`.
+The base/target branch should be `master`, unless you're setting up/working with stacked PRs, then it should be the preceding PR's branch.
 
 Open the PR with `devkit issue pr create`, not `gh pr create`. Its `pr_body` template in `devkit.local.toml` renders the body shape every PR here uses: my TL;DR, the `Closes` lines, then the Claude summary under a rule, ending in the model attribution. Writing the body by hand reproduces that shape by memory and drifts from it.
 
@@ -184,6 +184,9 @@ The TL;DR is mine and it is never yours to write. The template emits the heading
 The template renders only when the command creates a PR. Editing an open one is still `gh pr edit`, and the shape has to be preserved by hand there.
 
 
+<critical>
+The all-featurse integration only applies when not doing major refactors. While working on issue #70 or any of its children DO NOT INTEGRATE INTO all-features. A new branch for all-features will be cut from master after the refactor is done.
+</critical>
 Before opening PR or whenever I ask you, cherry-pick your changes/features into the `all-features` branch (it's normally checked out in a worktree). Then run the `install.local.py` script inside the `all-features` worktree.
 This is important so I test features before a PR.
 
