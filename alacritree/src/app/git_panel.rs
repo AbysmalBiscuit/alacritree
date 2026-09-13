@@ -543,11 +543,18 @@ fn native_program(program: &Program) -> String {
     }
 }
 
+fn native_pager_value(program: &Program, args: &[String]) -> String {
+    match program {
+        Program::Tool(tool) => diff_viewer::executable_pager_command(&tools::program(*tool), args),
+        Program::Custom { path, .. } => diff_viewer::pager_command(path, args),
+    }
+}
+
 fn native_diff_command(launch: Launch) -> (String, Vec<String>) {
     match launch {
         Launch::Pager { pager, pager_args, git_args } => diff_viewer::native_pager_command(
             &tools::program(Tool::Git),
-            &diff_viewer::pager_command(&native_program(&pager), &pager_args),
+            &native_pager_value(&pager, &pager_args),
             &git_args,
         ),
         Launch::Direct { program, args } => (native_program(&program), args),
@@ -571,6 +578,13 @@ fn program_name(program: &Program) -> &str {
     }
 }
 
+fn wsl_pager_value(program: &Program, path: &str, args: &[String]) -> String {
+    match program {
+        Program::Tool(_) => diff_viewer::executable_pager_command(path, args),
+        Program::Custom { .. } => diff_viewer::pager_command(path, args),
+    }
+}
+
 fn wsl_diff_command(
     ctx: &Context,
     distro: &str,
@@ -581,7 +595,7 @@ fn wsl_diff_command(
     match launch {
         Launch::Pager { pager, pager_args, git_args } => match wsl_program(ctx, distro, &pager) {
             Some(path) => {
-                let pager = diff_viewer::pager_command(&path, &pager_args);
+                let pager = wsl_pager_value(&pager, &path, &pager_args);
                 diff_viewer::wsl_pager_command(distro, workspace, &git, &pager, &git_args)
             },
             None => {
@@ -922,7 +936,11 @@ pub(super) fn file_row(
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 ui.set_min_height(row_h);
-                // Let the row receive clicks instead of its text labels.
+                // Labels default to `Sense::click_and_drag` for text selection;
+                // hit testing picks the smallest covering widget, so a clickable
+                // label inside our row would eat clicks before the row sees
+                // them. Opt out of selection on every label that lives inside
+                // a clickable row so the click falls through.
                 let badge = ui.add(
                     egui::Label::new(
                         RichText::new(change.kind.glyph()).color(color).monospace().small(),
@@ -1305,7 +1323,7 @@ mod tests {
 
     /// An app whose current workspace shows a diff pane under `key`. The
     /// session is never spawned, so no viewer runs.
-    fn app_with_diff_pane(key: &str) -> AlacritreeApp {
+    fn app_with_diff_pane(key: &str) -> (AlacritreeApp, SessionId) {
         let workspace = PathBuf::from("C:/repo/wt");
         let (_, notify_rx) = std::sync::mpsc::channel();
         let mut app = AlacritreeApp::from_parts(
@@ -1318,6 +1336,19 @@ mod tests {
             (None, None),
         );
         app.config.ui.last_session_close = crate::config::LastSessionClose::Navigate;
+        let (survivor, _) = Session::pending_command(
+            Context::default(),
+            &app.config,
+            Some(workspace.clone()),
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            "inert".to_string(),
+            Vec::new(),
+            "survivor".to_string(),
+            SessionKind::Shell,
+        );
+        let survivor_id = survivor.id;
+        app.sessions.push(survivor);
         let (session, _) = Session::pending_command(
             Context::default(),
             &app.config,
@@ -1331,7 +1362,7 @@ mod tests {
         );
         app.sessions.push(session);
         app.current_workspace = Some(workspace);
-        app
+        (app, survivor_id)
     }
 
     fn has_diff_pane(app: &AlacritreeApp) -> bool {
@@ -1340,20 +1371,60 @@ mod tests {
 
     #[test]
     fn choosing_the_open_section_again_closes_its_pane() {
-        let mut app = app_with_diff_pane("section:staged");
+        let (mut app, survivor_id) = app_with_diff_pane("section:staged");
+        let before = app.sessions.len();
         app.open_diff(&Context::default(), Target::Section(Section::Staged));
+        assert_eq!(app.sessions.len(), before - 1);
         assert!(!has_diff_pane(&app));
+        assert!(app.sessions.iter().any(|session| session.id == survivor_id));
+        assert!(app.modals.error_dialog.is_none());
     }
 
     #[test]
     fn a_section_the_viewer_cannot_open_leaves_the_open_pane_alone() {
-        let mut app = app_with_diff_pane("staged:a.rs");
+        let (mut app, _) = app_with_diff_pane("staged:a.rs");
         app.config.integrations.diff_viewer.viewer = Viewer::Direct {
             program: Program::Custom { path: "difft".to_string(), wsl_path: None },
             templates: Templates::default(),
         };
         app.open_diff(&Context::default(), Target::Section(Section::Staged));
         assert!(has_diff_pane(&app));
+    }
+
+    #[test]
+    fn a_wsl_diff_uses_the_configured_wsl_git_not_the_native_git() {
+        let _lock = crate::tools::test_configuration_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        struct RestoreToolConfiguration([crate::tools::ToolPaths; 6]);
+        impl Drop for RestoreToolConfiguration {
+            fn drop(&mut self) {
+                crate::tools::configure(self.0.clone());
+            }
+        }
+        let _restore = RestoreToolConfiguration(crate::tools::test_configuration());
+        let mut configured = crate::tools::Tool::ALL.map(crate::tools::ToolPaths::named);
+        configured[crate::tools::Tool::Git as usize] = crate::tools::ToolPaths {
+            native: "C:/native/git.exe".to_string(),
+            wsl: Some("/opt/wsl/bin/git".to_string()),
+        };
+        crate::tools::configure(configured);
+        let launch = Launch::Pager {
+            pager: Program::Custom {
+                path: "delta --side-by-side".to_string(),
+                wsl_path: Some("/opt/delta".to_string()),
+            },
+            pager_args: Vec::new(),
+            git_args: vec!["diff".to_string()],
+        };
+        let (_, args) = wsl_diff_command(
+            &Context::default(),
+            "kali-linux",
+            Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj"),
+            launch,
+        );
+        assert_eq!(args[9], "/opt/wsl/bin/git");
+        assert!(!args[9..].iter().any(|arg| arg == "C:/native/git.exe"));
     }
 
     #[test]

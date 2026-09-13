@@ -72,6 +72,17 @@ pub fn configure(paths: [ToolPaths; 6]) {
     *configured().write().unwrap_or_else(|e| e.into_inner()) = paths;
 }
 
+#[cfg(test)]
+pub(crate) fn test_configuration() -> [ToolPaths; 6] {
+    configured().read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+#[cfg(test)]
+pub(crate) fn test_configuration_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 fn configured_paths(tool: Tool) -> ToolPaths {
     configured().read().unwrap_or_else(|e| e.into_inner())[tool as usize].clone()
 }

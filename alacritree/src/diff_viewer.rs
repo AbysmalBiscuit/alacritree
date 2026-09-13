@@ -5,207 +5,6 @@
 //! values of the same type a custom one resolves to, so every viewer takes
 //! one path from a click to a spawn.
 
-#[cfg(test)]
-mod tests {
-    use std::path::Path;
-
-    use super::*;
-
-    fn row(file: &str, source: DiffSource) -> Target {
-        Target::Row(DiffRequest { file: file.to_string(), source })
-    }
-
-    fn branch() -> DiffSource {
-        DiffSource::Branch { base: "refs/remotes/origin/main".to_string() }
-    }
-
-    fn direct_args(viewer: &Viewer, target: &Target) -> Option<Vec<String>> {
-        match plan(viewer, target)? {
-            Launch::Direct { args, .. } => Some(args),
-            Launch::Pager { .. } => panic!("a direct viewer planned a pager launch"),
-        }
-    }
-
-    fn git_args(target: &Target) -> Vec<String> {
-        match plan(&Viewer::delta(), target).expect("delta opens everything") {
-            Launch::Pager { git_args, .. } => git_args,
-            Launch::Direct { .. } => panic!("delta planned a direct launch"),
-        }
-    }
-
-    #[test]
-    fn diff_args_per_source() {
-        let req = |source| DiffRequest { file: "a.rs".to_string(), source };
-        assert_eq!(diff_args(&req(DiffSource::Staged)), ["diff", "--cached", "--", "a.rs"]);
-        assert_eq!(diff_args(&req(DiffSource::Worktree)), ["diff", "--", "a.rs"]);
-        assert_eq!(diff_args(&req(DiffSource::Untracked)), [
-            "diff",
-            "--no-index",
-            "--",
-            "/dev/null",
-            "a.rs"
-        ]);
-        let base = DiffSource::Branch { base: "main".to_string() };
-        assert_eq!(diff_args(&req(base)), ["diff", "main...", "--", "a.rs"]);
-    }
-
-    #[test]
-    fn row_and_section_keys_never_collide() {
-        assert_eq!(row("a.rs", DiffSource::Staged).key(), "staged:a.rs");
-        assert_eq!(row("a.rs", branch()).key(), "branch:a.rs");
-        assert_eq!(Target::Section(Section::Staged).key(), "section:staged");
-        assert_eq!(Target::Section(Section::Unstaged).key(), "section:unstaged");
-        assert_eq!(
-            Target::Section(Section::Branch { base: "main".into() }).key(),
-            "section:branch"
-        );
-    }
-
-    #[test]
-    fn delta_pipes_each_target_through_the_pager() {
-        let launch = plan(&Viewer::delta(), &row("a.rs", DiffSource::Staged)).unwrap();
-        assert_eq!(launch, Launch::Pager {
-            pager: Program::Tool(Tool::Delta),
-            pager_args: vec!["--paging=always".to_string()],
-            git_args: vec!["diff".into(), "--cached".into(), "--".into(), "a.rs".into()],
-        });
-        assert_eq!(git_args(&Target::Section(Section::Staged)), ["diff", "--cached"]);
-        assert_eq!(git_args(&Target::Section(Section::Unstaged)), ["diff"]);
-        assert_eq!(git_args(&Target::Section(Section::Branch { base: "main".into() })), [
-            "diff", "main..."
-        ]);
-    }
-
-    #[test]
-    fn tuicr_reviews_rows_by_path_and_sections_by_scope() {
-        let tuicr = Viewer::tuicr();
-        for source in [DiffSource::Staged, DiffSource::Worktree, DiffSource::Untracked] {
-            assert_eq!(direct_args(&tuicr, &row("a.rs", source)).unwrap(), ["-w", "-p", "a.rs"]);
-        }
-        assert_eq!(direct_args(&tuicr, &row("a.rs", branch())).unwrap(), [
-            "-r",
-            "refs/remotes/origin/main...HEAD",
-            "-p",
-            "a.rs"
-        ]);
-        assert_eq!(direct_args(&tuicr, &Target::Section(Section::Staged)).unwrap(), ["-w"]);
-        assert_eq!(direct_args(&tuicr, &Target::Section(Section::Unstaged)).unwrap(), ["-w"]);
-        let changes = Target::Section(Section::Branch { base: "main".into() });
-        assert_eq!(direct_args(&tuicr, &changes).unwrap(), ["-r", "main...HEAD"]);
-        assert_eq!(tuicr.program(), &Program::Tool(Tool::Tuicr));
-    }
-
-    #[test]
-    fn a_file_name_stays_one_argument() {
-        let args = direct_args(&Viewer::tuicr(), &row("dir/my {base} 'x'.rs", DiffSource::Staged));
-        assert_eq!(args.unwrap(), ["-w", "-p", "dir/my {base} 'x'.rs"]);
-    }
-
-    #[test]
-    fn an_empty_template_or_a_missing_placeholder_value_opens_nothing() {
-        let viewer = Viewer::Direct {
-            program: Program::Custom { path: "difft".to_string(), wsl_path: None },
-            templates: Templates {
-                staged: vec!["--base".to_string(), "{base}".to_string()],
-                ..Templates::default()
-            },
-        };
-        let staged_row = row("a.rs", DiffSource::Staged);
-        assert!(!opens(&viewer, &staged_row));
-        assert!(plan(&viewer, &staged_row).is_none(), "a staged row has no base");
-        let unstaged_row = row("a.rs", DiffSource::Worktree);
-        assert!(!opens(&viewer, &unstaged_row));
-        assert!(plan(&viewer, &unstaged_row).is_none(), "the unstaged template is empty");
-        assert!(opens(&Viewer::delta(), &Target::Section(Section::Unstaged)));
-    }
-
-    #[test]
-    fn a_native_pager_launch_runs_git_with_the_pager_wired_in() {
-        let pager = pager_command(r"C:\tools\delta.exe", &["--paging=always".to_string()]);
-        let git_args = ["diff".to_string(), "--".to_string(), "a.rs".to_string()];
-        let (program, args) = native_pager_command("git", &pager, &git_args);
-        assert_eq!(program, "git");
-        assert_eq!(args, [
-            "-c",
-            r"core.pager=C:\tools\delta.exe --paging=always",
-            "diff",
-            "--",
-            "a.rs"
-        ]);
-    }
-
-    const WORKSPACE: &str = r"\\wsl.localhost\kali-linux\home\lev\proj";
-
-    #[test]
-    fn a_wsl_pager_launch_passes_git_pager_and_diff_as_positional_parameters() {
-        let git_args = ["diff".to_string(), "--cached".to_string()];
-        let (program, args) = wsl_pager_command(
-            "kali-linux",
-            Path::new(WORKSPACE),
-            "git",
-            "/bin/delta --paging=always",
-            &git_args,
-        );
-        assert_eq!(program, "wsl.exe");
-        assert_eq!(args[..7], ["-d", "kali-linux", "--cd", WORKSPACE, "--exec", "sh", "-c"]);
-        assert_eq!(
-            args[7],
-            r#"export LESS="${LESS-R}"; g=$1; p=$2; shift 2; exec "$g" -c "core.pager=$p" "$@""#
-        );
-        assert_eq!(args[8..], ["sh", "git", "/bin/delta --paging=always", "diff", "--cached"]);
-    }
-
-    #[test]
-    fn a_login_wsl_pager_launch_exports_less_after_the_profile() {
-        let (_, args) = wsl_pager_command_login(
-            "kali-linux",
-            Path::new(WORKSPACE),
-            "git",
-            "delta --paging=always",
-            &["diff".to_string()],
-        );
-        let script = &args[7];
-        assert!(script.contains("getent passwd"), "resolves the login shell: {script}");
-        assert!(
-            script.contains(r#"-lc 'export LESS="${LESS-R}"; g=$1; p=$2; shift 2; exec "$g" -c "core.pager=$p" "$@"' "$s" "$@""#),
-            "a LESS set by the profile still wins: {script}"
-        );
-        assert_eq!(args[8..], ["sh", "git", "delta --paging=always", "diff"]);
-    }
-
-    #[test]
-    fn a_wsl_direct_launch_execs_the_resolved_program() {
-        let (program, args) = wsl_direct_command(
-            "kali-linux",
-            Path::new(WORKSPACE),
-            "/home/lev/.cargo/bin/tuicr",
-            &["-w".to_string(), "-p".to_string(), "a b.rs".to_string()],
-        );
-        assert_eq!(program, "wsl.exe");
-        assert_eq!(args, [
-            "-d",
-            "kali-linux",
-            "--cd",
-            WORKSPACE,
-            "--exec",
-            "/home/lev/.cargo/bin/tuicr",
-            "-w",
-            "-p",
-            "a b.rs"
-        ]);
-    }
-
-    #[test]
-    fn a_login_wsl_direct_launch_passes_the_program_as_a_parameter() {
-        let (_, args) = wsl_direct_command_login("kali-linux", Path::new(WORKSPACE), "tuicr", &[
-            "-w".to_string(),
-        ]);
-        assert_eq!(args[..7], ["-d", "kali-linux", "--cd", WORKSPACE, "--exec", "sh", "-c"]);
-        assert!(args[7].contains("getent passwd"));
-        assert!(args[7].ends_with(r#"exec "$s" -lc 'exec "$@"' "$s" "$@""#), "{}", args[7]);
-        assert_eq!(args[8..], ["sh", "tuicr", "-w"]);
-    }
-}
 use std::path::Path;
 
 use crate::tools::Tool;
@@ -466,7 +265,21 @@ fn substitute(arg: &str, target: &Target) -> String {
 
 /// `pager` with its arguments, as one `core.pager` value.
 pub fn pager_command(pager: &str, args: &[String]) -> String {
-    std::iter::once(pager).chain(args.iter().map(String::as_str)).collect::<Vec<_>>().join(" ")
+    let mut words = vec![pager.to_string()];
+    words.extend(args.iter().map(|arg| shell_quote(arg)));
+    words.join(" ")
+}
+
+/// A registry-resolved executable path with arguments, as one `core.pager`
+/// value. Git runs that value through a shell, so quote the path as one word.
+pub fn executable_pager_command(path: &str, args: &[String]) -> String {
+    let mut words = vec![shell_quote(path)];
+    words.extend(args.iter().map(|arg| shell_quote(arg)));
+    words.join(" ")
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// git with the pager wired in as its `core.pager`.
@@ -554,4 +367,325 @@ fn wsl_sh(
     ];
     args.extend(positional);
     ("wsl.exe".to_string(), args)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use super::*;
+
+    fn row(file: &str, source: DiffSource) -> Target {
+        Target::Row(DiffRequest { file: file.to_string(), source })
+    }
+
+    fn branch() -> DiffSource {
+        DiffSource::Branch { base: "refs/remotes/origin/main".to_string() }
+    }
+
+    fn direct_args(viewer: &Viewer, target: &Target) -> Option<Vec<String>> {
+        match plan(viewer, target)? {
+            Launch::Direct { args, .. } => Some(args),
+            Launch::Pager { .. } => panic!("a direct viewer planned a pager launch"),
+        }
+    }
+
+    fn git_args(target: &Target) -> Vec<String> {
+        match plan(&Viewer::delta(), target).expect("delta opens everything") {
+            Launch::Pager { git_args, .. } => git_args,
+            Launch::Direct { .. } => panic!("delta planned a direct launch"),
+        }
+    }
+
+    #[test]
+    fn diff_args_per_source() {
+        let req = |source| DiffRequest { file: "a.rs".to_string(), source };
+        assert_eq!(diff_args(&req(DiffSource::Staged)), ["diff", "--cached", "--", "a.rs"]);
+        assert_eq!(diff_args(&req(DiffSource::Worktree)), ["diff", "--", "a.rs"]);
+        assert_eq!(diff_args(&req(DiffSource::Untracked)), [
+            "diff",
+            "--no-index",
+            "--",
+            "/dev/null",
+            "a.rs"
+        ]);
+        let base = DiffSource::Branch { base: "main".to_string() };
+        assert_eq!(diff_args(&req(base)), ["diff", "main...", "--", "a.rs"]);
+    }
+
+    #[test]
+    fn row_and_section_keys_never_collide() {
+        assert_eq!(row("a.rs", DiffSource::Staged).key(), "staged:a.rs");
+        assert_eq!(row("a.rs", branch()).key(), "branch:a.rs");
+        assert_eq!(Target::Section(Section::Staged).key(), "section:staged");
+        assert_eq!(Target::Section(Section::Unstaged).key(), "section:unstaged");
+        assert_eq!(
+            Target::Section(Section::Branch { base: "main".into() }).key(),
+            "section:branch"
+        );
+    }
+
+    #[test]
+    fn delta_pipes_each_target_through_the_pager() {
+        let launch = plan(&Viewer::delta(), &row("a.rs", DiffSource::Staged)).unwrap();
+        assert_eq!(launch, Launch::Pager {
+            pager: Program::Tool(Tool::Delta),
+            pager_args: vec!["--paging=always".to_string()],
+            git_args: vec!["diff".into(), "--cached".into(), "--".into(), "a.rs".into()],
+        });
+        assert_eq!(git_args(&Target::Section(Section::Staged)), ["diff", "--cached"]);
+        assert_eq!(git_args(&Target::Section(Section::Unstaged)), ["diff"]);
+        assert_eq!(git_args(&Target::Section(Section::Branch { base: "main".into() })), [
+            "diff", "main..."
+        ]);
+    }
+
+    #[test]
+    fn tuicr_reviews_rows_by_path_and_sections_by_scope() {
+        let tuicr = Viewer::tuicr();
+        for source in [DiffSource::Staged, DiffSource::Worktree, DiffSource::Untracked] {
+            assert_eq!(direct_args(&tuicr, &row("a.rs", source)).unwrap(), ["-w", "-p", "a.rs"]);
+        }
+        assert_eq!(direct_args(&tuicr, &row("a.rs", branch())).unwrap(), [
+            "-r",
+            "refs/remotes/origin/main...HEAD",
+            "-p",
+            "a.rs"
+        ]);
+        assert_eq!(direct_args(&tuicr, &Target::Section(Section::Staged)).unwrap(), ["-w"]);
+        assert_eq!(direct_args(&tuicr, &Target::Section(Section::Unstaged)).unwrap(), ["-w"]);
+        let changes = Target::Section(Section::Branch { base: "main".into() });
+        assert_eq!(direct_args(&tuicr, &changes).unwrap(), ["-r", "main...HEAD"]);
+        assert_eq!(tuicr.program(), &Program::Tool(Tool::Tuicr));
+    }
+
+    #[test]
+    fn a_file_name_stays_one_argument() {
+        let args = direct_args(&Viewer::tuicr(), &row("dir/my {base} 'x'.rs", DiffSource::Staged));
+        assert_eq!(args.unwrap(), ["-w", "-p", "dir/my {base} 'x'.rs"]);
+    }
+
+    #[test]
+    fn an_empty_template_or_a_missing_placeholder_value_opens_nothing() {
+        let viewer = Viewer::Direct {
+            program: Program::Custom { path: "difft".to_string(), wsl_path: None },
+            templates: Templates {
+                staged: vec!["--base".to_string(), "{base}".to_string()],
+                ..Templates::default()
+            },
+        };
+        let staged_row = row("a.rs", DiffSource::Staged);
+        assert!(!opens(&viewer, &staged_row));
+        assert!(plan(&viewer, &staged_row).is_none(), "a staged row has no base");
+        let unstaged_row = row("a.rs", DiffSource::Worktree);
+        assert!(!opens(&viewer, &unstaged_row));
+        assert!(plan(&viewer, &unstaged_row).is_none(), "the unstaged template is empty");
+        assert!(opens(&Viewer::delta(), &Target::Section(Section::Unstaged)));
+    }
+
+    #[test]
+    fn executable_pager_paths_are_quoted_but_custom_commands_keep_their_syntax() {
+        let args = vec!["--side-by-side".to_string(), "arg with spaces".to_string()];
+        assert_eq!(
+            executable_pager_command(r"C:\Program Files\delta\delta.exe", &args),
+            r#"'C:\Program Files\delta\delta.exe' '--side-by-side' 'arg with spaces'"#
+        );
+        assert_eq!(
+            pager_command("delta --side-by-side", &["--paging=always".to_string()]),
+            "delta --side-by-side '--paging=always'"
+        );
+    }
+
+    #[test]
+    fn a_native_pager_launch_runs_git_with_the_pager_wired_in() {
+        let pager =
+            executable_pager_command(r"C:\tools\delta.exe", &["--paging=always".to_string()]);
+        let git_args = ["diff".to_string(), "--".to_string(), "a.rs".to_string()];
+        let (program, args) = native_pager_command("git", &pager, &git_args);
+        assert_eq!(program, "git");
+        assert_eq!(args, [
+            "-c",
+            r"core.pager='C:\tools\delta.exe' '--paging=always'",
+            "diff",
+            "--",
+            "a.rs"
+        ]);
+    }
+
+    #[test]
+    // Git starts a pager only when stdout is a terminal, which a test never
+    // has, so this runs the `core.pager` value the way Git does: `sh -c`.
+    #[allow(clippy::disallowed_methods)] // This test runs Git's real shell.
+    fn a_real_git_pager_shell_handles_registry_paths_and_custom_arguments() {
+        use std::io::Write;
+
+        let Some(shell) = shell_for_git() else {
+            eprintln!("skipping the Git pager boundary test: Git's shell was not found");
+            return;
+        };
+        let temp = tempfile::tempdir().expect("a temp directory");
+        let pager_dir = temp.path().join(if cfg!(windows) {
+            "pager [metachar] space"
+        } else {
+            "pager [metachar] \\ 'quote' space"
+        });
+        fs::create_dir(&pager_dir).expect("create pager directory");
+        let pager_path = pager_dir.join("pager");
+        fs::write(
+            &pager_path,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ALACRITREE_DIFF_VIEWER_OUTPUT\"\ncat >> \
+             \"$ALACRITREE_DIFF_VIEWER_OUTPUT\"\n",
+        )
+        .expect("write the pager script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&pager_path, fs::Permissions::from_mode(0o755))
+                .expect("make pager executable");
+        }
+        let pager_path = pager_path.to_str().expect("pager path is UTF-8");
+
+        let captured = temp.path().join("captured diff.txt");
+        let run = |pager: String| {
+            let mut child = crate::command_ext::hidden(&shell)
+                .arg("-c")
+                .arg(&pager)
+                .env("ALACRITREE_DIFF_VIEWER_OUTPUT", &captured)
+                .stdin(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("run the pager through Git's shell");
+            child
+                .stdin
+                .take()
+                .expect("the pager's stdin")
+                .write_all(b"-before\n+after\n")
+                .expect("feed the diff to the pager");
+            let output = child.wait_with_output().expect("wait for the pager");
+            let capture = fs::read_to_string(&captured).unwrap_or_else(|err| {
+                panic!(
+                    "the pager never ran ({err}): status={:?}, stderr={}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+            capture.replace("\r\n", "\n")
+        };
+
+        let registry_pager = executable_pager_command(pager_path, &["--paging=always".to_string()]);
+        assert_eq!(run(registry_pager), "--paging=always\n-before\n+after\n");
+
+        let custom_pager = pager_command(&format!("{} --flag", shell_quote(pager_path)), &[
+            "two words".to_string(),
+        ]);
+        assert_eq!(run(custom_pager), "--flag\ntwo words\n-before\n+after\n");
+    }
+
+    const WORKSPACE: &str = r"\\wsl.localhost\kali-linux\home\lev\proj";
+
+    #[test]
+    fn a_wsl_pager_launch_passes_git_pager_and_diff_as_positional_parameters() {
+        let git_args = ["diff".to_string(), "--cached".to_string()];
+        let (program, args) = wsl_pager_command(
+            "kali-linux",
+            Path::new(WORKSPACE),
+            "git",
+            "/bin/delta --paging=always",
+            &git_args,
+        );
+        assert_eq!(program, "wsl.exe");
+        assert_eq!(args[..7], ["-d", "kali-linux", "--cd", WORKSPACE, "--exec", "sh", "-c"]);
+        assert_eq!(
+            args[7],
+            r#"export LESS="${LESS-R}"; g=$1; p=$2; shift 2; exec "$g" -c "core.pager=$p" "$@""#
+        );
+        assert_eq!(args[8..], ["sh", "git", "/bin/delta --paging=always", "diff", "--cached"]);
+    }
+
+    #[test]
+    fn a_login_wsl_pager_launch_exports_less_after_the_profile() {
+        let (_, args) = wsl_pager_command_login(
+            "kali-linux",
+            Path::new(WORKSPACE),
+            "git",
+            "delta --paging=always",
+            &["diff".to_string()],
+        );
+        let script = &args[7];
+        assert!(script.contains("getent passwd"), "resolves the login shell: {script}");
+        assert!(
+            script.contains(r#"-lc 'export LESS="${LESS-R}"; g=$1; p=$2; shift 2; exec "$g" -c "core.pager=$p" "$@"' "$s" "$@""#),
+            "a LESS set by the profile still wins: {script}"
+        );
+        assert_eq!(args[8..], ["sh", "git", "delta --paging=always", "diff"]);
+    }
+
+    #[test]
+    fn a_wsl_registry_pager_path_is_shell_quoted() {
+        let pager = executable_pager_command(r"/opt/tools/delta path\with'quote;echo", &[
+            "--side-by-side".to_string(),
+        ]);
+        let (_, args) =
+            wsl_pager_command("kali-linux", Path::new(WORKSPACE), "/usr/bin/git", &pager, &[
+                "diff".to_string(),
+            ]);
+        assert_eq!(args[10], r#"'/opt/tools/delta path\with'\''quote;echo' '--side-by-side'"#);
+    }
+
+    #[test]
+    fn a_wsl_direct_launch_execs_the_resolved_program() {
+        let (program, args) = wsl_direct_command(
+            "kali-linux",
+            Path::new(WORKSPACE),
+            "/home/lev/.cargo/bin/tuicr",
+            &["-w".to_string(), "-p".to_string(), "a b.rs".to_string()],
+        );
+        assert_eq!(program, "wsl.exe");
+        assert_eq!(args, [
+            "-d",
+            "kali-linux",
+            "--cd",
+            WORKSPACE,
+            "--exec",
+            "/home/lev/.cargo/bin/tuicr",
+            "-w",
+            "-p",
+            "a b.rs"
+        ]);
+    }
+
+    #[test]
+    fn a_login_wsl_direct_launch_passes_the_program_as_a_parameter() {
+        let (_, args) = wsl_direct_command_login("kali-linux", Path::new(WORKSPACE), "tuicr", &[
+            "-w".to_string(),
+        ]);
+        assert_eq!(args[..7], ["-d", "kali-linux", "--cd", WORKSPACE, "--exec", "sh", "-c"]);
+        assert!(args[7].contains("getent passwd"));
+        assert!(args[7].ends_with(r#"exec "$s" -lc 'exec "$@"' "$s" "$@""#), "{}", args[7]);
+        assert_eq!(args[8..], ["sh", "tuicr", "-w"]);
+    }
+
+    #[cfg(windows)]
+    #[allow(clippy::disallowed_methods)] // This test probes Git's bundled shell.
+    fn shell_for_git() -> Option<PathBuf> {
+        let output = crate::command_ext::hidden("git")
+            .arg("--exec-path")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .ok()?
+            .wait_with_output()
+            .ok()?;
+        let exec_path = String::from_utf8(output.stdout).ok()?;
+        let exec_path = PathBuf::from(exec_path.trim());
+        let root = exec_path.parent()?.parent()?.parent()?;
+        [root.join("usr/bin/sh.exe"), root.join("bin/sh.exe")]
+            .into_iter()
+            .find(|path| path.is_file())
+    }
+
+    #[cfg(not(windows))]
+    fn shell_for_git() -> Option<PathBuf> {
+        Some(PathBuf::from("/bin/sh"))
+    }
 }

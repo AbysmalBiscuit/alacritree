@@ -517,9 +517,10 @@ impl PasteConfig {
     }
 }
 
-/// `[integrations]`: how alacritree talks to the other tools it can see.  How
-/// what those tools contribute is *drawn* stays under `[ui]` — a herdr row's
-/// glyph is `ui.icons.herdr`, not a setting here.
+/// `[integrations]`: how alacritree invokes external tools and the controls
+/// specific to those integrations, such as the diff viewer and its section
+/// buttons. General sidebar and terminal appearance stays under `[ui]`; a
+/// herdr row's glyph is `ui.icons.herdr`, not a setting here.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct IntegrationsConfig {
     pub git: ToolConfig,
