@@ -126,11 +126,8 @@ fn wslenv_with_alacritree_vars(current: Option<&str>) -> String {
     wslenv
 }
 
-/// Listen on a caller-chosen path, without advertising it.
-///
-/// The real socket is named after the process id, which is unique per alacritree
-/// but not per *listener*: two tests in one test binary would otherwise bind the
-/// same name and answer each other's requests.
+/// Bind the socket and start accepting on it. Advertising the path to child
+/// processes is left to [`spawn_listener`].
 fn listen_at(
     path: PathBuf,
     repaint: impl Repaint,
@@ -276,13 +273,33 @@ fn socket_path() -> PathBuf {
     socket_dir().join(format!("alacritree-{}.sock", std::process::id()))
 }
 
-/// A listener on a name no other test in this binary will bind.
+/// The listener's routing with no socket in between. A request takes the path
+/// a connection thread gives it, and the ones bound for the app arrive on the
+/// receiver [`InMemory::new`] returns.
 #[cfg(test)]
-pub fn listen_for_test(
-    label: &str,
-    repaint: impl Repaint,
-) -> std::io::Result<(SocketHandle, Receiver<AppCall>)> {
-    listen_at(socket_dir().join(format!("alacritree-test-{label}.sock")), repaint)
+pub struct InMemory<R: Repaint> {
+    app_tx: Sender<AppCall>,
+    repaint: R,
+}
+
+#[cfg(test)]
+impl<R: Repaint> InMemory<R> {
+    pub fn new(repaint: R) -> (Self, Receiver<AppCall>) {
+        let (app_tx, app_rx) = mpsc::channel();
+        (Self { app_tx, repaint }, app_rx)
+    }
+}
+
+#[cfg(test)]
+impl<R: Repaint> super::protocol::Transport for InMemory<R> {
+    fn send(
+        &self,
+        request: &IpcRequest,
+        _timeout: Duration,
+    ) -> Result<serde_json::Value, super::protocol::SendError> {
+        dispatch(request.clone(), &self.app_tx, &self.repaint)
+            .map_err(super::protocol::SendError::Failed)
+    }
 }
 
 #[cfg(test)]

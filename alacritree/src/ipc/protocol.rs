@@ -216,6 +216,22 @@ pub fn send_request(
         .unwrap_or_else(|_| Err(SendError::Failed("alacritree did not reply in time".to_string())))
 }
 
+/// Where a client's requests go. Production sends them over a running
+/// alacritree's socket, and tests hand them to the listener's dispatch
+/// in-process.
+pub trait Transport {
+    fn send(&self, request: &IpcRequest, timeout: Duration) -> Result<Value, SendError>;
+}
+
+/// A running alacritree's socket: the given path, or the one discovery finds.
+pub struct LocalSocket<'a>(pub Option<&'a Path>);
+
+impl Transport for LocalSocket<'_> {
+    fn send(&self, request: &IpcRequest, timeout: Duration) -> Result<Value, SendError> {
+        send_request(self.0, request, timeout)
+    }
+}
+
 fn exchange(socket: Option<&Path>, request: &IpcRequest) -> Result<Value, SendError> {
     let stream = find_socket(socket).map_err(|_| SendError::NoInstance)?;
     exchange_on(stream, request).map_err(SendError::Failed)
