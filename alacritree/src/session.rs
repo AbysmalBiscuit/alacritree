@@ -281,9 +281,9 @@ pub struct Session {
     /// timer instead of polling the process table every frame.  `Cell` is
     /// enough since `Session` isn't `Sync` and the values are `Copy`.
     agent_cache: Cell<AgentCache>,
-    /// Distro identity used to parse and translate reports, even when the
-    /// foreground-process helper is disabled and no probe exists.
-    wsl_distro: Option<String>,
+    /// Distro identity used to translate OSC cwd reports. Present only when
+    /// cwd reporting is enabled.
+    reported_cwd_distro: Option<String>,
     /// Set for shimmed WSL sessions: the distro plus the probe key its
     /// shim published, unregistered again on drop.  The Windows process
     /// table ends at wsl.exe, so this is the only live view inside.
@@ -1375,7 +1375,7 @@ impl Session {
             last_report_cell: None,
             shell_pid: None,
             agent_cache: Cell::new(AgentCache::default()),
-            wsl_distro: None,
+            reported_cwd_distro: None,
             wsl_probe: None,
             priority_job: None,
             notifier: None,
@@ -1428,7 +1428,7 @@ impl Session {
         size: TermSize,
         cell_size: (f32, f32),
         shell_override: Option<Shell>,
-        wsl_distro: Option<String>,
+        report_distro: Option<String>,
         wsl_probe: Option<WslProbe>,
     ) -> (Self, OpenRequest) {
         // Overrides are argv built in code (`wsl.exe -d <distro> --cd <dir>`),
@@ -1452,7 +1452,7 @@ impl Session {
             title,
             SessionKind::Shell,
             escape_args,
-            wsl_distro,
+            report_distro,
             wsl_probe,
         )
     }
@@ -1500,18 +1500,18 @@ impl Session {
         title: String,
         kind: SessionKind,
         escape_args: bool,
-        wsl_distro: Option<String>,
+        report_distro: Option<String>,
         wsl_probe: Option<WslProbe>,
     ) -> (Self, OpenRequest) {
         let pty_cwd = pty_working_directory(working_directory.clone(), config);
         let window_size = window_size(size, cell_size);
-        let wsl_distro = if config.vt.report_cwd {
-            wsl_distro.or_else(|| wsl_probe.as_ref().map(|probe| probe.distro.clone()))
+        let reported_cwd_distro = if config.vt.report_cwd {
+            report_distro.or_else(|| wsl_probe.as_ref().map(|probe| probe.distro.clone()))
         } else {
             None
         };
 
-        let shell_platform = if wsl_distro.is_some() || wsl_probe.is_some() || cfg!(unix) {
+        let shell_platform = if reported_cwd_distro.is_some() || wsl_probe.is_some() || cfg!(unix) {
             osc_tap::ShellPlatform::Unix
         } else {
             osc_tap::ShellPlatform::Windows
@@ -1579,7 +1579,7 @@ impl Session {
             last_report_cell: None,
             shell_pid: None,
             agent_cache: Cell::new(AgentCache::default()),
-            wsl_distro,
+            reported_cwd_distro,
             wsl_probe,
             priority_job: None,
             notifier: None,
@@ -1713,7 +1713,7 @@ impl Session {
             while let Ok(event) = receiver.try_recv() {
                 match event {
                     osc_tap::OscEvent::Cwd(path) => {
-                        let distro = self.wsl_distro().map(str::to_string);
+                        let distro = self.reported_cwd_distro().map(str::to_string);
                         self.reported_cwd =
                             path.and_then(|path| resolve_reported_cwd(&path, distro.as_deref()));
                     },
@@ -1788,10 +1788,15 @@ impl Session {
         Processor::<StdSyncHandler>::new().advance(&mut *term, &hold_notice_bytes(chord));
     }
 
-    /// The distro a WSL session runs in. Dropped paths need it to
+    /// The distro a helper-backed WSL session runs in. Dropped paths need it to
     /// decide whether a `C:\` path has to be rewritten before a shell sees it.
     pub fn wsl_distro(&self) -> Option<&str> {
-        self.wsl_distro.as_deref()
+        self.wsl_probe.as_ref().map(|probe| probe.distro.as_str())
+    }
+
+    /// The distro used to translate an OSC cwd report, when reporting is on.
+    pub fn reported_cwd_distro(&self) -> Option<&str> {
+        self.reported_cwd_distro.as_deref()
     }
 
     /// Semantic sidebar state for this session. Process probing identifies a
@@ -2444,8 +2449,37 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn wsl_identity_is_retained_only_for_cwd_reporting() {
-        for (report_cwd, expected) in [(false, None), (true, Some("Ubuntu"))] {
+    fn helper_distro_remains_for_shell_consumers_without_report_context() {
+        let mut config = Config::default();
+        config.vt.report_cwd = false;
+        let probe = Some(WslProbe { distro: "Ubuntu".into(), key: "test-probe".into() });
+        let (mut session, _) = Session::pending_shell(
+            egui::Context::default(),
+            &config,
+            Some(PathBuf::from(r"C:\workspace")),
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            Some(Shell::new("wsl.exe".into(), Vec::new())),
+            None,
+            probe,
+        );
+
+        assert_eq!(session.wsl_distro(), Some("Ubuntu"));
+        assert_eq!(session.reported_cwd_distro(), None);
+        let (sender, receiver) = mpsc::channel();
+        session.osc_events = Some(receiver);
+        sender.send(osc_tap::OscEvent::Cwd(Some("/home/dev/src".into()))).unwrap();
+
+        session.drain_events(&Palette::default());
+
+        assert_eq!(session.reported_cwd, Some(PathBuf::from("/home/dev/src")));
+    }
+
+    #[test]
+    fn shell_and_report_distro_contexts_are_separate() {
+        for (report_cwd, expected_shell, expected_report) in
+            [(false, Some("Ubuntu"), None), (true, None, Some("Ubuntu"))]
+        {
             let mut config = Config::default();
             config.vt.report_cwd = report_cwd;
             let probe = (!report_cwd)
@@ -2461,7 +2495,8 @@ pub(crate) mod tests {
                 probe,
             );
 
-            assert_eq!(session.wsl_distro(), expected);
+            assert_eq!(session.wsl_distro(), expected_shell);
+            assert_eq!(session.reported_cwd_distro(), expected_report);
             assert_eq!(session.wsl_probe.is_some(), !report_cwd);
         }
     }
@@ -2481,7 +2516,7 @@ pub(crate) mod tests {
     #[test]
     fn draining_a_wsl_cwd_event_updates_the_reported_directory() {
         let mut session = pty_less_probe(SessionKind::Shell, "shell");
-        session.wsl_distro = Some("Ubuntu".to_string());
+        session.reported_cwd_distro = Some("Ubuntu".to_string());
         let (sender, receiver) = mpsc::channel();
         session.osc_events = Some(receiver);
         sender.send(osc_tap::OscEvent::Cwd(Some("/home/dev/src".to_string()))).unwrap();
@@ -2610,7 +2645,8 @@ pub(crate) mod tests {
             Some("Ubuntu".into()),
             None,
         );
-        assert_eq!(session.wsl_distro(), Some("Ubuntu"));
+        assert_eq!(session.reported_cwd_distro(), Some("Ubuntu"));
+        assert_eq!(session.wsl_distro(), None);
         assert!(session.wsl_probe.is_none());
 
         for (bytes, expected) in [
@@ -2641,6 +2677,7 @@ pub(crate) mod tests {
         expected_args: &[String],
     ) {
         let workspace = Some(PathBuf::from("C:/workspace"));
+        let expected_shell_distro = probe.as_ref().map(|probe| probe.distro.clone());
         let (mut session, mut request) = Session::pending_shell(
             egui::Context::default(),
             config,
@@ -2680,7 +2717,8 @@ pub(crate) mod tests {
             }
             assert_eq!(session.working_directory, workspace);
         }
-        assert_eq!(session.wsl_distro(), Some("Ubuntu"));
+        assert_eq!(session.reported_cwd_distro(), Some("Ubuntu"));
+        assert_eq!(session.wsl_distro(), expected_shell_distro.as_deref());
     }
 
     /// A session with no PTY behind it, so an injected sequence is the only
@@ -2713,7 +2751,7 @@ pub(crate) mod tests {
             last_report_cell: None,
             shell_pid: None,
             agent_cache: Cell::new(AgentCache::default()),
-            wsl_distro: None,
+            reported_cwd_distro: None,
             wsl_probe: None,
             priority_job: None,
             notifier: None,
