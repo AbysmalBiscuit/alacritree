@@ -444,6 +444,7 @@ pub struct AlacritreeApp {
 impl AlacritreeApp {
     fn from_parts(
         config: Config,
+        theme: Theme,
         persisted: state::PersistedState,
         projects: Vec<Project>,
         font_chain: Vec<crate::fonts::ChainFace>,
@@ -451,7 +452,6 @@ impl AlacritreeApp {
         notify_rx: Receiver<SessionId>,
         ipc: (Option<ipc::SocketHandle>, Option<Receiver<ipc::AppCall>>),
     ) -> Self {
-        let theme = Theme::from_config(&config);
         let color_glyph_budget_mb = config.font.color_glyph_cache_mb;
         let (ipc_socket, ipc_rx) = ipc;
         let row_labels = crate::row_label::LabelTemplates::new(
@@ -526,13 +526,12 @@ impl AlacritreeApp {
     fn configure_context(
         ctx: &Context,
         config: &Config,
+        theme: &Theme,
     ) -> (Vec<crate::fonts::ChainFace>, crate::fonts::FaceMetrics) {
         // A job's own closure cannot wake the loop when it unwinds, and the
         // failure it reports is only ever read from a frame.
         let waker_ctx = ctx.clone();
         jobs::pool().set_waker(move || waker_ctx.request_repaint());
-
-        let theme = Theme::from_config(config);
 
         let (font_chain, face_metrics) =
             crate::fonts::install_terminal_fonts(ctx, &config.font, &config.ui_font);
@@ -638,7 +637,8 @@ impl AlacritreeApp {
     }
 
     pub fn new(cc: &CreationContext<'_>, config: Config) -> Self {
-        let (font_chain, face_metrics) = Self::configure_context(&cc.egui_ctx, &config);
+        let theme = Theme::from_config(&config);
+        let (font_chain, face_metrics) = Self::configure_context(&cc.egui_ctx, &config, &theme);
         let (ipc_socket, ipc_rx) = Self::start_ipc(&cc.egui_ctx, config.ipc_socket);
         let (persisted, projects) = Self::load_projects(&config);
 
@@ -655,6 +655,7 @@ impl AlacritreeApp {
         let pr_status_concurrency = config.ui.pr_status_concurrency;
         let mut app = Self::from_parts(
             config,
+            theme,
             persisted,
             projects,
             font_chain,
@@ -5931,8 +5932,10 @@ mod tests {
         config.integrations.herdr.enabled = true;
         config.integrations.herdr.show_unmatched = true;
         let (_, notify_rx) = mpsc::channel();
+        let theme = Theme::from_config(&config);
         let mut app = AlacritreeApp::from_parts(
             config,
+            theme,
             state::PersistedState::default(),
             Vec::new(),
             Vec::new(),
@@ -5950,6 +5953,7 @@ mod tests {
         let (_, notify_rx) = mpsc::channel();
         let mut app = AlacritreeApp::from_parts(
             Config::default(),
+            Theme::from_config(&Config::default()),
             state::PersistedState::default(),
             Vec::new(),
             Vec::new(),
