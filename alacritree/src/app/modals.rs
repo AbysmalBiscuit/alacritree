@@ -1176,3 +1176,273 @@ fn modal_button(
     .inner
     .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
+
+pub(super) struct DeleteRequest {
+    pub(super) project_idx: usize,
+    pub(super) worktree_path: PathBuf,
+    pub(super) worktree_name: String,
+    pub(super) branch: Option<String>,
+    /// `None` until a count lands. The cache answers for a worktree the git
+    /// panel has shown; one never selected has to wait for the job.
+    pub(super) dirty: Option<DirtyCounts>,
+    /// Fills `dirty` when the cache was cold.
+    pub(super) dirty_job: Option<jobs::Job<DirtyCounts>>,
+    /// The checkout dir is already gone; confirm prunes metadata instead of
+    /// removing a directory.
+    pub(super) prunable: bool,
+    /// Checkbox state for the prune dialog's "also delete branch".
+    pub(super) delete_branch: bool,
+    /// Whether this confirm's removal passes `--force`: preset `true` when
+    /// the dirty count is already known dirty (a warm cache, or a cold
+    /// probe that landed before the confirm), left `false` while the count
+    /// is unknown, and set `true` when reopening as the retry after an
+    /// unforced removal was refused by git.
+    pub(super) force: bool,
+}
+
+/// An in-flight background delete/prune awaiting its git result.
+pub(super) struct DeleteTask {
+    pub(super) project_idx: usize,
+    /// Marks the matching sidebar row with a spinner while the removal runs.
+    pub(super) worktree_path: PathBuf,
+    pub(super) worktree_name: String,
+    pub(super) branch: Option<String>,
+    pub(super) dirty: Option<DirtyCounts>,
+    pub(super) delete_branch: bool,
+    /// Distinguishes the "prune" vs "delete" wording in a failure message.
+    pub(super) prunable: bool,
+    pub(super) job: jobs::Job<Result<(), String>>,
+}
+
+pub(super) enum CreateState {
+    Prompt {
+        project_idx: usize,
+        branch: String,
+        error: Option<String>,
+    },
+    Running {
+        project_idx: usize,
+        branch: String,
+        steps: Vec<String>,
+        rx: Receiver<Progress>,
+        /// Kept alive so dropping it doesn't cancel the still-running create
+        /// on the pool.  `rx` carries the result, so the handle is polled
+        /// only for the failure latch a panicked create reports through.
+        job: jobs::Job<()>,
+    },
+    Done {
+        project_idx: usize,
+        steps: Vec<String>,
+        result: Result<PathBuf, String>,
+    },
+}
+
+/// A worktree creation the user minimized from the running modal: it keeps
+/// running off-thread while they work, and its result is adopted in
+/// `poll_pending_creates`.
+pub(super) struct BackgroundCreate {
+    pub(super) project_idx: usize,
+    /// Shown on the sidebar placeholder row until the finished worktree
+    /// replaces it on refresh.
+    pub(super) branch: String,
+    pub(super) rx: Receiver<Progress>,
+    /// See `CreateState::Running::job`.
+    pub(super) job: jobs::Job<()>,
+}
+
+/// The rename dialog, keyed by root rather than index: an IPC `remove_project`
+/// can reorder `projects` while the modal is open.
+pub(super) struct RenameState {
+    pub(super) root: PathBuf,
+    /// Text being edited; seeded with the current display name.
+    pub(super) label: String,
+}
+
+/// The "remove project" confirmation modal.  Keyed by root, like the rename
+/// dialog, so a reorder or IPC removal under the modal can't retarget it.
+pub(super) struct ProjectRemoveState {
+    pub(super) root: PathBuf,
+    /// Display name, kept for the prompt after `projects` may have shifted.
+    pub(super) name: String,
+}
+
+/// Modal state for choosing a worktree's diff base.
+pub(super) struct BaseBranchPicker {
+    pub(super) worktree: PathBuf,
+    pub(super) query: String,
+    /// `None` until the listing lands; the picker opens before git answers.
+    /// `Err` is what git said when listing failed (not a repo, WSL down…).
+    pub(super) branches: Option<Result<Vec<String>, String>>,
+    pub(super) branches_job: Option<jobs::Job<Result<Vec<String>, String>>>,
+    /// Auto-detected base shown on the "Auto" row.
+    pub(super) detected: Option<String>,
+    pub(super) cursor: usize,
+}
+
+/// `git worktree remove` refuses a tree with work in it, and that refusal is
+/// the authority on whether removing would lose anything. Both fragments are
+/// real git wording: `contains modified or untracked files` is the current
+/// message, `is dirty` is what git 2.17 (the version that introduced
+/// `worktree remove`) said before the message was reworded.
+///
+/// `worktree.rs`'s failure string is `git <args>: fatal: '<path>' <reason>`,
+/// and `<path>` (attacker- or at least user-controlled) is echoed twice —
+/// once in the command args, once quoted right after `fatal:`. Matching
+/// against the raw message would let a worktree path that happens to spell
+/// out one of these fragments turn an unrelated failure (locked tree, main
+/// worktree, filesystem error) into a false "needs --force" prompt. Since
+/// git's own wording always lands after the closing quote of the path — never
+/// inside it — cutting the tail at the last `'` drops both copies of the path
+/// and leaves only text git itself authored.
+pub(super) fn refused_for_unsaved_work(message: &str) -> bool {
+    let tail = message.rsplit_once("fatal:").map_or(message, |(_, tail)| tail);
+    let reason = tail.rsplit_once('\'').map_or(tail, |(_, after)| after).to_ascii_lowercase();
+    reason.contains("contains modified or untracked files, use --force")
+        || reason.contains("is dirty, use --force")
+}
+
+pub(super) fn dirty_parts(counts: &DirtyCounts) -> String {
+    let mut parts = Vec::new();
+    if counts.staged > 0 {
+        parts.push(format!("{} staged", counts.staged));
+    }
+    if counts.modified > 0 {
+        parts.push(format!("{} modified", counts.modified));
+    }
+    if counts.untracked > 0 {
+        parts.push(format!("{} untracked", counts.untracked));
+    }
+    parts.join(", ")
+}
+
+/// The delete confirm's warning line.
+///
+/// `counts` is `None` until a count lands (`checking`) or after a probe
+/// failed and left nothing to show (`!checking`). `force` is whether this
+/// confirm would pass `--force` — a first attempt whose resolved count is
+/// already known dirty, or the retry after git refused an unforced removal.
+///
+/// `force` is checked first: a forced retry followed git's own refusal, so
+/// it is never safe to render "nothing to warn about" for it, regardless of
+/// what `counts` holds — a stale-clean read, or none at all (the request was
+/// confirmed before its probe landed, which cancelled the probe).
+pub(super) fn dirty_warning(
+    counts: Option<&DirtyCounts>,
+    force: bool,
+    checking: bool,
+) -> Option<String> {
+    if force {
+        return Some(match counts.filter(|c| c.is_dirty()) {
+            Some(counts) => {
+                format!(
+                    "Working tree has {} file(s) — they will be discarded with --force.",
+                    dirty_parts(counts)
+                )
+            },
+            None => "git reported local changes; they will be discarded with --force.".to_string(),
+        });
+    }
+    match counts {
+        Some(counts) if counts.is_dirty() => {
+            Some(format!("Working tree has {} file(s) with local changes.", dirty_parts(counts)))
+        },
+        Some(_) => None,
+        None if checking => Some("Checking working tree for uncommitted changes…".to_string()),
+        None => Some("Couldn't check the working tree for local changes.".to_string()),
+    }
+}
+
+/// Branches whose name contains `query`, case-insensitively.
+pub(super) fn filter_branches(branches: &[String], query: &str) -> Vec<String> {
+    let query = query.to_lowercase();
+    branches.iter().filter(|b| b.to_lowercase().contains(&query)).cloned().collect()
+}
+
+/// Where the picker cursor lands after this frame's filter changes.  Row 0 is
+/// always Auto, so reseeding a query edit to 0 would apply Auto on the primary
+/// "type a branch name, press Enter" flow.  A non-empty query instead seeds
+/// the first branch row (1), clamped to 0 when nothing matches; an empty
+/// query seeds Auto.  With no query change, the previous cursor is kept,
+/// clamped to the (possibly shrunk) filtered length.
+pub(super) fn picker_cursor(
+    query_changed: bool,
+    query_empty: bool,
+    prev: usize,
+    filtered_len: usize,
+) -> usize {
+    if query_changed {
+        if query_empty { 0 } else { 1.min(filtered_len) }
+    } else {
+        prev.min(filtered_len)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dirty_warning_stays_quiet_for_a_known_clean_unforced_tree() {
+        let clean = DirtyCounts::default();
+        assert_eq!(dirty_warning(Some(&clean), false, false), None);
+    }
+
+    #[test]
+    fn dirty_warning_distinguishes_checking_from_unavailable() {
+        let checking = dirty_warning(None, false, true).expect("still checking");
+        assert!(checking.to_lowercase().contains("checking"));
+        let unavailable = dirty_warning(None, false, false).expect("probe failed or was skipped");
+        assert!(!unavailable.to_lowercase().contains("checking"));
+    }
+
+    #[test]
+    fn refused_for_unsaved_work_matches_a_real_git_refusal() {
+        let message = "git worktree remove ../wt1: fatal: '../wt1' contains modified or untracked \
+                       files, use --force to delete it";
+        assert!(refused_for_unsaved_work(message));
+    }
+
+    #[test]
+    fn refused_for_unsaved_work_ignores_unrelated_failures() {
+        assert!(!refused_for_unsaved_work(
+            "git worktree remove ../wt1: fatal: '../wt1' is a main working tree"
+        ));
+    }
+
+    /// A worktree path that happens to contain the matched phrase must not
+    /// turn an unrelated failure into a false "needs --force" prompt --
+    /// `refused_for_unsaved_work` only reads the text after the closing
+    /// quote of the path, never the quoted path itself.
+    #[test]
+    fn refused_for_unsaved_work_is_not_fooled_by_a_path_spelling_out_the_phrase() {
+        let path = "../is dirty, use --force to delete it";
+        let message = format!(
+            "git worktree remove {path}: fatal: '{path}' cannot be locked: filesystem error"
+        );
+        assert!(!refused_for_unsaved_work(&message));
+    }
+
+    #[test]
+    fn picker_filter_is_a_case_insensitive_contains() {
+        let branches =
+            vec!["main".to_string(), "develop".to_string(), "origin/develop".to_string()];
+        assert_eq!(filter_branches(&branches, ""), branches);
+        assert_eq!(filter_branches(&branches, "DEV"), vec!["develop", "origin/develop"]);
+        assert!(filter_branches(&branches, "zz").is_empty());
+    }
+
+    #[test]
+    fn picker_cursor_seeds_the_first_match_on_a_non_empty_query_change() {
+        // Typing a query that matches something jumps past Auto to the first
+        // match, so Enter applies that match instead of Auto.
+        assert_eq!(picker_cursor(true, false, 0, 3), 1);
+        // A query with no matches has nothing to land on but Auto.
+        assert_eq!(picker_cursor(true, false, 0, 0), 0);
+        // Clearing the query back to empty returns the cursor to Auto.
+        assert_eq!(picker_cursor(true, true, 5, 3), 0);
+        // No query change this frame: clamp the previous cursor to the
+        // (possibly shrunk) filtered length instead of reseeding it.
+        assert_eq!(picker_cursor(false, false, 5, 3), 3);
+        assert_eq!(picker_cursor(false, false, 2, 3), 2);
+    }
+}
