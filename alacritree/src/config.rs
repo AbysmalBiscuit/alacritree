@@ -947,32 +947,63 @@ impl Default for UiFont {
 /// keys let the destructive one be marked. `reorder` and `upstream_diverged`
 /// share a default glyph and are otherwise unrelated.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct Icons {
+pub struct Icons<C = Rgb> {
     /// Glyph prefixing the sidebar search prompt.
-    pub search: IconStyle,
-    pub worktree_main: IconStyle,
-    pub worktree: IconStyle,
-    pub session: IconStyle,
-    pub herdr: IconStyle,
-    pub home: IconStyle,
-    pub project_expanded: IconStyle,
-    pub project_collapsed: IconStyle,
-    pub pr_open: IconStyle,
-    pub pr_draft: IconStyle,
-    pub pr_merged: IconStyle,
-    pub pr_closed: IconStyle,
-    pub upstream_level: IconStyle,
-    pub upstream_diverged: IconStyle,
-    pub upstream_gone: IconStyle,
-    pub upstream_untracked: IconStyle,
-    pub add_project: IconStyle,
-    pub new_worktree: IconStyle,
-    pub new_session: IconStyle,
-    pub remove_project: IconStyle,
-    pub delete_worktree: IconStyle,
-    pub close_session: IconStyle,
-    pub refresh: IconStyle,
-    pub reorder: IconStyle,
+    pub search: IconStyle<C>,
+    pub worktree_main: IconStyle<C>,
+    pub worktree: IconStyle<C>,
+    pub session: IconStyle<C>,
+    pub herdr: IconStyle<C>,
+    pub home: IconStyle<C>,
+    pub project_expanded: IconStyle<C>,
+    pub project_collapsed: IconStyle<C>,
+    pub pr_open: IconStyle<C>,
+    pub pr_draft: IconStyle<C>,
+    pub pr_merged: IconStyle<C>,
+    pub pr_closed: IconStyle<C>,
+    pub upstream_level: IconStyle<C>,
+    pub upstream_diverged: IconStyle<C>,
+    pub upstream_gone: IconStyle<C>,
+    pub upstream_untracked: IconStyle<C>,
+    pub add_project: IconStyle<C>,
+    pub new_worktree: IconStyle<C>,
+    pub new_session: IconStyle<C>,
+    pub remove_project: IconStyle<C>,
+    pub delete_worktree: IconStyle<C>,
+    pub close_session: IconStyle<C>,
+    pub refresh: IconStyle<C>,
+    pub reorder: IconStyle<C>,
+}
+
+impl<C: Copy> Icons<C> {
+    pub fn map_colors<D>(&self, f: impl Fn(C) -> D + Copy) -> Icons<D> {
+        Icons {
+            search: self.search.map_color(f),
+            worktree_main: self.worktree_main.map_color(f),
+            worktree: self.worktree.map_color(f),
+            session: self.session.map_color(f),
+            herdr: self.herdr.map_color(f),
+            home: self.home.map_color(f),
+            project_expanded: self.project_expanded.map_color(f),
+            project_collapsed: self.project_collapsed.map_color(f),
+            pr_open: self.pr_open.map_color(f),
+            pr_draft: self.pr_draft.map_color(f),
+            pr_merged: self.pr_merged.map_color(f),
+            pr_closed: self.pr_closed.map_color(f),
+            upstream_level: self.upstream_level.map_color(f),
+            upstream_diverged: self.upstream_diverged.map_color(f),
+            upstream_gone: self.upstream_gone.map_color(f),
+            upstream_untracked: self.upstream_untracked.map_color(f),
+            add_project: self.add_project.map_color(f),
+            new_worktree: self.new_worktree.map_color(f),
+            new_session: self.new_session.map_color(f),
+            remove_project: self.remove_project.map_color(f),
+            delete_worktree: self.delete_worktree.map_color(f),
+            close_session: self.close_session.map_color(f),
+            refresh: self.refresh.map_color(f),
+            reorder: self.reorder.map_color(f),
+        }
+    }
 }
 
 /// `[ui.focus_outline]`: stroke a border around a panel while it owns
@@ -1006,18 +1037,30 @@ impl Default for Icons {
 /// accepted as glyph-only, or a table that also styles color, weight, slant,
 /// and size.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
-pub struct IconStyle {
+pub struct IconStyle<C = Rgb> {
     pub glyph: Option<String>,
-    pub color: Option<Rgb>,
+    pub color: Option<C>,
     pub bold: bool,
     pub italic: bool,
     /// Logical pixels before `ui_scale`; clamped to the icon's slot at paint.
     pub size: Option<f32>,
 }
 
-impl IconStyle {
+impl<C> IconStyle<C> {
     pub fn or_glyph<'a>(&'a self, default: &'a str) -> &'a str {
         self.glyph.as_deref().map(str::trim).filter(|g| !g.is_empty()).unwrap_or(default)
+    }
+}
+
+impl<C: Copy> IconStyle<C> {
+    pub fn map_color<D>(&self, f: impl Fn(C) -> D) -> IconStyle<D> {
+        IconStyle {
+            glyph: self.glyph.clone(),
+            color: self.color.map(f),
+            bold: self.bold,
+            italic: self.italic,
+            size: self.size,
+        }
     }
 }
 
@@ -1025,16 +1068,22 @@ impl IconStyle {
 /// site normally paints, so an emphasis that sets only `bold` still tracks the
 /// theme.
 #[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
-pub struct TextEmphasis {
-    pub color: Option<Rgb>,
+pub struct TextEmphasis<C = Rgb> {
+    pub color: Option<C>,
     pub bold: bool,
     pub italic: bool,
+}
+
+impl<C: Copy> TextEmphasis<C> {
+    pub fn map_color<D>(self, f: impl Fn(C) -> D) -> TextEmphasis<D> {
+        TextEmphasis { color: self.color.map(f), bold: self.bold, italic: self.italic }
+    }
 }
 
 /// `[ui.path_style]`: how each site spells a path, plus the two emphases the
 /// `Zed` style paints with.  Every field defaults to today's rendering.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
-pub struct PathStyleConfig {
+pub struct PathStyleConfig<C = Rgb> {
     /// The `diff: <path>` pane title.
     pub diff_title: PathStyle,
     /// Staged / Unstaged / Changes-vs file rows in the git panel.
@@ -1042,8 +1091,20 @@ pub struct PathStyleConfig {
     /// The workspace path atop the git panel.
     pub git_header: PathStyle,
     /// `Zed` style only, and only at the two egui sites.
-    pub filename: TextEmphasis,
-    pub parent: TextEmphasis,
+    pub filename: TextEmphasis<C>,
+    pub parent: TextEmphasis<C>,
+}
+
+impl<C: Copy> PathStyleConfig<C> {
+    pub fn map_colors<D>(self, f: impl Fn(C) -> D + Copy) -> PathStyleConfig<D> {
+        PathStyleConfig {
+            diff_title: self.diff_title,
+            git_rows: self.git_rows,
+            git_header: self.git_header,
+            filename: self.filename.map_color(f),
+            parent: self.parent.map_color(f),
+        }
+    }
 }
 
 /// One correction to a decoration the font placed: a shift in physical pixels,

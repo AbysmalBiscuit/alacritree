@@ -928,14 +928,6 @@ fn default_bindings() -> Vec<KeyBinding> {
     b
 }
 
-/// Every binding that fires for `(key, mods)`.  Alacritty runs *all* matching
-/// bindings (see `Processor::process_key_bindings`), so the user's typical
-/// pattern of stacking `ClearLogNotice` + `chars = "\f"` on Ctrl+L works:
-/// the first action is our `Unsupported` no-op, the second writes 0x0c.
-pub fn all_matches(bindings: &[KeyBinding], key: Key, mods: Modifiers) -> Vec<&BindingAction> {
-    bindings.iter().filter(|b| b.key == key && mods.fires(b.mods)).map(|b| &b.action).collect()
-}
-
 fn parse_key(name: &str) -> Option<Key> {
     let n = name.trim();
     if n.len() == 1 {
@@ -1390,6 +1382,10 @@ fn unescape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn all_matches(bindings: &[KeyBinding], key: Key, mods: Modifiers) -> Vec<&BindingAction> {
+        bindings.iter().filter(|b| b.key == key && mods.fires(b.mods)).map(|b| &b.action).collect()
+    }
 
     fn raw_action(key: &str, mods: Option<&str>, action: &str) -> RawBinding {
         RawBinding {
