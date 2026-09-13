@@ -3,6 +3,9 @@
 //! its rows open.
 
 use super::*;
+use crate::diff_viewer::{
+    self, DiffRequest, DiffSource, Launch, Program, Target, Viewer, diff_key,
+};
 use crate::tools::{self, Tool};
 
 /// The toggle identities the git panel accepts: modified, deleted, untracked.
@@ -67,7 +70,7 @@ struct GitSidebarView {
 
 #[derive(Default)]
 struct GitSidebarRequests {
-    diff: Option<DiffRequest>,
+    diff: Option<Target>,
     open_picker: Option<PathBuf>,
 }
 
@@ -221,7 +224,7 @@ impl AlacritreeApp {
                 if let Some(req) =
                     git_row_diff_request(&cursor, self.git_panel.branch_base.as_deref())
                 {
-                    self.open_diff(ctx, req);
+                    self.open_diff(ctx, Target::Row(req));
                 }
             },
             Key::Escape => self.focus_terminal(),
@@ -438,46 +441,44 @@ impl AlacritreeApp {
         }
     }
 
-    /// Clicking a sidebar row either opens, replaces, or closes the workspace's
-    /// single diff pane:
-    /// - row matches the active diff → toggle off (close)
-    /// - row matches a different diff → drop the old pane, open this one
-    /// - no active diff → open a new pane
-    /// Dropping the old `Session` runs `Drop`, which sends `Msg::Shutdown` to
-    /// the event loop and exits delta cleanly.
-    fn open_diff(&mut self, ctx: &Context, req: DiffRequest) {
+    /// Choosing a row or section either opens, replaces, or closes the
+    /// workspace's single diff pane. Dropping the old `Session` sends
+    /// `Msg::Shutdown` to the event loop and exits the viewer cleanly.
+    fn open_diff(&mut self, ctx: &Context, target: Target) {
         let Some(workspace) = self.current_workspace.clone() else {
             return;
         };
-        let new_key = diff_key(&req);
-        let existing = self.sessions.iter().find(|s| {
-            s.working_directory.as_deref() == Some(&workspace)
-                && matches!(&s.kind, SessionKind::Diff { .. })
-        });
-        if let Some(session) = existing {
-            let id = session.id;
-            if matches!(&session.kind, SessionKind::Diff { key } if key == &new_key) {
-                // Keep ordinary close navigation when toggling a pane off.
-                self.close_session(ctx, id);
-                return;
-            }
+        let new_key = target.key();
+        let existing = self
+            .sessions
+            .iter()
+            .find(|s| {
+                s.working_directory.as_deref() == Some(&workspace)
+                    && matches!(&s.kind, SessionKind::Diff { .. })
+            })
+            .map(|s| (s.id, matches!(&s.kind, SessionKind::Diff { key } if key == &new_key)));
+        if let Some((id, true)) = existing {
+            self.close_session(ctx, id);
+            return;
+        }
+        let Some(launch) = diff_viewer::plan(&Viewer::delta(), &target) else {
+            return;
+        };
+        if let Some((id, _)) = existing {
             self.sessions.retain(|s| s.id != id);
         }
 
         let (program, args) = match wsl::classify(&workspace) {
-            wsl::Location::Wsl { distro, .. } => {
-                let repaint = ctx.clone();
-                match tools::wsl_resolved(Tool::Delta, &distro, move || repaint.request_repaint()) {
-                    Some(delta) => build_wsl_diff_command_direct(&distro, &workspace, &req, &delta),
-                    None => build_wsl_diff_command_login(&distro, &workspace, &req),
-                }
-            },
-            wsl::Location::Windows(_) => build_diff_command(&tools::program(Tool::Delta), &req),
+            wsl::Location::Wsl { distro, .. } => wsl_diff_command(ctx, &distro, &workspace, launch),
+            wsl::Location::Windows(_) => native_diff_command(launch),
         };
-        let title = format!(
-            "diff: {}",
-            path_style::render(&req.file, self.config.ui.path_style.diff_title, None)
-        );
+        let title = match &target {
+            Target::Row(req) => format!(
+                "diff: {}",
+                path_style::render(&req.file, self.config.ui.path_style.diff_title, None)
+            ),
+            Target::Section(section) => format!("diff: {}", section.label()),
+        };
         let (size, cell_size) = self.next_spawn_geometry();
         let (session, request) = Session::pending_command(
             ctx.clone(),
@@ -510,6 +511,71 @@ impl AlacritreeApp {
             }
             if let SessionKind::Diff { key } = &s.kind { Some(key.clone()) } else { None }
         })
+    }
+}
+
+fn native_program(program: &Program) -> String {
+    match program {
+        Program::Tool(tool) => tools::program(*tool),
+        Program::Custom { path, .. } => path.clone(),
+    }
+}
+
+fn native_diff_command(launch: Launch) -> (String, Vec<String>) {
+    match launch {
+        Launch::Pager { pager, pager_args, git_args } => diff_viewer::native_pager_command(
+            &tools::program(Tool::Git),
+            &diff_viewer::pager_command(&native_program(&pager), &pager_args),
+            &git_args,
+        ),
+        Launch::Direct { program, args } => (native_program(&program), args),
+    }
+}
+
+fn wsl_program(ctx: &Context, distro: &str, program: &Program) -> Option<String> {
+    match program {
+        Program::Tool(tool) => {
+            let repaint = ctx.clone();
+            tools::wsl_resolved(*tool, distro, move || repaint.request_repaint())
+        },
+        Program::Custom { wsl_path, .. } => wsl_path.clone(),
+    }
+}
+
+fn program_name(program: &Program) -> &str {
+    match program {
+        Program::Tool(tool) => tool.name(),
+        Program::Custom { path, .. } => path,
+    }
+}
+
+fn wsl_diff_command(
+    ctx: &Context,
+    distro: &str,
+    workspace: &Path,
+    launch: Launch,
+) -> (String, Vec<String>) {
+    let git = tools::wsl_program(Tool::Git);
+    match launch {
+        Launch::Pager { pager, pager_args, git_args } => match wsl_program(ctx, distro, &pager) {
+            Some(path) => {
+                let pager = diff_viewer::pager_command(&path, &pager_args);
+                diff_viewer::wsl_pager_command(distro, workspace, &git, &pager, &git_args)
+            },
+            None => {
+                let pager = diff_viewer::pager_command(program_name(&pager), &pager_args);
+                diff_viewer::wsl_pager_command_login(distro, workspace, &git, &pager, &git_args)
+            },
+        },
+        Launch::Direct { program, args } => match wsl_program(ctx, distro, &program) {
+            Some(path) => diff_viewer::wsl_direct_command(distro, workspace, &path, &args),
+            None => diff_viewer::wsl_direct_command_login(
+                distro,
+                workspace,
+                program_name(&program),
+                &args,
+            ),
+        },
     }
 }
 
@@ -598,7 +664,7 @@ fn paint_staged_section(
             let is_active = view.active_diff_key.as_deref() == Some(&diff_key(&request));
             let response = file_row(ui, file, &view.theme, is_active);
             if response.clicked() {
-                requests.diff = Some(request);
+                requests.diff = Some(Target::Row(request));
             }
             paint_git_row_cursor(
                 ui,
@@ -629,7 +695,7 @@ fn paint_unstaged_section(
             let is_active = view.active_diff_key.as_deref() == Some(&diff_key(&request));
             let response = file_row(ui, file, &view.theme, is_active);
             if response.clicked() {
-                requests.diff = Some(request);
+                requests.diff = Some(Target::Row(request));
             }
             paint_git_row_cursor(
                 ui,
@@ -698,7 +764,7 @@ fn paint_branch_section(
         let is_active = view.active_diff_key.as_deref() == Some(&diff_key(&request));
         let response = branch_diff_row(ui, stat, &view.theme, is_active);
         if response.clicked() {
-            requests.diff = Some(request);
+            requests.diff = Some(Target::Row(request));
         }
         paint_git_row_cursor(
             ui,
@@ -1006,36 +1072,6 @@ pub(super) fn git_toggles_pass(m: bool, d: bool, u: bool, kind: ChangeKind) -> b
         || (u && matches!(kind, ChangeKind::Untracked | ChangeKind::Added))
 }
 
-/// Which `git diff` flavor a sidebar click should open in delta.
-pub(super) enum DiffSource {
-    Staged,
-    Worktree,
-    Untracked,
-    /// Triple-dot diff against this base ref (merge-base, matching the
-    /// `Changes vs <branch>` sidebar section).
-    Branch {
-        base: String,
-    },
-}
-
-pub(super) struct DiffRequest {
-    pub(super) file: String,
-    pub(super) source: DiffSource,
-}
-
-/// Stable identifier for "the diff this click would open" — matched against
-/// the active diff session's `SessionKind::Diff { key }` to highlight the
-/// originating row and toggle the pane off when clicked again.
-pub(super) fn diff_key(req: &DiffRequest) -> String {
-    let tag = match &req.source {
-        DiffSource::Staged => "staged",
-        DiffSource::Worktree => "worktree",
-        DiffSource::Untracked => "untracked",
-        DiffSource::Branch { .. } => "branch",
-    };
-    format!("{tag}:{}", req.file)
-}
-
 /// The diff a git-panel cursor row would open, mirroring the render pass's
 /// per-section click mapping.  `None` for a branch-diff row with no resolved
 /// base, matching the render pass's unclickable base-less rows.
@@ -1061,94 +1097,6 @@ fn branch_diff_source(base: Option<&str>) -> Option<DiffSource> {
 /// pure addition.
 fn unstaged_diff_source(kind: Option<ChangeKind>) -> DiffSource {
     if kind == Some(ChangeKind::Untracked) { DiffSource::Untracked } else { DiffSource::Worktree }
-}
-
-/// git arguments (everything after `git`) for the requested diff — shared
-/// by the Windows and WSL pane commands.
-pub(super) fn diff_args(req: &DiffRequest) -> Vec<String> {
-    let mut args = vec!["diff".to_string()];
-    match &req.source {
-        DiffSource::Staged => args.push("--cached".to_string()),
-        DiffSource::Worktree => {},
-        // `--no-index` against /dev/null shows the untracked file as a pure
-        // addition; git special-cases "/dev/null" on every platform. Exits
-        // non-zero by design.
-        DiffSource::Untracked => args.push("--no-index".to_string()),
-        // Triple-dot diff = "from merge-base to HEAD" — matches the sidebar's
-        // `Changes vs <branch>` stat semantics in git_status.rs.
-        DiffSource::Branch { base } => args.push(format!("{base}...")),
-    }
-    args.push("--".to_string());
-    if matches!(req.source, DiffSource::Untracked) {
-        args.push("/dev/null".to_string());
-    }
-    args.push(req.file.clone());
-    args
-}
-
-/// Show the clicked file's `git diff` in `delta`, wired in as git's pager so
-/// git drives the pipe itself.  This drops the POSIX-`sh` dependency the old
-/// `sh -c '… | delta'` had — which had no equivalent on Windows, so diffs never
-/// opened there.  Paths/branches stay in argv, so no file name is shell-parsed.
-/// `delta` is the resolved program (bare `delta` from PATH, or a user override).
-pub(super) fn build_diff_command(delta: &str, req: &DiffRequest) -> (String, Vec<String>) {
-    let mut args = vec!["-c".to_string(), format!("core.pager={delta} --paging=always")];
-    args.extend(diff_args(req));
-    ("git".to_string(), args)
-}
-
-/// Run a known WSL delta path through `sh`, exporting `LESS` where git runs.
-pub(super) fn build_wsl_diff_command_direct(
-    distro: &str,
-    workspace: &Path,
-    req: &DiffRequest,
-    delta: &str,
-) -> (String, Vec<String>) {
-    let script = format!(
-        r#"export LESS="${{LESS-R}}"; exec git -c "core.pager={delta} --paging=always" "$@""#
-    );
-    let mut args = vec![
-        "-d".to_string(),
-        distro.to_string(),
-        "--cd".to_string(),
-        workspace.to_string_lossy().into_owned(),
-        "--exec".to_string(),
-        "sh".to_string(),
-        "-c".to_string(),
-        script,
-        "sh".to_string(),
-    ];
-    args.extend(diff_args(req));
-    ("wsl.exe".to_string(), args)
-}
-
-/// The distro-side diff before `delta`'s path is known: resolve the user's
-/// login shell (`getent passwd`) and re-exec through it so `delta` resolves
-/// from their real PATH — `--exec sh` alone only sees the default system PATH,
-/// which omits per-user install dirs like `~/.cargo/bin`.  The `LESS` export
-/// happens inside the login shell's script, after the profile is sourced, so
-/// a profile-set `LESS` wins — mirroring the `[env]` precedence on the
-/// Windows side.  Diff arguments travel as positional parameters through both
-/// shells, so no file name is shell-parsed.
-pub(super) fn build_wsl_diff_command_login(
-    distro: &str,
-    workspace: &Path,
-    req: &DiffRequest,
-) -> (String, Vec<String>) {
-    let script = r#"s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); [ -x "$s" ] || s=${SHELL:-/bin/sh}; exec "$s" -lc 'export LESS="${LESS-R}"; exec git -c "core.pager=delta --paging=always" "$@"' "$s" "$@""#;
-    let mut args = vec![
-        "-d".to_string(),
-        distro.to_string(),
-        "--cd".to_string(),
-        workspace.to_string_lossy().into_owned(),
-        "--exec".to_string(),
-        "sh".to_string(),
-        "-c".to_string(),
-        script.to_string(),
-        "sh".to_string(),
-    ];
-    args.extend(diff_args(req));
-    ("wsl.exe".to_string(), args)
 }
 
 /// Section header count: `visible of total` while a filter narrows the panel,
@@ -1253,104 +1201,6 @@ mod tests {
         assert!(git_row_diff_request(&row, None).is_none());
         let request = git_row_diff_request(&row, Some("main")).expect("a base makes it clickable");
         assert!(matches!(request.source, DiffSource::Branch { base } if base == "main"));
-    }
-
-    fn req(file: &str, source: DiffSource) -> DiffRequest {
-        DiffRequest { file: file.to_string(), source }
-    }
-
-    #[test]
-    fn diff_args_staged() {
-        let args = diff_args(&req("a.rs", DiffSource::Staged));
-        assert_eq!(args, vec!["diff", "--cached", "--", "a.rs"]);
-    }
-
-    #[test]
-    fn diff_args_worktree() {
-        let args = diff_args(&req("a.rs", DiffSource::Worktree));
-        assert_eq!(args, vec!["diff", "--", "a.rs"]);
-    }
-
-    #[test]
-    fn diff_args_untracked() {
-        let args = diff_args(&req("a.rs", DiffSource::Untracked));
-        assert_eq!(args, vec!["diff", "--no-index", "--", "/dev/null", "a.rs"]);
-    }
-
-    #[test]
-    fn diff_args_branch() {
-        let args = diff_args(&req("a.rs", DiffSource::Branch { base: "main".to_string() }));
-        assert_eq!(args, vec!["diff", "main...", "--", "a.rs"]);
-    }
-
-    #[test]
-    fn diff_command_uses_given_delta_program() {
-        let (program, args) = build_diff_command("delta", &req("a.rs", DiffSource::Staged));
-        assert_eq!(program, "git");
-        assert_eq!(args[0], "-c");
-        assert_eq!(args[1], "core.pager=delta --paging=always");
-        assert_eq!(&args[2..], diff_args(&req("a.rs", DiffSource::Staged)).as_slice());
-    }
-
-    #[test]
-    fn diff_command_honors_delta_override_path() {
-        let (_, args) =
-            build_diff_command(r"C:\tools\delta.exe", &req("a.rs", DiffSource::Worktree));
-        assert_eq!(args[1], r"core.pager=C:\tools\delta.exe --paging=always");
-    }
-
-    #[test]
-    fn wsl_diff_direct_uses_resolved_delta_and_keeps_pager_open() {
-        let (program, args) = build_wsl_diff_command_direct(
-            "kali-linux",
-            Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj"),
-            &req("a.rs", DiffSource::Staged),
-            "/home/lev/.cargo/bin/delta",
-        );
-        assert_eq!(program, "wsl.exe");
-        assert_eq!(args[..8], [
-            "-d",
-            "kali-linux",
-            "--cd",
-            r"\\wsl.localhost\kali-linux\home\lev\proj",
-            "--exec",
-            "sh",
-            "-c",
-            r#"export LESS="${LESS-R}"; exec git -c "core.pager=/home/lev/.cargo/bin/delta --paging=always" "$@""#,
-        ]);
-        assert_eq!(args[8], "sh");
-        assert_eq!(&args[9..], diff_args(&req("a.rs", DiffSource::Staged)).as_slice());
-    }
-
-    #[test]
-    fn wsl_diff_login_resolves_shell_and_keeps_pager_open() {
-        let (program, args) = build_wsl_diff_command_login(
-            "kali-linux",
-            Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj"),
-            &req("a.rs", DiffSource::Staged),
-        );
-        assert_eq!(program, "wsl.exe");
-        assert_eq!(args[..7], [
-            "-d",
-            "kali-linux",
-            "--cd",
-            r"\\wsl.localhost\kali-linux\home\lev\proj",
-            "--exec",
-            "sh",
-            "-c"
-        ]);
-        let script = &args[7];
-        assert!(script.contains("getent passwd"), "resolves login shell: {script}");
-        // The LESS export lives inside the login shell's script so a LESS
-        // sourced from the profile still wins.
-        assert!(
-            script.contains(
-                r#"-lc 'export LESS="${LESS-R}"; exec git -c "core.pager=delta --paging=always" "$@"'"#
-            ),
-            "keeps pager open after profile sourcing: {script}"
-        );
-        assert_eq!(args[8], "sh");
-        assert_eq!(&args[9..], diff_args(&req("a.rs", DiffSource::Staged)).as_slice());
     }
 
     #[test]
