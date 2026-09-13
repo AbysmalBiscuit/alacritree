@@ -185,10 +185,7 @@ Closes {{ issues_repo }}#{{ id }}
 Claude summary below:
 
 ---
-{% if stacked_on %}
-> Stacked on #{{ stacked_on }}. The base is `master`, so the diff below also
-> contains that PR's commits. Review #{{ stacked_on }} first.
-{% endif %}
+
 {{ input }}
 
 ---
