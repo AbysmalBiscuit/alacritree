@@ -219,7 +219,7 @@ impl AlacritreeApp {
 
     pub(super) fn show_project_sidebar(&mut self, ctx: &Context, panel_frame: Frame) -> egui::Rect {
         let view = self.project_sidebar_view(ctx);
-        let paint = SidebarPaint { view: &view, icons: &self.icons, herdr_icon: &self.herdr_icon };
+        let paint = SidebarPaint { view: &view, icons: &self.icons };
         let theme = view.theme;
         let mut requests = SidebarRequests::default();
         let panel_resp = SidePanel::left("left_sidebar")
@@ -664,8 +664,31 @@ struct SidebarView {
 #[derive(Clone, Copy)]
 struct SidebarPaint<'a> {
     view: &'a SidebarView,
-    icons: &'a Icons<Color32>,
-    herdr_icon: &'a IconStyle<Color32>,
+    icons: &'a PaintedIcons,
+}
+
+/// `[ui.icons]` and the `[integrations.herdr]` glyph, with colors converted
+/// for painting.
+pub(super) struct PaintedIcons {
+    ui: Icons<Color32>,
+    pub(super) herdr: IconStyle<Color32>,
+}
+
+impl PaintedIcons {
+    pub(super) fn new(config: &Config) -> Self {
+        Self {
+            ui: config.ui.icons.map_colors(rgb_to_color32),
+            herdr: config.integrations.herdr.icon.map_color(rgb_to_color32),
+        }
+    }
+}
+
+impl std::ops::Deref for PaintedIcons {
+    type Target = Icons<Color32>;
+
+    fn deref(&self) -> &Icons<Color32> {
+        &self.ui
+    }
 }
 
 impl SidebarView {
@@ -928,7 +951,6 @@ fn paint_workspace_children(
                     scroll,
                     paint.view.session_drag && movable,
                     paint.icons,
-                    paint.herdr_icon,
                     &paint.view.theme,
                 );
                 if act.activate {
@@ -949,8 +971,7 @@ fn paint_workspace_children(
                         if *side == row.side && *id == row.terminal_id
                 );
                 let scroll = paint.view.scrolls(is_cursor);
-                let act =
-                    herdr_row(ui, row, is_cursor, scroll, paint.herdr_icon, &paint.view.theme);
+                let act = herdr_row(ui, row, is_cursor, scroll, paint.icons, &paint.view.theme);
                 if act.attach {
                     requests.attach_herdr = Some((
                         ws.clone(),
@@ -1749,15 +1770,13 @@ pub(super) struct SessionRowAction {
 /// `draggable` makes the whole row the drag handle rather than adding a grip:
 /// a session row is a tab, where a project row's own controls are what a click
 /// there is usually for.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn session_row(
     ui: &mut egui::Ui,
     row: &SessionRowData,
     is_cursor: bool,
     scroll_into_view: bool,
     draggable: bool,
-    icons: &Icons<Color32>,
-    herdr_icon: &IconStyle<Color32>,
+    icons: &PaintedIcons,
     theme: &Theme,
 ) -> SessionRowAction {
     // Reserve a slot *before* the labels so the hover bg paints beneath them.
@@ -1794,7 +1813,7 @@ pub(super) fn session_row(
                         row.is_active,
                     );
                     if let Some(managed) = &row.managed {
-                        let rect = paint_managed_mark(ui, herdr_icon, theme, theme.text_muted);
+                        let rect = paint_managed_mark(ui, icons, theme, theme.text_muted);
                         managed_slot = Some((rect, managed_tooltip(managed)));
                     }
                     let (_, galley) = truncating_label(
@@ -1914,14 +1933,14 @@ fn row_name_text(
 /// hang the hint on it.
 fn paint_managed_mark(
     ui: &mut egui::Ui,
-    icon: &IconStyle<Color32>,
+    icons: &PaintedIcons,
     theme: &Theme,
     color: Color32,
 ) -> egui::Rect {
     // 10.0 is what the status marks beside it use, and `◫` shares its em
     // height with `◇` and `●`, so the same size puts them on one optical line.
     let (glyph, font, glyph_color) =
-        resolve_icon(icon, DEFAULT_HERDR_ICON, color, 10.0, 10.0, theme);
+        resolve_icon(&icons.herdr, DEFAULT_HERDR_ICON, color, 10.0, 10.0, theme);
     ui.label(RichText::new(glyph).color(glyph_color).font(font)).rect
 }
 
@@ -1937,7 +1956,7 @@ fn herdr_row(
     row: &HerdrRowData,
     is_cursor: bool,
     scroll_into_view: bool,
-    herdr_icon: &IconStyle<Color32>,
+    icons: &PaintedIcons,
     theme: &Theme,
 ) -> HerdrRowAction {
     // Reserve a slot *before* the label so the hover bg paints beneath it.
@@ -1953,7 +1972,7 @@ fn herdr_row(
                     let (rect, _) =
                         ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
                     paint_harness_mark(ui, row.managed.mark, rect, theme);
-                    paint_managed_mark(ui, herdr_icon, theme, theme.text_dim);
+                    paint_managed_mark(ui, icons, theme, theme.text_dim);
                     let text = row_name_text(ui, &row.name, theme.text_dim, theme.text_muted);
                     let _ = truncating_label(ui, text, theme.text_dim, egui::Sense::hover());
                 },

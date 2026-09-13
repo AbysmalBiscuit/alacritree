@@ -68,8 +68,8 @@ use herdr_glue::{
 };
 use modals::{BaseBranchPicker, CreateState, DeleteRequest, ProjectRemoveState, RenameState};
 use sidebar::{
-    HerdrRowData, SessionRowData, WorkspaceRowData, any_pr_toggle_active, project_filter_toggles,
-    session_row_name,
+    HerdrRowData, PaintedIcons, SessionRowData, WorkspaceRowData, any_pr_toggle_active,
+    project_filter_toggles, session_row_name,
 };
 use widgets::{
     ATTENTION_HINT, ICON_CLUSTER_SPACING, IconHints, ROW_STATUS_ICON_W, RowStatus, SessionMark,
@@ -382,10 +382,7 @@ pub struct AlacritreeApp {
     row_labels: crate::row_label::LabelTemplates,
     config: Config,
     theme: Theme,
-    /// `config.ui.icons` with its colors converted for painting.
-    icons: Icons<Color32>,
-    /// `config.integrations.herdr.icon` with its color converted for painting.
-    herdr_icon: IconStyle<Color32>,
+    icons: PaintedIcons,
     /// `config.bindings` with its keys converted for matching.
     shortcuts: crate::shortcut::Shortcuts,
     modals: modals::Modals,
@@ -504,8 +501,7 @@ impl AlacritreeApp {
             projects,
             pr_cache: PrCache::new(),
             row_labels,
-            icons: config.ui.icons.map_colors(rgb_to_color32),
-            herdr_icon: config.integrations.herdr.icon.map_color(rgb_to_color32),
+            icons: PaintedIcons::new(&config),
             shortcuts: crate::shortcut::Shortcuts::new(&config.bindings),
             config,
             theme,
@@ -3996,7 +3992,7 @@ fn unknown_worktree(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AttachMode, HerdrConfig, SidebarFocus, UiTheme};
+    use crate::config::{AttachMode, SidebarFocus, UiTheme};
     use crate::multiplexer::{CreatedPane, Launch};
 
     use super::focus::{build_sidebar_snapshot, search_reveal_root};
@@ -7296,8 +7292,7 @@ mod tests {
     /// buttons need the same recovery as the worktree row's.
     #[test]
     fn icon_tooltips_reach_the_session_and_home_row_buttons() {
-        let icons = crate::config::Icons::default().map_colors(rgb_to_color32);
-        let herdr_icon = HerdrConfig::default().icon.map_color(rgb_to_color32);
+        let icons = PaintedIcons::new(&Config::default());
         for (icon_tooltips, want) in [(true, true), (false, false)] {
             let mut config = Config::default();
             config.ui.icon_tooltips = icon_tooltips;
@@ -7314,7 +7309,7 @@ mod tests {
                 managed: None,
             };
             let mut session = |ui: &mut egui::Ui| {
-                session_row(ui, &row, false, false, false, &icons, &herdr_icon, &theme);
+                session_row(ui, &row, false, false, false, &icons, &theme);
             };
             assert_eq!(
                 hint_painted_over(&mut session, "×", "close session"),
@@ -7398,8 +7393,7 @@ mod tests {
     #[test]
     fn icon_tooltips_gate_the_status_slot_hint() {
         const WIDTH: f32 = 220.0;
-        let icons = crate::config::Icons::default().map_colors(rgb_to_color32);
-        let herdr_icon = HerdrConfig::default().icon.map_color(rgb_to_color32);
+        let icons = PaintedIcons::new(&Config::default());
         let session = |attention, activity| SessionRowData {
             id: 1,
             name: RowName::plain("zsh".to_owned()),
@@ -7418,7 +7412,7 @@ mod tests {
 
             let agent = session(false, SessionActivity::agent(Some("claude"), LiveState::Idle));
             let mut agent_row = |ui: &mut egui::Ui| {
-                session_row(ui, &agent, false, false, false, &icons, &herdr_icon, &theme);
+                session_row(ui, &agent, false, false, false, &icons, &theme);
             };
             assert_eq!(
                 hint_painted_over(&mut agent_row, DEFAULT_AGENT_ICON.as_str(), "claude is running",),
@@ -7434,7 +7428,7 @@ mod tests {
             let loading =
                 session(false, SessionActivity::agent(Some("claude"), LiveState::Working));
             let texts = texts_while_hovering_at(slot, WIDTH, |ui| {
-                session_row(ui, &loading, false, false, false, &icons, &herdr_icon, &theme);
+                session_row(ui, &loading, false, false, false, &icons, &theme);
             });
             assert_eq!(
                 texts.iter().flatten().any(|(text, _)| text == "claude is working"),
@@ -7444,7 +7438,7 @@ mod tests {
 
             let waiting = session(true, SessionActivity::Shell);
             let texts = texts_while_hovering_at(slot, WIDTH, |ui| {
-                session_row(ui, &waiting, false, false, false, &icons, &herdr_icon, &theme);
+                session_row(ui, &waiting, false, false, false, &icons, &theme);
             });
             assert_eq!(
                 texts.iter().flatten().any(|(text, _)| text == "needs attention"),
@@ -7624,8 +7618,7 @@ mod tests {
     #[test]
     fn hovering_an_elided_session_row_reveals_the_full_title() {
         let theme = Theme::from_config(&Config::default());
-        let icons = crate::config::Icons::default().map_colors(rgb_to_color32);
-        let herdr_icon = HerdrConfig::default().icon.map_color(rgb_to_color32);
+        let icons = PaintedIcons::new(&Config::default());
         let row = SessionRowData {
             id: 1,
             name: RowName::plain("cargo test --workspace --all-features -- --nocapture".to_owned()),
@@ -7637,7 +7630,7 @@ mod tests {
         };
 
         let texts = texts_while_hovering(140.0, |ui| {
-            session_row(ui, &row, false, false, false, &icons, &herdr_icon, &theme);
+            session_row(ui, &row, false, false, false, &icons, &theme);
         });
 
         assert!(
