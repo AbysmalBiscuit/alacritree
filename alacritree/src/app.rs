@@ -5862,9 +5862,31 @@ mod tests {
     use super::herdr_glue::{PendingHerdrAttach, PendingHerdrCreate};
     use super::modals::dirty_warning;
     use super::sidebar::{
-        RowName, herdr_display_name, home_row, session_row, session_row_title,
+        RowName, WorktreeRowView, herdr_display_name, home_row, session_row, session_row_title,
         sessions_filter_passes, upstream_badge, worktree_row,
     };
+
+    fn plain_worktree_row<'a>(
+        wt: &'a crate::projects::Worktree,
+        icons: &'a crate::config::Icons,
+        theme: &'a Theme,
+    ) -> WorktreeRowView<'a> {
+        WorktreeRowView {
+            wt,
+            missing: None,
+            display_name: &wt.name,
+            pr: None,
+            is_active: true,
+            is_cursor: false,
+            scroll_into_view: false,
+            attention: false,
+            activity: SessionActivity::Shell,
+            deleting: false,
+            profiles: &[],
+            icons,
+            theme,
+        }
+    }
 
     fn herdr_lifecycle_app() -> AlacritreeApp {
         let mut config = Config::default();
@@ -9179,22 +9201,7 @@ mod tests {
         };
 
         let texts = texts_while_hovering(140.0, |ui| {
-            worktree_row(
-                ui,
-                &wt,
-                None,
-                &wt.name,
-                None,
-                true,
-                false,
-                false,
-                false,
-                SessionActivity::Shell,
-                false,
-                &[],
-                &icons,
-                &theme,
-            );
+            worktree_row(ui, &plain_worktree_row(&wt, &icons, &theme));
         });
 
         assert!(
@@ -9352,22 +9359,7 @@ mod tests {
         };
         let output = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                worktree_row(
-                    ui,
-                    &wt,
-                    None,
-                    &wt.name,
-                    None,
-                    true,
-                    false,
-                    false,
-                    false,
-                    SessionActivity::Shell,
-                    false,
-                    &[],
-                    &icons,
-                    &theme,
-                );
+                worktree_row(ui, &plain_worktree_row(&wt, &icons, &theme));
             });
         });
         let (family, _, color) =
@@ -9486,22 +9478,10 @@ mod tests {
             state: PrState::Open,
         };
         let mut render = |ui: &mut egui::Ui| {
-            worktree_row(
-                ui,
-                &wt,
-                None,
-                &wt.name,
-                Some(&pr),
-                true,
-                false,
-                false,
-                false,
-                SessionActivity::Shell,
-                false,
-                &[],
-                &icons,
-                theme,
-            );
+            worktree_row(ui, &WorktreeRowView {
+                pr: Some(&pr),
+                ..plain_worktree_row(&wt, &icons, theme)
+            });
         };
 
         texts_while_hovering_icon(&mut render, glyph)
@@ -9812,22 +9792,7 @@ mod tests {
         };
         let output = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                worktree_row(
-                    ui,
-                    &wt,
-                    None,
-                    &wt.name,
-                    None,
-                    true,
-                    false,
-                    false,
-                    false,
-                    SessionActivity::Shell,
-                    false,
-                    &[],
-                    &icons,
-                    &theme,
-                );
+                worktree_row(ui, &plain_worktree_row(&wt, &icons, &theme));
             });
         });
 
@@ -9878,22 +9843,10 @@ mod tests {
             };
 
             let texts = texts_while_hovering(140.0, |ui| {
-                worktree_row(
-                    ui,
-                    &wt,
-                    None,
-                    name,
-                    None,
-                    true,
-                    false,
-                    false,
-                    false,
-                    SessionActivity::Shell,
-                    false,
-                    &[],
-                    &icons,
-                    &theme,
-                );
+                worktree_row(ui, &WorktreeRowView {
+                    display_name: name,
+                    ..plain_worktree_row(&wt, &icons, &theme)
+                });
             });
 
             assert_eq!(
@@ -9951,22 +9904,10 @@ mod tests {
         };
         let output = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                worktree_row(
-                    ui,
-                    &wt,
-                    None,
-                    &wt.name,
-                    Some(&pr),
-                    true,
-                    false,
-                    false,
-                    false,
-                    SessionActivity::Shell,
-                    false,
-                    &[],
-                    &icons,
-                    &theme,
-                );
+                worktree_row(ui, &WorktreeRowView {
+                    pr: Some(&pr),
+                    ..plain_worktree_row(&wt, &icons, &theme)
+                });
             });
         });
         output.shapes

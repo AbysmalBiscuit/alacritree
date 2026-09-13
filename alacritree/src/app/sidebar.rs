@@ -1231,22 +1231,21 @@ fn paint_worktree(
     if view.probing && matches!(wsl::classify(&wt.path), wsl::Location::Windows(_)) {
         requests.drawn_worktrees.push(wt.path.clone());
     }
-    let action = worktree_row(
-        ui,
+    let action = worktree_row(ui, &WorktreeRowView {
         wt,
         missing,
-        &state.label,
-        state.pr.as_ref(),
+        display_name: &state.label,
+        pr: state.pr.as_ref(),
         is_active,
         is_cursor,
-        scroll,
-        state.attention,
-        state.activity,
-        is_deleting,
-        &view.worktree_profiles,
-        &view.icons,
-        &view.theme,
-    );
+        scroll_into_view: scroll,
+        attention: state.attention,
+        activity: state.activity,
+        deleting: is_deleting,
+        profiles: &view.worktree_profiles,
+        icons: &view.icons,
+        theme: &view.theme,
+    });
     if action.activate {
         requests.activate = Some(wt.path.clone());
     }
@@ -1470,149 +1469,177 @@ pub(super) fn upstream_badge<'a>(
 /// wraps onto a second line instead of stretching the popup to fit it.
 const WORKTREE_MENU_MAX_WIDTH: f32 = 220.0;
 
-pub(super) fn worktree_row(
-    ui: &mut egui::Ui,
-    wt: &Worktree,
+/// What one worktree row paints from.
+pub(super) struct WorktreeRowView<'a> {
+    pub(super) wt: &'a Worktree,
     // What the liveness probe has seen since discovery ran, if anything.
     // `Some` overrides `wt.prunable` in both directions; `None` leaves it
     // standing.  Kept out of the flag itself because that also picks between
     // `git worktree remove` and a prune, and a probe must never decide that.
-    missing: Option<bool>,
-    display_name: &str,
-    pr: Option<&PrInfo>,
-    is_active: bool,
-    is_cursor: bool,
-    scroll_into_view: bool,
-    attention: bool,
-    activity: SessionActivity,
-    deleting: bool,
+    pub(super) missing: Option<bool>,
+    pub(super) display_name: &'a str,
+    pub(super) pr: Option<&'a PrInfo>,
+    pub(super) is_active: bool,
+    pub(super) is_cursor: bool,
+    pub(super) scroll_into_view: bool,
+    pub(super) attention: bool,
+    pub(super) activity: SessionActivity,
+    pub(super) deleting: bool,
     // Shell profiles offered in the row's "Open session" menu: `.0` is the
     // profile name (spawned and shown as the button label), `.1` is the
     // command shown on hover.
-    profiles: &[(String, String)],
-    icons: &Icons,
-    theme: &Theme,
-) -> WorktreeAction {
-    // Reserve a slot *before* the labels so the hover bg paints beneath them.
-    let bg_idx = ui.painter().add(egui::Shape::Noop);
-    let panel_x = ui.max_rect().x_range();
+    pub(super) profiles: &'a [(String, String)],
+    pub(super) icons: &'a Icons,
+    pub(super) theme: &'a Theme,
+}
 
-    let mut delete_clicked = false;
+/// The worktree row's trailing buttons: whether each was clicked, and the rect
+/// it occupies for routing a click the row response shadowed.
+#[derive(Default)]
+struct WorktreeRowClicks {
+    delete: bool,
+    delete_rect: Option<egui::Rect>,
+    spawn: bool,
+    spawn_rect: Option<egui::Rect>,
+}
+
+impl WorktreeRowClicks {
+    fn route_shadowed_click(&mut self, row_clicked: bool, pointer: Option<egui::Pos2>) {
+        if row_clicked && !self.delete && !self.spawn {
+            if let Some(pos) = pointer {
+                if self.delete_rect.is_some_and(|r| r.contains(pos)) {
+                    self.delete = true;
+                } else if self.spawn_rect.is_some_and(|r| r.contains(pos)) {
+                    self.spawn = true;
+                }
+            }
+        }
+    }
+
+    fn activates(&self, deleting: bool, row_clicked: bool) -> bool {
+        !deleting && row_clicked && !self.delete && !self.spawn
+    }
+}
+
+/// The delete and new-shell buttons, then the PR and upstream badges.
+fn worktree_row_controls(
+    ui: &mut egui::Ui,
+    row: &WorktreeRowView,
+    prunable: bool,
+    hints: &mut IconHints,
+) -> WorktreeRowClicks {
+    let (theme, icons) = (row.theme, row.icons);
+    let mut clicks = WorktreeRowClicks::default();
+    // Mid-removal the row is inert: swap its controls for a
+    // spinner so the user sees the delete is in flight.
+    if row.deleting {
+        braille_loader(ui, 12.0 * theme.ui_scale, theme.accent);
+        return clicks;
+    }
+    if !row.wt.is_main {
+        let hover = if prunable { "prune worktree" } else { "delete worktree and branch" };
+        let btn = styled_icon_button(
+            ui,
+            &icons.delete_worktree,
+            DEFAULT_CLOSE_ICON,
+            theme.text_muted,
+            theme,
+        );
+        hints.add(btn.rect, hover);
+        clicks.delete_rect = Some(btn.rect);
+        clicks.delete = btn.clicked();
+    }
+    let btn = styled_icon_button(ui, &icons.new_session, DEFAULT_ADD_ICON, theme.text_muted, theme);
+    hints.add(btn.rect, "new shell");
+    clicks.spawn_rect = Some(btn.rect);
+    clicks.spawn = btn.clicked();
+    if let Some(info) = row.pr {
+        let (style, default_glyph, color, word) = pr_badge(icons, theme, info.state);
+        let rect = paint_badge(ui, theme, style, default_glyph, color);
+        hints.add(rect, format!("PR #{} — {word}", info.number));
+    }
+    if let Some(state) = row.wt.upstream.as_ref() {
+        let (style, default_glyph, color, tip) = upstream_badge(icons, theme, state);
+        let rect = paint_badge(ui, theme, style, default_glyph, color);
+        hints.add(rect, tip);
+    }
+    clicks
+}
+
+/// Paint one status-sized badge glyph and return the rect it claimed.
+fn paint_badge(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    style: &IconStyle,
+    default_glyph: BakedGlyph,
+    color: Color32,
+) -> egui::Rect {
+    let (glyph, font, color) = resolve_icon(style, default_glyph, color, 10.0, 10.0, theme);
+    let (rect, _) = ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
+    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, glyph, font, color);
+    rect
+}
+
+/// The status icon and the name, returning the icon's hint and whether the
+/// name was elided.
+fn worktree_row_name(
+    ui: &mut egui::Ui,
+    row: &WorktreeRowView,
+    prunable: bool,
+) -> (Option<(egui::Rect, String)>, bool) {
+    let (theme, icons) = (row.theme, row.icons);
+    let (default_icon, default_glyph) = if row.wt.is_main {
+        (&icons.worktree_main, DEFAULT_WORKTREE_MAIN_ICON)
+    } else {
+        (&icons.worktree, DEFAULT_WORKTREE_ICON)
+    };
+    let name_color = if prunable || row.deleting {
+        theme.text_muted
+    } else if row.is_active {
+        theme.text
+    } else {
+        theme.text_dim
+    };
+    let status_hint = paint_row_status_icon(
+        ui,
+        theme,
+        RowStatus { attention: row.attention, activity: row.activity, managed: None },
+        default_icon,
+        default_glyph,
+        row.is_active,
+    );
+    let (_, galley) = truncating_label(
+        ui,
+        RichText::new(row.display_name).small().color(name_color),
+        name_color,
+        egui::Sense::hover(),
+    );
+    (status_hint, galley.elided)
+}
+
+/// The row's framed content with its tooltips attached, and the trailing
+/// buttons' clicks.
+fn worktree_row_frame(
+    ui: &mut egui::Ui,
+    row: &WorktreeRowView,
+    prunable: bool,
+) -> (egui::Response, WorktreeRowClicks) {
+    let theme = row.theme;
     let mut hints = IconHints::default();
-    let mut delete_rect: Option<egui::Rect> = None;
-    let mut spawn_clicked = false;
-    let mut spawn_rect: Option<egui::Rect> = None;
+    let mut clicks = WorktreeRowClicks::default();
     let mut name_elided = false;
     // The leading and trailing groups run as sibling closures, so the status
     // slot's hint travels out separately and joins the rest afterwards.
     let mut status_hint = None;
-    // Discovery's word, corrected by whatever the probe has seen since.  The
-    // main worktree is never offered for pruning, so it never greys either.
-    let prunable = worktree_looks_gone(wt, missing);
     // right: 0 keeps the worktree `×` at the same x as the project row's `×`,
     // which has no frame margin and sits flush against the panel's outer padding.
     let frame = Frame::default().inner_margin(Margin { left: 16, right: 0, top: 3, bottom: 3 });
     let resp = frame
         .show(ui, |ui| {
-            let (default_icon, default_glyph) = if wt.is_main {
-                (&icons.worktree_main, DEFAULT_WORKTREE_MAIN_ICON)
-            } else {
-                (&icons.worktree, DEFAULT_WORKTREE_ICON)
-            };
-            let name_color = if prunable || deleting {
-                theme.text_muted
-            } else if is_active {
-                theme.text
-            } else {
-                theme.text_dim
-            };
             row_with_trailing(
                 ui,
-                |ui| {
-                    status_hint = paint_row_status_icon(
-                        ui,
-                        theme,
-                        RowStatus { attention, activity, managed: None },
-                        default_icon,
-                        default_glyph,
-                        is_active,
-                    );
-                    let (_, galley) = truncating_label(
-                        ui,
-                        RichText::new(display_name).small().color(name_color),
-                        name_color,
-                        egui::Sense::hover(),
-                    );
-                    name_elided = galley.elided;
-                },
-                |ui| {
-                    // Mid-removal the row is inert: swap its controls for a
-                    // spinner so the user sees the delete is in flight.
-                    if deleting {
-                        braille_loader(ui, 12.0 * theme.ui_scale, theme.accent);
-                        return;
-                    }
-                    if !wt.is_main {
-                        let hover =
-                            if prunable { "prune worktree" } else { "delete worktree and branch" };
-                        let btn = styled_icon_button(
-                            ui,
-                            &icons.delete_worktree,
-                            DEFAULT_CLOSE_ICON,
-                            theme.text_muted,
-                            theme,
-                        );
-                        hints.add(btn.rect, hover);
-                        delete_rect = Some(btn.rect);
-                        if btn.clicked() {
-                            delete_clicked = true;
-                        }
-                    }
-                    let btn = styled_icon_button(
-                        ui,
-                        &icons.new_session,
-                        DEFAULT_ADD_ICON,
-                        theme.text_muted,
-                        theme,
-                    );
-                    hints.add(btn.rect, "new shell");
-                    spawn_rect = Some(btn.rect);
-                    if btn.clicked() {
-                        spawn_clicked = true;
-                    }
-                    if let Some(info) = pr {
-                        let (style, default_glyph, color, word) =
-                            pr_badge(icons, theme, info.state);
-                        let (glyph, font, color) =
-                            resolve_icon(style, default_glyph, color, 10.0, 10.0, theme);
-                        let (rect, _) = ui
-                            .allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
-                        ui.painter().text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            glyph,
-                            font,
-                            color,
-                        );
-                        hints.add(rect, format!("PR #{} — {word}", info.number));
-                    }
-                    if let Some(state) = wt.upstream.as_ref() {
-                        let (style, default_glyph, color, tip) =
-                            upstream_badge(icons, theme, state);
-                        let (glyph, font, color) =
-                            resolve_icon(style, default_glyph, color, 10.0, 10.0, theme);
-                        let (rect, _) = ui
-                            .allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
-                        ui.painter().text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            glyph,
-                            font,
-                            color,
-                        );
-                        hints.add(rect, tip);
-                    }
-                },
+                |ui| (status_hint, name_elided) = worktree_row_name(ui, row, prunable),
+                |ui| clicks = worktree_row_controls(ui, row, prunable, &mut hints),
             );
         })
         .response
@@ -1624,46 +1651,32 @@ pub(super) fn worktree_row(
         if prunable {
             resp.on_hover_text("worktree directory is missing — × prunes it")
         } else {
-            name_tooltip(resp, display_name, name_elided, theme.sidebar_tooltips)
+            name_tooltip(resp, row.display_name, name_elided, theme.sidebar_tooltips)
         }
     });
+    (resp, clicks)
+}
+
+pub(super) fn worktree_row(ui: &mut egui::Ui, row: &WorktreeRowView) -> WorktreeAction {
+    let theme = row.theme;
+    // Reserve a slot *before* the labels so the hover bg paints beneath them.
+    let bg_idx = ui.painter().add(egui::Shape::Noop);
+    let panel_x = ui.max_rect().x_range();
+
+    // Discovery's word, corrected by whatever the probe has seen since.  The
+    // main worktree is never offered for pruning, so it never greys either.
+    let prunable = worktree_looks_gone(row.wt, row.missing);
+    let (resp, mut clicks) = worktree_row_frame(ui, row, prunable);
 
     // Frame allocates its space at end-of-show, so its retroactive `interact`
     // registers *after* the inner button in egui's z-order — meaning clicks on
     // the × land on this row response, not the button.  Recover by routing
     // clicks whose position falls inside the button rect to delete.
-    if resp.clicked() && !delete_clicked && !spawn_clicked {
-        if let Some(pos) = resp.interact_pointer_pos() {
-            if delete_rect.is_some_and(|r| r.contains(pos)) {
-                delete_clicked = true;
-            } else if spawn_rect.is_some_and(|r| r.contains(pos)) {
-                spawn_clicked = true;
-            }
-        }
-    }
+    clicks.route_shadowed_click(resp.clicked(), resp.interact_pointer_pos());
 
-    let mut set_base_clicked = false;
-    let mut spawn_profile_clicked: Option<String> = None;
-    resp.context_menu(|ui| {
-        if ui.button("Set base branch…").clicked() {
-            set_base_clicked = true;
-            ui.close_menu();
-        }
-        if !profiles.is_empty() {
-            ui.separator();
-            ui.label(RichText::new("Open session").color(theme.text_muted).small());
-            ui.set_max_width(WORKTREE_MENU_MAX_WIDTH);
-            for (i, (name, command)) in profiles.iter().enumerate() {
-                let btn = ui.button(profile_menu_label(i + 1, name));
-                if btn.on_hover_text(command.as_str()).clicked() {
-                    spawn_profile_clicked = Some(name.clone());
-                    ui.close_menu();
-                }
-            }
-        }
-    });
+    let (set_base, spawn_profile) = worktree_row_menu(&resp, row);
 
-    let bg = if is_active {
+    let bg = if row.is_active {
         theme.row_active_bg
     } else if resp.hovered() {
         theme.row_hover_bg
@@ -1674,22 +1687,48 @@ pub(super) fn worktree_row(
     if bg != Color32::TRANSPARENT {
         ui.painter().set(bg_idx, egui::Shape::rect_filled(full_rect, 0.0, bg));
     }
-    if is_cursor {
+    if row.is_cursor {
         paint_cursor_outline(ui, full_rect, theme);
     }
-    if scroll_into_view {
+    if row.scroll_into_view {
         ui.scroll_to_rect(full_rect, theme.scroll_align);
     }
     WorktreeAction {
         // A prunable row is still worth clicking when shells are homed there;
         // `activate_worktree` turns the ones that aren't into the prune hint.
-        activate: !deleting && resp.clicked() && !delete_clicked && !spawn_clicked,
-        delete: delete_clicked,
-        spawn: spawn_clicked,
-        set_base: set_base_clicked,
-        spawn_profile: spawn_profile_clicked,
+        activate: clicks.activates(row.deleting, resp.clicked()),
+        delete: clicks.delete,
+        spawn: clicks.spawn,
+        set_base,
+        spawn_profile,
         rect: full_rect,
     }
+}
+
+/// The row's context menu, returning whether "Set base branch" was picked and
+/// the profile picked from "Open session", if any.
+fn worktree_row_menu(resp: &egui::Response, row: &WorktreeRowView) -> (bool, Option<String>) {
+    let mut set_base_clicked = false;
+    let mut spawn_profile_clicked: Option<String> = None;
+    resp.context_menu(|ui| {
+        if ui.button("Set base branch…").clicked() {
+            set_base_clicked = true;
+            ui.close_menu();
+        }
+        if !row.profiles.is_empty() {
+            ui.separator();
+            ui.label(RichText::new("Open session").color(row.theme.text_muted).small());
+            ui.set_max_width(WORKTREE_MENU_MAX_WIDTH);
+            for (i, (name, command)) in row.profiles.iter().enumerate() {
+                let btn = ui.button(profile_menu_label(i + 1, name));
+                if btn.on_hover_text(command.as_str()).clicked() {
+                    spawn_profile_clicked = Some(name.clone());
+                    ui.close_menu();
+                }
+            }
+        }
+    });
+    (set_base_clicked, spawn_profile_clicked)
 }
 
 pub(super) struct SessionRowAction {
