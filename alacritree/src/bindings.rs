@@ -1,13 +1,14 @@
 //! Parse `[[keyboard.bindings]]` from alacritty's config and match them
-//! against key presses.  Keys and modifiers are this module's own types so the
-//! parser links no GUI framework; `shortcut` converts input events into them.
+//! against key presses. Keys and modifiers are this module's own types so the
+//! parser links no GUI framework. `shortcut` converts each binding's key to
+//! egui's once, when the app is built, and converts only a press's modifiers.
 
 use schemars::JsonSchema;
 use serde::Deserialize;
 use strum::EnumIter;
 
-/// A key a binding can name.  Variant names follow egui's, which `shortcut`
-/// converts to and from.
+/// A key a binding can name. Variant names follow egui's, and `shortcut` maps
+/// each one to the egui key of the same name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, EnumIter)]
 pub enum Key {
     ArrowDown,
