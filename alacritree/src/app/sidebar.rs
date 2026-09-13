@@ -1928,3 +1928,108 @@ fn herdr_row(
     }
     HerdrRowAction { attach: resp.clicked() }
 }
+
+impl AlacritreeApp {
+    pub(super) fn dispatch_sidebar_action(&mut self, ctx: &Context, action: NamedAction) -> bool {
+        match action {
+            NamedAction::SidebarTop => self.sidebar_cursor_to_edge(true),
+            NamedAction::SidebarBottom => self.sidebar_cursor_to_edge(false),
+            NamedAction::SidebarNextProject => self.sidebar_cursor_project_jump(1),
+            NamedAction::SidebarPreviousProject => self.sidebar_cursor_project_jump(-1),
+            NamedAction::DeleteSelected => match self.sidebar.cursor.clone() {
+                Some(SidebarRow::Session(id)) => self.request_close_session(ctx, id),
+                Some(SidebarRow::Worktree(path)) => self.request_worktree_delete(&path),
+                Some(SidebarRow::Project(root)) => {
+                    if let Some(p) = self.projects.iter().find(|p| p.root == root) {
+                        self.modals.pending_project_remove =
+                            Some(ProjectRemoveState { name: p.display_name().to_string(), root });
+                    }
+                },
+                Some(SidebarRow::Home) | Some(SidebarRow::HerdrAgent(..)) | None => {},
+            },
+            NamedAction::RenameSelected => {
+                // Only project rows carry an editable label; sessions and
+                // worktrees take their names from the terminal title and the
+                // `[ui] worktree_name` template.
+                if let Some(SidebarRow::Project(root)) = self.sidebar.cursor.clone() {
+                    if let Some(p) = self.projects.iter().find(|p| p.root == root) {
+                        self.modals.pending_rename =
+                            Some(RenameState { root, label: p.display_name().to_string() });
+                    }
+                }
+            },
+            NamedAction::ToggleProjectExpanded => {
+                let Some(cursor) = self.sidebar.cursor.clone() else {
+                    return true;
+                };
+                let root = {
+                    let session_workspace = |id: SessionId| {
+                        self.sessions
+                            .iter()
+                            .find(|s| s.id == id)
+                            .map(|s| s.working_directory.clone())
+                    };
+                    row_project_root(&self.projects, session_workspace, &cursor)
+                };
+                if let Some(root) = root {
+                    let expanded =
+                        self.projects.iter().find(|p| p.root == root).is_some_and(|p| p.expanded);
+                    self.set_project_expanded(&root, !expanded);
+                    // Collapsing hides the cursored child; move the cursor to
+                    // the header so it doesn't point at a now-invisible row.
+                    if expanded && !matches!(cursor, SidebarRow::Project(_)) {
+                        self.set_sidebar_cursor(SidebarRow::Project(root));
+                    }
+                }
+            },
+            NamedAction::ClearProjectFilters => {
+                self.sidebar.filter.clear_toggles();
+            },
+            NamedAction::ToggleLeftSidebar => {
+                self.show_left_sidebar = !self.show_left_sidebar;
+                // A deliberate visibility change opts out of the auto-shown
+                // round trip, and a hidden sidebar cannot keep keyboard focus.
+                self.sidebar_auto_shown = false;
+                if !self.show_left_sidebar && self.focus == PaneFocus::ProjectsSidebar {
+                    self.focus = PaneFocus::Terminal;
+                }
+                self.persist_sidebars();
+            },
+            NamedAction::ToggleSidebarFocus => match self.focus {
+                PaneFocus::Terminal => self.focus_sidebar(),
+                PaneFocus::ProjectsSidebar => self.focus_terminal(),
+                // Toggle stays "left <-> terminal"; from the right panel it
+                // hops to the left one rather than doing nothing.
+                PaneFocus::GitSidebar => self.focus_sidebar(),
+            },
+            NamedAction::CloseSession => {
+                let cursored = if self.focus == PaneFocus::ProjectsSidebar {
+                    match &self.sidebar.cursor {
+                        Some(SidebarRow::Session(id)) => Some(*id),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let target = cursored
+                    .or_else(|| self.active_session_index().map(|idx| self.sessions[idx].id));
+                if let Some(id) = target {
+                    self.request_close_session(ctx, id);
+                }
+            },
+            NamedAction::FocusProjectsSidebar => {
+                if self.focus != PaneFocus::ProjectsSidebar {
+                    self.focus_sidebar();
+                }
+            },
+            _ => return false,
+        }
+        true
+    }
+
+    pub(super) fn dispatch_project_filter(&mut self, action: NamedAction) -> bool {
+        let Some(key) = project_filter_identity(action) else { return false };
+        self.sidebar.filter.toggle(key);
+        true
+    }
+}

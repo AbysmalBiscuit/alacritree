@@ -905,6 +905,34 @@ impl AlacritreeApp {
     }
 }
 
+impl AlacritreeApp {
+    pub(super) fn dispatch_herdr_action(&mut self, ctx: &Context, action: NamedAction) -> bool {
+        match action {
+            NamedAction::NewMultiplexerPane => {
+                if !self.config.integrations.herdr.enabled {
+                    self.modals.error_dialog = Some(HERDR_DISABLED.to_string());
+                } else {
+                    match self.default_multiplexer_side() {
+                        Ok(side) => {
+                            let workspace = self.current_workspace.clone();
+                            self.create_multiplexer_pane(ctx, side, workspace, None);
+                        },
+                        Err(e) => self.modals.error_dialog = Some(e),
+                    }
+                }
+            },
+            NamedAction::AttachAllMultiplexerPanes => {
+                self.attach_every_multiplexer_pane(ctx);
+            },
+            NamedAction::DetachAllMultiplexerPanes => {
+                self.detach_every_multiplexer_pane(ctx);
+            },
+            _ => return false,
+        }
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

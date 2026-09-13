@@ -955,3 +955,63 @@ fn paint_git_row_cursor(
         ui.scroll_to_rect(rect, theme.scroll_align);
     }
 }
+
+impl AlacritreeApp {
+    pub(super) fn dispatch_git_action(&mut self, ctx: &Context, action: NamedAction) -> bool {
+        match action {
+            NamedAction::SetBaseBranch => {
+                let target = base_branch_target(
+                    self.focus == PaneFocus::ProjectsSidebar,
+                    self.sidebar.cursor.as_ref(),
+                    |id| {
+                        self.sessions
+                            .iter()
+                            .find(|s| s.id == id)
+                            .map(|s| s.working_directory.clone())
+                    },
+                    &self.current_workspace,
+                );
+                if let Some(path) = target {
+                    self.open_base_branch_picker(path);
+                }
+            },
+            NamedAction::ClearGitFilters => {
+                self.git_panel.filter.clear_toggles();
+                self.after_git_filter_changed();
+            },
+            NamedAction::ToggleRightSidebar => {
+                self.show_right_sidebar = !self.show_right_sidebar;
+                // A deliberate visibility change opts out of the auto-shown
+                // round trip, and a hidden sidebar cannot keep keyboard focus.
+                self.git_panel.auto_shown = false;
+                if !self.show_right_sidebar && self.focus == PaneFocus::GitSidebar {
+                    self.focus = PaneFocus::Terminal;
+                }
+                self.persist_sidebars();
+            },
+            NamedAction::FocusGitSidebar => {
+                if self.focus != PaneFocus::GitSidebar {
+                    self.focus_git_sidebar()
+                } else {
+                    self.focus_terminal()
+                }
+            },
+            NamedAction::RefreshPrStatus => {
+                self.pr_cache.invalidate_all();
+                // The poll sites run while the sidebars paint, and the palette
+                // dispatches after both have; without a wake the re-query would
+                // wait for whatever repaint happened to come next.
+                ctx.request_repaint();
+            },
+            _ => return false,
+        }
+        true
+    }
+
+    pub(super) fn dispatch_git_filter(&mut self, action: NamedAction) -> bool {
+        let Some(key) = git_filter_identity(action) else { return false };
+        self.git_panel.filter.toggle(key);
+        self.after_git_filter_changed();
+        true
+    }
+}
