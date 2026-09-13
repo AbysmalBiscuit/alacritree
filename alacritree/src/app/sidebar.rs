@@ -875,8 +875,7 @@ fn paint_home_group(
         is_active,
         is_cursor,
         view.scrolls(is_cursor) || view.follows_home(),
-        view.home_attention,
-        view.home_activity,
+        RowStatus { attention: view.home_attention, activity: view.home_activity, managed: None },
         &view.icons,
         &view.theme,
     );
@@ -1278,8 +1277,7 @@ pub(super) fn home_row(
     is_active: bool,
     is_cursor: bool,
     scroll_into_view: bool,
-    attention: bool,
-    activity: SessionActivity,
+    status: RowStatus<'_>,
     icons: &Icons,
     theme: &Theme,
 ) -> HomeAction {
@@ -1302,7 +1300,7 @@ pub(super) fn home_row(
                     status_hint = paint_row_status_icon(
                         ui,
                         theme,
-                        RowStatus { attention, activity, managed: None },
+                        status,
                         &icons.home,
                         DEFAULT_HOME_ICON,
                         is_active,

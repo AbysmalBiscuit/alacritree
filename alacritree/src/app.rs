@@ -9565,7 +9565,15 @@ mod tests {
             );
 
             let mut home = |ui: &mut egui::Ui| {
-                home_row(ui, true, false, false, false, SessionActivity::Shell, &icons, &theme);
+                home_row(
+                    ui,
+                    true,
+                    false,
+                    false,
+                    RowStatus { attention: false, activity: SessionActivity::Shell, managed: None },
+                    &icons,
+                    &theme,
+                );
             };
             assert_eq!(
                 hint_painted_over(&mut home, "+", "new shell"),
