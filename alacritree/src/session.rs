@@ -1728,6 +1728,10 @@ impl Session {
             }
             self.osc_events = Some(receiver);
         }
+        if outcome.exited {
+            self.progress = None;
+            self.pointer_shape = None;
+        }
         outcome
     }
 
@@ -2472,7 +2476,7 @@ pub(crate) mod tests {
     #[test]
     fn osc52_read_is_refused_by_default_before_the_drain() {
         let config = Config::default();
-        let (session, _) = Session::pending_shell(
+        let (mut session, _) = Session::pending_shell(
             egui::Context::default(),
             &config,
             None,

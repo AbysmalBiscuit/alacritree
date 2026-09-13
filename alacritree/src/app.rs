@@ -7213,16 +7213,26 @@ fn session_name_tooltip(
     resp: egui::Response,
     name: &str,
     reported_cwd: Option<&Path>,
+    last_notification: Option<&str>,
     elided: bool,
     mode: SidebarTooltips,
 ) -> egui::Response {
-    let Some(path) = reported_cwd else {
+    if reported_cwd.is_none() && last_notification.is_none() {
         return name_tooltip(resp, name, elided, mode);
-    };
+    }
     if matches!(mode, SidebarTooltips::Off) || matches!(mode, SidebarTooltips::Elided if !elided) {
         return resp;
     }
-    name_tooltip(resp, &format!("{name}\n{}", path.display()), elided, mode)
+    let mut tooltip = name.to_owned();
+    if let Some(path) = reported_cwd {
+        tooltip.push('\n');
+        tooltip.push_str(&path.display().to_string());
+    }
+    if let Some(body) = last_notification {
+        tooltip.push('\n');
+        tooltip.push_str(body);
+    }
+    resp.on_hover_text(tooltip)
 }
 
 /// Lay a path out as the text of one truncating label.
@@ -8125,6 +8135,7 @@ struct SessionRowData {
     id: SessionId,
     name: RowName,
     reported_cwd: Option<PathBuf>,
+    last_notification: Option<String>,
     progress: Option<OscProgress>,
     needs_attention: bool,
     activity: SessionActivity,
@@ -9548,6 +9559,7 @@ fn session_row(
             resp,
             &row.name.text,
             row.reported_cwd.as_deref(),
+            row.last_notification.as_deref(),
             title_elided,
             theme.sidebar_tooltips,
         ),
@@ -10289,6 +10301,7 @@ impl AlacritreeApp {
                         id: s.id,
                         name: session_row_name(&s.title, activity, self.session_herdr_agent(s)),
                         reported_cwd: s.reported_cwd.clone(),
+                        last_notification: s.last_notification.clone(),
                         progress: s.progress,
                         needs_attention: s.needs_attention,
                         activity,
@@ -13132,6 +13145,7 @@ mod tests {
     #[test]
     fn session_notification_reaches_the_sidebar_hover_tooltip() {
         let mut app = test_app();
+        app.session_rows_always = true;
         app.sessions[0].last_notification = Some("build failed".to_string());
 
         for (mode, want) in [
@@ -17466,14 +17480,20 @@ mod tests {
         let ubuntu = Path::new(r"\\wsl.localhost\Ubuntu\home\dev\src");
         let debian = Path::new(r"\\wsl.localhost\Debian\home\dev\src");
 
-        for (workspace, directory, expected) in [
-            (None, ubuntu, Some("Ubuntu")),
-            (Some(native.to_path_buf()), ubuntu, Some("Ubuntu")),
-            (Some(ubuntu.to_path_buf()), debian, Some("Debian")),
-            (Some(ubuntu.to_path_buf()), native, None),
-        ] {
-            let (_, _, distro) = app.resolve_shell(&workspace, Some(directory));
-            assert_eq!(distro.as_deref(), expected);
+        for report_cwd in [false, true] {
+            app.config.vt.report_cwd = report_cwd;
+            for (workspace, directory, expected) in [
+                (None, ubuntu, Some("Ubuntu")),
+                (Some(native.to_path_buf()), ubuntu, Some("Ubuntu")),
+                (Some(ubuntu.to_path_buf()), debian, Some("Debian")),
+                (Some(ubuntu.to_path_buf()), native, None),
+            ] {
+                let (shell, _, distro) = app.resolve_shell(&workspace, Some(directory));
+                if expected.is_some() {
+                    assert!(shell.is_some(), "the WSL location still needs a launch shell");
+                }
+                assert_eq!(distro.as_deref(), report_cwd.then_some(expected).flatten());
+            }
         }
 
         app.config.profiles = test_profiles();
@@ -18456,6 +18476,7 @@ mod tests {
                 id: 1,
                 name: RowName::plain("zsh".to_owned()),
                 reported_cwd: None,
+                last_notification: None,
                 progress: None,
                 needs_attention: false,
                 activity: SessionActivity::Shell,
@@ -18546,6 +18567,7 @@ mod tests {
             id: 1,
             name: RowName::plain("zsh".to_owned()),
             reported_cwd: None,
+            last_notification: None,
             progress: None,
             needs_attention: attention,
             activity,
@@ -18816,6 +18838,7 @@ mod tests {
                 id: 1,
                 name: RowName::plain(name.to_owned()),
                 reported_cwd: Some(cwd.clone()),
+                last_notification: None,
                 progress: None,
                 needs_attention: false,
                 activity: SessionActivity::Shell,
@@ -18936,6 +18959,7 @@ mod tests {
             id: 1,
             name: RowName::plain("cargo test --workspace --all-features -- --nocapture".to_owned()),
             reported_cwd: None,
+            last_notification: None,
             progress: None,
             needs_attention: false,
             activity: SessionActivity::Shell,
