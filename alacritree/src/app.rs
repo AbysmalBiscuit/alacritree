@@ -22,8 +22,8 @@ use crate::config::{
     DEFAULT_REORDER_ICON, DEFAULT_SEARCH_ICON, DEFAULT_SESSION_ICON,
     DEFAULT_UPSTREAM_DIVERGED_ICON, DEFAULT_UPSTREAM_GONE_ICON, DEFAULT_UPSTREAM_LEVEL_ICON,
     DEFAULT_UPSTREAM_UNTRACKED_ICON, DEFAULT_WORKTREE_ICON, DEFAULT_WORKTREE_MAIN_ICON, FontConfig,
-    IconStyle, Icons, LastSessionClose, PathStyleConfig, ScrollbarStyle, SearchDepth, SearchScope,
-    SidebarFocus, SidebarTooltips, TextEmphasis, UiFont, UiTheme, profile_command,
+    IconStyle, Icons, LastSessionClose, PathStyleConfig, ScrollAlign, ScrollbarStyle, SearchDepth,
+    SearchScope, SidebarFocus, SidebarTooltips, TextEmphasis, UiFont, UiTheme, profile_command,
 };
 use crate::crash_log::{self, ExitReason};
 use crate::git_nav::{self, GitSection, SectionCount};
@@ -155,14 +155,13 @@ impl StateColors {
 impl Theme {
     fn from_config(config: &Config) -> Self {
         let terminal_bg = rgb_to_color32(config.palette.bg);
-        let sidebar_bg = config.ui.sidebar_background.unwrap_or(terminal_bg);
-        let text =
-            config.ui.sidebar_foreground.unwrap_or_else(|| rgb_to_color32(config.palette.fg));
-        let accent =
-            config.ui.sidebar_accent.unwrap_or_else(|| rgb_to_color32(config.palette.normal[4])); // ANSI blue
+        let sidebar_bg = config.ui.sidebar_background.map_or(terminal_bg, rgb_to_color32);
+        let text = rgb_to_color32(config.ui.sidebar_foreground.unwrap_or(config.palette.fg));
+        let accent = rgb_to_color32(config.ui.sidebar_accent.unwrap_or(config.palette.normal[4])); // ANSI blue
         let attention =
-            config.ui.sidebar_attention.unwrap_or_else(|| rgb_to_color32(config.palette.normal[3])); // ANSI yellow
-        let border = config.ui.sidebar_border.unwrap_or_else(|| lighten(sidebar_bg, 0.10));
+            rgb_to_color32(config.ui.sidebar_attention.unwrap_or(config.palette.normal[3])); // ANSI yellow
+        let border =
+            config.ui.sidebar_border.map_or_else(|| lighten(sidebar_bg, 0.10), rgb_to_color32);
         let text_muted = blend_toward(text, sidebar_bg, 0.55);
         let (font_normal, font_heading) = ui_text_px(&config.font, &config.ui_font);
         Self {
@@ -197,14 +196,21 @@ impl Theme {
             focus_outline: FocusOutlineTheme {
                 sidebar: config.ui.focus_outline.sidebar,
                 terminal: config.ui.focus_outline.terminal,
-                color: config.ui.focus_outline.color.unwrap_or(accent),
+                color: config.ui.focus_outline.color.map_or(accent, rgb_to_color32),
                 thickness: config.ui.focus_outline.thickness,
             },
             path_style: config.ui.path_style,
             sidebar_tooltips: config.ui.sidebar_tooltips,
             icon_tooltips: config.ui.icon_tooltips,
-            scroll_align: config.ui.sidebar_scroll_align.align(),
+            scroll_align: egui_scroll_align(config.ui.sidebar_scroll_align),
         }
+    }
+}
+
+fn egui_scroll_align(align: ScrollAlign) -> Option<egui::Align> {
+    match align {
+        ScrollAlign::Minimal => None,
+        ScrollAlign::Center => Some(egui::Align::Center),
     }
 }
 
@@ -2915,7 +2921,7 @@ fn path_text(
         }
         job.append(&text, 0.0, egui::TextFormat {
             font_id: egui::FontId::new(size, emphasis_family(e, &family)),
-            color: e.color.unwrap_or(base),
+            color: e.color.map_or(base, rgb_to_color32),
             valign,
             ..Default::default()
         });
@@ -3129,7 +3135,7 @@ fn resolve_icon<'a>(
     (
         style.or_glyph(default_glyph.as_str()),
         egui::FontId::new(size, family),
-        style.color.unwrap_or(default_color),
+        style.color.map_or(default_color, rgb_to_color32),
     )
 }
 
@@ -8907,7 +8913,8 @@ mod tests {
         assert_eq!(default_theme.attention, rgb_to_color32(Config::default().palette.normal[3]));
 
         let mut config = Config::default();
-        config.ui.sidebar_attention = Some(Color32::from_rgb(0xff, 0xb8, 0x6c));
+        config.ui.sidebar_attention =
+            Some(alacritty_terminal::vte::ansi::Rgb { r: 0xff, g: 0xb8, b: 0x6c });
         let theme = Theme::from_config(&config);
         assert_eq!(theme.attention, Color32::from_rgb(0xff, 0xb8, 0x6c));
     }
@@ -9244,7 +9251,10 @@ mod tests {
     #[test]
     fn a_configured_color_wins_over_the_site_default() {
         let theme = Theme::from_config(&Config::default());
-        let style = IconStyle { color: Some(Color32::RED), ..Default::default() };
+        let style = IconStyle {
+            color: Some(alacritty_terminal::vte::ansi::Rgb { r: 255, g: 0, b: 0 }),
+            ..Default::default()
+        };
         let (_, _, color) =
             resolve_icon(&style, DEFAULT_WORKTREE_ICON, Color32::WHITE, 10.0, 10.0, &theme);
         assert_eq!(color, Color32::RED);
@@ -9337,7 +9347,7 @@ mod tests {
         let mut icons = crate::config::Icons::default();
         icons.upstream_gone = IconStyle {
             glyph: Some("✕".to_string()),
-            color: Some(Color32::RED),
+            color: Some(alacritty_terminal::vte::ansi::Rgb { r: 255, g: 0, b: 0 }),
             bold: true,
             italic: false,
             size: None,
@@ -9417,7 +9427,7 @@ mod tests {
         let s = theme.ui_scale;
         let style = IconStyle {
             glyph: Some("▶".to_string()),
-            color: Some(Color32::RED),
+            color: Some(alacritty_terminal::vte::ansi::Rgb { r: 255, g: 0, b: 0 }),
             bold: true,
             italic: false,
             size: None,
@@ -9724,7 +9734,7 @@ mod tests {
         let mut icons = Icons::default();
         icons.delete_worktree = IconStyle {
             glyph: Some("✖".into()),
-            color: Some(Color32::RED),
+            color: Some(alacritty_terminal::vte::ansi::Rgb { r: 255, g: 0, b: 0 }),
             bold: true,
             ..Default::default()
         };
@@ -9760,7 +9770,11 @@ mod tests {
     #[test]
     fn a_glyphless_style_falls_back_to_the_site_default_glyph() {
         let theme = Theme::from_config(&Config::default());
-        let style = IconStyle { color: Some(Color32::RED), bold: true, ..Default::default() };
+        let style = IconStyle {
+            color: Some(alacritty_terminal::vte::ansi::Rgb { r: 255, g: 0, b: 0 }),
+            bold: true,
+            ..Default::default()
+        };
         let (glyph, font, color) =
             resolve_icon(&style, DEFAULT_CLOSE_ICON, theme.text_muted, 12.0, 16.0, &theme);
         assert_eq!(glyph, DEFAULT_CLOSE_ICON.as_str());
@@ -9780,7 +9794,7 @@ mod tests {
         let theme = Theme::from_config(&Config::default());
         let ctx = ctx_with_ui_variant_faces();
         let mut icons = crate::config::Icons::default();
-        let distinctive = Color32::from_rgb(200, 30, 220);
+        let distinctive = alacritty_terminal::vte::ansi::Rgb { r: 200, g: 30, b: 220 };
         icons.delete_worktree =
             IconStyle { color: Some(distinctive), bold: true, ..Default::default() };
         let wt = crate::projects::Worktree {
@@ -9807,7 +9821,8 @@ mod tests {
         let (delete_family, _, delete_color) =
             painted_glyph_style(&output.shapes, "×").expect("the delete button painted");
         assert_eq!(
-            delete_color, distinctive,
+            delete_color,
+            rgb_to_color32(distinctive),
             "the delete button must paint icons.delete_worktree's configured colour"
         );
         assert_eq!(delete_family, egui::FontFamily::Name(crate::fonts::UI_BOLD_FAMILY.into()));
