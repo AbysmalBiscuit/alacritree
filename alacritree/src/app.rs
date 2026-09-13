@@ -447,11 +447,11 @@ impl AlacritreeApp {
         theme: Theme,
         persisted: state::PersistedState,
         projects: Vec<Project>,
-        font_chain: Vec<crate::fonts::ChainFace>,
-        face_metrics: crate::fonts::FaceMetrics,
+        fonts: (Vec<crate::fonts::ChainFace>, crate::fonts::FaceMetrics),
         notify_rx: Receiver<SessionId>,
         ipc: (Option<ipc::SocketHandle>, Option<Receiver<ipc::AppCall>>),
     ) -> Self {
+        let (font_chain, face_metrics) = fonts;
         let color_glyph_budget_mb = config.font.color_glyph_cache_mb;
         let grid_snapshot = crate::terminal_view::GridSnapshot::new(&config.palette);
         let (ipc_socket, ipc_rx) = ipc;
@@ -639,7 +639,7 @@ impl AlacritreeApp {
 
     pub fn new(cc: &CreationContext<'_>, config: Config) -> Self {
         let theme = Theme::from_config(&config);
-        let (font_chain, face_metrics) = Self::configure_context(&cc.egui_ctx, &config, &theme);
+        let fonts = Self::configure_context(&cc.egui_ctx, &config, &theme);
         let (ipc_socket, ipc_rx) = Self::start_ipc(&cc.egui_ctx, config.ipc_socket);
         let (persisted, projects) = Self::load_projects(&config);
 
@@ -659,8 +659,7 @@ impl AlacritreeApp {
             theme,
             persisted,
             projects,
-            font_chain,
-            face_metrics,
+            fonts,
             notify_rx,
             (ipc_socket, ipc_rx),
         );
@@ -5939,8 +5938,7 @@ mod tests {
             theme,
             state::PersistedState::default(),
             Vec::new(),
-            Vec::new(),
-            crate::fonts::FaceMetrics::default(),
+            (Vec::new(), crate::fonts::FaceMetrics::default()),
             notify_rx,
             (None, None),
         );
@@ -5957,8 +5955,7 @@ mod tests {
             Theme::from_config(&Config::default()),
             state::PersistedState::default(),
             Vec::new(),
-            Vec::new(),
-            crate::fonts::FaceMetrics::default(),
+            (Vec::new(), crate::fonts::FaceMetrics::default()),
             notify_rx,
             (None, None),
         );
