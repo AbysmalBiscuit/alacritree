@@ -18,7 +18,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle, Rgb};
-use egui::Color32;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use strum::{EnumIter, IntoEnumIterator, IntoStaticStr};
@@ -620,11 +619,7 @@ pub enum ScrollbarStyle {
 }
 
 fn text_emphasis(raw: &RawTextEmphasis) -> TextEmphasis {
-    TextEmphasis {
-        color: raw.color.map(|v| rgb_to_color32(v.0)),
-        bold: raw.bold,
-        italic: raw.italic,
-    }
+    TextEmphasis { color: raw.color.map(|v| v.0), bold: raw.bold, italic: raw.italic }
 }
 
 /// A glyph alacritree ships and guarantees coverage for.  Paint helpers take
@@ -829,15 +824,6 @@ pub enum ScrollAlign {
     Center,
 }
 
-impl ScrollAlign {
-    pub fn align(self) -> Option<egui::Align> {
-        match self {
-            Self::Minimal => None,
-            Self::Center => Some(egui::Align::Center),
-        }
-    }
-}
-
 /// `[ui] search_scope`: whether a fuzzy query is confined by the panel's active
 /// toggle filters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
@@ -998,7 +984,7 @@ pub struct FocusOutline {
     pub sidebar: bool,
     pub terminal: bool,
     /// `None` falls back to the theme accent at resolution time.
-    pub color: Option<Color32>,
+    pub color: Option<Rgb>,
     /// Absolute logical pixels (deliberately not ui_scale-multiplied);
     /// clamped to ≥ 0.5.
     pub thickness: f32,
@@ -1022,7 +1008,7 @@ impl Default for Icons {
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct IconStyle {
     pub glyph: Option<String>,
-    pub color: Option<Color32>,
+    pub color: Option<Rgb>,
     pub bold: bool,
     pub italic: bool,
     /// Logical pixels before `ui_scale`; clamped to the icon's slot at paint.
@@ -1040,7 +1026,7 @@ impl IconStyle {
 /// theme.
 #[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
 pub struct TextEmphasis {
-    pub color: Option<Color32>,
+    pub color: Option<Rgb>,
     pub bold: bool,
     pub italic: bool,
 }
@@ -1140,11 +1126,11 @@ fn parse_adjust(field: &str, raw: &str) -> Adjust {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UiTheme {
-    pub sidebar_background: Option<Color32>,
-    pub sidebar_foreground: Option<Color32>,
-    pub sidebar_border: Option<Color32>,
-    pub sidebar_accent: Option<Color32>,
-    pub sidebar_attention: Option<Color32>,
+    pub sidebar_background: Option<Rgb>,
+    pub sidebar_foreground: Option<Rgb>,
+    pub sidebar_border: Option<Rgb>,
+    pub sidebar_accent: Option<Rgb>,
+    pub sidebar_attention: Option<Rgb>,
     /// Fire a desktop notification when a non-visible session needs attention.
     pub notifications: bool,
     /// How long an attention trigger must survive without the session going
@@ -2487,7 +2473,7 @@ impl From<RawIconStyle> for IconStyle {
             RawIconStyle::Glyph(glyph) => IconStyle { glyph: Some(glyph), ..Default::default() },
             RawIconStyle::Table { glyph, color, bold, italic, size } => IconStyle {
                 glyph,
-                color: color.map(|c| rgb_to_color32(c.0)),
+                color: color.map(|c| c.0),
                 bold,
                 italic,
                 size: size.map(|s| s.max(1.0)),
@@ -3147,11 +3133,11 @@ impl RawConfig {
         palette.draw_bold_with_bright = c.draw_bold_text_with_bright_colors;
 
         let ui = UiTheme {
-            sidebar_background: self.ui.sidebar_background.map(|v| rgb_to_color32(v.0)),
-            sidebar_foreground: self.ui.sidebar_foreground.map(|v| rgb_to_color32(v.0)),
-            sidebar_border: self.ui.sidebar_border.map(|v| rgb_to_color32(v.0)),
-            sidebar_accent: self.ui.sidebar_accent.map(|v| rgb_to_color32(v.0)),
-            sidebar_attention: self.ui.sidebar_attention.map(|v| rgb_to_color32(v.0)),
+            sidebar_background: self.ui.sidebar_background.map(|v| v.0),
+            sidebar_foreground: self.ui.sidebar_foreground.map(|v| v.0),
+            sidebar_border: self.ui.sidebar_border.map(|v| v.0),
+            sidebar_accent: self.ui.sidebar_accent.map(|v| v.0),
+            sidebar_attention: self.ui.sidebar_attention.map(|v| v.0),
             notifications: self.ui.notifications,
             attention_grace: Duration::from_millis(self.ui.attention_grace_ms),
             confirm_session_close: parse_closed_set(
@@ -3214,7 +3200,7 @@ impl RawConfig {
             focus_outline: FocusOutline {
                 sidebar: self.ui.focus_outline.sidebar,
                 terminal: self.ui.focus_outline.terminal,
-                color: self.ui.focus_outline.color.map(|v| rgb_to_color32(v.0)),
+                color: self.ui.focus_outline.color.map(|v| v.0),
                 thickness: self.ui.focus_outline.thickness.max(0.5),
             },
             scrollbar: parse_closed_set("ui.scrollbar", &self.ui.scrollbar),
@@ -3417,10 +3403,6 @@ fn apply_set(target: &mut [Rgb; 8], set: RawSet) {
             *slot = v.0;
         }
     }
-}
-
-fn rgb_to_color32(r: Rgb) -> Color32 {
-    Color32::from_rgb(r.r, r.g, r.b)
 }
 
 /// Drop unusable `[[ui.profiles]]` entries instead of failing the parse:
@@ -3856,7 +3838,7 @@ show_panes = true
             "[ui.path_style.filename]\ncolor = \"#e6e6e6\"\nbold = \
              true\n[ui.path_style.parent]\nitalic = true\n",
         );
-        assert_eq!(ui.path_style.filename.color, Some(Color32::from_rgb(0xe6, 0xe6, 0xe6)));
+        assert_eq!(ui.path_style.filename.color, Some(Rgb { r: 0xe6, g: 0xe6, b: 0xe6 }));
         assert!(ui.path_style.filename.bold);
         assert!(!ui.path_style.filename.italic);
         assert_eq!(ui.path_style.parent.color, None);
@@ -3983,7 +3965,7 @@ show_panes = true
         );
         let style = &ui.icons.upstream_gone;
         assert_eq!(style.or_glyph(""), "⌫");
-        assert_eq!(style.color, Some(Color32::from_rgb(0xff, 0x55, 0x55)));
+        assert_eq!(style.color, Some(Rgb { r: 0xff, g: 0x55, b: 0x55 }));
         assert!(style.bold);
         assert!(style.italic);
         assert_eq!(style.size, Some(14.0));
@@ -4013,7 +3995,7 @@ show_panes = true
             "icon = { glyph = \"⌫\", color = \"#ff5555\", bold = true, size = 12 }",
         );
         assert_eq!(icon.or_glyph("x"), "⌫");
-        assert_eq!(icon.color, Some(Color32::from_rgb(0xff, 0x55, 0x55)));
+        assert_eq!(icon.color, Some(Rgb { r: 0xff, g: 0x55, b: 0x55 }));
         assert!(icon.bold);
         assert_eq!(icon.size, Some(12.0));
     }
@@ -4669,7 +4651,7 @@ program = "second"
         let ui =
             ui_from_toml("[ui.icons]\ndelete_worktree = { glyph = \"✖\", color = \"#ff5555\" }");
         assert_eq!(ui.icons.delete_worktree.or_glyph(""), "✖");
-        assert_eq!(ui.icons.delete_worktree.color, Some(Color32::from_rgb(0xff, 0x55, 0x55)));
+        assert_eq!(ui.icons.delete_worktree.color, Some(Rgb { r: 0xff, g: 0x55, b: 0x55 }));
         // A sibling sharing the same default glyph is unaffected.
         assert_eq!(ui.icons.close_session.or_glyph(""), "×");
         assert_eq!(ui.icons.close_session.color, None);
@@ -4720,7 +4702,7 @@ program = "second"
         .focus_outline;
         assert!(fo.sidebar);
         assert!(fo.terminal);
-        assert_eq!(fo.color, Some(Color32::from_rgb(0x89, 0xb4, 0xfa)));
+        assert_eq!(fo.color, Some(Rgb { r: 0x89, g: 0xb4, b: 0xfa }));
         assert_eq!(fo.thickness, 2.5);
     }
 
@@ -4881,7 +4863,7 @@ program = "second"
         assert_eq!(ui_from_toml("").sidebar_attention, None);
         assert_eq!(
             ui_from_toml("[ui]\nsidebar_attention = \"#ffb86c\"").sidebar_attention,
-            Some(Color32::from_rgb(0xff, 0xb8, 0x6c))
+            Some(Rgb { r: 0xff, g: 0xb8, b: 0x6c })
         );
     }
 
