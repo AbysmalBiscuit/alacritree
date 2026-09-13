@@ -2461,8 +2461,8 @@ struct RawIcons {
     worktree: RawIconStyle,
     /// A terminal session row.
     session: RawIconStyle,
-    /// Deprecated. This value applies while `[integrations.herdr] icon` has
-    /// its built-in value. Remove it after migration.
+    /// Deprecated. This value applies only while `[integrations.herdr] icon`
+    /// is omitted. Remove it after migration.
     #[serde(skip_serializing_if = "Option::is_none")]
     herdr: Option<RawIconStyle>,
     /// The home tab, whose sessions inherit the launch directory.
@@ -2846,7 +2846,8 @@ struct RawGh {
     wsl_path: String,
     /// Poll `gh` for each branch's open pull request, which drives the PR row
     /// icons, the PR-state filters, and `$pr` in row templates.
-    pr_status: bool,
+    #[schemars(default = "default_pr_status")]
+    pr_status: Option<bool>,
     /// Max `gh` lookups in flight at once. Unset lets the pool decide, which
     /// is one below its own background ceiling so a lookup can never take
     /// the last slot local work needs. A value lowers that; nothing raises
@@ -2859,30 +2860,32 @@ impl Default for RawGh {
         Self {
             path: "gh".to_string(),
             wsl_path: String::new(),
-            pr_status: false,
+            pr_status: None,
             pr_status_concurrency: None,
         }
     }
 }
 
+fn default_pr_status() -> bool {
+    false
+}
+
 impl RawGh {
     fn resolve(self, moved: &MovedUiKeys) -> GhConfig {
-        let default = Self::default();
         let tool = tool_config(self.path, self.wsl_path, Tool::Gh);
         GhConfig {
             path: tool.path,
             wsl_path: tool.wsl_path,
             pr_status: moved_key(
                 self.pr_status,
-                default.pr_status,
                 moved.pr_status,
                 "[ui] pr_status",
                 "[integrations.gh] pr_status",
-            ),
+            )
+            .unwrap_or_else(default_pr_status),
             pr_status_concurrency: moved_key(
                 self.pr_status_concurrency,
-                default.pr_status_concurrency,
-                moved.pr_status_concurrency.map(Some),
+                moved.pr_status_concurrency,
                 "[ui] pr_status_concurrency",
                 "[integrations.gh] pr_status_concurrency",
             ),
@@ -3028,16 +3031,14 @@ struct MovedUiKeys {
     herdr_icon: Option<RawIconStyle>,
 }
 
-/// A deprecated key still applies from its old location. The old value
-/// applies while the new key sits at its default, because raw config structs
-/// accept unknown keys and dropping the old field would lose the override
-/// without a word.
-fn moved_key<T: PartialEq>(new: T, default: T, old: Option<T>, from: &str, to: &str) -> T {
-    let Some(old) = old else {
-        return new;
-    };
-    log::warn!("{from} is deprecated; set {to}");
-    if new == default { old } else { new }
+/// A deprecated key applies only where the file omits its replacement, so a
+/// replacement written at its default still wins. Raw config structs accept
+/// unknown keys, so dropping the old field would lose the override silently.
+fn moved_key<T>(new: Option<T>, old: Option<T>, from: &str, to: &str) -> Option<T> {
+    if old.is_some() {
+        log::warn!("{from} is deprecated; set {to}");
+    }
+    new.or(old)
 }
 
 /// A blank path means the side's default: the tool's name natively, and
@@ -3083,7 +3084,8 @@ struct RawHerdr {
     /// The glyph on a herdr pane's sidebar row and palette entry. A bare
     /// string sets the glyph; a table also styles its color, weight, slant
     /// and size, the way `[ui.icons]` keys do.
-    icon: RawIconStyle,
+    #[schemars(default = "default_herdr_icon")]
+    icon: Option<RawIconStyle>,
     /// Discover herdr servers and list their agents in the sidebar.  Inert
     /// when no herdr binary or server is present.
     enabled: bool,
@@ -3130,7 +3132,7 @@ impl Default for RawHerdr {
         Self {
             path: "herdr".to_string(),
             wsl_path: String::new(),
-            icon: raw_glyph(DEFAULT_HERDR_ICON),
+            icon: None,
             enabled: true,
             poll_interval_ms: 2000,
             show_unmatched: true,
@@ -3141,20 +3143,19 @@ impl Default for RawHerdr {
     }
 }
 
+fn default_herdr_icon() -> RawIconStyle {
+    raw_glyph(DEFAULT_HERDR_ICON)
+}
+
 impl RawHerdr {
     fn resolve(self, old_icon: Option<RawIconStyle>) -> HerdrConfig {
-        let default_icon = IconStyle::from(Self::default().icon);
         let tool = tool_config(self.path, self.wsl_path, Tool::Herdr);
         HerdrConfig {
             path: tool.path,
             wsl_path: tool.wsl_path,
-            icon: moved_key(
-                self.icon.into(),
-                default_icon,
-                old_icon.map(IconStyle::from),
-                "[ui.icons] herdr",
-                "[integrations.herdr] icon",
-            ),
+            icon: moved_key(self.icon, old_icon, "[ui.icons] herdr", "[integrations.herdr] icon")
+                .unwrap_or_else(default_herdr_icon)
+                .into(),
             enabled: self.enabled,
             poll_interval: Duration::from_millis(self.poll_interval_ms),
             show_unmatched: self.show_unmatched,
@@ -3263,8 +3264,8 @@ struct RawUi {
     /// Corrections to the underline and strikeout the font placed
     /// ([`RawDecorations`]).
     decorations: RawDecorations,
-    /// Deprecated. This value applies while `[integrations.gh] pr_status` has
-    /// its built-in value. Remove it after migration.
+    /// Deprecated. This value applies only while `[integrations.gh] pr_status`
+    /// is omitted. Remove it after migration.
     pr_status: Option<bool>,
     /// Paint a badge on each worktree row for its branch's upstream state.
     /// Local refs only: nothing fetches, so a branch deleted on the remote
@@ -3276,9 +3277,8 @@ struct RawUi {
     /// probe is one `stat` per listed row, which an exotic filesystem could
     /// make expensive.
     worktree_liveness: bool,
-    /// Deprecated. This value applies while `[integrations.gh]`
-    /// `pr_status_concurrency` has its built-in value. Remove it after
-    /// migration.
+    /// Deprecated. This value applies only while `[integrations.gh]`
+    /// `pr_status_concurrency` is omitted. Remove it after migration.
     pr_status_concurrency: Option<usize>,
     /// The font sidebars, tabs and dialogs are drawn with.
     font: RawUiFont,
@@ -4129,8 +4129,8 @@ show_panes = true
         });
     }
 
-    /// A table under the old key keeps its styling, and the new key wins once
-    /// it moves off the built-in glyph.
+    /// A table under the old key keeps its styling, and a written new key wins
+    /// even when it spells the built-in glyph.
     #[test]
     fn the_deprecated_ui_icons_herdr_applies_until_integrations_herdr_sets_icon() {
         let old = config_from("[ui.icons]\nherdr = { glyph = \"✦\", bold = true }\n");
@@ -4142,6 +4142,12 @@ show_panes = true
 
         let both = config_from("[ui.icons]\nherdr = \"✦\"\n[integrations.herdr]\nicon = \"◆\"\n");
         assert_eq!(both.integrations.herdr.icon.or_glyph(""), "◆");
+
+        let built_in = config_from(&format!(
+            "[ui.icons]\nherdr = \"✦\"\n[integrations.herdr]\nicon = \"{}\"\n",
+            DEFAULT_HERDR_ICON.as_str()
+        ));
+        assert_eq!(built_in.integrations.herdr.icon, HerdrConfig::default().icon);
     }
 
     /// A raw struct that gained a `Default` but lost its `serde(default)`
@@ -5250,8 +5256,9 @@ program = "second"
         assert!(ui_from_toml("[ui]\nupstream_status = true").upstream_status);
     }
 
-    /// The old `[ui]` keys keep working, and each new key wins once it moves
-    /// off its default.
+    /// The old `[ui]` keys keep working, and each written new key wins, even
+    /// at its default value. `pr_status_concurrency` has no value to write at
+    /// its default, since its default is unset.
     #[test]
     fn the_deprecated_ui_pr_status_keys_apply_until_integrations_gh_sets_them() {
         let old = config_from("[ui]\npr_status = true\npr_status_concurrency = 3\n");
@@ -5264,6 +5271,10 @@ program = "second"
         );
         assert!(both.integrations.gh.pr_status);
         assert_eq!(both.integrations.gh.pr_status_concurrency, Some(5));
+
+        let at_default =
+            config_from("[ui]\npr_status = true\n[integrations.gh]\npr_status = false\n");
+        assert!(!at_default.integrations.gh.pr_status);
     }
 
     /// The startup log reports a setting under the table the file now uses,

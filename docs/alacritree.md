@@ -687,8 +687,8 @@ wsl_path         = ""
 icon             = "✦"      # the glyph on herdr rows and palette entries. A
                             # bare string or a table uses the same styling as
                             # a [ui.icons] key. The deprecated [ui.icons]
-                            # herdr value applies while this key has its
-                            # built-in value. Remove it after migration.
+                            # herdr value applies only while this key is
+                            # omitted. Remove it after migration.
 enabled          = true     # false does no herdr work at all: no polling,
                             # no rows
 poll_interval_ms = 2000     # how often a reachable server is asked for its

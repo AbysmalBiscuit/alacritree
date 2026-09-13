@@ -738,7 +738,11 @@
           "type": "string"
         },
         "icon": {
-          "$ref": "#/$defs/RawIconStyle",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
           "default": "◫",
           "description": "The glyph on a herdr pane's sidebar row and palette entry. A bare\nstring sets the glyph; a table also styles its color, weight, slant\nand size, the way `[ui.icons]` keys do."
         },
@@ -838,7 +842,7 @@
               "$ref": "#/$defs/RawIconStyle"
             }
           ],
-          "description": "Deprecated. This value applies while `[integrations.herdr] icon` has\nits built-in value. Remove it after migration."
+          "description": "Deprecated. This value applies only while `[integrations.herdr] icon`\nis omitted. Remove it after migration."
         },
         "home": {
           "$ref": "#/$defs/RawIconStyle",
@@ -1559,11 +1563,11 @@
           "description": "How paths are abbreviated where the UI writes them."
         },
         "pr_status": {
-          "description": "Deprecated. This value applies while `[integrations.gh] pr_status` has\nits built-in value. Remove it after migration.",
+          "description": "Deprecated. This value applies only while `[integrations.gh] pr_status`\nis omitted. Remove it after migration.",
           "type": "boolean"
         },
         "pr_status_concurrency": {
-          "description": "Deprecated. This value applies while `[integrations.gh]`\n`pr_status_concurrency` has its built-in value. Remove it after\nmigration.",
+          "description": "Deprecated. This value applies only while `[integrations.gh]`\n`pr_status_concurrency` is omitted. Remove it after migration.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
