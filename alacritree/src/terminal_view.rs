@@ -39,7 +39,7 @@ pub fn show(
     gpu: Option<&GpuGrid>,
     detached_jobs: &mut Vec<jobs::Job<()>>,
 ) -> Response {
-    let font_id = FontId::monospace(config.font.egui_size());
+    let font_id = FontId::monospace(config.font.logical_size());
     let (cell_w_pt, cell_h_pt) =
         ui.ctx().fonts(|f| (f.glyph_width(&font_id, 'M'), f.row_height(&font_id)));
     // `Fonts` exposes no ascent, and deriving one from the face would miss the
@@ -1302,7 +1302,7 @@ fn paint_grid_gpu(
     ctx: &egui::Context,
 ) {
     let default_bg = snapshot.default_bg(&config.palette);
-    let size = config.font.egui_size();
+    let size = config.font.logical_size();
     // Collected under the lock and drawn after it: painting needs the glyph
     // caches, and the grid state has no business being held while they work.
     let mut overlays = Vec::new();
@@ -2364,8 +2364,8 @@ mod tests {
 
         let painted = painted_row(&ctx, &config, screen, "M\u{e600}".as_bytes());
 
-        let glyph_w =
-            ctx.fonts(|f| f.glyph_width(&FontId::monospace(config.font.egui_size()), '\u{e600}'));
+        let glyph_w = ctx
+            .fonts(|f| f.glyph_width(&FontId::monospace(config.font.logical_size()), '\u{e600}'));
         let cells = crate::glyph_cache::grown_cells(glyph_w, cell_w, MAX_EXTRA_CELLS);
         assert!(cells > 1, "the fixture's fallback glyph is not over-wide");
 
@@ -2408,8 +2408,8 @@ mod tests {
 
         let painted = painted_row(&ctx, &config, screen, "M\u{fb01}".as_bytes());
 
-        let glyph_w =
-            ctx.fonts(|f| f.glyph_width(&FontId::monospace(config.font.egui_size()), '\u{fb01}'));
+        let glyph_w = ctx
+            .fonts(|f| f.glyph_width(&FontId::monospace(config.font.logical_size()), '\u{fb01}'));
         assert!(glyph_w > cell_w * 1.25, "the fixture's letter is not over-wide");
         assert_eq!(x_of(&painted, "\u{fb01}"), origin + cell_w, "a letter was grown");
     }
