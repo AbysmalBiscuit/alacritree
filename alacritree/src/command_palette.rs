@@ -311,7 +311,7 @@ fn keys_for(bindings: &[KeyBinding], action: NamedAction) -> String {
     bindings
         .iter()
         .filter(|b| matches!(&b.action, BindingAction::Named(a) if *a == action))
-        .map(|b| format_shortcut(b.key, b.mods))
+        .map(|b| crate::shortcut::format(b.key, b.mods))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -326,7 +326,7 @@ pub fn first_key(bindings: &[KeyBinding], action: NamedAction) -> Option<String>
     bindings
         .iter()
         .find(|b| matches!(&b.action, BindingAction::Named(a) if *a == action))
-        .map(|b| format_shortcut(b.key, b.mods))
+        .map(|b| crate::shortcut::format(b.key, b.mods))
 }
 
 /// Ranked rows grouped under their headings. A section appears where its
@@ -342,11 +342,6 @@ pub fn group(items: &[PaletteItem], ranked: &[usize]) -> Vec<(PaletteSection, Ve
         }
     }
     out
-}
-
-fn format_shortcut(key: egui::Key, mods: egui::Modifiers) -> String {
-    egui::KeyboardShortcut::new(mods, key)
-        .format(&egui::ModifierNames::NAMES, cfg!(target_os = "macos"))
 }
 
 /// The palette's query, selection cursor, and reusable `nucleo` matcher.
