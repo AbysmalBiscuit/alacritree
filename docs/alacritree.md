@@ -684,6 +684,10 @@ branch_scope   = []         # section open nothing
                             # working directory matches
 path             = "herdr"  # the herdr binary on each side, set like the tables above
 wsl_path         = ""
+icon             = "✦"      # the glyph on herdr rows and palette entries. A
+                            # bare string or a table, like [ui.icons] keys
+                            # (see Icon styling). Supersedes the deprecated
+                            # [ui.icons] herdr
 enabled          = true     # false does no herdr work at all: no polling,
                             # no rows
 poll_interval_ms = 2000     # how often a reachable server is asked for its
@@ -805,8 +809,8 @@ Two things worth knowing about what the schema does and does not do:
 
 ### Icon styling
 
-Every `[ui.icons]` key takes either a bare glyph string, as shown above, or a
-table that styles it further:
+Every `[ui.icons]` key, and `[integrations.herdr] icon`, takes either a bare
+glyph string, as shown above, or a table that styles it further:
 
 ```toml
 [ui.icons]

@@ -81,6 +81,13 @@
       "attach": "Agent",
       "enabled": true,
       "follow_focus": "Herdr",
+      "icon": {
+        "bold": false,
+        "color": null,
+        "glyph": "◫",
+        "italic": false,
+        "size": null
+      },
       "path": "herdr",
       "poll_interval": {
         "nanos": 0,
@@ -274,13 +281,6 @@
         "bold": false,
         "color": null,
         "glyph": "×",
-        "italic": false,
-        "size": null
-      },
-      "herdr": {
-        "bold": false,
-        "color": null,
-        "glyph": "◫",
         "italic": false,
         "size": null
       },

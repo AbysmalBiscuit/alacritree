@@ -519,8 +519,7 @@ impl PasteConfig {
 
 /// `[integrations]`: how alacritree invokes external tools and the controls
 /// specific to those integrations, such as the diff viewer and its section
-/// buttons. General sidebar and terminal appearance stays under `[ui]`; a
-/// herdr row's glyph is `ui.icons.herdr`, not a setting here.
+/// buttons. General sidebar and terminal appearance stays under `[ui]`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct IntegrationsConfig {
     pub git: ToolConfig,
@@ -636,15 +635,17 @@ pub enum FollowFocus {
 }
 
 /// `[integrations.herdr]`: whether alacritree lists agents running under a
-/// herdr server in the sidebar, and what opening one attaches to.  On by
-/// default; a probe with no herdr binary or server present costs nothing, so
-/// an unmodified config pays no price for it.
+/// herdr server in the sidebar, what opening one attaches to, and the glyph
+/// that marks them. A probe with no herdr binary or server present costs
+/// nothing.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct HerdrConfig {
     /// The native herdr binary, as `[integrations.herdr] path` names it.
     pub path: String,
     /// The herdr binary inside WSL, or `None` to find it by name there.
     pub wsl_path: Option<String>,
+    /// The glyph on a herdr pane's sidebar row and palette entry.
+    pub icon: IconStyle,
     /// Discover herdr servers and list their agents in the sidebar.
     pub enabled: bool,
     /// How often a reachable herdr server is re-polled for agent state.
@@ -664,7 +665,7 @@ pub struct HerdrConfig {
 
 impl Default for HerdrConfig {
     fn default() -> Self {
-        RawHerdr::default().resolve()
+        RawHerdr::default().resolve(None)
     }
 }
 
@@ -1036,7 +1037,6 @@ pub struct Icons<C = Rgb> {
     pub worktree_main: IconStyle<C>,
     pub worktree: IconStyle<C>,
     pub session: IconStyle<C>,
-    pub herdr: IconStyle<C>,
     pub home: IconStyle<C>,
     pub project_expanded: IconStyle<C>,
     pub project_collapsed: IconStyle<C>,
@@ -1065,7 +1065,6 @@ impl<C: Copy> Icons<C> {
             worktree_main: self.worktree_main.map_color(f),
             worktree: self.worktree.map_color(f),
             session: self.session.map_color(f),
-            herdr: self.herdr.map_color(f),
             home: self.home.map_color(f),
             project_expanded: self.project_expanded.map_color(f),
             project_collapsed: self.project_collapsed.map_color(f),
@@ -2462,8 +2461,10 @@ struct RawIcons {
     worktree: RawIconStyle,
     /// A terminal session row.
     session: RawIconStyle,
-    /// A pane owned by a terminal workspace manager such as herdr.
-    herdr: RawIconStyle,
+    /// Deprecated location: `[integrations.herdr] icon` supersedes this and
+    /// wins once set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    herdr: Option<RawIconStyle>,
     /// The home tab, whose sessions inherit the launch directory.
     home: RawIconStyle,
     /// An expanded project.
@@ -2516,7 +2517,7 @@ impl Default for RawIcons {
             worktree_main: raw_glyph(DEFAULT_WORKTREE_MAIN_ICON),
             worktree: raw_glyph(DEFAULT_WORKTREE_ICON),
             session: raw_glyph(DEFAULT_SESSION_ICON),
-            herdr: raw_glyph(DEFAULT_HERDR_ICON),
+            herdr: None,
             home: raw_glyph(DEFAULT_HOME_ICON),
             project_expanded: raw_glyph(DEFAULT_PROJECT_EXPANDED_ICON),
             project_collapsed: raw_glyph(DEFAULT_PROJECT_COLLAPSED_ICON),
@@ -2546,7 +2547,6 @@ fn build_icons(raw: RawIcons) -> Icons {
         worktree_main: raw.worktree_main.into(),
         worktree: raw.worktree.into(),
         session: raw.session.into(),
-        herdr: raw.herdr.into(),
         home: raw.home.into(),
         project_expanded: raw.project_expanded.into(),
         project_collapsed: raw.project_collapsed.into(),
@@ -3010,7 +3010,7 @@ impl RawIntegrations {
             git: tool_config(self.git.path, self.git.wsl_path, Tool::Git),
             gh: self.gh.resolve(&moved),
             doppler: tool_config(self.doppler.path, self.doppler.wsl_path, Tool::Doppler),
-            herdr: self.herdr.resolve(),
+            herdr: self.herdr.resolve(moved.herdr_icon),
             delta: delta_config(self.delta.path, self.delta.wsl_path, moved.delta_path),
             tuicr: tool_config(self.tuicr.path, self.tuicr.wsl_path, Tool::Tuicr),
             diff_viewer: self.diff_viewer.resolve(),
@@ -3025,6 +3025,7 @@ struct MovedUiKeys {
     delta_path: Option<String>,
     pr_status: Option<bool>,
     pr_status_concurrency: Option<usize>,
+    herdr_icon: Option<RawIconStyle>,
 }
 
 /// A key that moved keeps working from where it used to live. The old value
@@ -3079,6 +3080,10 @@ struct RawHerdr {
     /// The program to run inside every WSL distro, as written. Empty finds it
     /// by name through the distro's login shell.
     wsl_path: String,
+    /// The glyph on a herdr pane's sidebar row and palette entry. A bare
+    /// string sets the glyph; a table also styles its color, weight, slant
+    /// and size, the way `[ui.icons]` keys do.
+    icon: RawIconStyle,
     /// Discover herdr servers and list their agents in the sidebar.  Inert
     /// when no herdr binary or server is present.
     enabled: bool,
@@ -3125,6 +3130,7 @@ impl Default for RawHerdr {
         Self {
             path: "herdr".to_string(),
             wsl_path: String::new(),
+            icon: raw_glyph(DEFAULT_HERDR_ICON),
             enabled: true,
             poll_interval_ms: 2000,
             show_unmatched: true,
@@ -3136,11 +3142,19 @@ impl Default for RawHerdr {
 }
 
 impl RawHerdr {
-    fn resolve(self) -> HerdrConfig {
+    fn resolve(self, old_icon: Option<RawIconStyle>) -> HerdrConfig {
+        let default_icon = IconStyle::from(Self::default().icon);
         let tool = tool_config(self.path, self.wsl_path, Tool::Herdr);
         HerdrConfig {
             path: tool.path,
             wsl_path: tool.wsl_path,
+            icon: moved_key(
+                self.icon.into(),
+                default_icon,
+                old_icon.map(IconStyle::from),
+                "[ui.icons] herdr",
+                "[integrations.herdr] icon",
+            ),
             enabled: self.enabled,
             poll_interval: Duration::from_millis(self.poll_interval_ms),
             show_unmatched: self.show_unmatched,
@@ -3510,6 +3524,7 @@ impl RawConfig {
             delta_path: self.ui.delta_path.take(),
             pr_status: self.ui.pr_status,
             pr_status_concurrency: self.ui.pr_status_concurrency,
+            herdr_icon: self.ui.icons.herdr.take(),
         };
         let config = Config::default();
         let mut palette = config.palette;
@@ -4092,7 +4107,40 @@ show_panes = true
 
     #[test]
     fn the_herdr_defaults_live_in_the_raw_layer() {
-        assert_eq!(HerdrConfig::default(), RawHerdr::default().resolve());
+        assert_eq!(HerdrConfig::default(), RawHerdr::default().resolve(None));
+    }
+
+    #[test]
+    fn the_herdr_icon_reads_from_integrations_herdr_in_either_form() {
+        let stock = config_from("");
+        assert_eq!(stock.integrations.herdr.icon.or_glyph(""), DEFAULT_HERDR_ICON.as_str());
+
+        let bare = config_from("[integrations.herdr]\nicon = \"✦\"\n");
+        assert_eq!(bare.integrations.herdr.icon.or_glyph(""), "✦");
+
+        let styled =
+            config_from("[integrations.herdr]\nicon = { glyph = \"✦\", bold = true, size = 8 }\n");
+        assert_eq!(styled.integrations.herdr.icon, IconStyle {
+            glyph: Some("✦".into()),
+            bold: true,
+            size: Some(8.0),
+            ..Default::default()
+        });
+    }
+
+    /// A table under the old key keeps its styling, and the new key wins once
+    /// it moves off the built-in glyph.
+    #[test]
+    fn the_deprecated_ui_icons_herdr_applies_until_integrations_herdr_sets_icon() {
+        let old = config_from("[ui.icons]\nherdr = { glyph = \"✦\", bold = true }\n");
+        assert_eq!(old.integrations.herdr.icon, IconStyle {
+            glyph: Some("✦".into()),
+            bold: true,
+            ..Default::default()
+        });
+
+        let both = config_from("[ui.icons]\nherdr = \"✦\"\n[integrations.herdr]\nicon = \"◆\"\n");
+        assert_eq!(both.integrations.herdr.icon.or_glyph(""), "◆");
     }
 
     /// A raw struct that gained a `Default` but lost its `serde(default)`

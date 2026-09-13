@@ -737,6 +737,11 @@
           ],
           "type": "string"
         },
+        "icon": {
+          "$ref": "#/$defs/RawIconStyle",
+          "default": "◫",
+          "description": "The glyph on a herdr pane's sidebar row and palette entry. A bare\nstring sets the glyph; a table also styles its color, weight, slant\nand size, the way `[ui.icons]` keys do."
+        },
         "path": {
           "default": "herdr",
           "description": "The program to run on Windows or natively. Its own name is looked up\non PATH; any other value runs as written.",
@@ -828,9 +833,12 @@
           "description": "The \"delete worktree\" button."
         },
         "herdr": {
-          "$ref": "#/$defs/RawIconStyle",
-          "default": "◫",
-          "description": "A pane owned by a terminal workspace manager such as herdr."
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "Deprecated location: `[integrations.herdr] icon` supersedes this and\nwins once set."
         },
         "home": {
           "$ref": "#/$defs/RawIconStyle",
@@ -1503,7 +1511,6 @@
             "add_project": "+",
             "close_session": "×",
             "delete_worktree": "×",
-            "herdr": "◫",
             "home": "⌂",
             "new_session": "+",
             "new_worktree": "+",
