@@ -330,3 +330,28 @@ impl AlacritreeApp {
         }
     }
 }
+
+impl AlacritreeApp {
+    pub(super) fn dispatch_search_action(&mut self, action: NamedAction) -> bool {
+        match action {
+            NamedAction::SidebarSearchConfirm => {
+                self.sidebar_search_confirm();
+            },
+            NamedAction::SidebarSearchCancel => {
+                self.sidebar_search_cancel();
+            },
+            NamedAction::SidebarSearchCancelToTerminal => {
+                self.sidebar_search_cancel_to_terminal();
+            },
+            NamedAction::ToggleSearchScope => {
+                self.sidebar_focus_state.search_scope = match self.sidebar_focus_state.search_scope
+                {
+                    SearchScope::Filtered => SearchScope::All,
+                    SearchScope::All => SearchScope::Filtered,
+                };
+            },
+            _ => return false,
+        }
+        true
+    }
+}
