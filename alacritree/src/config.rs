@@ -2461,8 +2461,8 @@ struct RawIcons {
     worktree: RawIconStyle,
     /// A terminal session row.
     session: RawIconStyle,
-    /// Deprecated location: `[integrations.herdr] icon` supersedes this and
-    /// wins once set.
+    /// Deprecated. This value applies while `[integrations.herdr] icon` has
+    /// its built-in value. Remove it after migration.
     #[serde(skip_serializing_if = "Option::is_none")]
     herdr: Option<RawIconStyle>,
     /// The home tab, whose sessions inherit the launch directory.
@@ -3263,8 +3263,8 @@ struct RawUi {
     /// Corrections to the underline and strikeout the font placed
     /// ([`RawDecorations`]).
     decorations: RawDecorations,
-    /// Deprecated location: `[integrations.gh] pr_status` supersedes this and
-    /// wins once set.
+    /// Deprecated. This value applies while `[integrations.gh] pr_status` has
+    /// its built-in value. Remove it after migration.
     pr_status: Option<bool>,
     /// Paint a badge on each worktree row for its branch's upstream state.
     /// Local refs only: nothing fetches, so a branch deleted on the remote
@@ -3276,8 +3276,9 @@ struct RawUi {
     /// probe is one `stat` per listed row, which an exotic filesystem could
     /// make expensive.
     worktree_liveness: bool,
-    /// Deprecated location: `[integrations.gh] pr_status_concurrency`
-    /// supersedes this and wins once set.
+    /// Deprecated. This value applies while `[integrations.gh]`
+    /// `pr_status_concurrency` has its built-in value. Remove it after
+    /// migration.
     pr_status_concurrency: Option<usize>,
     /// The font sidebars, tabs and dialogs are drawn with.
     font: RawUiFont,

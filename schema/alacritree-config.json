@@ -838,7 +838,7 @@
               "$ref": "#/$defs/RawIconStyle"
             }
           ],
-          "description": "Deprecated location: `[integrations.herdr] icon` supersedes this and\nwins once set."
+          "description": "Deprecated. This value applies while `[integrations.herdr] icon` has\nits built-in value. Remove it after migration."
         },
         "home": {
           "$ref": "#/$defs/RawIconStyle",
@@ -1559,11 +1559,11 @@
           "description": "How paths are abbreviated where the UI writes them."
         },
         "pr_status": {
-          "description": "Deprecated location: `[integrations.gh] pr_status` supersedes this and\nwins once set.",
+          "description": "Deprecated. This value applies while `[integrations.gh] pr_status` has\nits built-in value. Remove it after migration.",
           "type": "boolean"
         },
         "pr_status_concurrency": {
-          "description": "Deprecated location: `[integrations.gh] pr_status_concurrency`\nsupersedes this and wins once set.",
+          "description": "Deprecated. This value applies while `[integrations.gh]`\n`pr_status_concurrency` has its built-in value. Remove it after\nmigration.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
