@@ -27,6 +27,7 @@ RawFontFace.family
 RawFontFace.style
 RawGeneral.state_dir
 RawGeneral.working_directory
+RawGh.pr_status_concurrency
 RawIconStyle.color
 RawIconStyle.glyph
 RawIconStyle.size
@@ -54,6 +55,7 @@ RawTerminal.shell
 RawTextEmphasis.color
 RawUi.default_profile
 RawUi.delta_path
+RawUi.pr_status
 RawUi.pr_status_concurrency
 RawUi.project_name
 RawUi.sidebar_accent

@@ -452,7 +452,7 @@ impl AlacritreeApp {
         ctx: &Context,
         listed: &sidebar_nav::ListedRows,
     ) -> Vec<ProjectView> {
-        let pr_enabled = self.config.ui.pr_status;
+        let pr_enabled = self.config.integrations.gh.pr_status;
         let any_pr_toggle =
             any_pr_toggle_active(&self.sidebar.filter, self.sidebar_focus_state.search_scope);
         let current_workspace = self.current_workspace.as_deref();

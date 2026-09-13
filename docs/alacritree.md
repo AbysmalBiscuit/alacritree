@@ -509,11 +509,6 @@ hold_exited_sessions = "never"   # whether a session whose child has exited
                                  # A refused herdr attach is held whatever this
                                  # says: its refusal message is the only report
                                  # of what happened.
-pr_status          = false  # poll `gh` for each branch's open PR, which drives
-                            # the PR row icons, the PR-state filters, and $pr
-                            # below (default false)
-pr_status_concurrency = 8   # cap concurrent `gh` PR lookups; default 8,
-                            # clamped to a minimum of 1
 upstream_status    = false  # paint a badge on each worktree row for its
                             # branch's upstream state — level, diverged, gone,
                             # or untracked (default false; also gates whether
@@ -528,8 +523,8 @@ upstream_status    = false  # paint a badge on each worktree row for its
                             # root instead, so that override is not seen.
 worktree_name      = "$name ${pr: }"  # template for worktree row labels:
                             # $name, $branch, $path, $pr (as #123, needs
-                            # pr_status), and ${var:fallback}. Unset keeps the
-                            # plain worktree name
+                            # [integrations.gh] pr_status), and ${var:fallback}.
+                            # Unset keeps the plain worktree name
 project_name       = "$name"     # same for project rows ($name, $path). A
                                  # manual rename always wins over the template
 
@@ -585,9 +580,9 @@ session = "▪"
 home = "⌂"
 project_expanded = "▾"
 project_collapsed = "▸"
-pr_open = "⬤"               # the four PR glyphs need pr_status = true; they
-pr_draft = "◯"              # differ by colour, so overriding one shape is
-pr_merged = "⬤"             # usually not what you want
+pr_open = "⬤"               # the four PR glyphs need [integrations.gh]
+pr_draft = "◯"              # pr_status = true; they differ by colour, so
+pr_merged = "⬤"             # overriding one shape is usually not what you want
 pr_closed = "⬤"
 upstream_level = "✓"        # the four upstream glyphs need upstream_status =
 upstream_diverged = "⇅"     # true; each carries its own default color from
@@ -637,6 +632,19 @@ path     = "git"            # git, gh, doppler, herdr, delta and tuicr. path is
 wsl_path = ""               # the program inside every WSL distro, run as
                             # written; empty finds it by name through the
                             # distro's login shell
+
+[integrations.gh]
+path     = "gh"             # set like [integrations.git] above
+wsl_path = ""
+pr_status = true            # poll `gh` for each branch's open PR, which drives
+                            # the PR row icons, the PR-state filters, and $pr
+                            # in row templates. Supersedes the deprecated
+                            # [ui] pr_status
+pr_status_concurrency = 4   # cap concurrent `gh` PR lookups, minimum 1. Unset
+                            # stays one below the job pool's background
+                            # ceiling, which also caps any value set here.
+                            # Supersedes the deprecated [ui]
+                            # pr_status_concurrency
 
 [integrations.delta]
 path     = "delta"          # the pager the delta diff viewer runs. These

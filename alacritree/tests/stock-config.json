@@ -69,6 +69,8 @@
     },
     "gh": {
       "path": "gh",
+      "pr_status": false,
+      "pr_status_concurrency": null,
       "wsl_path": null
     },
     "git": {
@@ -446,8 +448,6 @@
         "italic": false
       }
     },
-    "pr_status": false,
-    "pr_status_concurrency": null,
     "project_name": null,
     "reap_descendants_on_close": false,
     "scrollbar": "Floating",

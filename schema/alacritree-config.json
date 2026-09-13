@@ -674,12 +674,23 @@
       "properties": {
         "path": {
           "default": "gh",
-          "description": "The program to run on Windows or natively. Its own name is\nlooked up on PATH; any other value runs as written.",
+          "description": "The program to run on Windows or natively. Its own name is looked up\non PATH; any other value runs as written.",
           "type": "string"
+        },
+        "pr_status": {
+          "default": false,
+          "description": "Poll `gh` for each branch's open pull request, which drives the PR row\nicons, the PR-state filters, and `$pr` in row templates.",
+          "type": "boolean"
+        },
+        "pr_status_concurrency": {
+          "description": "Max `gh` lookups in flight at once. Unset lets the pool decide, which\nis one below its own background ceiling so a lookup can never take\nthe last slot local work needs. A value lowers that; nothing raises\nit, because the pool's ceiling binds underneath either way.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         },
         "wsl_path": {
           "default": "",
-          "description": "The program to run inside every WSL distro, as written. Empty\nfinds it by name through the distro's login shell.",
+          "description": "The program to run inside every WSL distro, as written. Empty finds it\nby name through the distro's login shell.",
           "type": "string"
         }
       },
@@ -1541,12 +1552,11 @@
           "description": "How paths are abbreviated where the UI writes them."
         },
         "pr_status": {
-          "default": false,
-          "description": "Poll `gh` for each branch's open pull request, which drives the PR row\nicons, the PR-state filters, and `$pr` in row templates.",
+          "description": "Deprecated location: `[integrations.gh] pr_status` supersedes this and\nwins once set.",
           "type": "boolean"
         },
         "pr_status_concurrency": {
-          "description": "Max `gh` lookups in flight at once.  Unset lets the pool decide, which\nis one below its own background ceiling so a lookup can never take\nthe last slot local work needs.  A value lowers that; nothing raises\nit, because the pool's ceiling binds underneath either way.",
+          "description": "Deprecated location: `[integrations.gh] pr_status_concurrency`\nsupersedes this and wins once set.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"

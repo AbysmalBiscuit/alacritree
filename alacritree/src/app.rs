@@ -482,7 +482,7 @@ impl AlacritreeApp {
             session_drag: config.ui.session_reorder.drag,
             sessions_filter_counts_detached: config.ui.sessions_filter_counts_detached,
             sidebar: sidebar::Sidebar::new(PanelFilter::new(project_filter_toggles(
-                config.ui.pr_status,
+                config.integrations.gh.pr_status,
             ))),
             sidebar_auto_shown: false,
             last_followed: (None, None),
@@ -645,7 +645,7 @@ impl AlacritreeApp {
 
         let notify_rx = notify::channel();
 
-        let pr_status_concurrency = config.ui.pr_status_concurrency;
+        let pr_status_concurrency = config.integrations.gh.pr_status_concurrency;
         let mut app = Self::from_parts(
             config,
             theme,
