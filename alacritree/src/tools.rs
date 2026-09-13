@@ -103,6 +103,31 @@ pub fn wsl_resolved(
     lock(lookups()).resolve(distro, tool, Box::new(on_found))
 }
 
+/// The program to name for `tool` inside a distro where a shell finds it:
+/// the configured WSL path, else the bare name.
+pub fn wsl_program(tool: Tool) -> String {
+    wsl_override(tool).unwrap_or_else(|| tool.name().to_string())
+}
+
+/// The program to name for `tool` inside `distro` from a pool job. It uses a
+/// configured WSL path, a cached lookup, the resident helper, or the bare name.
+/// This runs off the UI thread because reaching the helper can start it.
+pub fn wsl_in_job(tool: Tool, distro: &str, _blocking: &jobs::Blocking) -> String {
+    if let Some(path) = wsl_override(tool) {
+        return path;
+    }
+    if let Some(path) = lock(lookups()).cached(distro, tool) {
+        return path;
+    }
+    match wsl_helper::capability(distro, tool.name()) {
+        Some(path) => {
+            lock(lookups()).found.insert((distro.to_string(), tool), path.clone());
+            path
+        },
+        None => tool.name().to_string(),
+    }
+}
+
 type Probe = Arc<dyn Fn(&str, Tool, &jobs::Blocking) -> Option<String> + Send + Sync>;
 
 fn lookups() -> &'static Mutex<Lookups> {
