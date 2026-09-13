@@ -570,7 +570,7 @@ pub fn discover_delta(distro: &str, blocking: &jobs::Blocking) -> Option<String>
     // The helper's hello already resolved delta through the login shell; a
     // missing capability is not a cached miss — fall through and re-check
     // live so a mid-session install is still picked up.
-    if let Some(path) = crate::wsl_helper::capability_delta(distro) {
+    if let Some(path) = crate::wsl_helper::capability(distro, "delta") {
         return Some(path);
     }
     probe_tools(distro, &["delta"], blocking).ok()?.into_iter().next().flatten()

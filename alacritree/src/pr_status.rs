@@ -665,7 +665,8 @@ fn query_gh(path: &Path, branch: &str, blocking: &jobs::Blocking) -> Option<PrIn
         // helper's hello honors per-user install dirs that the default
         // `--exec` PATH lacks.
         wsl::Location::Wsl { distro, linux_path } => {
-            let gh = crate::wsl_helper::capability_gh(&distro).unwrap_or_else(|| "gh".to_string());
+            let gh =
+                crate::wsl_helper::capability(&distro, "gh").unwrap_or_else(|| "gh".to_string());
             // The `origin` URL rides along on the first line: git2 cannot read
             // a repository that lives inside the distro, and a second round
             // trip would double the cost of a badge that already forks `gh`.
