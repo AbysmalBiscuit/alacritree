@@ -49,6 +49,20 @@
       "path": "delta",
       "wsl_path": null
     },
+    "diff_viewer": {
+      "button_icon": "review",
+      "section_buttons": false,
+      "viewer": {
+        "Pager": {
+          "args": [
+            "--paging=always"
+          ],
+          "pager": {
+            "Tool": "Delta"
+          }
+        }
+      }
+    },
     "doppler": {
       "path": "doppler",
       "wsl_path": null

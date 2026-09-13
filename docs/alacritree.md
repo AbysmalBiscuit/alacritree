@@ -637,6 +637,33 @@ wsl_path = ""               # supersede the deprecated [ui] delta_path, which
                             # still fills whichever of them is left at its
                             # default
 
+[integrations.diff_viewer]  # what the git panel's diff pane runs
+preset          = "delta"   # "delta" pipes git's diff through delta; "tuicr"
+                            # opens tuicr's review TUI on the clicked file,
+                            # and agents read its comments with
+                            # `tuicr review comments`; "custom" runs the table
+                            # below
+section_buttons = false     # draw a button on each git section header that
+                            # opens the whole section in the viewer
+button_icon     = "review"  # the glyph or word that button shows
+
+[integrations.diff_viewer.custom]   # used when preset = "custom"
+pager     = ""              # pager mode: a command git runs as core.pager.
+                            # Set this or path, never both
+wsl_pager = ""              # the same inside WSL; empty runs pager through
+                            # the distro's login shell
+path      = ""              # direct mode: a program that renders the diff
+                            # itself, run with one argument list per target
+wsl_path  = ""              # the same inside WSL, run as written; empty runs
+                            # path through the distro's login shell
+staged         = []         # rows: {file} is the row's path, and branch rows
+unstaged       = []         # also get {base}, the branch the panel diffs
+untracked      = []         # against
+branch         = []
+staged_scope   = []         # section headers: no {file}; branch_scope gets
+unstaged_scope = []         # {base}. An empty list makes that row kind or
+branch_scope   = []         # section open nothing
+
 [integrations.herdr]        # agents running under a herdr server, listed in
                             # the sidebar under the worktree each agent's
                             # working directory matches

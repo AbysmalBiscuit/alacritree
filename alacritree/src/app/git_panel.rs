@@ -3,9 +3,7 @@
 //! its rows open.
 
 use super::*;
-use crate::diff_viewer::{
-    self, DiffRequest, DiffSource, Launch, Program, Target, Viewer, diff_key,
-};
+use crate::diff_viewer::{self, DiffRequest, DiffSource, Launch, Program, Target, diff_key};
 use crate::tools::{self, Tool};
 
 /// The toggle identities the git panel accepts: modified, deleted, untracked.
@@ -461,7 +459,8 @@ impl AlacritreeApp {
             self.close_session(ctx, id);
             return;
         }
-        let Some(launch) = diff_viewer::plan(&Viewer::delta(), &target) else {
+        let Some(launch) = diff_viewer::plan(&self.config.integrations.diff_viewer.viewer, &target)
+        else {
             return;
         };
         if let Some((id, _)) = existing {

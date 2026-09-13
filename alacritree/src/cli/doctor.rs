@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 
 use crate::config::{self, Config, ConfigDiagnosis, ConfigFile, Profile, ShellConfig};
 use crate::crash_log::{Verdict, classify};
+use crate::diff_viewer::{Program, Viewer};
 use crate::ipc::protocol::{self, IpcRequest, SendError};
 use crate::shell_decision::{ShellDecision, shell_decision};
 use crate::wsl::{self, ShellChoice};
@@ -109,6 +110,7 @@ fn report(
     // added in one run — a section split in two prints its header twice.
     let mut checks = binary_checks();
     checks.extend(gh_auth_check());
+    checks.extend(diff_viewer_check(&config.integrations.diff_viewer.viewer));
     checks.push(shell_check(config.shell.as_ref()));
     checks.extend(wsl_checks(&wsl::distros()));
     checks.extend(config_checks(&config::diagnose(config_dir, overrides)));
@@ -150,6 +152,24 @@ fn tools() -> Vec<Tool> {
 
 fn binary_checks() -> Vec<Check> {
     tools().iter().map(|tool| tool_check(tool, find(&configured_program(tool.program)))).collect()
+}
+
+/// The program the configured diff viewer runs. A custom pager is a shell
+/// command line git hands to a shell, not a program to look up.
+fn diff_viewer_check(viewer: &Viewer) -> Option<Check> {
+    let program = match viewer {
+        Viewer::Pager { pager: Program::Custom { .. }, .. } => return None,
+        _ => match viewer.program() {
+            Program::Tool(tool) => tools::program(*tool),
+            Program::Custom { path, .. } => path.clone(),
+        },
+    };
+    let tool = Tool {
+        program: "diff viewer",
+        consequence: "the git panel's diff pane opens an error instead of a diff",
+        need: Need::Optional,
+    };
+    Some(tool_check(&tool, find(&program)))
 }
 
 /// A registry tool's configured path, which `locate` resolves as a path when
@@ -725,6 +745,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::diff_viewer::{Program, Templates, Viewer};
     use crate::state::{PersistedProject, PersistedState};
 
     const GIT: Tool =
@@ -762,6 +783,27 @@ mod tests {
     #[test]
     fn a_missing_optional_tool_only_warns() {
         assert_eq!(tool_check(&GH, None).status, Status::Warn);
+    }
+
+    /// A custom pager is a shell command line, not a program to look up.
+    #[test]
+    fn the_diff_viewer_check_looks_up_programs_only() {
+        let pager = Viewer::Pager {
+            pager: Program::Custom { path: "delta -s".to_string(), wsl_path: None },
+            args: Vec::new(),
+        };
+        assert!(diff_viewer_check(&pager).is_none());
+
+        let missing = Viewer::Direct {
+            program: Program::Custom {
+                path: "/definitely/not/here/tuicr".to_string(),
+                wsl_path: None,
+            },
+            templates: Templates::default(),
+        };
+        let check = diff_viewer_check(&missing).expect("a direct viewer is checked");
+        assert_eq!(check.name, "diff viewer");
+        assert_eq!(check.status, Status::Warn);
     }
 
     /// Doppler drives one optional feature, and most people have never wanted
