@@ -10,7 +10,7 @@ use egui::{Color32, Context, Frame, Margin, RichText, ScrollArea, SidePanel, Str
 
 use serde_json::{Value, json};
 
-use crate::bindings::{self, BindingAction, KeyBinding, NamedAction};
+use crate::bindings::{BindingAction, KeyBinding, NamedAction};
 use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
 use crate::command_palette::{self, CommandPalette, PaletteAction, PaletteItem};
@@ -1971,7 +1971,7 @@ impl AlacritreeApp {
             i.events.retain(|ev| {
                 if let egui::Event::Key { key, pressed: true, modifiers, .. } = ev {
                     let matched = dispatched_actions(
-                        crate::bindings::all_matches(&self.config.bindings, *key, *modifiers),
+                        crate::shortcut::matches(&self.config.bindings, *key, *modifiers),
                         scope,
                     );
                     if !matched.is_empty() {
@@ -2501,7 +2501,7 @@ fn consume_palette_keys(ctx: &Context, bindings: &[KeyBinding]) -> Vec<NamedActi
             let egui::Event::Key { key, pressed: true, modifiers, .. } = ev else {
                 return true;
             };
-            let matched: Vec<NamedAction> = bindings::all_matches(bindings, *key, *modifiers)
+            let matched: Vec<NamedAction> = crate::shortcut::matches(bindings, *key, *modifiers)
                 .into_iter()
                 .filter_map(|a| match a {
                     BindingAction::Named(n) if n.is_palette_scoped() => Some(*n),
@@ -3361,7 +3361,7 @@ fn drain_search_or_nav(
     }
     if searching {
         let mut matched = false;
-        for a in crate::bindings::all_matches(bindings, key, modifiers) {
+        for a in crate::shortcut::matches(bindings, key, modifiers) {
             if let BindingAction::Named(n) = a {
                 if n.is_search_scoped() {
                     steps.push(SidebarNavStep::SearchAction(*n));
@@ -11140,8 +11140,7 @@ mod tests {
     #[test]
     fn a_live_session_keeps_its_enter() {
         let bindings = crate::bindings::parse_bindings(Vec::new());
-        let matched =
-            crate::bindings::all_matches(&bindings, egui::Key::Enter, egui::Modifiers::NONE);
+        let matched = crate::shortcut::matches(&bindings, egui::Key::Enter, egui::Modifiers::NONE);
         assert!(
             matched
                 .iter()
@@ -11158,8 +11157,7 @@ mod tests {
     #[test]
     fn an_exited_session_dispatches_enter_to_the_close_action() {
         let bindings = crate::bindings::parse_bindings(Vec::new());
-        let matched =
-            crate::bindings::all_matches(&bindings, egui::Key::Enter, egui::Modifiers::NONE);
+        let matched = crate::shortcut::matches(&bindings, egui::Key::Enter, egui::Modifiers::NONE);
         let scope = BindingScope { exited_session_focused: true, ..scope() };
         let dispatched = dispatched_actions(matched, scope);
         assert_eq!(dispatched.len(), 1, "{dispatched:?}");
