@@ -50,10 +50,10 @@ gh pr list --repo mathix420/alacritree --state open --json number,title,headRefN
 
 Take the entry whose title carries the highest `[n]` marker; its `headRefName` is your base and `n + 1` is your marker. PR titles carry that marker: `feat(logging): record why alacritree died [8]`.
 
-The slug is the whole branch name, type prefix included, and the GitHub issue number comes first:
+The slug is the whole branch name, type prefix included, and the GitHub issue number comes first. `--summary` writes the issue's facts and description into the worktree, so the agent that picks the worktree up starts from the issue rather than from a branch name:
 
 ```sh
-devkit issue setup 41 --slug feat/decoration-metrics
+devkit issue setup 41 --summary --slug feat/decoration-metrics
 ```
 
 `devkit issue setup` cuts every branch from `origin/master` and takes no base flag, so a stacked branch is re-pointed once, before it has any commits of its own:
