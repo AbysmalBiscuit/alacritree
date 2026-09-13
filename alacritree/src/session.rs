@@ -1505,8 +1505,9 @@ impl Session {
     ) -> (Self, OpenRequest) {
         let pty_cwd = pty_working_directory(working_directory.clone(), config);
         let window_size = window_size(size, cell_size);
-        let wsl_distro =
-            wsl_distro.or_else(|| wsl_probe.as_ref().map(|probe| probe.distro.clone()));
+        let wsl_distro = wsl_distro
+            .filter(|_| config.vt.report_cwd)
+            .or_else(|| wsl_probe.as_ref().map(|probe| probe.distro.clone()));
 
         let shell_platform = if wsl_distro.is_some() || cfg!(unix) {
             osc_tap::ShellPlatform::Unix
@@ -2438,6 +2439,26 @@ pub(crate) mod tests {
             resolve_reported_cwd("/home/dev/src", None),
             Some(PathBuf::from("/home/dev/src")),
         );
+    }
+
+    #[test]
+    fn wsl_identity_is_retained_only_for_cwd_reporting() {
+        for (report_cwd, expected) in [(false, None), (true, Some("Ubuntu"))] {
+            let mut config = Config::default();
+            config.vt.report_cwd = report_cwd;
+            let (session, _) = Session::pending_shell(
+                egui::Context::default(),
+                &config,
+                Some(PathBuf::from(r"C:\workspace")),
+                TermSize::new(80, 24),
+                (8.0, 16.0),
+                Some(Shell::new("wsl.exe".into(), Vec::new())),
+                Some("Ubuntu".into()),
+                None,
+            );
+
+            assert_eq!(session.wsl_distro(), expected);
+        }
     }
 
     #[test]

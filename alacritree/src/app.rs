@@ -2187,7 +2187,16 @@ impl AlacritreeApp {
             log::warn!("{msg}");
             return Err(std::io::Error::new(std::io::ErrorKind::NotFound, msg));
         };
-        let (shell, wsl_probe, wsl_distro) = profile_session_shell(profile);
+        let helper_enabled = wsl_helper::enabled();
+        let report_cwd = self.config.vt.report_cwd;
+        let default_distro = default_wsl_distro_for_argv(
+            &profile.program,
+            &profile.args,
+            helper_enabled,
+            report_cwd,
+        );
+        let (shell, wsl_probe, wsl_distro) =
+            profile_session_shell(profile, helper_enabled, report_cwd, default_distro.as_deref());
         self.spawn_session_with_shell(ctx, ws.clone(), ws, shell, wsl_probe, wsl_distro)
     }
 
@@ -2212,7 +2221,11 @@ impl AlacritreeApp {
             wsl::Location::Wsl { distro, .. } => Some(distro),
             wsl::Location::Windows(_) => None,
         });
-        let known: Vec<String> = wsl::distros().into_iter().map(|d| d.name).collect();
+        let helper_enabled = wsl_helper::enabled();
+        let report_cwd = self.config.vt.report_cwd;
+        let distros = wsl::distros();
+        let default_distro = distros.iter().find(|d| d.is_default).map(|d| d.name.clone());
+        let known: Vec<String> = distros.into_iter().map(|d| d.name).collect();
         match shell_decision(
             choice.as_ref(),
             location_distro.as_deref(),
@@ -2220,15 +2233,25 @@ impl AlacritreeApp {
             &self.config.profiles,
             self.config.default_profile.as_deref(),
         ) {
-            ShellDecision::ConfigShell => config_session_shell(&self.config),
+            ShellDecision::ConfigShell => config_session_shell(
+                &self.config,
+                helper_enabled,
+                report_cwd,
+                default_distro.as_deref(),
+            ),
             // A WSL decision comes from the project override or the actual
             // directory being launched, which may be a reported sibling path.
             ShellDecision::WslDistro(distro) => match directory.or(path) {
-                Some(p) => wsl_session_shell(&distro, p),
+                Some(p) => wsl_session_shell(&distro, p, helper_enabled, report_cwd),
                 None => (None, None, None),
             },
             ShellDecision::Profile(name) => match self.config.profile(&name) {
-                Some(profile) => profile_session_shell(profile),
+                Some(profile) => profile_session_shell(
+                    profile,
+                    helper_enabled,
+                    report_cwd,
+                    default_distro.as_deref(),
+                ),
                 None => (None, None, None),
             },
         }
@@ -3931,7 +3954,12 @@ impl AlacritreeApp {
             },
             BindingAction::Named(NamedAction::SpawnNewInstance) => {
                 let ws = self.current_workspace.clone();
-                if let Err(e) = self.spawn_sibling_session(ctx) {
+                let result = if self.config.vt.report_cwd {
+                    self.spawn_sibling_session(ctx)
+                } else {
+                    self.spawn_session(ctx, ws.clone())
+                };
+                if let Err(e) = result {
                     self.report_spawn_failure(ctx, &ws, &e);
                 }
             },
@@ -6231,50 +6259,79 @@ fn wsl_shell(distro: &str, workdir: &Path) -> Shell {
     Shell::new(program, args)
 }
 
-/// Shimmed when the resident helper is on; the plain wsl.exe login-shell
-/// launch otherwise. The distro remains known even without a probe.
+/// Launch a WSL shell, adding the resident probe only when it is enabled.
 fn wsl_session_shell(
     distro: &str,
     workdir: &Path,
+    helper_enabled: bool,
+    report_cwd: bool,
 ) -> (Option<Shell>, Option<WslProbe>, Option<String>) {
-    if !wsl_helper::enabled() {
-        return (Some(wsl_shell(distro, workdir)), None, Some(distro.to_string()));
+    if !helper_enabled {
+        return (Some(wsl_shell(distro, workdir)), None, report_cwd.then(|| distro.to_string()));
     }
     let key = wsl_helper::new_probe_key();
     let (program, args) = wsl_helper::shim_invocation(distro, workdir, &key);
     (
         Some(Shell::new(program, args)),
         Some(WslProbe { distro: distro.to_string(), key }),
-        Some(distro.to_string()),
+        report_cwd.then(|| distro.to_string()),
     )
 }
 
-/// Recognized WSL argv carries its distro even without the optional probe
-/// shim. Exotic argv stays raw and its distro stays unknown.
-fn shimmed_wsl_argv(
+/// Resolve the default distro only for a recognized bare WSL launch.
+fn default_wsl_distro_for_argv(
     program: &str,
     args: &[String],
-) -> Option<(Option<Shell>, Option<WslProbe>, String)> {
+    helper_enabled: bool,
+    report_cwd: bool,
+) -> Option<String> {
+    if !helper_enabled && !report_cwd {
+        return None;
+    }
+    let (_, distro) = wsl_helper::wrap_profile_argv(program, args, "")?;
+    distro.or_else(|| wsl::distros().into_iter().find(|d| d.is_default).map(|d| d.name))
+}
+
+/// Return the launch context for recognized WSL argv. Exotic argv stays raw
+/// and its distro stays unknown.
+fn wsl_argv_context(
+    program: &str,
+    args: &[String],
+    helper_enabled: bool,
+    report_cwd: bool,
+    default_distro: Option<&str>,
+) -> Option<(Option<Shell>, Option<WslProbe>, Option<String>)> {
+    if !helper_enabled && !report_cwd {
+        return None;
+    }
     let key = wsl_helper::new_probe_key();
     let (args, distro) = wsl_helper::wrap_profile_argv(program, args, &key)?;
-    let distro =
-        distro.or_else(|| wsl::distros().into_iter().find(|d| d.is_default).map(|d| d.name))?;
-    if !wsl_helper::enabled() {
-        return Some((None, None, distro));
+    let distro = distro.or_else(|| default_distro.map(str::to_owned))?;
+    if !helper_enabled {
+        return Some((None, None, report_cwd.then_some(distro)));
     }
     Some((
         Some(Shell::new(program.to_string(), args)),
         Some(WslProbe { distro: distro.clone(), key }),
-        distro,
+        report_cwd.then_some(distro),
     ))
 }
 
 fn profile_session_shell(
     profile: &crate::config::Profile,
+    helper_enabled: bool,
+    report_cwd: bool,
+    default_distro: Option<&str>,
 ) -> (Option<Shell>, Option<WslProbe>, Option<String>) {
-    match shimmed_wsl_argv(&profile.program, &profile.args) {
+    match wsl_argv_context(
+        &profile.program,
+        &profile.args,
+        helper_enabled,
+        report_cwd,
+        default_distro,
+    ) {
         Some((shell, probe, distro)) => {
-            (shell.or_else(|| Some(profile_shell(profile))), probe, Some(distro))
+            (shell.or_else(|| Some(profile_shell(profile))), probe, distro)
         },
         None => (Some(profile_shell(profile)), None, None),
     }
@@ -6285,11 +6342,17 @@ fn profile_session_shell(
 /// `Session::pending_shell`'s own config-shell default.
 fn config_session_shell(
     config: &crate::config::Config,
+    helper_enabled: bool,
+    report_cwd: bool,
+    default_distro: Option<&str>,
 ) -> (Option<Shell>, Option<WslProbe>, Option<String>) {
     match &config.shell {
-        Some(s) => match shimmed_wsl_argv(&s.program, &s.args) {
-            Some((shell, probe, distro)) => (shell, probe, Some(distro)),
-            None => (None, None, None),
+        Some(s) => {
+            match wsl_argv_context(&s.program, &s.args, helper_enabled, report_cwd, default_distro)
+            {
+                Some((shell, probe, distro)) => (shell, probe, distro),
+                None => (None, None, None),
+            }
         },
         None => (None, None, None),
     }
@@ -17267,26 +17330,26 @@ mod tests {
 
     #[test]
     fn reported_cwd_survives_wsl_profile_without_the_helper() {
-        assert_wsl_cwd_without_helper(false);
+        let profile = crate::config::Profile {
+            name: "ubuntu".into(),
+            program: "wsl.exe".into(),
+            args: vec!["--distribution".into(), "Ubuntu".into(), "--cd".into(), "/home/dev".into()],
+        };
+        let mut config = Config::default();
+        config.vt.report_cwd = true;
+        let (shell, probe, distro) = profile_session_shell(&profile, false, true, None);
+        assert!(probe.is_none());
+        session::tests::assert_wsl_reported_cwd_through_tap(
+            &config,
+            shell,
+            probe,
+            distro,
+            &profile.args,
+        );
     }
 
     #[test]
     fn reported_cwd_survives_wsl_config_without_the_helper() {
-        assert_wsl_cwd_without_helper(true);
-    }
-
-    fn assert_wsl_cwd_without_helper(config_shell: bool) {
-        static HELPER_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _lock = HELPER_GATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        struct RestoreHelper(bool);
-        impl Drop for RestoreHelper {
-            fn drop(&mut self) {
-                wsl_helper::set_enabled(self.0);
-            }
-        }
-        let _restore = RestoreHelper(wsl_helper::enabled());
-        wsl_helper::set_enabled(false);
-
         let profile = crate::config::Profile {
             name: "ubuntu".into(),
             program: "wsl.exe".into(),
@@ -17298,12 +17361,7 @@ mod tests {
             program: profile.program.clone(),
             args: profile.args.clone(),
         });
-
-        let (shell, probe, distro) = if config_shell {
-            config_session_shell(&config)
-        } else {
-            profile_session_shell(&profile)
-        };
+        let (shell, probe, distro) = config_session_shell(&config, false, true, None);
         assert!(probe.is_none());
         session::tests::assert_wsl_reported_cwd_through_tap(
             &config,
@@ -17312,39 +17370,35 @@ mod tests {
             distro,
             &profile.args,
         );
+    }
 
-        for enabled in [false, true] {
-            wsl_helper::set_enabled(enabled);
-            for args in
-                [vec!["-d", "Ubuntu"], vec![], vec!["-d", "Ubuntu", "--exec", "bash"], vec![
-                    "--distribution",
-                ]]
-            {
-                let mut profile = profile.clone();
-                profile.args = args.iter().map(|arg| (*arg).to_string()).collect();
-                config.shell.as_mut().unwrap().args = profile.args.clone();
-                let (shell, probe, distro) = if config_shell {
-                    config_session_shell(&config)
-                } else {
-                    profile_session_shell(&profile)
-                };
-                let expected_distro = match args.as_slice() {
-                    ["-d", "Ubuntu"] => Some("Ubuntu".to_string()),
-                    [] => wsl::distros().into_iter().find(|d| d.is_default).map(|d| d.name),
-                    _ => None,
-                };
-                assert_eq!(distro, expected_distro, "helper={enabled}, argv={args:?}");
-                if enabled && expected_distro.is_some() {
-                    let probe = probe.unwrap();
-                    assert_eq!(Some(probe.distro), expected_distro);
-                    let (wrapped, _) =
-                        wsl_helper::wrap_profile_argv(&profile.program, &profile.args, &probe.key)
-                            .unwrap();
-                    assert_eq!(shell, Some(Shell::new(profile.program, wrapped)));
-                } else {
-                    assert!(probe.is_none());
-                    assert_eq!(shell, (!config_shell).then(|| profile_shell(&profile)));
-                }
+    #[test]
+    fn wsl_profile_context_respects_helper_and_cwd_gates() {
+        let profile = crate::config::Profile {
+            name: "ubuntu".into(),
+            program: "wsl.exe".into(),
+            args: Vec::new(),
+        };
+
+        for (helper_enabled, report_cwd) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let (shell, probe, distro) =
+                profile_session_shell(&profile, helper_enabled, report_cwd, Some("Ubuntu"));
+            assert_eq!(distro, report_cwd.then(|| "Ubuntu".to_string()));
+            assert_eq!(
+                probe.as_ref().map(|probe| probe.distro.as_str()),
+                helper_enabled.then_some("Ubuntu")
+            );
+
+            if helper_enabled {
+                let probe = probe.as_ref().unwrap();
+                let (wrapped, _) =
+                    wsl_helper::wrap_profile_argv(&profile.program, &profile.args, &probe.key)
+                        .unwrap();
+                assert_eq!(shell, Some(Shell::new(profile.program.clone(), wrapped)));
+            } else {
+                assert_eq!(shell, Some(profile_shell(&profile)));
             }
         }
     }

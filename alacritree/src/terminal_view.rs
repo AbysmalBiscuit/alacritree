@@ -24,8 +24,18 @@ use crate::links::{self, Link};
 use crate::session::{EventProxy, Session, SessionId, SessionKind, TermSize};
 use crate::{decoration_sprites, jobs, mouse, paste};
 
-fn grid_cursor(requested: Option<CursorIcon>, over_link: bool) -> CursorIcon {
-    if over_link { CursorIcon::PointingHand } else { requested.unwrap_or(CursorIcon::Text) }
+fn grid_cursor(
+    requested: Option<CursorIcon>,
+    over_link: bool,
+    pointer_shape_enabled: bool,
+) -> Option<CursorIcon> {
+    if over_link {
+        Some(CursorIcon::PointingHand)
+    } else if pointer_shape_enabled {
+        requested
+    } else {
+        None
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -106,7 +116,11 @@ pub fn show(
         .input(|i| i.pointer.hover_pos())
         .is_some_and(|pos| pointer_owns_grid(ui.ctx(), ui.layer_id(), rect, pos))
     {
-        ui.ctx().set_cursor_icon(grid_cursor(session.pointer_shape, peek.link.is_some()));
+        if let Some(cursor) =
+            grid_cursor(session.pointer_shape, peek.link.is_some(), config.vt.pointer_shape)
+        {
+            ui.ctx().set_cursor_icon(cursor);
+        }
     }
     // Apps that negotiate mouse tracking want the raw button/motion stream, not
     // local selection — matching alacritty, Shift is the escape hatch that still
@@ -1788,18 +1802,22 @@ mod tests {
 
     #[test]
     fn the_grid_cursor_prefers_what_the_application_asked_for() {
-        assert_eq!(grid_cursor(Some(CursorIcon::Crosshair), false), CursorIcon::Crosshair);
-        assert_eq!(grid_cursor(None, false), CursorIcon::Text);
         assert_eq!(
-            grid_cursor(Some(CursorIcon::Crosshair), true),
-            CursorIcon::PointingHand,
+            grid_cursor(Some(CursorIcon::Crosshair), false, true),
+            Some(CursorIcon::Crosshair)
+        );
+        assert_eq!(grid_cursor(None, false, true), None);
+        assert_eq!(
+            grid_cursor(Some(CursorIcon::Crosshair), true, false),
+            Some(CursorIcon::PointingHand),
             "a hovered link still wins: it tells the user the click does something",
         );
-        assert_eq!(grid_cursor(None, true), CursorIcon::PointingHand);
+        assert_eq!(grid_cursor(None, true, false), Some(CursorIcon::PointingHand));
+        assert_eq!(grid_cursor(Some(CursorIcon::Wait), false, false), None);
     }
 
     #[test]
-    fn the_grid_cursor_updates_on_link_and_non_link_frames() {
+    fn the_grid_cursor_preserves_default_when_pointer_shape_is_disabled() {
         let ctx = egui::Context::default();
         let mut config = Config::default();
         config.window.padding_x = 0.0;
@@ -1811,11 +1829,11 @@ mod tests {
         paint_one_frame(&ctx, &mut session, &config, &mut caches, Vec2::new(640.0, 480.0));
 
         for (requested, pos, expected) in [
-            (None, Pos2::new(100.0, 100.0), CursorIcon::Text),
-            (Some(CursorIcon::Crosshair), Pos2::new(100.0, 100.0), CursorIcon::Crosshair),
+            (None, Pos2::new(100.0, 100.0), CursorIcon::Default),
+            (Some(CursorIcon::Crosshair), Pos2::new(100.0, 100.0), CursorIcon::Default),
             (Some(CursorIcon::Crosshair), Pos2::new(12.0, 12.0), CursorIcon::PointingHand),
-            (Some(CursorIcon::Crosshair), Pos2::new(100.0, 100.0), CursorIcon::Crosshair),
-            (Some(CursorIcon::Wait), Pos2::new(100.0, 100.0), CursorIcon::Wait),
+            (Some(CursorIcon::Crosshair), Pos2::new(100.0, 100.0), CursorIcon::Default),
+            (Some(CursorIcon::Wait), Pos2::new(100.0, 100.0), CursorIcon::Default),
             (Some(CursorIcon::Wait), Pos2::new(700.0, 500.0), CursorIcon::Default),
         ] {
             session.pointer_shape = requested;
