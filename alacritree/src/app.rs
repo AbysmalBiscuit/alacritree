@@ -127,8 +127,9 @@ struct Theme {
     /// Where a row a sidebar scrolled to is parked; `None` is egui's own
     /// minimal scroll.
     scroll_align: Option<egui::Align>,
-    /// Error text, the palette's red.
+    /// Error and success text, the palette's red and green.
     error: Color32,
+    ok: Color32,
     /// The scratchpad editor's text and its placeholder hint.
     editor_text: Color32,
     editor_hint: Color32,
@@ -221,6 +222,7 @@ impl Theme {
             icon_tooltips: config.ui.icon_tooltips,
             scroll_align: egui_scroll_align(config.ui.sidebar_scroll_align),
             error: rgb_to_color32(config.palette.normal[1]),
+            ok: rgb_to_color32(config.palette.normal[2]),
             editor_text,
             editor_hint: blend_toward(editor_text, terminal_bg, 0.55),
             git: GitColors {
