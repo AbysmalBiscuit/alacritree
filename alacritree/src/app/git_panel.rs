@@ -691,11 +691,7 @@ fn paint_unstaged_section(
             if !view.unstaged_visible.contains(&file.path) {
                 continue;
             }
-            let source = if file.kind == ChangeKind::Untracked {
-                DiffSource::Untracked
-            } else {
-                DiffSource::Worktree
-            };
+            let source = unstaged_diff_source(Some(file.kind));
             let request = DiffRequest { file: file.path.clone(), source };
             let is_active = view.active_diff_key.as_deref() == Some(&diff_key(&request));
             let response = file_row(ui, file, &view.theme, &view.palette, is_active);
@@ -752,7 +748,7 @@ fn paint_branch_section(
         if !view.branch_visible.contains(&stat.path) {
             continue;
         }
-        let Some(base) = view.branch_base.clone() else {
+        let Some(source) = branch_diff_source(view.branch_base.as_deref()) else {
             let response = branch_diff_row(ui, stat, &view.theme, &view.palette, false);
             paint_git_row_cursor(
                 ui,
@@ -765,7 +761,7 @@ fn paint_branch_section(
             );
             continue;
         };
-        let request = DiffRequest { file: stat.path.clone(), source: DiffSource::Branch { base } };
+        let request = DiffRequest { file: stat.path.clone(), source };
         let is_active = view.active_diff_key.as_deref() == Some(&diff_key(&request));
         let response = branch_diff_row(ui, stat, &view.theme, &view.palette, is_active);
         if response.clicked() {
@@ -1135,16 +1131,22 @@ pub(super) fn git_row_diff_request(
 ) -> Option<DiffRequest> {
     let source = match row.section {
         GitSection::Staged => DiffSource::Staged,
-        GitSection::Unstaged => {
-            if row.kind == Some(ChangeKind::Untracked) {
-                DiffSource::Untracked
-            } else {
-                DiffSource::Worktree
-            }
-        },
-        GitSection::Branch => DiffSource::Branch { base: base?.to_string() },
+        GitSection::Unstaged => unstaged_diff_source(row.kind),
+        GitSection::Branch => branch_diff_source(base)?,
     };
     Some(DiffRequest { file: row.path.clone(), source })
+}
+
+/// A branch-diff row with no resolved base has nothing to diff against, so it
+/// opens nothing.
+fn branch_diff_source(base: Option<&str>) -> Option<DiffSource> {
+    Some(DiffSource::Branch { base: base?.to_string() })
+}
+
+/// An untracked file has no index entry to diff against, so it opens as a
+/// pure addition.
+fn unstaged_diff_source(kind: Option<ChangeKind>) -> DiffSource {
+    if kind == Some(ChangeKind::Untracked) { DiffSource::Untracked } else { DiffSource::Worktree }
 }
 
 /// git arguments (everything after `git`) for the requested diff — shared
@@ -1304,6 +1306,20 @@ mod tests {
         // toggle applies and passes once a wide search stands it down.
         assert!(!git_toggles_pass(true, false, false, ChangeKind::Untracked));
         assert!(git_toggles_pass(false, false, false, ChangeKind::Untracked));
+    }
+
+    #[test]
+    fn an_unstaged_untracked_file_opens_a_no_index_diff() {
+        assert!(matches!(unstaged_diff_source(Some(ChangeKind::Untracked)), DiffSource::Untracked));
+        assert!(matches!(unstaged_diff_source(Some(ChangeKind::Modified)), DiffSource::Worktree));
+    }
+
+    #[test]
+    fn a_branch_row_without_a_base_opens_no_diff() {
+        let row = git_nav::GitRow { section: GitSection::Branch, path: "a.rs".into(), kind: None };
+        assert!(git_row_diff_request(&row, None).is_none());
+        let request = git_row_diff_request(&row, Some("main")).expect("a base makes it clickable");
+        assert!(matches!(request.source, DiffSource::Branch { base } if base == "main"));
     }
 
     fn req(file: &str, source: DiffSource) -> DiffRequest {
