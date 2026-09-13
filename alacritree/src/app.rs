@@ -453,6 +453,7 @@ impl AlacritreeApp {
         ipc: (Option<ipc::SocketHandle>, Option<Receiver<ipc::AppCall>>),
     ) -> Self {
         let color_glyph_budget_mb = config.font.color_glyph_cache_mb;
+        let grid_snapshot = crate::terminal_view::GridSnapshot::new(&config.palette);
         let (ipc_socket, ipc_rx) = ipc;
         let row_labels = crate::row_label::LabelTemplates::new(
             config.ui.worktree_name.clone(),
@@ -506,7 +507,7 @@ impl AlacritreeApp {
             ),
             face_metrics,
             glyph_cache: crate::glyph_cache::GlyphCache::new(),
-            grid_snapshot: crate::terminal_view::GridSnapshot::new(),
+            grid_snapshot,
             gpu_grid: crate::grid_gl::GpuGrid::new(),
             frame_log: crate::frame_log::FrameLog::start(),
             phases: crate::frame_log::Phases::new(),
@@ -4596,7 +4597,7 @@ impl AlacritreeApp {
         let sidebar_fill = if translucent { Color32::TRANSPARENT } else { theme.sidebar_bg };
         // Opaque, this fill is what a collapsed cell shows, so it tracks the
         // terminal's background for the same reason the clear does.
-        let terminal_bg = self.grid_snapshot.default_bg(&self.config.palette);
+        let terminal_bg = self.grid_snapshot.default_bg();
         let central_fill = if translucent { Color32::TRANSPARENT } else { terminal_bg };
 
         FramePaintView { theme, modal_open, sidebar_fill, central_fill }
@@ -4784,7 +4785,7 @@ impl eframe::App for AlacritreeApp {
         // configured one.  eframe reads it before `update`, so a colour OSC 11
         // moved this frame lands next frame; terminal output requests a repaint
         // of its own, so the stale frame is replaced rather than left up.
-        let bg = self.grid_snapshot.default_bg(&self.config.palette);
+        let bg = self.grid_snapshot.default_bg();
         // Deliberately not premultiplied, where alacritty's `renderer::clear`
         // writes `(rgb * alpha, alpha)`.  `egui_glow::clear` hands these to
         // `glClearColor` untouched and the compositor reads the framebuffer as
