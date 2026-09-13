@@ -20,7 +20,7 @@ use crate::wsl::{self};
 use crate::wsl_helper::{self, WslProbe};
 use crate::{herdr, path_style};
 
-use super::{HarnessMark, Managed, managed_tooltip};
+use super::{ActionOrigin, HarnessMark, Managed, managed_tooltip};
 
 /// Logical-pixel (normal, heading) sizes for UI text.  `[ui.font] size`
 /// overrides the normal size directly (same pt→px conversion as
@@ -51,21 +51,6 @@ pub(super) enum PaneFocus {
 pub(super) enum FocusDir {
     Left,
     Right,
-}
-
-/// Where a dispatched binding action came from.  A keyboard action consumed
-/// a real key press, so FocusLeft/FocusRight may re-synthesize it into the
-/// PTY when the inner TUI should handle it.  An IPC action has no key press
-/// to forward — the caller is typically that inner program declaring it has
-/// no window in the requested direction, and passthrough would bounce the
-/// key straight back to it.  A palette action consumed a key press too, but
-/// arrives with the panel still searching over a row the query may have
-/// hidden — so actions that need a browsing cursor are refused at this origin.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ActionOrigin {
-    Keyboard,
-    Palette,
-    Ipc,
 }
 
 /// What a FocusLeft/FocusRight press does, decided by [`focus_move`].

@@ -172,3 +172,18 @@ impl AlacritreeApp {
         self.dispatch_scroll_or_other(action);
     }
 }
+
+/// Where a dispatched binding action came from.  A keyboard action consumed
+/// a real key press, so FocusLeft/FocusRight may re-synthesize it into the
+/// PTY when the inner TUI should handle it.  An IPC action has no key press
+/// to forward — the caller is typically that inner program declaring it has
+/// no window in the requested direction, and passthrough would bounce the
+/// key straight back to it.  A palette action consumed a key press too, but
+/// arrives with the panel still searching over a row the query may have
+/// hidden — so actions that need a browsing cursor are refused at this origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ActionOrigin {
+    Keyboard,
+    Palette,
+    Ipc,
+}
