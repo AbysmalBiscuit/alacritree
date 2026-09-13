@@ -172,6 +172,7 @@ fn main() -> eframe::Result<()> {
     }
     wsl::set_automount_root(config.wsl_automount_root.clone());
     wsl_helper::set_enabled(config.wsl_resident_helper);
+    tools::configure(config.integrations.tool_paths());
     let translucent = config.window.opacity < 1.0;
 
     let mut viewport = egui::ViewportBuilder::default()

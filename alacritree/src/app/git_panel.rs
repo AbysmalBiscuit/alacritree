@@ -309,11 +309,7 @@ impl AlacritreeApp {
             pr_info.as_ref().map(|p| p.base_branch.as_str()),
             project_default.as_deref(),
         );
-        // Single non-blocking poll: returns the last known status and
-        // kicks off a background refresh if stale or if the hint
-        // changed since the last completed compute.  Cloned so the
-        // `self.git_panel.status` borrow ends before the cursor repair below
-        // mutates other `self` fields.
+        // Clone the non-blocking poll result before cursor repair mutates `self`.
         let status = cache.poll(effective_default.as_deref(), ctx).clone();
 
         // Prefer the resolved ref (e.g. `refs/remotes/origin/main`) so
@@ -461,31 +457,22 @@ impl AlacritreeApp {
         if let Some(session) = existing {
             let id = session.id;
             if matches!(&session.kind, SessionKind::Diff { key } if key == &new_key) {
-                // Routing through close_session applies the same
-                // sibling-promotion and fallback navigation as any other
-                // close, so toggling off the diff pane never strands the
-                // workspace on an empty view.
+                // Keep ordinary close navigation when toggling a pane off.
                 self.close_session(ctx, id);
                 return;
             }
             self.sessions.retain(|s| s.id != id);
         }
 
-        let delta_override = self.config.delta_path.clone();
         let (program, args) = match wsl::classify(&workspace) {
             wsl::Location::Wsl { distro, .. } => {
                 let repaint = ctx.clone();
-                let delta = delta_override.or_else(|| {
-                    tools::wsl_resolved(Tool::Delta, &distro, move || repaint.request_repaint())
-                });
-                match delta {
+                match tools::wsl_resolved(Tool::Delta, &distro, move || repaint.request_repaint()) {
                     Some(delta) => build_wsl_diff_command_direct(&distro, &workspace, &req, &delta),
                     None => build_wsl_diff_command_login(&distro, &workspace, &req),
                 }
             },
-            wsl::Location::Windows(_) => {
-                build_diff_command(delta_override.as_deref().unwrap_or("delta"), &req)
-            },
+            wsl::Location::Windows(_) => build_diff_command(&tools::program(Tool::Delta), &req),
         };
         let title = format!(
             "diff: {}",
@@ -562,13 +549,7 @@ fn paint_git_branch_header(
 ) {
     let theme = &view.theme;
     let Some(branch) = &view.status.branch else { return };
-    // A greedy `truncate()` label in a plain `horizontal` row
-    // consumes all the width, shoving any trailing widgets past
-    // the panel edge. Since the right sidebar's `ScrollArea`
-    // grows to fit its content, that overflow ratchets the whole
-    // panel wider every frame until the full branch name fits.
-    // Pin `vs <default>` to the right and let the current branch
-    // truncate in the space that's left, so the row can't overflow.
+    // Pin the base label so a long branch cannot widen the sidebar.
     let default =
         view.status.default_branch.as_deref().filter(|default| *default != branch.as_str());
     row_with_trailing(
@@ -731,16 +712,7 @@ fn paint_branch_section(
     }
 }
 
-/// Render a collapsed-when-empty git section.
-///
-/// Empty sections are skipped entirely — a placeholder glyph for "no files
-/// here" added visual noise without communicating anything the count badge
-/// didn't already say.
-///
-/// `gap` carries the inter-section spacing: consumed above a section that
-/// renders and re-armed below it, so spacing lands between sections but never
-/// after the last one — trailing padding would make the content overflow the
-/// panel and show a scrollbar with nothing to scroll.
+/// Render a git section, skipping empty content and avoiding trailing spacing.
 fn section<R>(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -783,22 +755,14 @@ pub(super) fn file_row(
     let path_color = if is_active { theme.text } else { theme.text_dim };
     let mut path_galley = None;
     let mut hints = IconHints::default();
-    // `ui.horizontal` sizes its response rect to the (often short) path text,
-    // leaving most of the row's width as a dead zone — and short labels make
-    // the row barely taller than the text, so vertical misses are easy too.
-    // Allocate an explicit interact-sized row and pad it out so the click hit
-    // box spans the full panel width and the row's full height.
+    // Reserve the full row so short paths do not shrink the click target.
     let resp = ui
         .allocate_ui_with_layout(
             egui::vec2(ui.available_width(), row_h),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 ui.set_min_height(row_h);
-                // Labels default to `Sense::click_and_drag` for text selection;
-                // hit testing picks the smallest covering widget, so a clickable
-                // label inside our row would eat clicks before the row sees
-                // them.  Opt out of selection on every label that lives inside
-                // a clickable row so the click falls through.
+                // Let the row receive clicks instead of its text labels.
                 let badge = ui.add(
                     egui::Label::new(
                         RichText::new(change.kind.glyph()).color(color).monospace().small(),
@@ -1133,16 +1097,7 @@ pub(super) fn build_diff_command(delta: &str, req: &DiffRequest) -> (String, Vec
     ("git".to_string(), args)
 }
 
-/// The distro-side diff when `delta`'s absolute path is known (autodiscovered
-/// or a user override): a plain `sh` finds it without sourcing a login profile,
-/// so this avoids the per-open profile cost of the login fallback.
-///
-/// The `LESS=R` the diff pane puts in the child's environment stays on the
-/// Windows side of the wsl.exe boundary (only `WSLENV`-listed variables
-/// cross), so git in the distro would hand its pager `LESS=FRX` and `F`
-/// (quit-if-one-screen) would reap short diffs on open.  The script exports
-/// `LESS` itself where git runs.  Diff arguments travel as positional
-/// parameters, so no file name is shell-parsed.
+/// Run a known WSL delta path through `sh`, exporting `LESS` where git runs.
 pub(super) fn build_wsl_diff_command_direct(
     distro: &str,
     workspace: &Path,

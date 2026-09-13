@@ -24,7 +24,7 @@ use crate::crash_log::{Verdict, classify};
 use crate::ipc::protocol::{self, IpcRequest, SendError};
 use crate::shell_decision::{ShellDecision, shell_decision};
 use crate::wsl::{self, ShellChoice};
-use crate::{command_ext, jobs, state};
+use crate::{command_ext, jobs, state, tools};
 
 /// An instance that is wedged should not wedge the report too.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -103,6 +103,7 @@ fn report(
     overrides: &[toml::Value],
 ) -> Vec<Check> {
     let (config, _) = config::load(config_dir, overrides);
+    tools::configure(config.integrations.tool_paths());
 
     // Rows are grouped by section on the way out, so each section has to be
     // added in one run — a section split in two prints its header twice.

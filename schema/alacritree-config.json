@@ -377,6 +377,36 @@
       },
       "type": "object"
     },
+    "RawDelta": {
+      "properties": {
+        "path": {
+          "default": "delta",
+          "description": "The program to run on Windows or natively. Its own name is\nlooked up on PATH; any other value runs as written.",
+          "type": "string"
+        },
+        "wsl_path": {
+          "default": "",
+          "description": "The program to run inside every WSL distro, as written. Empty\nfinds it by name through the distro's login shell.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "RawDoppler": {
+      "properties": {
+        "path": {
+          "default": "doppler",
+          "description": "The program to run on Windows or natively. Its own name is\nlooked up on PATH; any other value runs as written.",
+          "type": "string"
+        },
+        "wsl_path": {
+          "default": "",
+          "description": "The program to run inside every WSL distro, as written. Empty\nfinds it by name through the distro's login shell.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "RawFocusOutline": {
       "properties": {
         "color": {
@@ -519,6 +549,36 @@
       },
       "type": "object"
     },
+    "RawGh": {
+      "properties": {
+        "path": {
+          "default": "gh",
+          "description": "The program to run on Windows or natively. Its own name is\nlooked up on PATH; any other value runs as written.",
+          "type": "string"
+        },
+        "wsl_path": {
+          "default": "",
+          "description": "The program to run inside every WSL distro, as written. Empty\nfinds it by name through the distro's login shell.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "RawGit": {
+      "properties": {
+        "path": {
+          "default": "git",
+          "description": "The program to run on Windows or natively. Its own name is\nlooked up on PATH; any other value runs as written.",
+          "type": "string"
+        },
+        "wsl_path": {
+          "default": "",
+          "description": "The program to run inside every WSL distro, as written. Empty\nfinds it by name through the distro's login shell.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "RawHerdr": {
       "properties": {
         "attach": {
@@ -545,6 +605,11 @@
           ],
           "type": "string"
         },
+        "path": {
+          "default": "herdr",
+          "description": "The program to run on Windows or natively. Its own name is looked up\non PATH; any other value runs as written.",
+          "type": "string"
+        },
         "poll_interval_ms": {
           "default": 2000,
           "description": "How often a reachable herdr server is re-polled for agent state.",
@@ -561,6 +626,11 @@
           "default": true,
           "description": "List panes whose working directory matches no worktree, under Home.",
           "type": "boolean"
+        },
+        "wsl_path": {
+          "default": "",
+          "description": "The program to run inside every WSL distro, as written. Empty finds it\nby name through the distro's login shell.",
+          "type": "string"
         }
       },
       "type": "object"
@@ -755,9 +825,29 @@
     },
     "RawIntegrations": {
       "properties": {
+        "delta": {
+          "$ref": "#/$defs/RawDelta",
+          "description": "The pager the delta diff viewer runs."
+        },
+        "doppler": {
+          "$ref": "#/$defs/RawDoppler",
+          "description": "The Doppler CLI behind scope mirroring for new worktrees."
+        },
+        "gh": {
+          "$ref": "#/$defs/RawGh",
+          "description": "The GitHub CLI behind PR badges and diff base branches."
+        },
+        "git": {
+          "$ref": "#/$defs/RawGit",
+          "description": "The git CLI, for the commands alacritree spawns. Repository reads go\nthrough libgit2, and scripts inside WSL find git on that distro's PATH."
+        },
         "herdr": {
           "$ref": "#/$defs/RawHerdr",
           "description": "Agents running under a herdr server."
+        },
+        "tuicr": {
+          "$ref": "#/$defs/RawTuicr",
+          "description": "The review TUI the tuicr diff viewer runs."
         }
       },
       "type": "object"
@@ -1178,6 +1268,21 @@
       },
       "type": "object"
     },
+    "RawTuicr": {
+      "properties": {
+        "path": {
+          "default": "tuicr",
+          "description": "The program to run on Windows or natively. Its own name is\nlooked up on PATH; any other value runs as written.",
+          "type": "string"
+        },
+        "wsl_path": {
+          "default": "",
+          "description": "The program to run inside every WSL distro, as written. Empty\nfinds it by name through the distro's login shell.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "RawUi": {
       "properties": {
         "async_session_spawn": {
@@ -1216,7 +1321,7 @@
           "type": "string"
         },
         "delta_path": {
-          "description": "Explicit `delta` program for the diff pane.  Set, it is used verbatim\nin git's `core.pager` and skips WSL delta autodiscovery; unset, native\ndiffs run bare `delta` from PATH.",
+          "description": "Deprecated location: `[integrations.delta] path` and `wsl_path`\nsupersede this, and each wins on its own side once set.",
           "type": "string"
         },
         "drop": {

@@ -66,6 +66,12 @@ fn configured() -> &'static RwLock<[ToolPaths; 6]> {
     PATHS.get_or_init(|| RwLock::new(Tool::ALL.map(ToolPaths::named)))
 }
 
+/// Publish the configured paths of every tool, indexed like [`Tool::ALL`].
+/// Runs once at startup, before anything spawns a tool.
+pub fn configure(paths: [ToolPaths; 6]) {
+    *configured().write().unwrap_or_else(|e| e.into_inner()) = paths;
+}
+
 fn configured_paths(tool: Tool) -> ToolPaths {
     configured().read().unwrap_or_else(|e| e.into_inner())[tool as usize].clone()
 }

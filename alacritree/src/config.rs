@@ -24,6 +24,7 @@ use strum::{EnumIter, IntoEnumIterator, IntoStaticStr};
 
 use crate::bindings::{self, KeyBinding};
 use crate::path_style::PathStyle;
+use crate::tools::{Tool, ToolPaths};
 
 /// `[env]` carries whatever the user's environment carries, and a config dump
 /// ends up attached to bug reports.  Key names survive: that `FOO` was set is
@@ -60,11 +61,6 @@ pub struct Config {
     pub state_dir: Option<PathBuf>,
     pub wsl_automount_root: String,
     pub wsl_resident_helper: bool,
-    /// Explicit `delta` program for the diff pane, from `[ui] delta_path`.
-    /// When set it is used verbatim in git's `core.pager` on every platform
-    /// and skips WSL delta autodiscovery; when unset, native diffs run bare
-    /// `delta` (from PATH) and WSL diffs discover it inside the distro.
-    pub delta_path: Option<String>,
     pub profiles: Vec<Profile>,
     /// Validated at load: always names an entry in `profiles` when `Some`.
     pub default_profile: Option<String>,
@@ -523,9 +519,50 @@ impl PasteConfig {
 /// `[integrations]`: how alacritree talks to the other tools it can see.  How
 /// what those tools contribute is *drawn* stays under `[ui]` — a herdr row's
 /// glyph is `ui.icons.herdr`, not a setting here.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct IntegrationsConfig {
+    pub git: ToolConfig,
+    pub gh: ToolConfig,
+    pub doppler: ToolConfig,
     pub herdr: HerdrConfig,
+    pub delta: ToolConfig,
+    pub tuicr: ToolConfig,
+}
+
+impl Default for IntegrationsConfig {
+    fn default() -> Self {
+        RawIntegrations::default().resolve(None)
+    }
+}
+
+impl IntegrationsConfig {
+    pub fn paths(&self, tool: Tool) -> ToolPaths {
+        let (native, wsl) = match tool {
+            Tool::Git => (&self.git.path, &self.git.wsl_path),
+            Tool::Gh => (&self.gh.path, &self.gh.wsl_path),
+            Tool::Delta => (&self.delta.path, &self.delta.wsl_path),
+            Tool::Doppler => (&self.doppler.path, &self.doppler.wsl_path),
+            Tool::Herdr => (&self.herdr.path, &self.herdr.wsl_path),
+            Tool::Tuicr => (&self.tuicr.path, &self.tuicr.wsl_path),
+        };
+        ToolPaths { native: native.clone(), wsl: wsl.clone() }
+    }
+
+    /// Indexed like [`Tool::ALL`], the shape `tools::configure` takes.
+    pub fn tool_paths(&self) -> [ToolPaths; 6] {
+        Tool::ALL.map(|tool| self.paths(tool))
+    }
+}
+
+/// `[integrations.<tool>]` for a tool with nothing to configure but where
+/// it lives.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ToolConfig {
+    /// The tool's own name, or a native path that runs as written.
+    pub path: String,
+    /// A path that runs as written inside every WSL distro, or `None` to
+    /// find the tool by name there.
+    pub wsl_path: Option<String>,
 }
 
 /// What opening a herdr agent row attaches to.
@@ -562,6 +599,10 @@ pub enum FollowFocus {
 /// an unmodified config pays no price for it.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct HerdrConfig {
+    /// The native herdr binary, as `[integrations.herdr] path` names it.
+    pub path: String,
+    /// The herdr binary inside WSL, or `None` to find it by name there.
+    pub wsl_path: Option<String>,
     /// Discover herdr servers and list their agents in the sidebar.
     pub enabled: bool,
     /// How often a reachable herdr server is re-polled for agent state.
@@ -1433,7 +1474,6 @@ impl Default for Config {
             state_dir: None,
             wsl_automount_root: "/mnt".to_string(),
             wsl_resident_helper: true,
-            delta_path: None,
             profiles: Vec::new(),
             default_profile: None,
             integrations: IntegrationsConfig::default(),
@@ -2725,13 +2765,103 @@ impl Default for RawUiPaste {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawIntegrations {
+    /// The git CLI, for the commands alacritree spawns. Repository reads go
+    /// through libgit2, and scripts inside WSL find git on that distro's PATH.
+    git: RawGit,
+    /// The GitHub CLI behind PR badges and diff base branches.
+    gh: RawGh,
+    /// The Doppler CLI behind scope mirroring for new worktrees.
+    doppler: RawDoppler,
     /// Agents running under a herdr server.
     herdr: RawHerdr,
+    /// The pager the delta diff viewer runs.
+    delta: RawDelta,
+    /// The review TUI the tuicr diff viewer runs.
+    tuicr: RawTuicr,
+}
+
+/// Declares an `[integrations.<tool>]` table whose only keys name it on each
+/// side of a Windows and WSL installation.
+macro_rules! raw_tool_table {
+    ($raw:ident, $program:literal) => {
+        #[derive(Debug, Deserialize, JsonSchema)]
+        #[serde(default)]
+        struct $raw {
+            /// The program to run on Windows or natively. Its own name is
+            /// looked up on PATH; any other value runs as written.
+            path: String,
+            /// The program to run inside every WSL distro, as written. Empty
+            /// finds it by name through the distro's login shell.
+            wsl_path: String,
+        }
+
+        impl Default for $raw {
+            fn default() -> Self {
+                Self { path: $program.to_string(), wsl_path: String::new() }
+            }
+        }
+    };
+}
+
+raw_tool_table!(RawGit, "git");
+raw_tool_table!(RawGh, "gh");
+raw_tool_table!(RawDoppler, "doppler");
+raw_tool_table!(RawDelta, "delta");
+raw_tool_table!(RawTuicr, "tuicr");
+
+impl RawIntegrations {
+    fn resolve(self, deprecated_delta_path: Option<String>) -> IntegrationsConfig {
+        IntegrationsConfig {
+            git: tool_config(self.git.path, self.git.wsl_path, Tool::Git),
+            gh: tool_config(self.gh.path, self.gh.wsl_path, Tool::Gh),
+            doppler: tool_config(self.doppler.path, self.doppler.wsl_path, Tool::Doppler),
+            herdr: self.herdr.resolve(),
+            delta: delta_config(self.delta.path, self.delta.wsl_path, deprecated_delta_path),
+            tuicr: tool_config(self.tuicr.path, self.tuicr.wsl_path, Tool::Tuicr),
+        }
+    }
+}
+
+/// A blank path means the side's default: the tool's name natively, and
+/// discovery inside WSL.
+fn tool_config(path: String, wsl_path: String, tool: Tool) -> ToolConfig {
+    ToolConfig {
+        path: if path.trim().is_empty() { tool.name().to_string() } else { path },
+        wsl_path: Some(wsl_path).filter(|path| !path.trim().is_empty()),
+    }
+}
+
+/// `[ui] delta_path` was one path used on both sides. It still fills each
+/// side `[integrations.delta]` leaves at its default, because raw config
+/// structs accept unknown keys and dropping it would lose the override.
+fn delta_config(path: String, wsl_path: String, deprecated: Option<String>) -> ToolConfig {
+    let mut delta = tool_config(path, wsl_path, Tool::Delta);
+    let Some(old) = deprecated.filter(|old| !old.trim().is_empty()) else {
+        return delta;
+    };
+    let native_default = delta.path == Tool::Delta.name();
+    let wsl_default = delta.wsl_path.is_none();
+    if native_default || wsl_default {
+        log::warn!("[ui] delta_path is deprecated; set [integrations.delta] path and wsl_path");
+    }
+    if native_default {
+        delta.path = old.clone();
+    }
+    if wsl_default {
+        delta.wsl_path = Some(old);
+    }
+    delta
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawHerdr {
+    /// The program to run on Windows or natively. Its own name is looked up
+    /// on PATH; any other value runs as written.
+    path: String,
+    /// The program to run inside every WSL distro, as written. Empty finds it
+    /// by name through the distro's login shell.
+    wsl_path: String,
     /// Discover herdr servers and list their agents in the sidebar.  Inert
     /// when no herdr binary or server is present.
     enabled: bool,
@@ -2776,6 +2906,8 @@ struct RawHerdr {
 impl Default for RawHerdr {
     fn default() -> Self {
         Self {
+            path: "herdr".to_string(),
+            wsl_path: String::new(),
             enabled: true,
             poll_interval_ms: 2000,
             show_unmatched: true,
@@ -2788,7 +2920,10 @@ impl Default for RawHerdr {
 
 impl RawHerdr {
     fn resolve(self) -> HerdrConfig {
+        let tool = tool_config(self.path, self.wsl_path, Tool::Herdr);
         HerdrConfig {
+            path: tool.path,
+            wsl_path: tool.wsl_path,
             enabled: self.enabled,
             poll_interval: Duration::from_millis(self.poll_interval_ms),
             show_unmatched: self.show_unmatched,
@@ -2880,9 +3015,8 @@ struct RawUi {
     /// Whether session rows can be dragged, and how far a reorder may carry
     /// a session.
     session_reorder: RawSessionReorder,
-    /// Explicit `delta` program for the diff pane.  Set, it is used verbatim
-    /// in git's `core.pager` and skips WSL delta autodiscovery; unset, native
-    /// diffs run bare `delta` from PATH.
+    /// Deprecated location: `[integrations.delta] path` and `wsl_path`
+    /// supersede this, and each wins on its own side once set.
     delta_path: Option<String>,
     /// Sidebar glyph overrides.
     icons: RawIcons,
@@ -3425,10 +3559,9 @@ impl RawConfig {
                 .and_then(|raw| parse_config_path(raw, "general.state_dir")),
             wsl_automount_root,
             wsl_resident_helper,
-            delta_path: self.ui.delta_path.filter(|s| !s.trim().is_empty()),
             profiles,
             default_profile,
-            integrations: IntegrationsConfig { herdr: self.integrations.herdr.resolve() },
+            integrations: self.integrations.resolve(self.ui.delta_path),
         }
     }
 }
@@ -3858,17 +3991,63 @@ show_panes = true
         assert!(!raw.into_config().wsl_resident_helper);
     }
 
+    fn paths(native: &str, wsl: Option<&str>) -> ToolPaths {
+        ToolPaths { native: native.to_string(), wsl: wsl.map(str::to_string) }
+    }
+
     #[test]
-    fn delta_path_parses_and_blank_is_none() {
-        let raw: RawConfig = toml::from_str("").unwrap();
-        assert_eq!(raw.into_config().delta_path, None);
+    fn tool_paths_default_to_their_names_and_discovery_inside_wsl() {
+        let config = config_from("");
+        for tool in Tool::ALL {
+            assert_eq!(config.integrations.paths(tool), ToolPaths::named(tool), "{tool:?}");
+        }
+    }
 
-        let raw: RawConfig = toml::from_str("[ui]\ndelta_path = \"/opt/delta\"").unwrap();
-        assert_eq!(raw.into_config().delta_path.as_deref(), Some("/opt/delta"));
+    #[test]
+    fn a_tool_table_sets_each_side_and_blank_means_the_default() {
+        let config = config_from(
+            "[integrations.gh]\npath = \"C:/tools/gh.exe\"\nwsl_path = \
+             \"/opt/gh/bin/gh\"\n[integrations.herdr]\nwsl_path = \
+             \"/home/lev/.local/bin/herdr\"\n[integrations.tuicr]\npath = \"  \"\nwsl_path = \"  \
+             \"\n",
+        );
+        assert_eq!(
+            config.integrations.paths(Tool::Gh),
+            paths("C:/tools/gh.exe", Some("/opt/gh/bin/gh"))
+        );
+        assert_eq!(
+            config.integrations.paths(Tool::Herdr),
+            paths("herdr", Some("/home/lev/.local/bin/herdr"))
+        );
+        assert_eq!(config.integrations.paths(Tool::Tuicr), ToolPaths::named(Tool::Tuicr));
+    }
 
-        // A blank override is treated as unset so discovery still runs.
-        let raw: RawConfig = toml::from_str("[ui]\ndelta_path = \"  \"").unwrap();
-        assert_eq!(raw.into_config().delta_path, None);
+    /// The deprecated key was one path used on both sides. It keeps doing
+    /// that for each side the new keys leave at its default.
+    #[test]
+    fn the_deprecated_ui_delta_path_fills_each_side_left_at_its_default() {
+        let old = config_from("[ui]\ndelta_path = \"/opt/delta\"\n");
+        assert_eq!(old.integrations.paths(Tool::Delta), paths("/opt/delta", Some("/opt/delta")));
+
+        let native_set = config_from(
+            "[ui]\ndelta_path = \"/opt/delta\"\n[integrations.delta]\npath = \"C:/delta.exe\"\n",
+        );
+        assert_eq!(
+            native_set.integrations.paths(Tool::Delta),
+            paths("C:/delta.exe", Some("/opt/delta"))
+        );
+
+        let both_set = config_from(
+            "[ui]\ndelta_path = \"/opt/delta\"\n[integrations.delta]\npath = \
+             \"C:/delta.exe\"\nwsl_path = \"/usr/local/bin/delta\"\n",
+        );
+        assert_eq!(
+            both_set.integrations.paths(Tool::Delta),
+            paths("C:/delta.exe", Some("/usr/local/bin/delta"))
+        );
+
+        let blank = config_from("[ui]\ndelta_path = \"  \"\n");
+        assert_eq!(blank.integrations.paths(Tool::Delta), ToolPaths::named(Tool::Delta));
     }
 
     #[test]

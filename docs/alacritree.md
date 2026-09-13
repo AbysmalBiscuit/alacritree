@@ -519,8 +519,6 @@ upstream_status    = false  # paint a badge on each worktree row for its
                             # linked worktree that overrides branch.* in its
                             # own config.worktree is read from the project
                             # root instead, so that override is not seen.
-delta_path         = "delta"     # explicit delta binary for the diff pane;
-                                 # unset discovers it on PATH
 worktree_name      = "$name ${pr: }"  # template for worktree row labels:
                             # $name, $branch, $path, $pr (as #123, needs
                             # pr_status), and ${var:fallback}. Unset keeps the
@@ -625,9 +623,25 @@ image_keep  = 20            # how many PNGs the default directory keeps.
                             # Minimum 1 — the image a paste just handed to the
                             # shell always survives the sweep
 
+[integrations.git]          # one table per external program alacritree runs:
+path     = "git"            # git, gh, doppler, herdr, delta and tuicr. path is
+                            # the Windows or native program: the bare name is
+                            # looked up on PATH, anything else runs as written
+wsl_path = ""               # the program inside every WSL distro, run as
+                            # written; empty finds it by name through the
+                            # distro's login shell
+
+[integrations.delta]
+path     = "delta"          # the pager the delta diff viewer runs. These
+wsl_path = ""               # supersede the deprecated [ui] delta_path, which
+                            # still fills whichever of them is left at its
+                            # default
+
 [integrations.herdr]        # agents running under a herdr server, listed in
                             # the sidebar under the worktree each agent's
                             # working directory matches
+path             = "herdr"  # the herdr binary on each side, set like the tables above
+wsl_path         = ""
 enabled          = true     # false does no herdr work at all: no polling,
                             # no rows
 poll_interval_ms = 2000     # how often a reachable server is asked for its
