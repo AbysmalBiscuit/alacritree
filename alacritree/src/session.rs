@@ -256,6 +256,7 @@ pub struct Session {
     pub term: Arc<FairMutex<Term<EventProxy>>>,
     pub events: mpsc::Receiver<TermEvent>,
     pub osc_events: Option<mpsc::Receiver<osc_tap::OscEvent>>,
+    pub progress: Option<osc_tap::Progress>,
     pub scratchpad: Option<scratchpad::Editor>,
     /// Latched attention flag, cleared when the user views this session.
     pub needs_attention: bool,
@@ -1363,6 +1364,7 @@ impl Session {
             term,
             events,
             osc_events: None,
+            progress: None,
             scratchpad: Some(editor),
             needs_attention: false,
             pending_attention: None,
@@ -1562,6 +1564,7 @@ impl Session {
             term: term.clone(),
             events,
             osc_events,
+            progress: None,
             scratchpad: None,
             needs_attention: false,
             pending_attention: None,
@@ -1713,6 +1716,7 @@ impl Session {
                         self.last_notification = Some(body.clone());
                         outcome.notifications = Some(body);
                     },
+                    osc_tap::OscEvent::Progress(progress) => self.progress = Some(progress),
                     _ => {},
                 }
             }
@@ -2462,6 +2466,47 @@ pub(crate) mod tests {
         assert_eq!(session.working_directory, None);
     }
 
+    #[test]
+    fn progress_osc_bytes_update_the_session_through_the_tap() {
+        use osc_tap::Progress;
+
+        let mut config = Config::default();
+        config.vt.progress = true;
+        let (mut session, mut request) = Session::pending_shell(
+            egui::Context::default(),
+            &config,
+            None,
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(session.progress, None);
+        for (bytes, expected) in [
+            ("\x1b]9;4;1;50\x07", Progress::Set(50)),
+            ("\x1b]9;4;2;25\x1b\\", Progress::Error(25)),
+            ("\x1b]9;4;4;75\x07", Progress::Paused(75)),
+            ("\x1b]9;4;3\x07", Progress::Indeterminate),
+            ("\x1b]9;4;0\x07", Progress::Clear),
+        ] {
+            request.tap.as_mut().unwrap().offer(bytes.as_bytes());
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let outcome = session.drain_events(&config.palette);
+                assert!(outcome.notifications.is_none());
+                if session.progress == Some(expected) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "progress report was not drained: {bytes:?}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            session.drain_events(&config.palette);
+            assert_eq!(session.progress, Some(expected));
+        }
+    }
+
+    #[test]
     fn reported_cwd_osc_bytes_reach_a_wsl_session_without_a_probe() {
         let mut config = Config::default();
         config.vt.report_cwd = true;
@@ -2569,6 +2614,7 @@ pub(crate) mod tests {
             term,
             events,
             osc_events: None,
+            progress: None,
             scratchpad: None,
             needs_attention: false,
             pending_attention: None,

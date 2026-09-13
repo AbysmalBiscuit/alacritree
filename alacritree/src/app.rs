@@ -29,6 +29,7 @@ use crate::crash_log::{self, ExitReason};
 use crate::git_nav::{self, GitSection, SectionCount};
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, GitStatus, StatusCache};
 use crate::multiplexer::{CreatedPane, Herdr, Launch, Multiplexer, MultiplexerSession, PaneTarget};
+use crate::osc_tap::Progress as OscProgress;
 use crate::panel_filter::{self, PanelFilter};
 use crate::path_style::PathStyle;
 use crate::pending_spawn::{Finished, PendingSpawns};
@@ -8081,6 +8082,7 @@ struct SessionRowData {
     id: SessionId,
     name: RowName,
     reported_cwd: Option<PathBuf>,
+    progress: Option<OscProgress>,
     needs_attention: bool,
     activity: SessionActivity,
     /// This workspace's remembered active session (accent icon).
@@ -9385,6 +9387,32 @@ struct SessionRowAction {
     rect: egui::Rect,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProgressTone {
+    Normal,
+    Error,
+    Paused,
+}
+
+fn progress_bar_fill(progress: OscProgress, width: f32) -> f32 {
+    let fraction = match progress {
+        OscProgress::Clear => 0.0,
+        OscProgress::Set(p) | OscProgress::Error(p) | OscProgress::Paused(p) => {
+            f32::from(p) / 100.0
+        },
+        OscProgress::Indeterminate => 1.0,
+    };
+    width * fraction
+}
+
+fn progress_tone(progress: OscProgress) -> ProgressTone {
+    match progress {
+        OscProgress::Error(_) => ProgressTone::Error,
+        OscProgress::Paused(_) => ProgressTone::Paused,
+        _ => ProgressTone::Normal,
+    }
+}
+
 /// `draggable` makes the whole row the drag handle rather than adding a grip:
 /// a session row is a tab, where a project row's own controls are what a click
 /// there is usually for.
@@ -9399,6 +9427,8 @@ fn session_row(
 ) -> SessionRowAction {
     // Reserve a slot *before* the labels so the hover bg paints beneath them.
     let bg_idx = ui.painter().add(egui::Shape::Noop);
+    let progress = row.progress.filter(|progress| *progress != OscProgress::Clear);
+    let progress_idx = progress.map(|_| ui.painter().add(egui::Shape::Noop));
     let panel_x = ui.max_rect().x_range();
 
     let mut close_clicked = false;
@@ -9502,6 +9532,19 @@ fn session_row(
     let full_rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
     if bg != Color32::TRANSPARENT {
         ui.painter().set(bg_idx, egui::Shape::rect_filled(full_rect, 0.0, bg));
+    }
+    if let (Some(progress), Some(index)) = (progress, progress_idx) {
+        let color = match progress_tone(progress) {
+            ProgressTone::Normal => theme.accent,
+            ProgressTone::Error => theme.attention,
+            ProgressTone::Paused => theme.text_muted,
+        };
+        let height = (2.0 * theme.ui_scale).min(full_rect.height());
+        let bar = egui::Rect::from_min_size(
+            egui::pos2(full_rect.left(), full_rect.bottom() - height),
+            egui::vec2(progress_bar_fill(progress, full_rect.width()), height),
+        );
+        ui.painter().set(index, egui::Shape::rect_filled(bar, 0.0, color));
     }
     if is_cursor {
         paint_cursor_outline(ui, full_rect, theme);
@@ -10203,6 +10246,7 @@ impl AlacritreeApp {
                         id: s.id,
                         name: session_row_name(&s.title, activity, self.session_herdr_agent(s)),
                         reported_cwd: s.reported_cwd.clone(),
+                        progress: s.progress,
                         needs_attention: s.needs_attention,
                         activity,
                         is_active: active == Some(s.id),
@@ -12638,6 +12682,111 @@ fn notify_worker(body: String, id: SessionId, _ctx: egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_progress_bar_fills_and_tones_by_state() {
+        use crate::osc_tap::Progress;
+
+        for (progress, fill, tone) in [
+            (Progress::Set(50), 50.0, ProgressTone::Normal),
+            (Progress::Set(0), 0.0, ProgressTone::Normal),
+            (Progress::Set(100), 100.0, ProgressTone::Normal),
+            (Progress::Error(25), 25.0, ProgressTone::Error),
+            (Progress::Paused(75), 75.0, ProgressTone::Paused),
+            (Progress::Indeterminate, 100.0, ProgressTone::Normal),
+            (Progress::Clear, 0.0, ProgressTone::Normal),
+        ] {
+            assert_eq!(progress_bar_fill(progress, 100.0), fill);
+            assert_eq!(progress_bar_fill(progress, 200.0), fill * 2.0);
+            assert_eq!(progress_bar_fill(progress, 0.0), 0.0);
+            assert_eq!(progress_tone(progress), tone);
+        }
+    }
+
+    #[test]
+    fn progress_drains_into_rows_with_the_expected_bar_and_no_cursor_rebuild() {
+        use crate::osc_tap::{OscEvent, Progress};
+
+        let mut app = test_app();
+        app.session_rows_always = true;
+        let ctx = Context::default();
+        let id = app.sessions[0].id;
+        app.set_active_in_current_workspace(id);
+        let (sender, receiver) = mpsc::channel();
+        app.sessions[0].osc_events = Some(receiver);
+        app.reconcile_sidebar_focus(&ctx);
+        let cursor = app.sidebar_cursor.clone();
+        let theme = Theme::from_config(&app.config);
+        let icons = Icons::default();
+
+        for (progress, fraction, color) in [
+            (None, 0.0, None),
+            (Some(Progress::Set(50)), 0.5, Some(theme.accent)),
+            (Some(Progress::Error(25)), 0.25, Some(theme.attention)),
+            (Some(Progress::Paused(75)), 0.75, Some(theme.text_muted)),
+            (Some(Progress::Indeterminate), 1.0, Some(theme.accent)),
+            (Some(Progress::Clear), 0.0, None),
+        ] {
+            if let Some(progress) = progress {
+                sender.send(OscEvent::Progress(progress)).unwrap();
+            }
+            app.sessions[0].drain_events(&app.config.palette);
+            assert_eq!(app.sessions[0].progress, progress);
+            let (_, counts) = crate::steady_state::measure(|| app.reconcile_sidebar_focus(&ctx));
+            assert_eq!(counts.allocs, 0, "progress must not invalidate cursor reconciliation");
+            assert_eq!(app.sidebar_cursor, cursor);
+
+            let listed = app.listed_workspace_rows();
+            let rows = app.workspace_rows(&None, &listed);
+            let row = rows
+                .iter()
+                .find_map(|row| match row {
+                    WorkspaceRowData::Session(row) if row.id == id => Some(row),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(row.progress, progress);
+            let mut rect = egui::Rect::NOTHING;
+            let frames = frames_while_hovering_at(egui::pos2(-100.0, -100.0), 220.0, |ui| {
+                rect = session_row(ui, row, false, false, true, &icons, &theme).rect;
+            });
+            for shapes in frames.iter().skip(1) {
+                let bars: Vec<_> = shapes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, clipped)| match &clipped.shape {
+                        egui::Shape::Rect(shape)
+                            if shape.rect.bottom() == rect.bottom()
+                                && shape.rect.height() <= 3.0 * theme.ui_scale =>
+                        {
+                            Some((index, shape))
+                        },
+                        _ => None,
+                    })
+                    .collect();
+                match color {
+                    None => assert!(bars.is_empty(), "unexpected bar for {progress:?}"),
+                    Some(color) => {
+                        assert_eq!(bars.len(), 1);
+                        let (index, bar) = bars[0];
+                        assert_eq!(bar.fill, color);
+                        assert_eq!(bar.rect.left(), rect.left());
+                        assert!((bar.rect.width() - rect.width() * fraction).abs() < 0.01);
+                        assert!(bar.rect.height() > 0.0);
+                        assert!(shapes[..index].iter().any(|clipped| matches!(
+                            &clipped.shape, egui::Shape::Rect(shape)
+                                if shape.rect == rect && shape.fill == theme.row_active_bg
+                        )));
+                        let text_index = shapes
+                            .iter()
+                            .position(|clipped| matches!(clipped.shape, egui::Shape::Text(_)))
+                            .expect("row text painted");
+                        assert!(index < text_index, "bar must paint behind text and buttons");
+                    },
+                }
+            }
+        }
+    }
 
     pub(super) mod notifications {
         use super::*;
@@ -18214,6 +18363,7 @@ mod tests {
                 id: 1,
                 name: RowName::plain("zsh".to_owned()),
                 reported_cwd: None,
+                progress: None,
                 needs_attention: false,
                 activity: SessionActivity::Shell,
                 is_active: true,
@@ -18303,6 +18453,7 @@ mod tests {
             id: 1,
             name: RowName::plain("zsh".to_owned()),
             reported_cwd: None,
+            progress: None,
             needs_attention: attention,
             activity,
             is_active: true,
@@ -18572,6 +18723,7 @@ mod tests {
                 id: 1,
                 name: RowName::plain(name.to_owned()),
                 reported_cwd: Some(cwd.clone()),
+                progress: None,
                 needs_attention: false,
                 activity: SessionActivity::Shell,
                 is_active: true,
@@ -18691,6 +18843,7 @@ mod tests {
             id: 1,
             name: RowName::plain("cargo test --workspace --all-features -- --nocapture".to_owned()),
             reported_cwd: None,
+            progress: None,
             needs_attention: false,
             activity: SessionActivity::Shell,
             is_active: true,
