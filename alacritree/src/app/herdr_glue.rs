@@ -904,3 +904,52 @@ impl AlacritreeApp {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn close_session_removes_only_its_attach_and_view_focus() {
+        let mut herdr = HerdrGlue::new();
+        let first_id = 1;
+        let first_key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "first".into() };
+        let second_key =
+            herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "second".into() };
+        let (first_tx, first_rx) = mpsc::channel();
+        let (second_tx, second_rx) = mpsc::channel();
+
+        herdr.pending_attach.push(PendingHerdrAttach {
+            job: None,
+            target: unlisted_pane_target(&first_key, "w1:p1"),
+            key: first_key.clone(),
+            workspace: None,
+            previous: None,
+            waiters: vec![first_tx],
+        });
+        herdr.pending_attach.push(PendingHerdrAttach {
+            job: None,
+            target: unlisted_pane_target(&second_key, "w1:p2"),
+            key: second_key.clone(),
+            workspace: None,
+            previous: None,
+            waiters: vec![second_tx],
+        });
+        herdr.view_focus = Some(herdr::HerdrViewFocus {
+            session: first_id,
+            key: first_key.clone(),
+            job: jobs::Job::ready(Ok(())),
+        });
+
+        herdr.close_session(first_id, Some(&first_key));
+
+        assert!(herdr.view_focus.is_none());
+        assert_eq!(herdr.pending_attach.len(), 1);
+        assert_eq!(herdr.pending_attach[0].key, second_key);
+        assert_eq!(
+            first_rx.try_recv().unwrap(),
+            Err("the session behind this pane was closed before the attach finished".to_string())
+        );
+        assert!(second_rx.try_recv().is_err());
+    }
+}
