@@ -15,8 +15,7 @@ use crate::command_palette::{self};
 use crate::config::{
     AttachMode, FontConfig, SearchDepth, SearchScope, SidebarFocus, UiFont, UiTheme,
 };
-use crate::git_nav::{self, GitSection, SectionCount};
-use crate::git_status::{ChangeKind, DirtyCounts};
+use crate::git_status::DirtyCounts;
 use crate::multiplexer::{CreatedPane, Launch, PaneTarget};
 use crate::panel_filter::PanelFilter;
 use crate::path_style::PathStyle;
@@ -256,17 +255,6 @@ pub(super) fn project_filter_identity(action: NamedAction) -> Option<char> {
     }
 }
 
-/// The git-panel toggle a named action flips, or `None` for an action that is
-/// not one of its filters.
-pub(super) fn git_filter_identity(action: NamedAction) -> Option<char> {
-    match action {
-        NamedAction::ToggleModifiedFilter => Some('m'),
-        NamedAction::ToggleDeletedFilter => Some('d'),
-        NamedAction::ToggleUntrackedFilter => Some('u'),
-        _ => None,
-    }
-}
-
 /// Whether any toggle dimension narrows the projects panel this frame —
 /// session presence, attention, or PR state. `project_self` falls back to
 /// plain fuzzy matching only when this is false.
@@ -318,16 +306,6 @@ pub(super) fn pr_generation_for(generation: u64, any_pr_toggle_active: bool) -> 
 /// would hide worktrees for want of a lookup it declined to start.
 pub(super) fn should_poll_pr(pr_enabled: bool, expanded: bool, any_pr_toggle: bool) -> bool {
     pr_enabled && (expanded || any_pr_toggle)
-}
-
-/// Whether a git-status row survives the git panel's toggle dimension. Unlike
-/// `project_toggles_pass`, standing this down needs no separate `apply` flag:
-/// forcing all three toggles to `false` already makes `!any` admit every row.
-pub(super) fn git_toggles_pass(m: bool, d: bool, u: bool, kind: ChangeKind) -> bool {
-    let any = m || d || u;
-    !any || (m && matches!(kind, ChangeKind::Modified | ChangeKind::Renamed))
-        || (d && kind == ChangeKind::Deleted)
-        || (u && matches!(kind, ChangeKind::Untracked | ChangeKind::Added))
 }
 
 pub(super) struct DeleteRequest {
@@ -443,57 +421,6 @@ pub(super) struct DraggedProject(pub(super) PathBuf);
 #[derive(Clone)]
 pub(super) struct DraggedSession(pub(super) SessionId);
 
-/// Which `git diff` flavor a sidebar click should open in delta.
-pub(super) enum DiffSource {
-    Staged,
-    Worktree,
-    Untracked,
-    /// Triple-dot diff against this base ref (merge-base, matching the
-    /// `Changes vs <branch>` sidebar section).
-    Branch {
-        base: String,
-    },
-}
-
-pub(super) struct DiffRequest {
-    pub(super) file: String,
-    pub(super) source: DiffSource,
-}
-
-/// Stable identifier for "the diff this click would open" — matched against
-/// the active diff session's `SessionKind::Diff { key }` to highlight the
-/// originating row and toggle the pane off when clicked again.
-pub(super) fn diff_key(req: &DiffRequest) -> String {
-    let tag = match &req.source {
-        DiffSource::Staged => "staged",
-        DiffSource::Worktree => "worktree",
-        DiffSource::Untracked => "untracked",
-        DiffSource::Branch { .. } => "branch",
-    };
-    format!("{tag}:{}", req.file)
-}
-
-/// The diff a git-panel cursor row would open, mirroring the render pass's
-/// per-section click mapping.  `None` for a branch-diff row with no resolved
-/// base, matching the render pass's unclickable base-less rows.
-pub(super) fn git_row_diff_request(
-    row: &git_nav::GitRow,
-    base: Option<&str>,
-) -> Option<DiffRequest> {
-    let source = match row.section {
-        GitSection::Staged => DiffSource::Staged,
-        GitSection::Unstaged => {
-            if row.kind == Some(ChangeKind::Untracked) {
-                DiffSource::Untracked
-            } else {
-                DiffSource::Worktree
-            }
-        },
-        GitSection::Branch => DiffSource::Branch { base: base?.to_string() },
-    };
-    Some(DiffRequest { file: row.path.clone(), source })
-}
-
 /// Where the user lands when a herdr attach fails after switching them.  The
 /// job answers frames later, so a switch made in between is theirs and
 /// outranks the restore: `previous` is handed back only while `current` is
@@ -573,103 +500,6 @@ pub(super) fn holds_self_boost(session: SessionBoost) -> bool {
 /// session has to be reached, whatever the sessions before it answered.
 pub(super) fn frame_holds_self_boost(boosts: impl Iterator<Item = SessionBoost>) -> bool {
     boosts.fold(false, |held, session| held | holds_self_boost(session))
-}
-
-/// git arguments (everything after `git`) for the requested diff — shared
-/// by the Windows and WSL pane commands.
-pub(super) fn diff_args(req: &DiffRequest) -> Vec<String> {
-    let mut args = vec!["diff".to_string()];
-    match &req.source {
-        DiffSource::Staged => args.push("--cached".to_string()),
-        DiffSource::Worktree => {},
-        // `--no-index` against /dev/null shows the untracked file as a pure
-        // addition; git special-cases "/dev/null" on every platform. Exits
-        // non-zero by design.
-        DiffSource::Untracked => args.push("--no-index".to_string()),
-        // Triple-dot diff = "from merge-base to HEAD" — matches the sidebar's
-        // `Changes vs <branch>` stat semantics in git_status.rs.
-        DiffSource::Branch { base } => args.push(format!("{base}...")),
-    }
-    args.push("--".to_string());
-    if matches!(req.source, DiffSource::Untracked) {
-        args.push("/dev/null".to_string());
-    }
-    args.push(req.file.clone());
-    args
-}
-
-/// Show the clicked file's `git diff` in `delta`, wired in as git's pager so
-/// git drives the pipe itself.  This drops the POSIX-`sh` dependency the old
-/// `sh -c '… | delta'` had — which had no equivalent on Windows, so diffs never
-/// opened there.  Paths/branches stay in argv, so no file name is shell-parsed.
-/// `delta` is the resolved program (bare `delta` from PATH, or a user override).
-pub(super) fn build_diff_command(delta: &str, req: &DiffRequest) -> (String, Vec<String>) {
-    let mut args = vec!["-c".to_string(), format!("core.pager={delta} --paging=always")];
-    args.extend(diff_args(req));
-    ("git".to_string(), args)
-}
-
-/// The distro-side diff when `delta`'s absolute path is known (autodiscovered
-/// or a user override): a plain `sh` finds it without sourcing a login profile,
-/// so this avoids the per-open profile cost of the login fallback.
-///
-/// The `LESS=R` the diff pane puts in the child's environment stays on the
-/// Windows side of the wsl.exe boundary (only `WSLENV`-listed variables
-/// cross), so git in the distro would hand its pager `LESS=FRX` and `F`
-/// (quit-if-one-screen) would reap short diffs on open.  The script exports
-/// `LESS` itself where git runs.  Diff arguments travel as positional
-/// parameters, so no file name is shell-parsed.
-pub(super) fn build_wsl_diff_command_direct(
-    distro: &str,
-    workspace: &Path,
-    req: &DiffRequest,
-    delta: &str,
-) -> (String, Vec<String>) {
-    let script = format!(
-        r#"export LESS="${{LESS-R}}"; exec git -c "core.pager={delta} --paging=always" "$@""#
-    );
-    let mut args = vec![
-        "-d".to_string(),
-        distro.to_string(),
-        "--cd".to_string(),
-        workspace.to_string_lossy().into_owned(),
-        "--exec".to_string(),
-        "sh".to_string(),
-        "-c".to_string(),
-        script,
-        "sh".to_string(),
-    ];
-    args.extend(diff_args(req));
-    ("wsl.exe".to_string(), args)
-}
-
-/// The distro-side diff before `delta`'s path is known: resolve the user's
-/// login shell (`getent passwd`) and re-exec through it so `delta` resolves
-/// from their real PATH — `--exec sh` alone only sees the default system PATH,
-/// which omits per-user install dirs like `~/.cargo/bin`.  The `LESS` export
-/// happens inside the login shell's script, after the profile is sourced, so
-/// a profile-set `LESS` wins — mirroring the `[env]` precedence on the
-/// Windows side.  Diff arguments travel as positional parameters through both
-/// shells, so no file name is shell-parsed.
-pub(super) fn build_wsl_diff_command_login(
-    distro: &str,
-    workspace: &Path,
-    req: &DiffRequest,
-) -> (String, Vec<String>) {
-    let script = r#"s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); [ -x "$s" ] || s=${SHELL:-/bin/sh}; exec "$s" -lc 'export LESS="${LESS-R}"; exec git -c "core.pager=delta --paging=always" "$@"' "$s" "$@""#;
-    let mut args = vec![
-        "-d".to_string(),
-        distro.to_string(),
-        "--cd".to_string(),
-        workspace.to_string_lossy().into_owned(),
-        "--exec".to_string(),
-        "sh".to_string(),
-        "-c".to_string(),
-        script.to_string(),
-        "sh".to_string(),
-    ];
-    args.extend(diff_args(req));
-    ("wsl.exe".to_string(), args)
 }
 
 pub(super) fn wsl_shell(distro: &str, workdir: &Path) -> Shell {
@@ -964,16 +794,6 @@ impl PaletteColumns {
 
     pub(super) fn keys_x(&self, left: f32) -> f32 {
         self.action_x(left) + self.action + self.gap
-    }
-}
-
-/// Section header count: `visible of total` while a filter narrows the panel,
-/// the plain total otherwise.
-pub(super) fn section_count_label(count: &SectionCount, filtering: bool) -> String {
-    if filtering {
-        format!("{} of {}", count.visible, count.total)
-    } else {
-        format!("{}", count.total)
     }
 }
 
@@ -1951,37 +1771,6 @@ pub(super) fn row_project_root(
         .map(|p| p.root.clone())
 }
 
-/// The branch the git panel diffs against: the user's explicit override,
-/// else the open PR's base (what GitHub will review), else the project's
-/// detected default branch.
-pub(super) fn effective_base_branch(
-    override_branch: Option<&str>,
-    pr_base: Option<&str>,
-    project_default: Option<&str>,
-) -> Option<String> {
-    override_branch.or(pr_base).or(project_default).map(str::to_string)
-}
-
-/// The worktree a SetBaseBranch press targets: the sidebar cursor's worktree
-/// while the projects sidebar owns focus (a session row resolves to its
-/// workspace), otherwise the current workspace.  Home and project-header
-/// cursors, and the home workspace, have no base branch to override.
-pub(super) fn base_branch_target(
-    sidebar_focused: bool,
-    cursor: Option<&SidebarRow>,
-    session_workspace: impl Fn(SessionId) -> Option<WorkspaceKey>,
-    current: &WorkspaceKey,
-) -> Option<PathBuf> {
-    if sidebar_focused {
-        return match cursor {
-            Some(SidebarRow::Worktree(p)) => Some(p.clone()),
-            Some(SidebarRow::Session(id)) => session_workspace(*id).flatten(),
-            _ => None,
-        };
-    }
-    current.clone()
-}
-
 /// The session a SelectNextSession/SelectPreviousSession press lands on:
 /// one flat ring over every open session, workspaces in sidebar order and
 /// each workspace's sessions in the order its rows are drawn.  `None` means stay put — a
@@ -2660,15 +2449,6 @@ mod tests {
     fn profile_menu_label_numbers_from_one() {
         assert_eq!(profile_menu_label(1, "WSL"), "1. WSL");
         assert_eq!(profile_menu_label(2, "cmd"), "2. cmd");
-    }
-
-    #[test]
-    fn base_branch_precedence_is_override_then_pr_then_default() {
-        let f = effective_base_branch;
-        assert_eq!(f(Some("develop"), Some("main"), Some("master")), Some("develop".into()));
-        assert_eq!(f(None, Some("main"), Some("master")), Some("main".into()));
-        assert_eq!(f(None, None, Some("master")), Some("master".into()));
-        assert_eq!(f(None, None, None), None);
     }
 
     #[test]
@@ -3377,14 +3157,6 @@ mod tests {
     }
 
     #[test]
-    fn a_wide_search_stands_down_the_git_toggles() {
-        // Toggled on for "modified" only, an untracked row fails while the
-        // toggle applies and passes once a wide search stands it down.
-        assert!(!git_toggles_pass(true, false, false, ChangeKind::Untracked));
-        assert!(git_toggles_pass(false, false, false, ChangeKind::Untracked));
-    }
-
-    #[test]
     fn a_pr_toggle_alone_makes_any_toggle_active() {
         assert!(!any_project_toggle_active(false, false, false));
         assert!(any_project_toggle_active(false, false, true));
@@ -3413,104 +3185,6 @@ mod tests {
         let path = PathBuf::from("/worktree");
         let pr_matches: HashMap<PathBuf, bool> = HashMap::new();
         assert!(!worktree_pr_passes(true, &pr_matches, &path));
-    }
-
-    fn req(file: &str, source: DiffSource) -> DiffRequest {
-        DiffRequest { file: file.to_string(), source }
-    }
-
-    #[test]
-    fn diff_args_staged() {
-        let args = diff_args(&req("a.rs", DiffSource::Staged));
-        assert_eq!(args, vec!["diff", "--cached", "--", "a.rs"]);
-    }
-
-    #[test]
-    fn diff_args_worktree() {
-        let args = diff_args(&req("a.rs", DiffSource::Worktree));
-        assert_eq!(args, vec!["diff", "--", "a.rs"]);
-    }
-
-    #[test]
-    fn diff_args_untracked() {
-        let args = diff_args(&req("a.rs", DiffSource::Untracked));
-        assert_eq!(args, vec!["diff", "--no-index", "--", "/dev/null", "a.rs"]);
-    }
-
-    #[test]
-    fn diff_args_branch() {
-        let args = diff_args(&req("a.rs", DiffSource::Branch { base: "main".to_string() }));
-        assert_eq!(args, vec!["diff", "main...", "--", "a.rs"]);
-    }
-
-    #[test]
-    fn diff_command_uses_given_delta_program() {
-        let (program, args) = build_diff_command("delta", &req("a.rs", DiffSource::Staged));
-        assert_eq!(program, "git");
-        assert_eq!(args[0], "-c");
-        assert_eq!(args[1], "core.pager=delta --paging=always");
-        assert_eq!(&args[2..], diff_args(&req("a.rs", DiffSource::Staged)).as_slice());
-    }
-
-    #[test]
-    fn diff_command_honors_delta_override_path() {
-        let (_, args) =
-            build_diff_command(r"C:\tools\delta.exe", &req("a.rs", DiffSource::Worktree));
-        assert_eq!(args[1], r"core.pager=C:\tools\delta.exe --paging=always");
-    }
-
-    #[test]
-    fn wsl_diff_direct_uses_resolved_delta_and_keeps_pager_open() {
-        let (program, args) = build_wsl_diff_command_direct(
-            "kali-linux",
-            Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj"),
-            &req("a.rs", DiffSource::Staged),
-            "/home/lev/.cargo/bin/delta",
-        );
-        assert_eq!(program, "wsl.exe");
-        assert_eq!(args[..8], [
-            "-d",
-            "kali-linux",
-            "--cd",
-            r"\\wsl.localhost\kali-linux\home\lev\proj",
-            "--exec",
-            "sh",
-            "-c",
-            r#"export LESS="${LESS-R}"; exec git -c "core.pager=/home/lev/.cargo/bin/delta --paging=always" "$@""#,
-        ]);
-        assert_eq!(args[8], "sh");
-        assert_eq!(&args[9..], diff_args(&req("a.rs", DiffSource::Staged)).as_slice());
-    }
-
-    #[test]
-    fn wsl_diff_login_resolves_shell_and_keeps_pager_open() {
-        let (program, args) = build_wsl_diff_command_login(
-            "kali-linux",
-            Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj"),
-            &req("a.rs", DiffSource::Staged),
-        );
-        assert_eq!(program, "wsl.exe");
-        assert_eq!(args[..7], [
-            "-d",
-            "kali-linux",
-            "--cd",
-            r"\\wsl.localhost\kali-linux\home\lev\proj",
-            "--exec",
-            "sh",
-            "-c"
-        ]);
-        let script = &args[7];
-        assert!(script.contains("getent passwd"), "resolves login shell: {script}");
-        // The LESS export lives inside the login shell's script so a LESS
-        // sourced from the profile still wins.
-        assert!(
-            script.contains(
-                r#"-lc 'export LESS="${LESS-R}"; exec git -c "core.pager=delta --paging=always" "$@"'"#
-            ),
-            "keeps pager open after profile sourcing: {script}"
-        );
-        assert_eq!(args[8], "sh");
-        assert_eq!(&args[9..], diff_args(&req("a.rs", DiffSource::Staged)).as_slice());
     }
 
     #[test]
@@ -3593,35 +3267,6 @@ mod tests {
 
         let out = plan_move(true, false, None, false);
         assert!(matches!(out.source, SourceRepair::Remove), "no session left to promote");
-    }
-
-    #[test]
-    fn set_base_branch_targets_the_cursored_worktree_when_sidebar_focused() {
-        let wt = PathBuf::from("C:/repo/wt");
-        let none = |_id: SessionId| -> Option<WorkspaceKey> { None };
-        let cursor = SidebarRow::Worktree(wt.clone());
-        assert_eq!(
-            base_branch_target(true, Some(&cursor), none, &Some(PathBuf::from("C:/other"))),
-            Some(wt)
-        );
-    }
-
-    #[test]
-    fn set_base_branch_ignores_home_and_project_rows() {
-        let none = |_id: SessionId| -> Option<WorkspaceKey> { None };
-        assert_eq!(base_branch_target(true, Some(&SidebarRow::Home), none, &None), None);
-        let cursor = SidebarRow::Project(PathBuf::from("C:/repo"));
-        let none2 = |_id: SessionId| -> Option<WorkspaceKey> { None };
-        assert_eq!(base_branch_target(true, Some(&cursor), none2, &None), None);
-    }
-
-    #[test]
-    fn set_base_branch_falls_back_to_the_current_worktree() {
-        let wt = PathBuf::from("C:/repo/wt");
-        let none = |_id: SessionId| -> Option<WorkspaceKey> { None };
-        assert_eq!(base_branch_target(false, None, none, &Some(wt.clone())), Some(wt));
-        let none2 = |_id: SessionId| -> Option<WorkspaceKey> { None };
-        assert_eq!(base_branch_target(false, None, none2, &None), None, "home has no base branch");
     }
 
     /// The job's spans, as `path_label` itself builds them via `zed_spans`,
