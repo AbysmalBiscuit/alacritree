@@ -1,4 +1,6 @@
 use super::*;
+use crate::config::AttachMode;
+use crate::multiplexer::{CreatedPane, Launch};
 
 pub(super) struct HerdrGlue {
     /// Shared-view attaches whose herdr calls are running on the pool,
@@ -933,6 +935,271 @@ impl AlacritreeApp {
     }
 }
 
+/// Where the user lands when a herdr attach fails after switching them.  The
+/// job answers frames later, so a switch made in between is theirs and
+/// outranks the restore: `previous` is handed back only while `current` is
+/// still the workspace the attach moved them to.
+pub(super) fn workspace_after_failed_attach(
+    current: &WorkspaceKey,
+    switched_to: &WorkspaceKey,
+    previous: WorkspaceKey,
+) -> WorkspaceKey {
+    if current == switched_to { previous } else { current.clone() }
+}
+
+/// The external supervisor a pane belongs to.  Named rather than flagged
+/// because a second harness would otherwise add a parallel boolean to every
+/// row, and because what a row must say — whose mark to paint, how to get
+/// out, whether the attach is exclusive — varies by harness rather than by
+/// row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Managed {
+    /// What the tooltip calls it.
+    pub(super) harness: &'static str,
+    /// The harness's own detach chord, already rendered.  `None` when its
+    /// config could not be read or binds detach to nothing, both of which are
+    /// reasons to stay quiet rather than name a chord the user may not have.
+    pub(super) detach: Option<String>,
+    /// The attach shares the harness's whole view rather than one pane, so
+    /// the row says so before a resize reveals it.
+    pub(super) shared_view: bool,
+    /// The agent kind the harness detected, spelled the way it invokes it.
+    pub(super) kind: Option<String>,
+    /// The pane's own title, when it says something the kind does not.
+    pub(super) title: Option<String>,
+    /// How the harness draws the state it reports.  `None` when it is no
+    /// longer reporting one — a pane alacritree still holds open after its
+    /// harness stopped listing it.
+    pub(super) mark: Option<HarnessMark>,
+}
+
+impl Managed {
+    /// `agent` is herdr's current word on the pane, and `None` once it stops
+    /// reporting one — a pane alacritree still holds open after its harness
+    /// let go of it, which has a harness and a way out but no state or name.
+    pub(super) fn herdr(
+        side: &herdr::Side,
+        settings: &herdr::Settings,
+        attach: AttachMode,
+        agent: Option<&herdr::Agent>,
+    ) -> Self {
+        let kind = agent.and_then(|a| a.kind.clone());
+        let title =
+            agent.and_then(|a| a.title.clone()).filter(|t| Some(t.as_str()) != kind.as_deref());
+        Self {
+            harness: "herdr",
+            detach: settings.detach.clone(),
+            shared_view: !herdr::attaches_directly(
+                side,
+                attach,
+                agent.is_none_or(|a| a.status.is_some()),
+            ),
+            mark: agent
+                .and_then(|a| a.status)
+                .map(|status| herdr_mark(status, settings.indicators)),
+            kind,
+            title,
+        }
+    }
+
+    /// What the harness calls this pane: the agent kind backquoted as the
+    /// command it is, and the title quoted as the words it is.
+    pub(super) fn pane_name(&self) -> Option<String> {
+        match (&self.kind, &self.title) {
+            (Some(kind), Some(title)) => Some(format!("`{kind}` \"{title}\"")),
+            (Some(kind), None) => Some(format!("`{kind}`")),
+            (None, Some(title)) => Some(format!("\"{title}\"")),
+            (None, None) => None,
+        }
+    }
+}
+
+/// The mark a harness paints for the state it reports, in that harness's own
+/// vocabulary.  Resolved once per row, so a pane reads the same whether it is
+/// listed or attached — the two are drawn by different painters, and attaching
+/// must not repaint a pane in a language it does not speak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct HarnessMark {
+    pub(super) glyph: &'static str,
+    pub(super) tone: StateTone,
+    /// The harness's own word for this state, for the hover text.
+    pub(super) label: &'static str,
+}
+
+/// What a harness means by a state's color.  Named rather than carried as a
+/// `Color32` so the palette stays alacritree's and a row snapshot stays free
+/// of the theme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StateTone {
+    Blocked,
+    Working,
+    Done,
+    Idle,
+    /// The harness reported something alacritree does not recognise.
+    Unclear,
+}
+
+/// herdr's state vocabulary, taken from its own `state_icon_symbol` and
+/// `state_label_color`.  Which of the two sets applies is herdr's `[ui]
+/// status_indicators`, so a user who picked one in herdr gets it here too.
+///
+/// `done` is `idle` on herdr's internal axis and a status of its own over its
+/// API, which is the axis alacritree reads — so the two arrive already
+/// distinguished, without the "has a human looked at it yet" bit herdr tracks
+/// to tell them apart.
+pub(super) fn herdr_mark(status: herdr::Status, indicators: herdr::Indicators) -> HarnessMark {
+    use herdr::Indicators::{Dots, Symbols};
+    use herdr::Status::{Blocked, Done, Idle, Unknown, Working};
+    let (glyph, tone) = match (indicators, status) {
+        (_, Idle) => ("○", StateTone::Idle),
+        (_, Unknown) => ("·", StateTone::Unclear),
+        (Dots, Blocked) => ("●", StateTone::Blocked),
+        (Dots, Working) => ("●", StateTone::Working),
+        (Dots, Done) => ("●", StateTone::Done),
+        (Symbols, Blocked) => ("×", StateTone::Blocked),
+        (Symbols, Working) => ("◐", StateTone::Working),
+        (Symbols, Done) => ("✓", StateTone::Done),
+    };
+    HarnessMark { glyph, tone, label: status.label() }
+}
+
+/// The workspaces a herdr agent may be matched against.  A checkout that
+/// looks gone offers none, which is what makes an agent working there
+/// unmatched rather than parked under a row that can only refuse it.
+/// `missing` is the liveness cache's word for a path, `None` where it has
+/// none, so the row's grey and this list agree about the same directory.
+pub(super) fn herdr_workspaces(
+    projects: &[Project],
+    missing: impl Fn(&Path) -> Option<bool>,
+) -> Vec<PathBuf> {
+    projects
+        .iter()
+        .flat_map(|p| p.worktrees.iter())
+        .filter(|wt| !worktree_looks_gone(wt, missing(&wt.path)))
+        .map(|wt| wt.path.clone())
+        .collect()
+}
+
+/// What a harness-managed row explains on hover, one fact per comma: the
+/// state, since that is what changes; who reports it; whether the attach is
+/// the harness's whole view; and what the harness calls the pane.  The way
+/// out follows in parentheses, since it is an instruction rather than
+/// another fact about the pane.
+///
+/// The same sentence serves a listed agent and an attached one.  Attaching
+/// changes how alacritree draws a pane, not what there is to say about it,
+/// and the chord has no other surface in alacritree — it is the harness's
+/// key, not one of ours — so it has to reach the row the user is sitting in.
+pub(super) fn managed_tooltip(managed: &Managed) -> String {
+    let mut parts = Vec::new();
+    if let Some(mark) = managed.mark {
+        parts.push(mark.label.to_owned());
+    }
+    parts.push(managed.harness.to_owned());
+    if managed.shared_view {
+        parts.push("shared view".to_owned());
+    }
+    parts.extend(managed.pane_name());
+    let mut hint = parts.join(", ");
+    hint.push('.');
+    if let Some(chord) = &managed.detach {
+        // Backquoted because the chord is a sequence, not one combination:
+        // unquoted, "detach with Ctrl+B q" reads as a sentence whose last
+        // word happens to be `q`.
+        hint.push_str(&format!(" (detach with `{chord}`)"));
+    }
+    hint
+}
+
+/// A shared-view attach waiting on herdr.  The gesture answers with the argv
+/// its client runs, so everything the session needs is in hand by the time it
+/// opens.
+pub(super) struct PendingHerdrAttach {
+    pub(super) job: Option<jobs::Job<Result<Launch, String>>>,
+    /// The pane to focus once the gesture runs.  A pane the listing has since
+    /// dropped is focused as this said, since nothing newer says otherwise.
+    pub(super) target: PaneTarget,
+    pub(super) key: herdr::HerdrKey,
+    pub(super) workspace: WorkspaceKey,
+    /// Where to hand the user back when herdr refuses.  A shared-view
+    /// attach answers frames after the switch, so the caller cannot restore
+    /// the workspace itself the way a direct attach lets it.
+    pub(super) previous: WorkspaceKey,
+    /// Clients parked on this attach.  A shared-view attach opens its session
+    /// frames after the request that asked for it, so there is nothing to
+    /// answer with until `poll_herdr_attach` resolves.
+    pub(super) waiters: Vec<mpsc::Sender<ipc::IpcResult>>,
+}
+
+/// A pane being created.  The attach it turns into is the ordinary one, so
+/// this queue only carries the gesture: `poll_herdr_create` hands the pane it
+/// names to `attach_herdr_agent` and stops there.
+///
+/// One waiter, not a list: nothing merges two creates, since the pane they
+/// would be merged on has no identity until herdr answers.
+pub(super) struct PendingHerdrCreate {
+    pub(super) job: jobs::Job<Result<CreatedPane, String>>,
+    pub(super) side: herdr::Side,
+    pub(super) workspace: WorkspaceKey,
+    pub(super) waiter: Option<mpsc::Sender<ipc::IpcResult>>,
+}
+
+/// A pane the listing no longer carries.  Claiming an agent is in it keeps
+/// every caller on the path it took before the pane went, which is what
+/// `herdr_pane_has_agent` answers for the same reason.
+pub(super) fn unlisted_pane_target(key: &herdr::HerdrKey, pane_id: &str) -> PaneTarget {
+    PaneTarget {
+        side: key.side.clone(),
+        pane_id: pane_id.to_string(),
+        tab_id: None,
+        has_agent: true,
+    }
+}
+
+/// A name that reaches no server, as opposed to one whose server is down: a
+/// caller retrying this one is retrying a typo.
+pub(super) fn not_a_side(name: &str) -> String {
+    format!("`{name}` is not a side, expected `native` or `wsl:<distro>`")
+}
+
+/// The directory a new pane opens in, spelled where the multiplexer resolves
+/// it: the distro's own path on a WSL side, the Windows path on the native
+/// one.  `None` leaves the choice to the multiplexer.  A workspace with no
+/// spelling inside the distro is an `Err`, since a pane opened anywhere else
+/// would still have its session filed under that workspace.
+pub(super) fn multiplexer_cwd(
+    side: &herdr::Side,
+    workspace: Option<&Path>,
+) -> Result<Option<String>, String> {
+    let Some(path) = workspace else { return Ok(None) };
+    match side {
+        herdr::Side::Native => Ok(Some(path.display().to_string())),
+        herdr::Side::Wsl(distro) => wsl::windows_to_linux(path)
+            .map(Some)
+            .ok_or_else(|| format!("{} has no path inside the {distro} distro", path.display())),
+    }
+}
+
+/// Where a herdr pane lives, in the fields an attach takes back.  `pane_id`
+/// and `tab_id` are null when the listing does not carry the pane, which
+/// says the cache does not know right now rather than that the pane is
+/// gone.
+pub(super) fn multiplexer_json(
+    side: &herdr::Side,
+    terminal_id: &str,
+    session: Option<String>,
+    pane: Option<&herdr::Agent>,
+) -> Value {
+    json!({
+        "name": "herdr",
+        "side": side.name(),
+        "session": session,
+        "terminal_id": terminal_id,
+        "pane_id": pane.map(|pane| pane.pane_id.clone()),
+        "tab_id": pane.and_then(|pane| pane.tab_id.clone()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -979,5 +1246,153 @@ mod tests {
             Err("the session behind this pane was closed before the attach finished".to_string())
         );
         assert!(second_rx.try_recv().is_err());
+    }
+
+    /// The multiplexer resolves the directory where it runs, so a WSL side is
+    /// handed the distro's own spelling of the workspace and never the
+    /// Windows path the sidebar holds.
+    #[cfg(windows)]
+    #[test]
+    fn a_new_pane_opens_in_the_workspace_spelled_for_its_own_side() {
+        let workspace = PathBuf::from(r"\\wsl.localhost\ubuntu\home\dev\repo");
+        assert_eq!(
+            multiplexer_cwd(&herdr::Side::Wsl("ubuntu".into()), Some(&workspace)),
+            Ok(Some("/home/dev/repo".to_string()))
+        );
+        assert_eq!(
+            multiplexer_cwd(&herdr::Side::Native, Some(&workspace)),
+            Ok(Some(workspace.display().to_string()))
+        );
+    }
+
+    /// The home workspace names no directory, so herdr picks its own default
+    /// rather than being handed an empty path.
+    #[test]
+    fn a_new_pane_in_the_home_workspace_names_no_directory() {
+        assert_eq!(multiplexer_cwd(&herdr::Side::Native, None), Ok(None));
+        assert_eq!(multiplexer_cwd(&herdr::Side::Wsl("ubuntu".into()), None), Ok(None));
+    }
+
+    /// herdr distinguishes four live states and says so on its own panes.
+    /// Collapsing any pair onto one mark would make the sidebar say less
+    /// about a pane than the window it came from.
+    #[test]
+    fn herdr_marks_keep_its_four_states_apart() {
+        for set in [herdr::Indicators::Dots, herdr::Indicators::Symbols] {
+            let marks: Vec<HarnessMark> = [
+                herdr::Status::Blocked,
+                herdr::Status::Working,
+                herdr::Status::Done,
+                herdr::Status::Idle,
+            ]
+            .into_iter()
+            .map(|status| herdr_mark(status, set))
+            .collect();
+            for (i, a) in marks.iter().enumerate() {
+                for b in &marks[i + 1..] {
+                    assert_ne!(a, b, "{set:?} draws two states the same");
+                }
+            }
+        }
+    }
+
+    /// Taken from herdr's own `state_icon_symbol`, so a pane carries one mark
+    /// whether it is read in herdr or in the sidebar.
+    #[test]
+    fn herdr_marks_are_the_ones_herdr_paints() {
+        let dots = |status| herdr_mark(status, herdr::Indicators::Dots).glyph;
+        assert_eq!(dots(herdr::Status::Blocked), "●");
+        assert_eq!(dots(herdr::Status::Working), "●");
+        assert_eq!(dots(herdr::Status::Done), "●");
+        assert_eq!(dots(herdr::Status::Idle), "○");
+
+        let symbols = |status| herdr_mark(status, herdr::Indicators::Symbols).glyph;
+        assert_eq!(symbols(herdr::Status::Blocked), "×");
+        assert_eq!(symbols(herdr::Status::Working), "◐");
+        assert_eq!(symbols(herdr::Status::Done), "✓");
+        assert_eq!(symbols(herdr::Status::Idle), "○");
+    }
+
+    /// A status alacritree does not recognise is herdr declining to say, and
+    /// the row says that rather than claiming the agent is idle.
+    #[test]
+    fn an_unknown_herdr_status_is_drawn_as_no_reading() {
+        for set in [herdr::Indicators::Dots, herdr::Indicators::Symbols] {
+            let mark = herdr_mark(herdr::Status::Unknown, set);
+            assert_eq!(mark.glyph, "·");
+            assert_eq!(mark.tone, StateTone::Unclear);
+        }
+    }
+
+    /// The click switched workspace before handing the gesture over, so a
+    /// failure puts the user back where the click found them.
+    #[test]
+    fn a_failed_attach_hands_back_the_workspace_it_switched_from() {
+        let switched_to = Some(PathBuf::from("/code/wt"));
+        let previous = Some(PathBuf::from("/code/other"));
+        assert_eq!(
+            workspace_after_failed_attach(&switched_to, &switched_to, previous.clone()),
+            previous
+        );
+    }
+
+    /// The home tab is a workspace like any other, so an attach launched from
+    /// it is restored to it rather than read as nothing to go back to.
+    #[test]
+    fn a_failed_attach_restores_the_home_tab() {
+        let switched_to = Some(PathBuf::from("/code/wt"));
+        assert_eq!(workspace_after_failed_attach(&switched_to, &switched_to, None), None);
+    }
+
+    /// herdr answers frames after the click, and a switch made in between is
+    /// the user's own: restoring over it would pull them out of a workspace
+    /// they chose.
+    #[test]
+    fn a_failed_attach_leaves_a_workspace_the_user_moved_to_alone() {
+        let current = Some(PathBuf::from("/code/elsewhere"));
+        let switched_to = Some(PathBuf::from("/code/wt"));
+        assert_eq!(workspace_after_failed_attach(&current, &switched_to, None), current);
+    }
+
+    /// A session alacritree still holds open after herdr stopped listing its
+    /// pane has no state and no name left to report, but it is still herdr's
+    /// and the user still has to know how to leave it.
+    #[test]
+    fn an_unlisted_pane_still_says_how_to_leave() {
+        let settings =
+            herdr::Settings { detach: Some("Ctrl+B q".into()), ..herdr::Settings::default() };
+        let managed =
+            Managed::herdr(&herdr::Side::Wsl("d".into()), &settings, AttachMode::Agent, None);
+        assert_eq!(managed_tooltip(&managed), "herdr. (detach with `Ctrl+B q`)");
+    }
+
+    /// A checkout the liveness cache calls gone offers no workspace, so the
+    /// agent working in it matches nothing and lists under Home.  Matched to
+    /// the removed worktree instead, its row's Enter could only refuse.
+    #[test]
+    fn a_gone_worktree_offers_no_workspace_to_an_agent() {
+        use crate::sidebar_nav;
+
+        let projects = vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2"])];
+        let gone = PathBuf::from("/a/wt2");
+        let workspaces = herdr_workspaces(&projects, |path| Some(path == gone));
+        assert_eq!(workspaces, vec![PathBuf::from("/a/wt1")]);
+
+        let agent = herdr::Agent {
+            terminal_id: "t1".into(),
+            pane_id: "w1:p1".into(),
+            tab_id: Some("w1:t1".into()),
+            kind: None,
+            title: None,
+            status: Some(herdr::Status::Idle),
+            focused: false,
+            cwd: Some(gone.to_string_lossy().into_owned()),
+            foreground_cwd: None,
+        };
+        assert_eq!(
+            herdr::match_workspace(&agent, &herdr::Side::Native, &workspaces),
+            None,
+            "an agent under a removed checkout falls back to Home"
+        );
     }
 }

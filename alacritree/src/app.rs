@@ -60,6 +60,9 @@ mod model;
 mod sidebar;
 
 use focus::DeferredClose;
+use herdr_glue::{
+    HarnessMark, Managed, StateTone, herdr_mark, managed_tooltip, unlisted_pane_target,
+};
 use modals::{BaseBranchPicker, CreateState, DeleteRequest, ProjectRemoveState, RenameState};
 use model::*;
 
@@ -4773,6 +4776,7 @@ mod tests {
         GIT_FILTER_TOGGLES, base_branch_target, branch_diff_row, file_row, git_filter_identity,
         git_path_label, path_header_label,
     };
+    use super::herdr_glue::{PendingHerdrAttach, PendingHerdrCreate};
     use super::modals::dirty_warning;
     use super::sidebar::{home_row, session_row, upstream_badge, worktree_row};
 
