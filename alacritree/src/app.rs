@@ -4767,7 +4767,8 @@ mod tests {
     use crate::multiplexer::{CreatedPane, Launch};
 
     use super::git_panel::{
-        GIT_FILTER_TOGGLES, branch_diff_row, file_row, git_path_label, path_header_label,
+        GIT_FILTER_TOGGLES, base_branch_target, branch_diff_row, file_row, git_filter_identity,
+        git_path_label, path_header_label,
     };
     use super::sidebar::{home_row, session_row, upstream_badge, worktree_row};
 
