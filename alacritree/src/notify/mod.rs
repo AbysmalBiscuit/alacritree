@@ -53,7 +53,7 @@ pub fn latest_click(rx: &Receiver<SessionId>) -> Option<SessionId> {
 /// Spawn a throwaway thread so the platform notifier's synchronous calls
 /// don't stall the paint loop.  The thread posts the session's id back
 /// through `NOTIFY_TX` when the user clicks the notification.
-pub fn attention(session: &Session, repaint: &impl Repaint) {
+pub fn attention(session: &Session<impl Repaint>, repaint: &impl Repaint) {
     let where_label = session
         .working_directory
         .as_ref()
