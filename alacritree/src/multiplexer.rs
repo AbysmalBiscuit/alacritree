@@ -1,12 +1,13 @@
 //! Which terminal multiplexer owns a pane, and what alacritree asks it in
 //! order to host one.
 //!
-//! Every question the app asks about a pane goes behind
-//! [`MultiplexerSession`], so a second multiplexer is a new [`Multiplexer`]
-//! variant rather than a new branch at every call site.
-//! The trait still speaks herdr's agent and key types, and the polling caches
-//! stay in herdr's own module, where their shape is honest about having
-//! exactly one example.
+//! Attaching, focusing, creating panes and matching agents to workspaces go
+//! behind [`MultiplexerSession`], so a second multiplexer is a new
+//! [`Multiplexer`] variant rather than a new branch at every call site.
+//! Following a pane into a shared view still spells herdr's own `session
+//! attach` in the app. The trait still speaks herdr's agent and key types,
+//! and the polling caches stay in herdr's own module, where their shape is
+//! honest about having exactly one example.
 
 use std::path::PathBuf;
 
