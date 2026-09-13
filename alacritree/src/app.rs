@@ -1549,7 +1549,7 @@ impl AlacritreeApp {
         &mut self,
         ctx: &Context,
         workspace: WorkspaceKey,
-        directory: WorkspaceKey,
+        directory: Option<PathBuf>,
         shell: Option<Shell>,
         wsl_probe: Option<WslProbe>,
         wsl_distro: Option<String>,
@@ -9924,6 +9924,8 @@ impl AlacritreeApp {
                 AttentionVerdict::Wait(remaining) => ctx.request_repaint_after(remaining),
                 AttentionVerdict::Fire => {
                     self.sessions[idx].pending_attention = None;
+                    // Only toast on the transition into needs_attention unless
+                    // an explicit notification supplies a body.
                     let was_attending = self.sessions[idx].needs_attention;
                     self.sessions[idx].needs_attention = true;
                     let notification = self.pending_notifications.remove(&self.sessions[idx].id);
@@ -12915,10 +12917,9 @@ mod tests {
 
         #[test]
         fn osc52_reads_are_refused_when_the_session_is_unfocused_or_hidden() {
-            for (visibility, label) in [
-                (Visibility::VisibleAndUnfocused, "unfocused"),
-                (Visibility::Hidden, "hidden"),
-            ] {
+            for (visibility, label) in
+                [(Visibility::VisibleAndUnfocused, "unfocused"), (Visibility::Hidden, "hidden")]
+            {
                 let mut app = notification_app();
                 let answered = Arc::new(Mutex::new(false));
                 let answered_by_formatter = Arc::clone(&answered);
@@ -12932,10 +12933,7 @@ mod tests {
 
                 app.drain(visibility);
 
-                assert!(
-                    !*answered.lock().expect("formatter marker"),
-                    "a {label} session answered"
-                );
+                assert!(!*answered.lock().expect("formatter marker"), "a {label} session answered");
             }
         }
 
@@ -12950,7 +12948,7 @@ mod tests {
         }
 
         #[test]
-    fn notifications_to_a_latched_session_each_toast_after_debounce() {
+        fn notifications_to_a_latched_session_each_toast_after_debounce() {
             let mut app = notification_app();
             app.app.config.ui.attention_grace = Duration::from_secs(60);
             app.deliver_notification("build started", Visibility::Hidden);

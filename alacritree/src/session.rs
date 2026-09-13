@@ -321,11 +321,11 @@ pub struct Session {
 /// A WSL session's payload is a Linux path. The distro comes from the
 /// session rather than the sequence, which is why the resulting UNC path is
 /// trustworthy where one built from the payload would not be.
-fn resolve_reported_cwd(path: &str, distro: Option<&str>) -> Option<PathBuf> {
-    Some(match distro {
+fn resolve_reported_cwd(path: &str, distro: Option<&str>) -> PathBuf {
+    match distro {
         Some(distro) => crate::wsl::linux_to_windows(path, distro),
         None => PathBuf::from(path),
-    })
+    }
 }
 
 /// The reported directory when it exists here, the workspace otherwise. One
@@ -1715,7 +1715,7 @@ impl Session {
                     osc_tap::OscEvent::Cwd(path) => {
                         let distro = self.reported_cwd_distro().map(str::to_string);
                         self.reported_cwd =
-                            path.and_then(|path| resolve_reported_cwd(&path, distro.as_deref()));
+                            path.map(|path| resolve_reported_cwd(&path, distro.as_deref()));
                     },
                     osc_tap::OscEvent::Notify(body) => {
                         let body = truncate_notification(body);
@@ -2405,26 +2405,21 @@ pub(crate) mod tests {
 
         let expected = std::env::temp_dir().join(format!("alacritree-osc7-{}", std::process::id()));
         #[cfg(unix)]
-        let (program, args) = (
-            "/bin/sh".to_string(),
-            vec![
-                "-c".to_string(),
-                format!("printf '\\033]7;file://localhost{}\\007'; sleep 30", expected.display()),
-            ],
-        );
+        let (program, args) = ("/bin/sh".to_string(), vec![
+            "-c".to_string(),
+            format!("printf '\\033]7;file://localhost{}\\007'; sleep 30", expected.display()),
+        ]);
         #[cfg(windows)]
         let (program, args) = {
             let url_path = expected.to_string_lossy().replace('\\', "/");
-            (
-                "powershell".to_string(),
-                vec![
-                    "-NoProfile".to_string(),
-                    "-Command".to_string(),
-                    format!(
-                        "[Console]::Out.Write([char]27 + ']7;file://localhost/{url_path}' + [char]7); Start-Sleep -Seconds 30"
-                    ),
-                ],
-            )
+            ("powershell".to_string(), vec![
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                format!(
+                    "[Console]::Out.Write([char]27 + ']7;file://localhost/{url_path}' + [char]7); \
+                     Start-Sleep -Seconds 30"
+                ),
+            ])
         };
 
         let mut session = Session::spawn_command(
@@ -2518,16 +2513,13 @@ pub(crate) mod tests {
     fn a_reported_cwd_is_translated_for_a_wsl_session() {
         assert_eq!(
             resolve_reported_cwd("/home/dev/src", Some("Ubuntu")),
-            Some(crate::wsl::linux_to_windows("/home/dev/src", "Ubuntu")),
+            crate::wsl::linux_to_windows("/home/dev/src", "Ubuntu"),
         );
     }
 
     #[test]
     fn a_reported_cwd_is_taken_as_given_without_a_distro() {
-        assert_eq!(
-            resolve_reported_cwd("/home/dev/src", None),
-            Some(PathBuf::from("/home/dev/src")),
-        );
+        assert_eq!(resolve_reported_cwd("/home/dev/src", None), PathBuf::from("/home/dev/src"),);
     }
 
     #[test]
@@ -2636,7 +2628,7 @@ pub(crate) mod tests {
             let deadline = Instant::now() + Duration::from_secs(2);
             loop {
                 let outcome = session.drain_events(&config.palette);
-                assert!(outcome.notifications.is_empty());
+                assert!(outcome.notifications.is_none());
                 if session.pointer_shape == Some(expected) {
                     break;
                 }

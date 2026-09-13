@@ -164,6 +164,18 @@ pub struct DebugConfig {
     pub log_dir: Option<PathBuf>,
 }
 
+impl Default for DebugConfig {
+    fn default() -> Self {
+        Self {
+            crash_log: true,
+            persistent_logging: false,
+            gpu_timing: false,
+            frame_log: false,
+            log_dir: None,
+        }
+    }
+}
+
 /// Sequences alacritree reads off the PTY byte stream rather than through
 /// `Term`.  Each is off by default: turning one on starts a parser thread
 /// per session and changes what the UI shows.
@@ -180,18 +192,6 @@ impl VtConfig {
     /// thread entirely.
     pub fn any_enabled(&self) -> bool {
         self.report_cwd || self.notify || self.progress || self.pointer_shape
-    }
-}
-
-impl Default for DebugConfig {
-    fn default() -> Self {
-        Self {
-            crash_log: true,
-            persistent_logging: false,
-            gpu_timing: false,
-            frame_log: false,
-            log_dir: None,
-        }
     }
 }
 
@@ -2021,6 +2021,18 @@ struct RawDebug {
     log_dir: Option<String>,
 }
 
+impl Default for RawDebug {
+    fn default() -> Self {
+        Self {
+            crash_log: true,
+            persistent_logging: false,
+            gpu_timing: false,
+            frame_log: false,
+            log_dir: None,
+        }
+    }
+}
+
 /// alacritree-only, so it belongs in `alacritree.toml`.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
@@ -2038,18 +2050,6 @@ struct RawVt {
     progress: bool,
     /// Let an application choose the mouse cursor over the grid with OSC 22.
     pointer_shape: bool,
-}
-
-impl Default for RawDebug {
-    fn default() -> Self {
-        Self {
-            crash_log: true,
-            persistent_logging: false,
-            gpu_timing: false,
-            frame_log: false,
-            log_dir: None,
-        }
-    }
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]

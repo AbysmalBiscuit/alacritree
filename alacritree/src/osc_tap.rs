@@ -1,9 +1,8 @@
 //! The OSC sequences `vte`'s `ansi` layer recognises and drops, read off a
 //! copy of the PTY byte stream.
 //!
-//! Everything here is a pure decision about bytes.  The thread that feeds it
-//! and the session that consumes its output live elsewhere, so every rule
-//! below is testable without a PTY.
+//! The tap thread feeds the pure decisions below, while the session that
+//! consumes its output lives elsewhere. Every rule is testable without a PTY.
 
 use std::sync::OnceLock;
 
