@@ -195,6 +195,11 @@ Features I plan to work are tracked via GitHub issues on my fork: `https://githu
 
 Never propose to upstream features for vendored crates. This is an AI/vibe coded project, so nothing will be upstreamed to vendored crates. The only upstreaming PRs that we will do are to Arnaud's fork (`alacritree`).
 
+
+## Alacritree config
+
+When adding new entries to the config, always add default values so they are included in the generated spec.
+
 ## Agent skills
 
 ### Repository skills
