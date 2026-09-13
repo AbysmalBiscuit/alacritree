@@ -59,6 +59,7 @@ mod modals;
 mod model;
 mod sidebar;
 
+use focus::DeferredClose;
 use modals::{BaseBranchPicker, CreateState, DeleteRequest, ProjectRemoveState, RenameState};
 use model::*;
 
@@ -4767,6 +4768,7 @@ mod tests {
     use crate::config::{AttachMode, SidebarFocus, UiTheme};
     use crate::multiplexer::{CreatedPane, Launch};
 
+    use super::focus::{build_sidebar_snapshot, search_reveal_root};
     use super::git_panel::{
         GIT_FILTER_TOGGLES, base_branch_target, branch_diff_row, file_row, git_filter_identity,
         git_path_label, path_header_label,

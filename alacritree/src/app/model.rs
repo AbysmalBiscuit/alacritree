@@ -24,7 +24,7 @@ use crate::sidebar_nav::{self, SidebarRow};
 use crate::workspace::WorkspaceKey;
 use crate::wsl::{self};
 use crate::wsl_helper::{self, WslProbe};
-use crate::{herdr, ipc, jobs, path_style, sidebar_focus};
+use crate::{herdr, ipc, jobs, path_style};
 
 /// Logical-pixel (normal, heading) sizes for UI text.  `[ui.font] size`
 /// overrides the normal size directly (same pt→px conversion as
@@ -290,13 +290,6 @@ pub(super) fn search_reaches_children(depth: SearchDepth, query_is_empty: bool) 
 pub(super) fn any_pr_toggle_active(filter: &PanelFilter, scope: SearchScope) -> bool {
     filter.toggles_apply(scope)
         && ['o', 'd', 'm', 'c'].into_iter().any(|key| filter.is_toggled(key))
-}
-
-/// The cache generation the reconciler observes.  Held at `0` unless a PR
-/// filter is active, so a banked result only invalidates a row set that
-/// actually depends on PR state.
-pub(super) fn pr_generation_for(generation: u64, any_pr_toggle_active: bool) -> u64 {
-    if any_pr_toggle_active { generation } else { 0 }
 }
 
 /// Whether this worktree's PR state is polled this frame.  Collapsed projects
@@ -1193,162 +1186,6 @@ pub(super) fn workspace_entries(
     entries
 }
 
-/// Step the lockstep index over the rows a skipped worktree owns.
-///
-/// The projection is built before the deletion is known, so it still lists
-/// the worktree with everything under it.  Leaving the index parked on a row
-/// no node will match again would mark every later node unprojected, and the
-/// cursor repair reads an unprojected row as one that has gone away.
-pub(super) fn skip_projected_rows(
-    rows: &[SidebarRow],
-    next_row: &mut usize,
-    listed: &sidebar_nav::ListedRows,
-    path: &Path,
-) {
-    if rows.get(*next_row) != Some(&SidebarRow::Worktree(path.to_path_buf())) {
-        return;
-    }
-    *next_row += 1;
-    for entry in listed.get(&Some(path.to_path_buf())).map_or(&[][..], Vec::as_slice) {
-        if rows.get(*next_row) != Some(&entry.row()) {
-            break;
-        }
-        *next_row += 1;
-    }
-}
-
-/// Assemble the model arena and the projection.  `rows` is the projection —
-/// exactly what the cursor steps over — and `live` is the model: every running
-/// session, whatever the listing threshold or the filter says.  Building
-/// membership from `listed` instead would make the last session in a workspace
-/// read as deleted the moment its sibling closed.
-///
-/// `listed` is the listing the projection was built from.  A herdr row exists
-/// only while its agent is listed, so there is no wider model to take it from,
-/// and reading a second listing here could disagree with `rows`.
-///
-/// `skip_worktree` drops a worktree whose deletion is already committed but
-/// whose git operation has not finished, so nothing lands the cursor — or a
-/// new shell — inside a directory on its way out.
-///
-/// Nodes are pushed in exactly the order `sidebar_nav::visible_rows` emits,
-/// with unprojected nodes interleaved, so one forward index into `rows`
-/// classifies every node.  Asking `rows.contains` per node instead would be
-/// quadratic in path comparisons on a path that runs whenever the user types.
-pub(super) fn build_sidebar_snapshot(
-    projects: &[Project],
-    live: &[(WorkspaceKey, SessionId)],
-    listed: &sidebar_nav::ListedRows,
-    rows: &[SidebarRow],
-    skip_worktree: Option<&Path>,
-    inputs: sidebar_focus::ObservedInputs,
-) -> sidebar_focus::TreeSnapshot {
-    use sidebar_focus::Parent;
-    use sidebar_nav::WorkspaceEntry;
-
-    let mut b = sidebar_focus::SnapshotBuilder::default();
-    let mut next_row = 0usize;
-    let mut placed = vec![false; live.len()];
-
-    // Consume `rows` in lockstep: a node is projected exactly when it is the
-    // row the projection expects next.
-    let push = |b: &mut sidebar_focus::SnapshotBuilder,
-                next_row: &mut usize,
-                row: SidebarRow,
-                parent: Parent| {
-        let projected = rows.get(*next_row) == Some(&row);
-        if projected {
-            *next_row += 1;
-        }
-        b.push(row, parent, projected)
-    };
-    let push_workspace = |b: &mut sidebar_focus::SnapshotBuilder,
-                          next_row: &mut usize,
-                          placed: &mut [bool],
-                          ws: &WorkspaceKey,
-                          parent: Parent| {
-        let entries = listed.get(ws).map_or(&[][..], Vec::as_slice);
-        for entry in entries {
-            push(b, next_row, entry.row(), parent);
-        }
-        // A workspace lists every shell session it has or none of them, and a
-        // session attached to a herdr pane is always listed, so a session
-        // reaching the second arm here belongs to a workspace that listed
-        // nothing at all.  It is running, so the model keeps it; it is drawn
-        // nowhere, so the projection does not.
-        for (i, (w, id)) in live.iter().enumerate() {
-            if w != ws {
-                continue;
-            }
-            placed[i] = true;
-            if !entries.contains(&WorkspaceEntry::Session(*id)) {
-                b.push(SidebarRow::Session(*id), parent, false);
-            }
-        }
-    };
-
-    let home_id = push(&mut b, &mut next_row, SidebarRow::Home, Parent::Root);
-    push_workspace(&mut b, &mut next_row, &mut placed, &None, Parent::Node(home_id));
-
-    for p in projects {
-        let project_id =
-            push(&mut b, &mut next_row, SidebarRow::Project(p.root.clone()), Parent::Root);
-        for wt in &p.worktrees {
-            if skip_worktree == Some(wt.path.as_path()) {
-                skip_projected_rows(rows, &mut next_row, listed, &wt.path);
-                continue;
-            }
-            let wt_id = push(
-                &mut b,
-                &mut next_row,
-                SidebarRow::Worktree(wt.path.clone()),
-                Parent::Node(project_id),
-            );
-            let ws = Some(wt.path.clone());
-            push_workspace(&mut b, &mut next_row, &mut placed, &ws, Parent::Node(wt_id));
-        }
-    }
-
-    // Sessions whose workspace has no row left — a removed project, or a
-    // worktree already treated as gone.  They are running, so they belong in
-    // the model; they have no place in the tree, so they are nobody's sibling.
-    for (i, (_, id)) in live.iter().enumerate() {
-        if !placed[i] {
-            b.push(SidebarRow::Session(*id), Parent::Detached, false);
-        }
-    }
-
-    debug_assert_eq!(next_row, rows.len(), "every projected row must be in the arena");
-    b.finish(inputs)
-}
-
-/// The cursor, workspace, and active session the reconciler last wrote.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SidebarFocusWrite {
-    pub(super) cursor: Option<SidebarRow>,
-    pub(super) workspace: WorkspaceKey,
-    pub(super) active: Option<SessionId>,
-}
-
-/// Whether focus moved behind the reconciler's back.  The active session is
-/// part of the comparison because the tab and session cycling actions can
-/// switch sessions without leaving the workspace, changing nothing else.
-/// Comparing the resulting state rather than matching on action names covers
-/// every route to them — rebound keys, the command palette, MCP — at the price
-/// of `ensure_active_session` and `adopt_active_session` marking their own
-/// writes so their self-healing does not read as navigation.
-pub(super) fn sidebar_focus_overtaken(
-    written: &Option<SidebarFocusWrite>,
-    cursor: Option<&SidebarRow>,
-    workspace: &WorkspaceKey,
-    active: Option<SessionId>,
-) -> bool {
-    match written {
-        None => false,
-        Some(w) => w.cursor.as_ref() != cursor || w.workspace != *workspace || w.active != active,
-    }
-}
-
 /// Where the view goes after a session's removal.
 #[derive(Debug, PartialEq)]
 pub(super) enum CloseFallback {
@@ -1490,20 +1327,6 @@ pub(super) fn ring_landing(
     prefer.and_then(|root| search(Some(root))).or_else(|| search(None))
 }
 
-/// A close-fallback verdict the reconciler owes the terminal, and the worktree
-/// whose rows must already read as gone.  The verdict is carried rather than
-/// recomputed because only `close_fallback` knows the difference between
-/// staying put, hopping to the project's main checkout, and going home.
-#[derive(Debug)]
-pub(super) struct DeferredClose {
-    pub(super) verdict: CloseFallback,
-    /// Set when an asynchronous worktree deletion is in flight: `projects`
-    /// still lists it, so without this the reconciler would see an intact row
-    /// and could spawn a shell inside the directory being removed.  It pairs
-    /// with any verdict, including a ring landing in another project.
-    pub(super) removed_worktree: Option<PathBuf>,
-}
-
 /// Whether the reconciler owns post-removal navigation.  Under `"follow"` the
 /// landing row decides where the terminal goes, so acting here first would
 /// show one workspace for a frame and another the next.
@@ -1552,22 +1375,6 @@ pub(super) fn project_main_for(projects: &[Project], ws: &Path) -> Option<PathBu
     let project = projects.iter().find(|p| p.root == root)?;
     let main = project.worktrees.iter().find(|w| w.is_main)?;
     if main.path == ws { None } else { Some(main.path.clone()) }
-}
-
-/// The project to expand so `row` still renders once search exits, if any.
-/// Only child rows qualify: search lists matched worktrees and sessions whatever
-/// their project's `expanded` flag says, so they vanish when the query clears.
-/// A header is already its own row, and expanding it would turn selecting a
-/// project into a toggle.
-pub(super) fn search_reveal_root(
-    projects: &[Project],
-    session_workspace: impl Fn(SessionId) -> Option<WorkspaceKey>,
-    row: &SidebarRow,
-) -> Option<PathBuf> {
-    if !matches!(row, SidebarRow::Worktree(_) | SidebarRow::Session(_)) {
-        return None;
-    }
-    row_project_root(projects, session_workspace, row)
 }
 
 /// The root of the project owning `row`: a worktree resolves by its path, a
@@ -1879,6 +1686,7 @@ pub(super) fn activity_json(activity: SessionActivity) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use super::super::focus::DeferredClose;
     use super::*;
     use crate::command_palette::PaletteItem;
     use crate::test_util::titled_herdr_agent as titled;
@@ -2064,38 +1872,6 @@ mod tests {
             v.swap(a, b);
         }
         v
-    }
-
-    #[test]
-    fn the_sentinel_sees_a_same_workspace_session_switch() {
-        let written =
-            SidebarFocusWrite { cursor: Some(SidebarRow::Home), workspace: None, active: Some(1) };
-        let written = Some(written);
-
-        // The reconciler's own values still stand.
-        assert!(!sidebar_focus_overtaken(&written, Some(&SidebarRow::Home), &None, Some(1)));
-
-        // Any action that switches sessions without leaving the workspace —
-        // SelectNextTab, SelectNextSession, SelectTab(n) — changes neither the
-        // cursor nor the workspace, only the active session.
-        assert!(sidebar_focus_overtaken(&written, Some(&SidebarRow::Home), &None, Some(2)));
-
-        // A different workspace, and a different cursor, each count too.
-        assert!(sidebar_focus_overtaken(
-            &written,
-            Some(&SidebarRow::Home),
-            &Some(PathBuf::from("/a/wt1")),
-            Some(1),
-        ));
-        assert!(sidebar_focus_overtaken(
-            &written,
-            Some(&SidebarRow::Project(PathBuf::from("/a"))),
-            &None,
-            Some(1),
-        ));
-
-        // Nothing written yet cannot have been overtaken.
-        assert!(!sidebar_focus_overtaken(&None, Some(&SidebarRow::Home), &None, Some(1)));
     }
 
     #[test]
@@ -3020,155 +2796,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn snapshot_parents_agree_with_the_row_model() {
-        use crate::sidebar_focus::Parent;
-        use crate::sidebar_nav::{self, SidebarRow};
-
-        // Two projects, one collapsed, with sessions under the expanded one.
-        let projects = vec![
-            sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2"]),
-            sidebar_nav::tests::project("/b", false, &["/b/wt1"]),
-        ];
-        let live =
-            vec![(None, 1), (Some(PathBuf::from("/a/wt1")), 2), (Some(PathBuf::from("/a/wt1")), 3)];
-        let listed = sidebar_nav::tests::sessions_only(HashMap::from([
-            (None, vec![1]),
-            (Some(PathBuf::from("/a/wt1")), vec![2, 3]),
-        ]));
-        let rows = sidebar_nav::visible_rows(&projects, &listed);
-        let snapshot =
-            build_sidebar_snapshot(&projects, &live, &listed, &rows, None, Default::default());
-
-        for row in &rows {
-            let id = snapshot.find(row).expect("every projected row is in the model");
-            let arena_parent = match snapshot.parent(id) {
-                Parent::Root => None,
-                Parent::Node(p) => Some(snapshot.row(p).clone()),
-                Parent::Detached => panic!("a projected row is never detached: {row:?}"),
-            };
-            assert_eq!(
-                arena_parent,
-                sidebar_nav::left_target(&rows, row),
-                "arena parent must agree with the row model for {row:?}"
-            );
-        }
-
-        // The collapsed project's worktree is in the model but not projected.
-        let hidden = snapshot
-            .find(&SidebarRow::Worktree(PathBuf::from("/b/wt1")))
-            .expect("collapsed worktrees stay in the model");
-        assert!(!snapshot.is_projected(hidden));
-    }
-
-    #[test]
-    fn a_session_below_the_listing_threshold_is_still_in_the_model() {
-        use crate::sidebar_nav::{self, SidebarRow};
-
-        let projects = vec![sidebar_nav::tests::project("/a", true, &["/a/wt1"])];
-        // One live session in the worktree.  The real rule needs two before it
-        // lists any, so this one is live but unprojected.
-        let live = vec![(Some(PathBuf::from("/a/wt1")), 7)];
-        let listed = {
-            let mut l = sidebar_nav::ListedRows::new();
-            let entries = workspace_entries(&[7], Vec::new(), false);
-            assert!(entries.is_empty(), "the threshold rule must actually drop this session");
-            if !entries.is_empty() {
-                l.insert(Some(PathBuf::from("/a/wt1")), entries);
-            }
-            l
-        };
-        let rows = sidebar_nav::visible_rows(&projects, &listed);
-        let snapshot =
-            build_sidebar_snapshot(&projects, &live, &listed, &rows, None, Default::default());
-
-        let id = snapshot
-            .find(&SidebarRow::Session(7))
-            .expect("a live session is in the model whatever the listing threshold says");
-        assert!(!snapshot.is_projected(id), "but it is not a navigable row");
-    }
-
-    #[test]
-    fn a_session_whose_project_is_gone_is_detached_not_deleted() {
-        use crate::sidebar_focus::Parent;
-        use crate::sidebar_nav::{self, SidebarRow};
-
-        // `remove_project` drops the project but keeps its sessions running.
-        let projects: Vec<crate::projects::Project> = vec![];
-        let live = vec![(Some(PathBuf::from("/orphan/wt1")), 5)];
-        let listed = sidebar_nav::ListedRows::new();
-        let rows = sidebar_nav::visible_rows(&projects, &listed);
-        let snapshot =
-            build_sidebar_snapshot(&projects, &live, &listed, &rows, None, Default::default());
-
-        let id = snapshot.find(&SidebarRow::Session(5)).expect("the session is still running");
-        assert_eq!(
-            snapshot.parent(id),
-            Parent::Detached,
-            "an orphan must not become a sibling of Home"
-        );
-    }
-
-    #[test]
-    fn a_worktree_being_deleted_reads_as_gone_immediately() {
-        use crate::sidebar_nav::{self, SidebarRow};
-
-        let projects = vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2"])];
-        let listed = sidebar_nav::ListedRows::new();
-        let rows = sidebar_nav::visible_rows(&projects, &listed);
-        let doomed = PathBuf::from("/a/wt2");
-        let snapshot = build_sidebar_snapshot(
-            &projects,
-            &[],
-            &listed,
-            &rows,
-            Some(doomed.as_path()),
-            Default::default(),
-        );
-
-        assert_eq!(
-            snapshot.find(&SidebarRow::Worktree(doomed)),
-            None,
-            "the async git delete has not finished, but the row must not read as present"
-        );
-        assert!(snapshot.find(&SidebarRow::Worktree(PathBuf::from("/a/wt1"))).is_some());
-    }
-
-    /// The rows below a worktree being deleted must stay navigable.
-    ///
-    /// The projection is built before the deletion is known, so it still
-    /// lists the doomed worktree.  The builder consumes that projection in
-    /// lockstep, so skipping the worktree without stepping the index leaves
-    /// it parked on a row nothing will ever match again — every later node
-    /// reads as unprojected, and the cursor repair treats an unprojected row
-    /// as one that has gone away.
-    #[test]
-    fn rows_below_a_deleted_worktree_stay_navigable() {
-        use crate::sidebar_nav::{self, SidebarRow};
-
-        let projects =
-            vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2", "/a/wt3"])];
-        let listed = sidebar_nav::ListedRows::new();
-        let rows = sidebar_nav::visible_rows(&projects, &listed);
-        let doomed = PathBuf::from("/a/wt2");
-        let snapshot = build_sidebar_snapshot(
-            &projects,
-            &[],
-            &listed,
-            &rows,
-            Some(doomed.as_path()),
-            Default::default(),
-        );
-
-        let below = snapshot
-            .find(&SidebarRow::Worktree(PathBuf::from("/a/wt3")))
-            .expect("the worktree below the deleted one is still in the tree");
-        assert!(
-            snapshot.is_projected(below),
-            "a row below the one being deleted must still be navigable"
-        );
-    }
-
     /// A checkout the liveness cache calls gone offers no workspace, so the
     /// agent working in it matches nothing and lists under Home.  Matched to
     /// the removed worktree instead, its row's Enter could only refuse.
@@ -3197,41 +2824,6 @@ mod tests {
             None,
             "an agent under a removed checkout falls back to Home"
         );
-    }
-
-    /// The lockstep walk follows the listing, not the session vector.
-    ///
-    /// Attaching to the second pane first leaves the two sessions in the
-    /// opposite order to herdr's, and a walk that trusted the vector would
-    /// push them the wrong way round, match neither against the projection
-    /// and trip its own assert.
-    #[test]
-    fn the_snapshot_walk_follows_the_listing_not_the_session_vector() {
-        use crate::sidebar_nav::{self, SidebarRow};
-
-        let projects = vec![sidebar_nav::tests::project("/a", true, &["/a/wt1"])];
-        let wt = Some(PathBuf::from("/a/wt1"));
-        // Attached in the order 9 then 4; herdr lists the panes 4 then 9.
-        let live = vec![(wt.clone(), 9), (wt.clone(), 4)];
-        let listed = sidebar_nav::ListedRows::from([(wt.clone(), vec![
-            sidebar_nav::WorkspaceEntry::Session(4),
-            sidebar_nav::WorkspaceEntry::Session(9),
-        ])]);
-        let rows = sidebar_nav::visible_rows(&projects, &listed);
-        let snapshot =
-            build_sidebar_snapshot(&projects, &live, &listed, &rows, None, Default::default());
-
-        assert_eq!(rows, vec![
-            SidebarRow::Home,
-            SidebarRow::Project(PathBuf::from("/a")),
-            SidebarRow::Worktree(PathBuf::from("/a/wt1")),
-            SidebarRow::Session(4),
-            SidebarRow::Session(9),
-        ]);
-        for row in &rows {
-            let id = snapshot.find(row).expect("every projected row is in the model");
-            assert!(snapshot.is_projected(id), "{row:?} must stay navigable");
-        }
     }
 
     /// Dispatch cannot catch a wrong pairing: `toggle` drops an identity the
@@ -3308,14 +2900,6 @@ mod tests {
 
         assert!(any_pr_toggle_active(&f, SearchScope::Filtered));
         assert!(!any_pr_toggle_active(&f, SearchScope::All));
-    }
-
-    /// The reconciler must not churn for users who never touch a PR filter:
-    /// every banked result would otherwise rebuild the row set.
-    #[test]
-    fn the_generation_reaches_the_reconciler_only_while_filtering() {
-        assert_eq!(pr_generation_for(7, false), 0);
-        assert_eq!(pr_generation_for(7, true), 7);
     }
 
     #[test]
