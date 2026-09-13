@@ -257,6 +257,7 @@ pub struct Session {
     pub events: mpsc::Receiver<TermEvent>,
     pub osc_events: Option<mpsc::Receiver<osc_tap::OscEvent>>,
     pub progress: Option<osc_tap::Progress>,
+    pub pointer_shape: Option<egui::CursorIcon>,
     pub scratchpad: Option<scratchpad::Editor>,
     /// Latched attention flag, cleared when the user views this session.
     pub needs_attention: bool,
@@ -1365,6 +1366,7 @@ impl Session {
             events,
             osc_events: None,
             progress: None,
+            pointer_shape: None,
             scratchpad: Some(editor),
             needs_attention: false,
             pending_attention: None,
@@ -1565,6 +1567,7 @@ impl Session {
             events,
             osc_events,
             progress: None,
+            pointer_shape: None,
             scratchpad: None,
             needs_attention: false,
             pending_attention: None,
@@ -1717,7 +1720,7 @@ impl Session {
                         outcome.notifications = Some(body);
                     },
                     osc_tap::OscEvent::Progress(progress) => self.progress = Some(progress),
-                    _ => {},
+                    osc_tap::OscEvent::PointerShape(icon) => self.pointer_shape = Some(icon),
                 }
             }
             self.osc_events = Some(receiver);
@@ -2467,6 +2470,66 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn pointer_shape_osc_bytes_update_the_session_through_the_tap() {
+        let mut config = Config::default();
+        config.vt.pointer_shape = true;
+        let (mut session, mut request) = Session::pending_shell(
+            egui::Context::default(),
+            &config,
+            None,
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(session.pointer_shape, None);
+        for (bytes, expected) in [
+            ("\x1b]22;crosshair\x07", egui::CursorIcon::Crosshair),
+            ("\x1b]22;wait\x1b\\", egui::CursorIcon::Wait),
+            ("\x1b]22;default\x07", egui::CursorIcon::Default),
+        ] {
+            request.tap.as_mut().unwrap().offer(bytes.as_bytes());
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let outcome = session.drain_events(&config.palette);
+                assert!(outcome.notifications.is_empty());
+                if session.pointer_shape == Some(expected) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "pointer shape was not drained: {bytes:?}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            session.drain_events(&config.palette);
+            assert_eq!(session.pointer_shape, Some(expected));
+        }
+        assert_eq!(session.reported_cwd, None);
+        assert_eq!(session.progress, None);
+        assert_eq!(session.last_notification, None);
+        assert!(!session.needs_attention);
+        assert_eq!(session.exit_status, None);
+    }
+
+    #[test]
+    fn disabled_pointer_shape_does_not_create_a_tap() {
+        let config = Config::default();
+        assert!(!config.vt.any_enabled());
+        let (session, request) = Session::pending_shell(
+            egui::Context::default(),
+            &config,
+            None,
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            None,
+            None,
+            None,
+        );
+        assert!(request.tap.is_none());
+        assert!(session.osc_events.is_none());
+        assert_eq!(session.pointer_shape, None);
+    }
+
+    #[test]
     fn progress_osc_bytes_update_the_session_through_the_tap() {
         use osc_tap::Progress;
 
@@ -2615,6 +2678,7 @@ pub(crate) mod tests {
             events,
             osc_events: None,
             progress: None,
+            pointer_shape: None,
             scratchpad: None,
             needs_attention: false,
             pending_attention: None,
