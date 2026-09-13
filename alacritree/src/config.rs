@@ -3018,8 +3018,8 @@ impl RawIntegrations {
     }
 }
 
-/// Settings that used to live under `[ui]`, taken out of the raw `[ui]`
-/// table so the `[integrations]` table that owns them now can resolve them.
+/// Deprecated `[ui]` keys, taken out of the raw `[ui]` table and handed to
+/// the `[integrations]` tables that own them.
 #[derive(Default)]
 struct MovedUiKeys {
     delta_path: Option<String>,
@@ -3028,7 +3028,7 @@ struct MovedUiKeys {
     herdr_icon: Option<RawIconStyle>,
 }
 
-/// A key that moved keeps working from where it used to live. The old value
+/// A deprecated key still applies from its old location. The old value
 /// applies while the new key sits at its default, because raw config structs
 /// accept unknown keys and dropping the old field would lose the override
 /// without a word.
@@ -3246,8 +3246,8 @@ struct RawUi {
     /// Whether session rows can be dragged, and how far a reorder may carry
     /// a session.
     session_reorder: RawSessionReorder,
-    /// Deprecated location: `[integrations.delta] path` and `wsl_path`
-    /// supersede this, and each wins on its own side once set.
+    /// Deprecated. This value applies on each side while `[integrations.delta]`
+    /// `path` or `wsl_path` has its built-in value. Remove it after migration.
     delta_path: Option<String>,
     /// Sidebar glyph overrides.
     icons: RawIcons,

@@ -1465,7 +1465,7 @@
           "type": "string"
         },
         "delta_path": {
-          "description": "Deprecated location: `[integrations.delta] path` and `wsl_path`\nsupersede this, and each wins on its own side once set.",
+          "description": "Deprecated. This value applies on each side while `[integrations.delta]`\n`path` or `wsl_path` has its built-in value. Remove it after migration.",
           "type": "string"
         },
         "drop": {
