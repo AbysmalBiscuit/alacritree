@@ -59,6 +59,7 @@ mod modals;
 mod model;
 mod sidebar;
 
+use actions::ActionOrigin;
 use focus::DeferredClose;
 use herdr_glue::{
     HarnessMark, Managed, StateTone, herdr_mark, managed_tooltip, unlisted_pane_target,
