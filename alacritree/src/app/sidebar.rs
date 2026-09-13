@@ -821,15 +821,7 @@ fn session_drop_target(
     slot: Option<(usize, SessionId)>,
     requests: &mut SidebarRequests,
 ) {
-    let Some((dragged, range)) = view.drag_range.as_ref() else { return };
-    // The dragged row's own edges are no-ops, so offering them
-    // as targets would paint a drop that does nothing.
-    if slot.is_some_and(|(_, id)| id == *dragged) {
-        return;
-    }
-    if !range.contains(ws) {
-        return;
-    }
+    let Some(dragged) = drop_candidate(view.drag_range.as_ref(), ws, slot) else { return };
     let Some(pointer) = ui.input(|i| i.pointer.interact_pos()) else { return };
     if !row_rect.contains(pointer) {
         return;
@@ -858,9 +850,25 @@ fn session_drop_target(
         },
     };
     if ui.input(|i| i.pointer.any_released()) {
-        requests.session_drop = Some((*dragged, ws.clone(), position));
+        requests.session_drop = Some((dragged, ws.clone(), position));
         egui::DragAndDrop::clear_payload(ui.ctx());
     }
+}
+
+/// The session a drop on a row in `ws` would move: the dragged one, unless the
+/// row is that session's own or `ws` lies outside its reorder range.
+fn drop_candidate(
+    drag_range: Option<&(SessionId, Vec<WorkspaceKey>)>,
+    ws: &WorkspaceKey,
+    slot: Option<(usize, SessionId)>,
+) -> Option<SessionId> {
+    let (dragged, range) = drag_range?;
+    // The dragged row's own edges are no-ops, so offering them
+    // as targets would paint a drop that does nothing.
+    if slot.is_some_and(|(_, id)| id == *dragged) {
+        return None;
+    }
+    range.contains(ws).then_some(*dragged)
 }
 
 fn paint_home_group(
@@ -2358,6 +2366,66 @@ pub(super) fn close_button_hint(managed: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_row_takes_no_drop_of_its_own_session() {
+        let range = (7, vec![None]);
+        assert_eq!(drop_candidate(Some(&range), &None, Some((0, 7))), None);
+        assert_eq!(drop_candidate(Some(&range), &None, Some((1, 8))), Some(7));
+    }
+
+    #[test]
+    fn a_workspace_outside_the_reorder_range_takes_no_drop() {
+        let range = (7, vec![None]);
+        let elsewhere = Some(PathBuf::from("/repo/other"));
+        assert_eq!(drop_candidate(Some(&range), &elsewhere, None), None);
+        assert_eq!(drop_candidate(Some(&range), &None, None), Some(7));
+    }
+
+    fn worktree_buttons() -> WorktreeRowClicks {
+        let at = |x: f32| egui::Rect::from_min_size(egui::pos2(x, 0.0), egui::vec2(10.0, 10.0));
+        WorktreeRowClicks {
+            delete_rect: Some(at(100.0)),
+            spawn_rect: Some(at(80.0)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_row_click_over_the_delete_button_deletes_instead_of_activating() {
+        let mut clicks = worktree_buttons();
+        clicks.route_shadowed_click(true, Some(egui::pos2(105.0, 5.0)));
+        assert!(clicks.delete && !clicks.spawn);
+        assert!(!clicks.activates(false, true));
+
+        let mut clicks = worktree_buttons();
+        clicks.route_shadowed_click(true, Some(egui::pos2(20.0, 5.0)));
+        assert!(!clicks.delete && !clicks.spawn);
+        assert!(clicks.activates(false, true));
+    }
+
+    #[test]
+    fn a_row_click_over_the_spawn_button_spawns_instead_of_activating() {
+        let mut clicks = worktree_buttons();
+        clicks.route_shadowed_click(true, Some(egui::pos2(85.0, 5.0)));
+        assert!(clicks.spawn && !clicks.delete);
+        assert!(!clicks.activates(false, true));
+    }
+
+    #[test]
+    fn a_button_already_clicked_keeps_the_row_click_from_rerouting() {
+        let mut clicks = worktree_buttons();
+        clicks.spawn = true;
+        clicks.route_shadowed_click(true, Some(egui::pos2(105.0, 5.0)));
+        assert!(clicks.spawn && !clicks.delete);
+    }
+
+    #[test]
+    fn a_worktree_mid_removal_ignores_a_row_click() {
+        let mut clicks = worktree_buttons();
+        clicks.route_shadowed_click(true, Some(egui::pos2(20.0, 5.0)));
+        assert!(!clicks.activates(true, true));
+    }
 
     /// The "workspaces" depth never reaches a child, whatever the query:
     /// `child_matches` is not built, so `current_project_rows` feeds
