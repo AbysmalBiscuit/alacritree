@@ -56,7 +56,6 @@ mod focus;
 mod git_panel;
 mod herdr_glue;
 mod modals;
-mod model;
 mod sidebar;
 
 use actions::ActionOrigin;
@@ -65,7 +64,6 @@ use herdr_glue::{
     HarnessMark, Managed, StateTone, herdr_mark, managed_tooltip, unlisted_pane_target,
 };
 use modals::{BaseBranchPicker, CreateState, DeleteRequest, ProjectRemoveState, RenameState};
-use model::*;
 use sidebar::{
     HerdrRowData, SessionRowData, WorkspaceRowData, any_pr_toggle_active, project_filter_toggles,
     session_row_name,
