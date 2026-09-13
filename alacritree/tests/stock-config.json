@@ -59,6 +59,7 @@
     }
   },
   "ipc_socket": true,
+  "osc52": "onlycopy",
   "palette": {
     "bg": {
       "b": 24,
@@ -450,6 +451,12 @@
     "family": null,
     "italic_family": null,
     "size": null
+  },
+  "vt": {
+    "notify": false,
+    "pointer_shape": false,
+    "progress": false,
+    "report_cwd": false
   },
   "window": {
     "opacity": 1.0,
