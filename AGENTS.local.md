@@ -2,9 +2,11 @@ Whenever working on features, the goal is to preserve the original behavior so A
 
 So new UX/UI features need to provide config options that are used to enable them.
 
-## Code comments and docstrings
+## Code comments and doc strings
 
 Follow the guidelines from the `/unslop` skill and the agent-guard hook messages.
+
+Don't add multiple spaces sporadically in doc strings/comments. The ones that exist in the code base are a mistake and need to be cleaned up.
 
 ### Content
 
