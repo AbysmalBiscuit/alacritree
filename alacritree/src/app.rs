@@ -4776,7 +4776,7 @@ impl eframe::App for AlacritreeApp {
 
 /// Logical-pixel (normal, heading) sizes for UI text.  `[ui.font] size`
 /// overrides the normal size directly (same pt→px conversion as
-/// `FontConfig::egui_size`); the heading keeps its existing ratio to normal
+/// `FontConfig::logical_size`); the heading keeps its existing ratio to normal
 /// text.  Unset, both fall back to the `[font]`-derived values unchanged.
 fn ui_text_px(font: &FontConfig, ui_font: &UiFont) -> (f32, f32) {
     match ui_font.size {
