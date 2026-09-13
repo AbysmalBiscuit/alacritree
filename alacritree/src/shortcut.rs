@@ -1,26 +1,74 @@
 //! Where egui key presses meet the bindings table.  `bindings` names keys and
 //! modifiers in its own types so the config parser links no GUI framework, and
-//! this module translates at the input boundary.
+//! this module translates them once, when the app is built.
 
-use strum::IntoEnumIterator;
+use crate::bindings::{BindingAction, Key, KeyBinding, Modifiers, NamedAction};
 
-use crate::bindings::{self, BindingAction, Key, KeyBinding, Modifiers};
+/// The configured bindings with each key already in egui's terms and each
+/// trigger already spelled, so a key press or a painted palette row converts
+/// nothing.
+pub struct Shortcuts {
+    entries: Vec<Shortcut>,
+}
 
-/// Every binding that fires for an egui key press.  A key no binding can name
-/// fires nothing.
-pub fn matches(
-    bindings: &[KeyBinding],
+struct Shortcut {
     key: egui::Key,
-    mods: egui::Modifiers,
-) -> Vec<&BindingAction> {
-    match Key::iter().find(|k| egui_key(*k) == key) {
-        Some(key) => bindings::all_matches(bindings, key, binding_mods(mods)),
-        None => Vec::new(),
+    mods: Modifiers,
+    action: BindingAction,
+    label: String,
+}
+
+impl Shortcuts {
+    pub fn new(bindings: &[KeyBinding]) -> Self {
+        let entries = bindings
+            .iter()
+            .map(|b| Shortcut {
+                key: egui_key(b.key),
+                mods: b.mods,
+                action: b.action.clone(),
+                label: label(b.key, b.mods),
+            })
+            .collect();
+        Self { entries }
+    }
+
+    /// Every binding that fires for a key press.  Alacritty runs *all*
+    /// matching bindings (see `Processor::process_key_bindings`), so the
+    /// user's typical pattern of stacking `ClearLogNotice` + `chars = "\f"` on
+    /// Ctrl+L works: the first action is our `Unsupported` no-op, the second
+    /// writes 0x0c.
+    pub fn matches(&self, key: egui::Key, mods: egui::Modifiers) -> Vec<&BindingAction> {
+        let mods = binding_mods(mods);
+        self.entries
+            .iter()
+            .filter(|s| s.key == key && mods.fires(s.mods))
+            .map(|s| &s.action)
+            .collect()
+    }
+
+    /// Every bound action, in binding order.
+    pub fn actions(&self) -> impl Iterator<Item = &BindingAction> {
+        self.entries.iter().map(|s| &s.action)
+    }
+
+    /// The spelled triggers bound to `action`, in binding order: user bindings
+    /// before the defaults they did not replace.
+    pub fn labels(&self, action: NamedAction) -> impl Iterator<Item = &str> {
+        self.entries
+            .iter()
+            .filter(move |s| matches!(s.action, BindingAction::Named(a) if a == action))
+            .map(|s| s.label.as_str())
     }
 }
 
-/// How the palette spells a binding's trigger.
-pub fn format(key: Key, mods: Modifiers) -> String {
+/// egui-winit raises `command` alongside `ctrl` on every Ctrl press off macOS,
+/// and sets `mac_cmd` only where `command` already says the same, so dropping
+/// `mac_cmd` loses nothing `Modifiers::fires` needs.
+fn binding_mods(mods: egui::Modifiers) -> Modifiers {
+    Modifiers { alt: mods.alt, ctrl: mods.ctrl, shift: mods.shift, command: mods.command }
+}
+
+fn label(key: Key, mods: Modifiers) -> String {
     let mods = egui::Modifiers {
         alt: mods.alt,
         ctrl: mods.ctrl,
@@ -30,13 +78,6 @@ pub fn format(key: Key, mods: Modifiers) -> String {
     };
     egui::KeyboardShortcut::new(mods, egui_key(key))
         .format(&egui::ModifierNames::NAMES, cfg!(target_os = "macos"))
-}
-
-/// egui-winit raises `command` alongside `ctrl` on every Ctrl press off macOS,
-/// and sets `mac_cmd` only where `command` already says the same, so dropping
-/// `mac_cmd` loses nothing `Modifiers::fires` needs.
-fn binding_mods(mods: egui::Modifiers) -> Modifiers {
-    Modifiers { alt: mods.alt, ctrl: mods.ctrl, shift: mods.shift, command: mods.command }
 }
 
 fn egui_key(key: Key) -> egui::Key {
@@ -130,11 +171,14 @@ fn egui_key(key: Key) -> egui::Key {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::bindings::{NamedAction, RawBinding, parse_bindings};
+    use strum::IntoEnumIterator;
 
-    fn named(bindings: &[KeyBinding], key: egui::Key, mods: egui::Modifiers) -> Vec<NamedAction> {
-        matches(bindings, key, mods)
+    use super::*;
+    use crate::bindings::{RawBinding, parse_bindings};
+
+    fn named(shortcuts: &Shortcuts, key: egui::Key, mods: egui::Modifiers) -> Vec<NamedAction> {
+        shortcuts
+            .matches(key, mods)
             .into_iter()
             .filter_map(|a| match a {
                 BindingAction::Named(n) => Some(*n),
@@ -143,12 +187,12 @@ mod tests {
             .collect()
     }
 
-    /// A key mapped onto another key's egui counterpart would fire that key's
-    /// bindings instead of its own.
+    /// Both key types spell each key the same way, so a key whose arm points
+    /// at any other egui key fails here by name.
     #[test]
-    fn every_binding_key_has_its_own_egui_key() {
+    fn every_binding_key_converts_to_the_egui_key_of_the_same_name() {
         for key in Key::iter() {
-            assert_eq!(Key::iter().find(|k| egui_key(*k) == egui_key(key)), Some(key));
+            assert_eq!(format!("{:?}", egui_key(key)), format!("{key:?}"));
         }
     }
 
@@ -157,25 +201,25 @@ mod tests {
     #[test]
     #[cfg(not(target_os = "macos"))]
     fn a_ctrl_press_carrying_command_fires_ctrl_bindings_only() {
-        let bindings = parse_bindings(vec![RawBinding {
+        let shortcuts = Shortcuts::new(&parse_bindings(vec![RawBinding {
             key: "L".into(),
             mods: None,
             mode: None,
             chars: None,
             action: Some("ToggleSessionRows".into()),
             command: None,
-        }]);
+        }]));
         let ctrl = egui::Modifiers { ctrl: true, command: true, ..egui::Modifiers::NONE };
-        assert_eq!(named(&bindings, egui::Key::K, ctrl), vec![NamedAction::TogglePalette]);
-        assert!(named(&bindings, egui::Key::L, ctrl).is_empty());
-        assert_eq!(named(&bindings, egui::Key::L, egui::Modifiers::NONE), vec![
+        assert_eq!(named(&shortcuts, egui::Key::K, ctrl), vec![NamedAction::TogglePalette]);
+        assert!(named(&shortcuts, egui::Key::L, ctrl).is_empty());
+        assert_eq!(named(&shortcuts, egui::Key::L, egui::Modifiers::NONE), vec![
             NamedAction::ToggleSessionRows
         ]);
     }
 
     #[test]
     fn a_key_no_binding_names_fires_nothing() {
-        let bindings = parse_bindings(Vec::new());
-        assert!(matches(&bindings, egui::Key::F35, egui::Modifiers::NONE).is_empty());
+        let shortcuts = Shortcuts::new(&parse_bindings(Vec::new()));
+        assert!(shortcuts.matches(egui::Key::F35, egui::Modifiers::NONE).is_empty());
     }
 }

@@ -236,7 +236,7 @@ impl AlacritreeApp {
                         ui,
                         "Projects",
                         &self.sidebar.filter,
-                        &self.config.ui.icons.search,
+                        &self.icons.search,
                         &theme,
                         self.sidebar.filter.toggles_apply(self.sidebar_focus_state.search_scope),
                     );
@@ -413,7 +413,7 @@ impl AlacritreeApp {
 
         SidebarView {
             theme: self.theme,
-            icons: self.config.ui.icons.clone(),
+            icons: self.icons.clone(),
             probing,
             reorder_mode: self.sidebar.reorder_mode,
             session_drag: self.session_drag,
@@ -646,7 +646,7 @@ impl AlacritreeApp {
 /// borrow `projects` mutably alongside it.
 struct SidebarView {
     theme: Theme,
-    icons: Icons,
+    icons: Icons<Color32>,
     probing: bool,
     reorder_mode: bool,
     session_drag: bool,
@@ -1286,7 +1286,7 @@ pub(super) fn home_row(
     is_cursor: bool,
     scroll_into_view: bool,
     status: RowStatus<'_>,
-    icons: &Icons,
+    icons: &Icons<Color32>,
     theme: &Theme,
 ) -> HomeAction {
     // Reserve a slot *before* the labels so the hover bg paints beneath them.
@@ -1391,7 +1391,7 @@ pub(super) struct WorktreeAction {
 /// spinner stands in until `poll_pending_creates` refreshes the project and the
 /// real worktree row takes its place.  Indentation and the leading glyph match
 /// `worktree_row` so it lines up with its future sibling.
-fn creating_row(ui: &mut egui::Ui, branch: &str, icons: &Icons, theme: &Theme) {
+fn creating_row(ui: &mut egui::Ui, branch: &str, icons: &Icons<Color32>, theme: &Theme) {
     let s = theme.ui_scale;
     let frame = Frame::default().inner_margin(Margin { left: 16, right: 0, top: 3, bottom: 3 });
     frame.show(ui, |ui| {
@@ -1424,10 +1424,10 @@ fn creating_row(ui: &mut egui::Ui, branch: &str, icons: &Icons, theme: &Theme) {
 
 /// Badge glyph, color, and tooltip word for a PR state.
 fn pr_badge<'a>(
-    icons: &'a Icons,
+    icons: &'a Icons<Color32>,
     theme: &Theme,
     state: PrState,
-) -> (&'a IconStyle, BakedGlyph, Color32, &'static str) {
+) -> (&'a IconStyle<Color32>, BakedGlyph, Color32, &'static str) {
     match state {
         PrState::Open => (&icons.pr_open, DEFAULT_PR_OPEN_ICON, theme.pr_open, "open"),
         PrState::Draft => (&icons.pr_draft, DEFAULT_PR_DRAFT_ICON, theme.pr_draft, "draft"),
@@ -1439,10 +1439,10 @@ fn pr_badge<'a>(
 /// Badge style, color, and tooltip for an upstream state.  The tooltip names
 /// the upstream ref because the glyph cannot.
 pub(super) fn upstream_badge<'a>(
-    icons: &'a Icons,
+    icons: &'a Icons<Color32>,
     theme: &Theme,
     state: &UpstreamState,
-) -> (&'a IconStyle, BakedGlyph, Color32, String) {
+) -> (&'a IconStyle<Color32>, BakedGlyph, Color32, String) {
     match state {
         UpstreamState::Level { upstream } => (
             &icons.upstream_level,
@@ -1495,7 +1495,7 @@ pub(super) struct WorktreeRowView<'a> {
     // profile name (spawned and shown as the button label), `.1` is the
     // command shown on hover.
     pub(super) profiles: &'a [(String, String)],
-    pub(super) icons: &'a Icons,
+    pub(super) icons: &'a Icons<Color32>,
     pub(super) theme: &'a Theme,
 }
 
@@ -1576,7 +1576,7 @@ fn worktree_row_controls(
 fn paint_badge(
     ui: &mut egui::Ui,
     theme: &Theme,
-    style: &IconStyle,
+    style: &IconStyle<Color32>,
     default_glyph: BakedGlyph,
     color: Color32,
 ) -> egui::Rect {
@@ -1753,7 +1753,7 @@ pub(super) fn session_row(
     is_cursor: bool,
     scroll_into_view: bool,
     draggable: bool,
-    icons: &Icons,
+    icons: &Icons<Color32>,
     theme: &Theme,
 ) -> SessionRowAction {
     // Reserve a slot *before* the labels so the hover bg paints beneath them.
@@ -1910,7 +1910,7 @@ fn row_name_text(
 /// hang the hint on it.
 fn paint_managed_mark(
     ui: &mut egui::Ui,
-    icons: &Icons,
+    icons: &Icons<Color32>,
     theme: &Theme,
     color: Color32,
 ) -> egui::Rect {
@@ -1933,7 +1933,7 @@ fn herdr_row(
     row: &HerdrRowData,
     is_cursor: bool,
     scroll_into_view: bool,
-    icons: &Icons,
+    icons: &Icons<Color32>,
     theme: &Theme,
 ) -> HerdrRowAction {
     // Reserve a slot *before* the label so the hover bg paints beneath it.
