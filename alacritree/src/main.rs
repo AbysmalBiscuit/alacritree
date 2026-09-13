@@ -64,6 +64,7 @@ mod steady_state;
 mod terminal_view;
 #[cfg(test)]
 mod test_util;
+mod tools;
 mod upstream;
 #[cfg(windows)]
 mod win_session;

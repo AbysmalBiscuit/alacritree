@@ -3,6 +3,7 @@
 //! its rows open.
 
 use super::*;
+use crate::tools::{self, Tool};
 
 /// The toggle identities the git panel accepts: modified, deleted, untracked.
 pub(super) const GIT_FILTER_TOGGLES: &[char] = &['m', 'd', 'u'];
@@ -28,14 +29,6 @@ pub(super) struct GitPanel {
     /// Per-worktree override of the git panel's diff base, keyed by worktree
     /// path.  Mirrors `state.toml`; written through `state::set_base_branch`.
     pub(super) base_branch_overrides: HashMap<PathBuf, String>,
-    /// Resolved absolute path of `delta` inside each WSL distro, so diff panes
-    /// stop re-sourcing a login profile on every open.  Successes only: a miss
-    /// is never stored, so installing delta mid-session is picked up later.
-    pub(super) wsl_delta_paths: HashMap<String, String>,
-    /// In-flight delta discoveries, keyed by distro, mirroring
-    /// `pending_project_refresh` — resolved off the UI thread, adopted in
-    /// `wsl_delta_path`.
-    pub(super) pending_delta: HashMap<String, jobs::Job<Option<String>>>,
 }
 
 impl GitPanel {
@@ -49,8 +42,6 @@ impl GitPanel {
             branch_base: None,
             auto_shown: false,
             base_branch_overrides,
-            wsl_delta_paths: HashMap::new(),
-            pending_delta: HashMap::new(),
         }
     }
 }
@@ -482,12 +473,15 @@ impl AlacritreeApp {
 
         let delta_override = self.config.delta_path.clone();
         let (program, args) = match wsl::classify(&workspace) {
-            wsl::Location::Wsl { distro, .. } => match delta_override {
-                Some(delta) => build_wsl_diff_command_direct(&distro, &workspace, &req, &delta),
-                None => match self.wsl_delta_path(&distro, ctx) {
+            wsl::Location::Wsl { distro, .. } => {
+                let repaint = ctx.clone();
+                let delta = delta_override.or_else(|| {
+                    tools::wsl_resolved(Tool::Delta, &distro, move || repaint.request_repaint())
+                });
+                match delta {
                     Some(delta) => build_wsl_diff_command_direct(&distro, &workspace, &req, &delta),
                     None => build_wsl_diff_command_login(&distro, &workspace, &req),
-                },
+                }
             },
             wsl::Location::Windows(_) => {
                 build_diff_command(delta_override.as_deref().unwrap_or("delta"), &req)
@@ -517,45 +511,6 @@ impl AlacritreeApp {
                 self.modals.error_dialog = Some(format!("failed to open diff: {e}"));
             },
         }
-    }
-
-    /// Cached absolute path of `delta` inside `distro`, if known.  Adopts a
-    /// finished background discovery, then spawns one when the path is neither
-    /// cached nor already in flight.  Returns `None` until the first discovery
-    /// lands — callers fall back to the login-shell command meanwhile.  A miss
-    /// is never cached, so the discovery re-runs and a mid-session install is
-    /// picked up on a later open.
-    fn wsl_delta_path(&mut self, distro: &str, ctx: &Context) -> Option<String> {
-        match self.git_panel.pending_delta.get(distro).map(|job| (job.poll(), job.failed())) {
-            Some((Some(Some(path)), _)) => {
-                self.git_panel.pending_delta.remove(distro);
-                self.git_panel.wsl_delta_paths.insert(distro.to_string(), path);
-            },
-            // A found-nothing landing and a panicked lookup both clear the
-            // pending entry: the former banked its answer, the latter has
-            // none to bank, and either way it must not wedge this distro out
-            // of ever being retried.
-            Some((Some(None), _)) | Some((None, true)) => {
-                self.git_panel.pending_delta.remove(distro);
-            },
-            _ => {},
-        }
-
-        if let Some(path) = self.git_panel.wsl_delta_paths.get(distro) {
-            return Some(path.clone());
-        }
-
-        if !self.git_panel.pending_delta.contains_key(distro) {
-            let distro_owned = distro.to_string();
-            let ctx = ctx.clone();
-            let job = jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
-                let found = wsl::discover_delta(&distro_owned, blocking);
-                ctx.request_repaint();
-                found
-            });
-            self.git_panel.pending_delta.insert(distro.to_string(), job);
-        }
-        None
     }
 
     /// Key of the diff currently displayed in this workspace, if any.  Used by
