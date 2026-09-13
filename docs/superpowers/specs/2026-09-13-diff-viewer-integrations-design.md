@@ -20,7 +20,7 @@ Separately, alacritree looks up external programs inside WSL distros in three pl
 ## Non-goals
 
 - Sending review output to agents. Agents read tuicr comments through `tuicr review comments` and tuicr's own skill. Push forwarding is #95.
-- Overriding the git library. `git2` calls stay as they are; `[integrations.git] path` governs only spawned `git` processes.
+- Overriding the git library. `git2` calls stay as they are; `[integrations.git] path` governs only `git` processes alacritree spawns by name. Batch scripts that run inside a WSL distro keep finding `git` on that distro's PATH through the resident helper's plain `sh`.
 
 ## Config
 
@@ -31,21 +31,27 @@ A setting that exists only because of a tool lives in that tool's table as a fla
 ```toml
 [integrations.git]
 path = "git"
+wsl_path = ""
 
 [integrations.gh]
 path = "gh"
+wsl_path = ""
 
 [integrations.doppler]
 path = "doppler"
+wsl_path = ""
 
 [integrations.herdr]
 path = "herdr"            # joins the existing herdr keys
+wsl_path = ""
 
 [integrations.delta]
 path = "delta"
+wsl_path = ""
 
 [integrations.tuicr]
 path = "tuicr"
+wsl_path = ""
 
 [integrations.diff_viewer]
 preset = "delta"          # "delta" | "tuicr" | "custom"
@@ -55,8 +61,10 @@ button_icon = "review"    # glyph or label drawn on each section header
 [integrations.diff_viewer.custom]
 # Pager mode: git runs the panel's own diff with this as core.pager.
 pager = ""
+wsl_pager = ""
 # Direct mode: path plus one argv template per row kind and per section.
 path = ""
+wsl_path = ""
 staged = []
 unstaged = []
 untracked = []
@@ -68,15 +76,14 @@ branch_scope = []
 
 ### Tool paths
 
-A tool's `path` defaults to its own name. When `path` equals that name, alacritree resolves it: from `PATH` natively, through the tool registry inside WSL. Any other value is used verbatim on both sides and is never probed, because `wsl::probe_tools` interpolates program names into a shell script and only registry literals may reach it.
+Each tool has one path per side, because a Windows path means nothing inside a distro.
+
+- `path` is the native program. It defaults to the tool's name, which the OS finds on `PATH`; any other value runs as written.
+- `wsl_path` is the program inside every WSL distro. It defaults to empty, which finds the tool by name through the tool registry; any other value runs as written and is never probed, because `wsl::probe_tools` interpolates program names into a shell script and only registry literals may reach it.
 
 ### `[ui] delta_path`
 
-It stays readable and is marked deprecated in its doc comment, the same treatment `[ui.wsl] automount_root` got. Resolution order for delta:
-
-1. `[integrations.delta] path` when it differs from `"delta"`.
-2. `[ui] delta_path` when set, with a `log::warn!` naming the new key.
-3. `"delta"`.
+It stays readable and is marked deprecated in its doc comment, the same treatment `[ui.wsl] automount_root` got. It was one path used on both sides, so it keeps filling each side that `[integrations.delta]` leaves at its default: `path` while it is `"delta"`, `wsl_path` while it is empty. Filling either side logs a `log::warn!` naming the new keys. An existing config therefore behaves as it did.
 
 Dropping the key outright would silently lose the override, because the raw config structs do not deny unknown fields.
 
@@ -84,7 +91,9 @@ Dropping the key outright would silently lose the override, because the raw conf
 
 `preset = "custom"` needs exactly one mode: a non-empty `pager`, or a non-empty `path` together with the templates. Anything else logs a warning and resolves to the delta preset, matching how `[integrations.herdr]` handles unknown values.
 
-A direct-mode template left empty makes that row kind or section unavailable: its rows stay unclickable and its header shows no button.
+`wsl_pager` and `wsl_path` pair with `pager` and `path` for WSL workspaces. Empty, the native value runs through the distro's login shell, which finds a bare name; set, it runs as written.
+
+A direct-mode template left empty makes that row kind or section unavailable: a click on its rows opens nothing and its header shows no button.
 
 ### Placeholders
 
@@ -108,42 +117,46 @@ tuicr's revision parser accepts `A...B` as a merge-base range, so its branch tar
 
 ## Architecture
 
-The work builds on the #71 refactor branch, where the git panel lives in `app/git_panel.rs` and owns its state in `GitPanel`. Two new modules sit at crate level. Both are consumed from outside `app/`: `config.rs` holds the resolved viewer and `cli/doctor.rs` uses the tool registry, and nothing outside `app/` may reference `crate::app`.
+The work builds on the branch of PR #227, which already carries the #71 split: the git panel lives in `app/git_panel.rs` and owns its state in `GitPanel`. Two new modules sit at crate level. Both are consumed from outside `app/`: `config.rs` holds the resolved viewer and `cli/doctor.rs` uses the tool registry, and nothing outside `app/` may reference `crate::app`.
+
+Neither module adds a module cycle. `tools` imports `wsl`, `wsl_helper` and `jobs`. `diff_viewer` imports only `tools::Tool`. `config` imports both. `wsl_helper` names tools by program name and never imports `tools`.
 
 ### `tools.rs`
 
 The registry of external programs and their WSL resolution.
 
 - `enum Tool { Git, Gh, Delta, Doppler, Herdr, Tuicr }` with `name()` returning the literal program name and `ALL`.
-- A per-distro cache of resolved absolute paths. A miss is never cached, so a mid-session install is picked up on a later lookup.
-- A non-blocking lookup for the UI thread that returns the cached path or `None` and starts one background probe per distro and tool when none is in flight, requesting a repaint when it lands. This absorbs the adopt-then-spawn logic that `wsl_delta_path` holds today.
-- A blocking probe of `Tool::ALL` for `doctor`.
-- `resolve(&Config, Tool, side) -> String`: the configured `path` when it differs from the tool's name, otherwise the name natively or the cached WSL path. Every spawn of a registry tool goes through it, so an override applies everywhere that tool runs.
+- `ToolPaths { native, wsl }` per tool, published once at startup by `configure`, the same way `wsl::set_automount_root` and `wsl_helper::set_enabled` are. The spawn sites that need a path (`pr_status`, `doppler`, `worktree`, herdr) hold no `Config`, so the registry is the one place they read it from. `main.rs` and `doctor` call `configure` after loading config.
+- `program(Tool) -> String`: the native path, which is the bare name unless set. Native spawns use it.
+- `wsl_program(Tool) -> String`: the WSL path when set, otherwise the bare name. Spawns inside a distro where a shell finds the program use it.
+- `wsl_resolved(Tool, distro, on_found) -> Option<String>`: for the UI thread. It returns the override or a cached path, and otherwise starts at most one background lookup per distro and tool and returns `None`. The lookup asks the resident helper's hello first, then probes live, and calls `on_found` so the caller repaints. A miss is never cached, so a mid-session install is picked up on a later lookup. This absorbs the adopt-then-spawn logic `wsl_delta_path` held.
+- `wsl_in_job(Tool, distro, &Blocking) -> String`: the same answer for a pool job, which may reach the helper directly and falls back to the bare name.
 
 Callers that move onto it:
 
-- `wsl_helper.rs`: the hello probes every `Tool::ALL` name instead of git, delta and gh, and seeds the cache. The field count changes, so `PROTOCOL_VERSION` goes up. `capability_delta` and `capability_gh` go away.
+- `wsl_helper.rs`: the hello probes every registry name in `HELLO_TOOLS` instead of git, delta and gh, and `capability(distro, program)` replaces `capability_delta` and `capability_gh`. The field count changes, so `PROTOCOL_VERSION` goes to 2. A test pins `HELLO_TOOLS` to `Tool::ALL`.
 - `wsl.rs`: `discover_delta` goes away. `probe_tools` stays as the probe primitive.
-- `cli/doctor.rs`: `WSL_TOOLS` becomes `Tool::ALL`. Consequence text per tool stays in doctor. Natively, doctor adds an optional check for the tool the configured viewer needs.
-- `pr_status.rs`: the WSL `gh` resolution reads the registry.
-- `herdr/cli.rs` and `multiplexer.rs`: `PROGRAM` goes away; herdr launches take the resolved path.
-- `projects.rs`, `worktree.rs`, `pr_status.rs`, `doppler.rs`, `cli/doctor.rs` and the app's own `git` spawns: each `command_ext::hidden` call for a registry tool takes the resolved path instead of a literal name.
+- `cli/doctor.rs`: `WSL_TOOLS` becomes `Tool::ALL`. Consequence text per tool stays in doctor. Native binary checks look up the configured path, and doctor adds an optional check for the program the configured viewer runs.
+- `pr_status.rs`: native `gh` spawns use `program`, the WSL one uses `wsl_in_job`.
+- `herdr/cli.rs`, `multiplexer.rs` and `app/herdr_glue.rs`: `PROGRAM` becomes `herdr::program(side)`.
+- `worktree.rs` and `doppler.rs`: each spawn of a registry tool takes `program`, or `wsl_program` inside a distro, instead of a literal name.
 - `GitPanel` loses `wsl_delta_paths` and `pending_delta`.
 
 ### `diff_viewer.rs`
 
 Pure: no egui, no app state.
 
-- The resolved config types: `Preset`, `Viewer` (pager or direct, with its templates), built from `[integrations.diff_viewer]` plus the tool paths.
-- `DiffRequest`, `DiffSource`, `diff_key`, `diff_args` and the WSL command builders, moved out of `app/model.rs`.
-- `enum Target { Row(DiffRequest), Section(Section) }`, where `Section` is staged, unstaged or branch with its base.
-- `plan(&Viewer, &Target) -> Option<Launch>`, returning `None` when the target is unavailable for this viewer.
-- `enum Launch { Pager { pager, git_args }, Direct { program, args } }`.
-- The WSL wrapping for both launch kinds. Pager launches keep the existing direct and login-shell builders and their `LESS` export. Direct launches use `wsl.exe --cd <workspace> --exec <resolved> <args>` when the path is resolved, and otherwise re-exec through the login shell with the program passed as a positional parameter.
+- `enum Program { Tool(Tool), Custom { path, wsl_path } }`: a registry tool resolved at spawn time, or a custom viewer's native value with its optional WSL counterpart.
+- `enum Viewer { Pager { pager, args }, Direct { program, templates } }` with `Viewer::delta()` and `Viewer::tuicr()` as the presets, and `Templates` holding one argv list per row kind and per section.
+- `DiffRequest`, `DiffSource`, `diff_key` and `diff_args`, moved out of `app/git_panel.rs`.
+- `enum Target { Row(DiffRequest), Section(Section) }`, where `Section` is staged, unstaged or branch with its base, and `Target::key()` names the pane.
+- `opens(&Viewer, &Target) -> bool` and `plan(&Viewer, &Target) -> Option<Launch>`, which returns `None` when the target is unavailable for this viewer.
+- `enum Launch { Pager { pager, pager_args, git_args }, Direct { program, args } }`.
+- The native and WSL builders for both launch kinds. A pager launch passes git, the pager command and the diff arguments to one `sh` script as positional parameters, which exports `LESS` where git runs; before the pager's path is known the same script runs through the login shell. A direct launch uses `wsl.exe --cd <workspace> --exec <resolved> <args>` when the path is known, and otherwise re-execs through the login shell with the program passed as a positional parameter.
 
 ### `config.rs`
 
-`IntegrationsConfig` gains `delta`, `tuicr` and `diff_viewer`. `Config::delta_path` goes away; its resolution moves into building the `Viewer`.
+`IntegrationsConfig` gains `git`, `gh`, `doppler`, `delta` and `tuicr` tool tables with `path` and `wsl_path`, and `diff_viewer`; `HerdrConfig` gains `path` and `wsl_path`. `IntegrationsConfig::tool_paths()` is what `tools::configure` takes. `DiffViewerPreset` is the closed set for `preset`, and `DiffViewerConfig` holds the resolved `Viewer`, `section_buttons` and `button_icon`. `Config::delta_path` goes away; its precedence moves into resolving `[integrations.delta] path`.
 
 ### `app/git_panel.rs`
 
@@ -163,11 +176,13 @@ Pure: no egui, no app state.
 ## Testing
 
 - `diff_viewer.rs`: each preset renders the expected argv for every target; placeholders substitute per element and a file name containing spaces or quotes stays one argument; empty custom templates make targets unavailable; invalid custom falls back to delta; WSL wrapping for direct launches, resolved and login-shell.
-- `config.rs`: the delta path precedence, including the deprecated key and its warning.
-- `tools.rs`: hello parsing at the new protocol version; a miss is not cached; the non-blocking lookup starts one probe per distro and tool.
-- `app/git_panel.rs`: with `GitPanel` constructible without an eframe window, a section target toggles its pane and a row target replaces it.
-- Regenerate the schema with `ALACRITREE_UPDATE_SCHEMA=1 cargo test -p alacritree --test config_schema`; `config_schema` and `schema_defaults` pass.
+- `config.rs`: tool paths default to their names and WSL discovery, and a blank value means the default; the deprecated delta key fills each side left at its default; presets, an unknown preset, and custom validation including the WSL values.
+- `wsl_helper.rs`: hello parsing at protocol 2, and the script's probe list matching `HELLO_TOOLS`.
+- `tools.rs`: `HELLO_TOOLS` matches `Tool::ALL`; a lookup runs once per distro and tool and keeps its hit; a miss is not kept; a landed lookup calls `on_found`.
+- `cli/doctor.rs`: the per-distro report covers every registry tool; the viewer check skips a custom pager and warns on a missing program.
+- `app/git_panel.rs`: an app built with `AlacritreeApp::from_parts` and an unspawned diff session shows that choosing the open section closes its pane and that a section the viewer cannot open leaves the pane alone; the Review actions map to their sections.
+- Regenerate the schema and stock config with `devkit run task test --env ALACRITREE_UPDATE_SCHEMA=1 --env ALACRITREE_UPDATE_STOCK=1`; `config_schema`, `schema_defaults` and `the_stock_config_is_unchanged` pass on a plain run.
 
 ## Delivery
 
-One PR closing #82, including the tool registry. The branch stacks on the #71 refactor PR once that is open, per the `[n]` stacking rule.
+One PR closing #82, including the tool registry. The branch stacks on PR #227 per the `[n]` stacking rule. The implementation plan is `docs/superpowers/plans/2026-09-13-diff-viewer-integrations.md`.
