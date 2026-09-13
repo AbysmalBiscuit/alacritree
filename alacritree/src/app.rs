@@ -59,6 +59,7 @@ mod modals;
 mod model;
 mod sidebar;
 
+use modals::{BaseBranchPicker, CreateState, DeleteRequest, ProjectRemoveState, RenameState};
 use model::*;
 
 #[derive(Clone, Copy)]
@@ -4770,6 +4771,7 @@ mod tests {
         GIT_FILTER_TOGGLES, base_branch_target, branch_diff_row, file_row, git_filter_identity,
         git_path_label, path_header_label,
     };
+    use super::modals::dirty_warning;
     use super::sidebar::{home_row, session_row, upstream_badge, worktree_row};
 
     fn herdr_lifecycle_app() -> AlacritreeApp {
