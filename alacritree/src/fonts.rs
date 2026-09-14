@@ -29,9 +29,9 @@ use crate::config::{FontConfig, UiFont};
 /// when someone has hundreds of fonts installed.
 const MAX_FALLBACK_FACES: usize = 32;
 
-pub const BOLD_FAMILY: &str = "alacritree_bold";
-pub const ITALIC_FAMILY: &str = "alacritree_italic";
-pub const BOLD_ITALIC_FAMILY: &str = "alacritree_bold_italic";
+pub(crate) const BOLD_FAMILY: &str = "alacritree_bold";
+pub(crate) const ITALIC_FAMILY: &str = "alacritree_italic";
+pub(crate) const BOLD_ITALIC_FAMILY: &str = "alacritree_bold_italic";
 
 /// Glyphs alacritree paints itself, so the chrome renders on systems whose
 /// fonts lack them.  Appended last in each chrome family, so an installed
@@ -54,9 +54,9 @@ const UI_FAMILY: &str = "alacritree_ui";
 /// `BOLD_FAMILY`/`ITALIC_FAMILY`/`BOLD_ITALIC_FAMILY` (the terminal grid's
 /// variant faces) so a `[ui.font]` override never changes what bold/italic
 /// cells render in the terminal.
-pub const UI_BOLD_FAMILY: &str = "alacritree_ui_bold";
-pub const UI_ITALIC_FAMILY: &str = "alacritree_ui_italic";
-pub const UI_BOLD_ITALIC_FAMILY: &str = "alacritree_ui_bold_italic";
+pub(crate) const UI_BOLD_FAMILY: &str = "alacritree_ui_bold";
+pub(crate) const UI_ITALIC_FAMILY: &str = "alacritree_ui_italic";
+pub(crate) const UI_BOLD_ITALIC_FAMILY: &str = "alacritree_ui_bold_italic";
 
 #[derive(Clone, Copy)]
 enum Variant {
@@ -471,7 +471,7 @@ mod disk_cache {
 /// colour glyph renderer resolves against this same order and must see the
 /// face the user asked for.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ChainFace {
+pub(crate) struct ChainFace {
     pub path: PathBuf,
     pub face_index: u32,
     /// egui cannot rasterize this face; only the colour glyph renderer can.
@@ -705,7 +705,7 @@ const STRIKEOUT_ASCENDER_RATIO: f32 = 0.35;
 /// a strikeout position is positive, and so is the ascender while the
 /// descender is negative.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct FaceMetrics {
+pub(crate) struct FaceMetrics {
     pub ascender: f32,
     pub descender: f32,
     pub underline_position: f32,
@@ -730,7 +730,7 @@ impl Default for FaceMetrics {
 impl FaceMetrics {
     /// Read face `index` of `data`.  Anything the face leaves at zero, omits,
     /// or cannot express is filled in by `resolve_fallbacks`.
-    pub fn from_face(data: &[u8], index: u32) -> Self {
+    pub(crate) fn from_face(data: &[u8], index: u32) -> Self {
         let Ok(face) = ttf_parser::Face::parse(data, index) else {
             log::warn!("could not parse the terminal face; using default decoration metrics");
             return Self::default();
@@ -1009,7 +1009,7 @@ fn install_symbol_fallback(defs: &mut FontDefinitions, ui: &UiFont) {
 
 /// Maps ANSI-style bold/italic flags onto the chrome font family carrying
 /// that style; unstyled text keeps using `Proportional` directly.
-pub fn ui_variant_family(bold: bool, italic: bool) -> FontFamily {
+pub(crate) fn ui_variant_family(bold: bool, italic: bool) -> FontFamily {
     match (bold, italic) {
         (false, false) => FontFamily::Proportional,
         (true, false) => FontFamily::Name(UI_BOLD_FAMILY.into()),
@@ -1022,7 +1022,7 @@ pub fn ui_variant_family(bold: bool, italic: bool) -> FontFamily {
 /// fallback chain, in the order egui consults it, for the colour glyph
 /// renderer to resolve against, together with the decoration metrics of the
 /// face at its head.
-pub fn install_terminal_fonts(
+pub(crate) fn install_terminal_fonts(
     ctx: &Context,
     font: &FontConfig,
     ui: &UiFont,
@@ -1656,7 +1656,11 @@ mod fontconfig_resolve {
 
     use super::{FallbackFace, ResolvedFace, Variant};
 
-    pub fn resolve(family: &str, style: Option<&str>, variant: Variant) -> Option<ResolvedFace> {
+    pub(super) fn resolve(
+        family: &str,
+        style: Option<&str>,
+        variant: Variant,
+    ) -> Option<ResolvedFace> {
         let fc = Fontconfig::new()?;
         let mut pattern = Pattern::new(&fc);
 
@@ -1688,7 +1692,7 @@ mod fontconfig_resolve {
     /// font's named instances (FreeType's encoding).  ttf_parser and epaint
     /// take a plain collection index and cannot apply a named instance
     /// anyway, so the default instance stands in for the named one.
-    pub fn plain_face_index(index: i32) -> u32 {
+    pub(super) fn plain_face_index(index: i32) -> u32 {
         (index.max(0) as u32) & 0xFFFF
     }
 
@@ -1696,7 +1700,7 @@ mod fontconfig_resolve {
     /// any whose Unicode coverage is fully covered by an earlier entry.  This
     /// is the same chain `FcFontMatch` walks per glyph when crossfont misses,
     /// so registering it up front in egui gives equivalent coverage.
-    pub fn sorted_fallbacks(
+    pub(super) fn sorted_fallbacks(
         family: &str,
         style: Option<&str>,
         variant: Variant,
