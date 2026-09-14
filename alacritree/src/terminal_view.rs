@@ -3214,7 +3214,7 @@ mod tests {
             let each = start.elapsed() / iterations;
             let (build, tessellate) = (build / iterations, tessellate / iterations);
 
-            let (_, counts) = crate::steady_state::measure(|| {
+            let (_, counts) = crate::alloc_count::measure(|| {
                 paint_one_frame(&ctx, &mut session, &config, &mut caches, screen)
             });
 

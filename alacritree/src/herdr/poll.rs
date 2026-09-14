@@ -198,7 +198,7 @@ impl EndpointCache {
 
     /// A cache holding one listing at a chosen sample time, for tests that
     /// drive `HerdrViewSync` without a poll behind them.
-    #[cfg(test)]
+    #[doc(hidden)]
     pub fn for_test(side: Side, agents: Vec<Agent>, sampled_at: Instant) -> Self {
         let mut cache = Self::new(side);
         cache.agents = agents;

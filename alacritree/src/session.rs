@@ -2150,7 +2150,7 @@ mod tests {
         }
         let each = started.elapsed() / iterations;
 
-        let (_, counts) = crate::steady_state::measure(|| windows_process_probe::probe(pid));
+        let (_, counts) = crate::alloc_count::measure(|| windows_process_probe::probe(pid));
         println!(
             "probe on the calling thread: {each:?}, {} allocations ({} KiB)",
             counts.allocs,
