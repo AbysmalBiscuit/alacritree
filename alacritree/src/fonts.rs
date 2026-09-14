@@ -347,13 +347,13 @@ mod disk_cache {
     const MAGIC: &[u8; 4] = b"ATCC";
     const VERSION: u32 = 1;
 
-    pub struct CachedFile {
+    pub(super) struct CachedFile {
         pub size: u64,
         pub mtime_millis: u64,
         pub faces: HashMap<u32, Vec<(u32, u32)>>,
     }
 
-    pub fn default_cache_path() -> Option<PathBuf> {
+    pub(super) fn default_cache_path() -> Option<PathBuf> {
         let local_app_data = std::env::var_os("LOCALAPPDATA")?;
         Some(PathBuf::from(local_app_data).join("alacritree").join("coverage-cache.v1.bin"))
     }
@@ -361,14 +361,14 @@ mod disk_cache {
     /// A file's identity for cache purposes: byte size plus modification
     /// time.  Either changing is treated as "this file might have new
     /// glyphs" and forces a rescan of every face in it.
-    pub fn stat_file(path: &Path) -> Option<(u64, u64)> {
+    pub(super) fn stat_file(path: &Path) -> Option<(u64, u64)> {
         let meta = std::fs::metadata(path).ok()?;
         let modified = meta.modified().ok()?;
         let millis = modified.duration_since(UNIX_EPOCH).ok()?.as_millis() as u64;
         Some((meta.len(), millis))
     }
 
-    pub fn load(path: &Path) -> Option<HashMap<String, CachedFile>> {
+    pub(super) fn load(path: &Path) -> Option<HashMap<String, CachedFile>> {
         let bytes = std::fs::read(path).ok()?;
         parse(&bytes)
     }
@@ -426,7 +426,7 @@ mod disk_cache {
 
     /// Font problems must never fail startup, so every I/O error here is
     /// swallowed after a debug log; the next launch simply rescans.
-    pub fn write(path: &Path, files: &HashMap<String, CachedFile>) {
+    pub(super) fn write(path: &Path, files: &HashMap<String, CachedFile>) {
         let mut buf = Vec::new();
         buf.extend_from_slice(MAGIC);
         buf.extend_from_slice(&VERSION.to_le_bytes());
@@ -2808,12 +2808,12 @@ mod coverage {
     use std::path::PathBuf;
 
     #[derive(Clone, Debug, Default, PartialEq)]
-    pub struct Coverage {
+    pub(super) struct Coverage {
         ranges: Vec<(u32, u32)>,
     }
 
     #[derive(Clone, Debug, PartialEq)]
-    pub struct Candidate {
+    pub(super) struct Candidate {
         pub path: PathBuf,
         pub face_index: u32,
         pub family: String,
@@ -2828,7 +2828,7 @@ mod coverage {
     impl Coverage {
         /// Build from an arbitrary codepoint list: sorted, deduped, and
         /// collapsed into inclusive, disjoint ranges.
-        pub fn from_codepoints(mut codepoints: Vec<u32>) -> Self {
+        pub(super) fn from_codepoints(mut codepoints: Vec<u32>) -> Self {
             codepoints.sort_unstable();
             codepoints.dedup();
             let mut ranges: Vec<(u32, u32)> = Vec::new();
@@ -2850,7 +2850,7 @@ mod coverage {
         /// through `from_codepoints`, which is why `walk` is `Fn`: `codepoints`
         /// has no early exit, so the first pass has to finish before the second
         /// can start.
-        pub fn from_ascending_walk(walk: impl Fn(&mut dyn FnMut(u32))) -> Self {
+        pub(super) fn from_ascending_walk(walk: impl Fn(&mut dyn FnMut(u32))) -> Self {
             let mut ranges: Vec<(u32, u32)> = Vec::new();
             let mut ascending = true;
             walk(&mut |cp| {
@@ -2877,7 +2877,7 @@ mod coverage {
         /// The Unicode bound matters too: a well-formed but bogus range like
         /// `(0, u32::MAX)` would mark everything as covered and silently empty
         /// the automatic chain until the font file changes.
-        pub fn from_stored_ranges(ranges: Vec<(u32, u32)>) -> Option<Self> {
+        pub(super) fn from_stored_ranges(ranges: Vec<(u32, u32)>) -> Option<Self> {
             if ranges.iter().any(|&(start, end)| start > end || end > 0x10FFFF) {
                 return None;
             }
@@ -2887,11 +2887,11 @@ mod coverage {
             Some(Self { ranges })
         }
 
-        pub fn ranges(&self) -> &[(u32, u32)] {
+        pub(super) fn ranges(&self) -> &[(u32, u32)] {
             &self.ranges
         }
 
-        pub fn merge(&mut self, other: &Coverage) {
+        pub(super) fn merge(&mut self, other: &Coverage) {
             let mut merged: Vec<(u32, u32)> =
                 Vec::with_capacity(self.ranges.len() + other.ranges.len());
             let push = |merged: &mut Vec<(u32, u32)>, range: (u32, u32)| match merged.last_mut() {
@@ -2921,7 +2921,7 @@ mod coverage {
         /// How many codepoints `self` covers that `other` doesn't — the
         /// FcFontSort(trim) keep-test, counted rather than merely detected so
         /// the trim can weigh what a face adds against what it costs.
-        pub fn novel_codepoints(&self, other: &Coverage) -> u64 {
+        pub(super) fn novel_codepoints(&self, other: &Coverage) -> u64 {
             let mut novel = 0;
             let mut i = 0;
             for &(start, end) in &self.ranges {
@@ -2977,7 +2977,7 @@ mod coverage {
     /// same-family siblings, then weight/slant matches, then monospace, then
     /// everything else; ties break on family name, path, and face index so
     /// the resulting chain is deterministic across runs.
-    pub fn order_candidates(
+    pub(super) fn order_candidates(
         candidates: &mut [(Candidate, Coverage)],
         family: &str,
         weight: u16,
@@ -3003,7 +3003,7 @@ mod coverage {
     /// keeping only faces that cover codepoints the seed face and the
     /// already-kept faces don't — and, for the large ones, enough of them to
     /// justify carrying the face at all.
-    pub fn trim_by_coverage(
+    pub(super) fn trim_by_coverage(
         candidates: Vec<(Candidate, Coverage)>,
         seed_coverage: &Coverage,
         limit: usize,
