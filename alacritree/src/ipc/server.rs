@@ -29,7 +29,7 @@ use crate::{git_status, jobs};
 /// Absolute path to the running binary.  A shell can exec the CLI through it
 /// without a PATH lookup — which is the only reliable way in a distro, where
 /// the Windows binary is reachable through interop but is not on `$PATH`.
-pub(crate) const EXE_ENV: &str = "ALACRITREE_EXE";
+const EXE_ENV: &str = "ALACRITREE_EXE";
 
 /// How long a connection waits for the UI thread before giving up — long
 /// enough for a busy frame, short enough that a wedged app doesn't hang

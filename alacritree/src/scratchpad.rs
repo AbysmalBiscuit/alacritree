@@ -92,7 +92,7 @@ impl Editor {
     }
 }
 
-pub(crate) fn editor_id(session_id: u64) -> Id {
+fn editor_id(session_id: u64) -> Id {
     Id::new(("scratchpad-editor", session_id))
 }
 

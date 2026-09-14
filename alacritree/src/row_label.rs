@@ -19,7 +19,7 @@ use crate::projects::{Project, Worktree};
 /// Substitute `vars` into `template`.  `None` on any subst error or when the
 /// trimmed result is empty — the caller falls back to the plain name either
 /// way, because a blank row label is as useless as a failed one.
-pub(crate) fn render_label(template: &str, vars: &HashMap<String, String>) -> Option<String> {
+fn render_label(template: &str, vars: &HashMap<String, String>) -> Option<String> {
     let rendered = subst::substitute(template, vars).ok()?;
     let trimmed = rendered.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())

@@ -19,7 +19,7 @@ use crate::fonts::FaceMetrics;
 /// Underline styles, in the order their tiles sit in the strip.  Zero is the
 /// undecorated cell, whose tile is never sampled: the vertex shader collapses
 /// that quad rather than reading it.
-pub(crate) const UNDERLINE_KINDS: u16 = 6;
+const UNDERLINE_KINDS: u16 = 6;
 
 pub(crate) const NONE: u16 = 0;
 pub(crate) const STRAIGHT: u16 = 1;

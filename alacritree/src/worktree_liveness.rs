@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 /// How long a batch of results stands before the visible rows are checked
 /// again.  Matches `git_status::StatusCache`, which answers the same "did this
 /// worktree change under us" question at the same human timescale.
-pub(crate) const FRESH_FOR: Duration = Duration::from_millis(1500);
+const FRESH_FOR: Duration = Duration::from_millis(1500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Liveness {

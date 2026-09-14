@@ -602,7 +602,7 @@ pub(crate) fn spawn_delete(
 /// (git calls these *prunable*). Uses git2's per-worktree prune rather than
 /// shelling out to `git worktree prune`, which would sweep every stale
 /// worktree in the repo instead of just the one the user asked about.
-pub(crate) fn prune_worktree(
+fn prune_worktree(
     project_root: &Path,
     worktree_name: &str,
     branch: Option<&str>,

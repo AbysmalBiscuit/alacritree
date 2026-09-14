@@ -16,7 +16,7 @@ use crate::glyph_cache::{AtlasState, Face};
 
 /// Slot 0 is reserved for a cell with nothing to draw.  Its size is zero, so
 /// the vertex shader collapses the quad and the rasterizer discards it.
-pub(crate) const BLANK_SLOT: u16 = 0;
+const BLANK_SLOT: u16 = 0;
 
 /// Where one character's artwork sits in egui's font atlas and where it is
 /// drawn relative to its cell.  Read off a galley epaint laid out, so the
@@ -62,7 +62,7 @@ pub(crate) struct GlyphInstance {
 /// egui lays a one-character galley out as exactly one quad; anything else
 /// (a character with no ink, a fallback that produced nothing) has no slot and
 /// draws as blank.
-pub(crate) fn slot_from_galley(galley: &Galley) -> Option<GlyphSlot> {
+fn slot_from_galley(galley: &Galley) -> Option<GlyphSlot> {
     let row = galley.rows.first()?;
     let v = &row.visuals.mesh.vertices;
     if v.len() != 4 {

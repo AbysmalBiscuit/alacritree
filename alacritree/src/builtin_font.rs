@@ -151,7 +151,7 @@ pub(crate) fn is_builtin_glyph(c: char) -> bool {
 }
 
 /// Returns the rasterized glyph if the character is part of the built-in font.
-pub(crate) fn builtin_glyph(
+fn builtin_glyph(
     character: char,
     metrics: &Metrics,
     offset: &FontDelta,

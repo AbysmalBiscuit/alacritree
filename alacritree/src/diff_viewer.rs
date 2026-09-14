@@ -42,7 +42,7 @@ pub(crate) fn diff_key(req: &DiffRequest) -> String {
 }
 
 /// git arguments after `git` for the requested diff.
-pub(crate) fn diff_args(req: &DiffRequest) -> Vec<String> {
+fn diff_args(req: &DiffRequest) -> Vec<String> {
     let mut args = vec!["diff".to_string()];
     match &req.source {
         DiffSource::Staged => args.push("--cached".to_string()),
