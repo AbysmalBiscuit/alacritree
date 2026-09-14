@@ -24,7 +24,7 @@ pub(super) const ID: &str =
     "https://github.com/mathix420/alacritree/releases/latest/download/alacritree-config.json";
 
 /// The schema document, pretty-printed with a trailing newline.
-pub(super) fn document() -> String {
+pub fn document() -> String {
     let mut schema =
         serde_json::to_value(crate::config::json_schema()).expect("a schema serializes");
     let obj = schema.as_object_mut().expect("a struct schema is a JSON object");

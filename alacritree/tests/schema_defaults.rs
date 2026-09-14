@@ -10,15 +10,11 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use alacritree::command_ext::hidden;
+use alacritree::cli::schema_document;
 use serde_json::Value;
 
 fn generated() -> Value {
-    // A test has no UI thread for a blocking wait to stall.
-    #[allow(clippy::disallowed_methods)]
-    let out = hidden(env!("CARGO_BIN_EXE_alacritree")).arg("schema").output().unwrap();
-    assert!(out.status.success(), "`alacritree schema` failed");
-    serde_json::from_slice(&out.stdout).unwrap()
+    serde_json::from_str(&schema_document()).unwrap()
 }
 
 fn allowlist_path() -> PathBuf {

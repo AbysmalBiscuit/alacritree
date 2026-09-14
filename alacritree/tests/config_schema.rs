@@ -9,15 +9,7 @@
 
 use std::path::PathBuf;
 
-use alacritree::command_ext::hidden;
-
-fn generated() -> String {
-    // A test has no UI thread for a blocking wait to stall.
-    #[allow(clippy::disallowed_methods)]
-    let out = hidden(env!("CARGO_BIN_EXE_alacritree")).arg("schema").output().unwrap();
-    assert!(out.status.success(), "`alacritree schema` failed");
-    String::from_utf8(out.stdout).unwrap()
-}
+use alacritree::cli::schema_document;
 
 fn schema_path() -> PathBuf {
     // The manifest dir is `alacritree/`; the schema is published from the
@@ -27,7 +19,7 @@ fn schema_path() -> PathBuf {
 
 #[test]
 fn the_committed_schema_matches_the_config_types() {
-    let generated = generated();
+    let generated = schema_document();
     let committed = std::fs::read_to_string(schema_path()).unwrap_or_default();
     if committed == generated {
         return;
@@ -69,7 +61,7 @@ fn the_committed_schema_names_where_it_is_published() {
 
 #[test]
 fn empty_collections_publish_their_defaults() {
-    let schema: serde_json::Value = serde_json::from_str(&generated()).unwrap();
+    let schema: serde_json::Value = serde_json::from_str(&schema_document()).unwrap();
     for (section, key) in
         [("RawColors", "indexed_colors"), ("RawUi", "profiles"), ("RawWorkspace", "overrides")]
     {
