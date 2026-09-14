@@ -9,16 +9,14 @@
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::process::Command;
 
+use alacritree::command_ext::hidden;
 use serde_json::Value;
 
 fn generated() -> Value {
-    // The child is alacritree itself, a GUI-subsystem binary that allocates no
-    // console, so there is no window to hide.  This crate has no lib target, so
-    // an integration test cannot reach `command_ext::hidden`.
+    // A test has no UI thread for a blocking wait to stall.
     #[allow(clippy::disallowed_methods)]
-    let out = Command::new(env!("CARGO_BIN_EXE_alacritree")).arg("schema").output().unwrap();
+    let out = hidden(env!("CARGO_BIN_EXE_alacritree")).arg("schema").output().unwrap();
     assert!(out.status.success(), "`alacritree schema` failed");
     serde_json::from_slice(&out.stdout).unwrap()
 }

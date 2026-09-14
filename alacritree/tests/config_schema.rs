@@ -8,15 +8,13 @@
 //! also the one that fixes it.
 
 use std::path::PathBuf;
-use std::process::Command;
+
+use alacritree::command_ext::hidden;
 
 fn generated() -> String {
-    // The child here is alacritree itself, a GUI-subsystem binary that
-    // allocates no console at all, so there is no window to hide. This crate
-    // has no lib target, so an integration test cannot reach
-    // `command_ext::hidden` to build it the sanctioned way.
+    // A test has no UI thread for a blocking wait to stall.
     #[allow(clippy::disallowed_methods)]
-    let out = Command::new(env!("CARGO_BIN_EXE_alacritree")).arg("schema").output().unwrap();
+    let out = hidden(env!("CARGO_BIN_EXE_alacritree")).arg("schema").output().unwrap();
     assert!(out.status.success(), "`alacritree schema` failed");
     String::from_utf8(out.stdout).unwrap()
 }
