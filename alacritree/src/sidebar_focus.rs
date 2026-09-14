@@ -1232,7 +1232,7 @@ mod tests {
         assert!(base_big.matches(&big, std::iter::empty(), ui));
         let big_visits = visits();
 
-        // 50×10 is 10× the records of 10×5.  Linear work lands near 10×;
+        // 50×10 is 10× the records of 10×5. Linear work lands near 10×;
         // anything quadratic lands near 100× and trips this well before a
         // timing threshold would notice.
         assert!(

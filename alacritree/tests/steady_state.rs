@@ -42,7 +42,7 @@ fn tree(projects: usize, worktrees: usize) -> Vec<Project> {
         .collect()
 }
 
-/// Sessions carrying the titles a live query makes the compare walk.  An
+/// Sessions carrying the titles a live query makes the compare walk. An
 /// empty title compares without allocating whatever `matches` does with
 /// it, so a fixture full of them cannot tell a borrowed comparison from
 /// one that copies each title first.
