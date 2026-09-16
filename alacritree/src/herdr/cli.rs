@@ -156,12 +156,13 @@ pub fn running_session_name(side: &Side) -> Result<String, String> {
         .unwrap_or_else(fallback))
 }
 
-/// The `herdr` subcommand that opens a tab and brings it to the front, so a
-/// shared view attaching afterwards is already showing the pane it made.
-/// `--cwd` is left off entirely when no directory is chosen, since herdr's
-/// own default is a better answer than an empty path.
-fn create_args(cwd: Option<&str>) -> Vec<String> {
-    let mut args = vec!["tab".into(), "create".into(), "--focus".into()];
+/// The `herdr` subcommand that opens a tab, bringing it to the front when
+/// `focus` is set so a shared view attaching afterwards is already showing
+/// the pane it made. `--cwd` is left off entirely when no directory is
+/// chosen, since herdr's own default is a better answer than an empty path.
+fn create_args(cwd: Option<&str>, focus: bool) -> Vec<String> {
+    let focus = if focus { "--focus" } else { "--no-focus" };
+    let mut args = vec!["tab".into(), "create".into(), focus.into()];
     if let Some(cwd) = cwd {
         args.push("--cwd".into());
         args.push(cwd.into());
@@ -169,14 +170,15 @@ fn create_args(cwd: Option<&str>) -> Vec<String> {
     args
 }
 
-/// Opens a tab in the user's own herdr window and focuses it.  A process
-/// spawn that waits on herdr starting up, so it only ever runs on the pool.
+/// Opens a tab in the user's own herdr window, focusing it when `focus` is
+/// set. A process spawn that waits on herdr starting up, so it only ever
+/// runs on the pool.
 ///
 /// `cwd` is spelled in the side's own terms: a Windows path on the native
 /// side, and a path inside the distro on a WSL one, since herdr resolves it
 /// where it runs.
-pub fn create_pane(side: &Side, cwd: Option<String>) -> Result<CreatedPane, String> {
-    let create = create_args(cwd.as_deref());
+pub fn create_pane(side: &Side, cwd: Option<String>, focus: bool) -> Result<CreatedPane, String> {
+    let create = create_args(cwd.as_deref(), focus);
     let borrowed: Vec<&str> = create.iter().map(String::as_str).collect();
     let (program, args) = side.command(&program(side), &borrowed);
     #[allow(clippy::disallowed_methods)] // Running herdr is this function's job.
@@ -242,22 +244,24 @@ pub(super) type HerdrAttachResult = Result<(String, Vec<String>), String>;
 
 /// What a shared-view attach asks herdr before its client can start: focus
 /// the pane, since every app client draws whatever herdr has focused, then
-/// name the session, since that is what the client attaches to.  Both are
-/// process spawns, and on native Windows both wait on herdr starting up,
-/// which is why this only ever runs on the pool.
+/// name the session, since that is what the client attaches to. A `None` focus
+/// leaves herdr where it is. Both are process spawns, and on native Windows
+/// both wait on herdr starting up, which is why this only runs on the pool.
 ///
 /// `cached_name` is what the endpoint learned in the background.  A gesture
 /// that beats the first read asks herdr itself: a wait is better than a
 /// refusal.
 pub fn herdr_attach_gesture(
     side: &Side,
-    focus: &[String],
+    focus: Option<&[String]>,
     cached_name: Option<String>,
 ) -> HerdrAttachResult {
     // Two argv spawns, no shell: the only shell a `Native` command could
     // reach on this side is cmd.exe, which does not understand `sh_quote`'s
     // single-quoting.
-    focus_pane(side, focus)?;
+    if let Some(focus) = focus {
+        focus_pane(side, focus)?;
+    }
     let session = match cached_name {
         Some(session) => session,
         None => running_session_name(side)?,
@@ -313,14 +317,21 @@ mod tests {
     /// showed the pane before it.
     #[test]
     fn a_created_pane_is_focused_and_takes_a_cwd_only_when_one_is_chosen() {
-        assert_eq!(create_args(None), vec!["tab", "create", "--focus"]);
-        assert_eq!(create_args(Some("/tmp/review")), vec![
+        assert_eq!(create_args(None, true), vec!["tab", "create", "--focus"]);
+        assert_eq!(create_args(Some("/tmp/review"), true), vec![
             "tab",
             "create",
             "--focus",
             "--cwd",
             "/tmp/review"
         ]);
+    }
+
+    /// herdr focuses a new tab unless told otherwise, so leaving the user's
+    /// window alone has to be said out loud.
+    #[test]
+    fn a_pane_created_without_focus_says_so() {
+        assert_eq!(create_args(None, false), vec!["tab", "create", "--no-focus"]);
     }
 
     #[test]

@@ -131,8 +131,9 @@ pub(crate) trait MultiplexerSession {
     fn open_multiplexer_session(&self, target: &PaneTarget, mode: AttachMode) -> Option<Launch>;
 
     /// What a shared view needs before its client can start: point the
-    /// multiplexer at the pane, then name the session to attach to.  Both are
-    /// process calls, so this only ever runs off the UI thread.
+    /// multiplexer at the pane when `focus` is set, then name the session to
+    /// attach to. Both are process calls, so this only ever runs off the UI
+    /// thread.
     ///
     /// `cached_name` is the session name already learned in the background.
     /// A gesture that beats the first read asks the multiplexer itself, since
@@ -141,17 +142,23 @@ pub(crate) trait MultiplexerSession {
         &self,
         target: &PaneTarget,
         cached_name: Option<String>,
+        focus: bool,
     ) -> Result<Launch, String>;
 
-    /// Open a pane on `side` and focus it, so a shared view attaching
-    /// afterwards is already showing the pane this names.  A process call,
-    /// so this only ever runs off the UI thread.
+    /// Open a pane on `side`, focusing it when `focus` is set so a shared
+    /// view attaching afterwards is already showing the pane this names. A
+    /// process call, so this only ever runs off the UI thread.
     ///
     /// `cwd` is spelled in the side's own terms: a Windows path on the native
     /// side, a path inside the distro on a WSL one, since the multiplexer
     /// resolves it where it runs.  `None` leaves the directory to the
     /// multiplexer's own default.
-    fn create_pane(&self, side: &Side, cwd: Option<String>) -> Result<CreatedPane, String>;
+    fn create_pane(
+        &self,
+        side: &Side,
+        cwd: Option<String>,
+        focus: bool,
+    ) -> Result<CreatedPane, String>;
 
     /// Whether a row on `side` opens the agent's own pane rather than a
     /// shared view. `has_agent` is false for a pane the multiplexer found no
@@ -208,14 +215,21 @@ impl MultiplexerSession for Herdr {
         &self,
         target: &PaneTarget,
         cached_name: Option<String>,
+        focus: bool,
     ) -> Result<Launch, String> {
-        let focus = herdr::focus_args(target);
-        let (program, argv) = herdr::herdr_attach_gesture(&target.side, &focus, cached_name)?;
+        let focus = focus.then(|| herdr::focus_args(target));
+        let (program, argv) =
+            herdr::herdr_attach_gesture(&target.side, focus.as_deref(), cached_name)?;
         Ok(Launch { program, argv })
     }
 
-    fn create_pane(&self, side: &Side, cwd: Option<String>) -> Result<CreatedPane, String> {
-        herdr::create_pane(side, cwd)
+    fn create_pane(
+        &self,
+        side: &Side,
+        cwd: Option<String>,
+        focus: bool,
+    ) -> Result<CreatedPane, String> {
+        herdr::create_pane(side, cwd, focus)
     }
 
     fn attaches_directly(&self, side: &Side, mode: AttachMode, has_agent: bool) -> bool {

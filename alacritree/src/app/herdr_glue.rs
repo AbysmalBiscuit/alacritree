@@ -55,23 +55,24 @@ impl AlacritreeApp {
     /// Opens a herdr agent in a session running herdr's attach client.  The
     /// session is an ordinary shell, so nothing in the grid or input path
     /// treats it specially; only the key marks it as this agent's row.
-    /// Returns whether the attach succeeded so the caller can switch
-    /// `current_workspace` to `workspace` first and restore it on failure —
-    /// the same replace-and-restore shape `spawn_shell_request` uses, needed
-    /// here for the same reason: a refusal is only readable in the
-    /// workspace it happened in.  `unlisted` stands in for a pane the
-    /// listing does not carry.
+    /// Returns whether the attach succeeded so the caller can make `switch`
+    /// first and undo it on failure, the same replace-and-restore shape
+    /// `spawn_shell_request` uses, needed here for the same reason: a refusal
+    /// is only readable in the workspace it happened in.  `unlisted` stands
+    /// in for a pane the listing does not carry.
     pub(super) fn attach_herdr_agent(
         &mut self,
         ctx: &Context,
         key: herdr::HerdrKey,
         unlisted: PaneTarget,
-        workspace: WorkspaceKey,
-        previous: WorkspaceKey,
+        switch: &WorkspaceSwitch,
         waiter: Option<mpsc::Sender<ipc::protocol::IpcResult>>,
+        focus: AttachFocus,
     ) -> bool {
         if let Some(id) = self.herdr_session_for(&key) {
-            self.activate_session_by_id(id);
+            if focus.takes() {
+                self.activate_session_by_id(id);
+            }
             if let Some(waiter) = waiter {
                 let _ = waiter.send(Ok(json!({ "session_id": id })));
             }
@@ -85,22 +86,19 @@ impl AlacritreeApp {
         if let Some(launch) = multiplexer.open_multiplexer_session(&target, attach) {
             // Nothing to ask herdr first: the pane id is the whole target,
             // and the client attaches to it directly.
-            let opened =
-                self.open_herdr_session(ctx, key, workspace, launch.program, launch.argv, false);
+            let opened = self.open_herdr_session(ctx, key, switch.to.clone(), launch, false, focus);
             return match opened {
                 Some(id) => {
                     self.park_attach_reply(id, waiter);
                     true
                 },
                 None => {
-                    if let Some(waiter) = waiter {
-                        let message = self
-                            .modals
-                            .error_dialog
-                            .clone()
-                            .unwrap_or_else(|| "failed to attach the pane".to_string());
-                        let _ = waiter.send(Err(message));
-                    }
+                    let message = self
+                        .modals
+                        .error_dialog
+                        .take()
+                        .unwrap_or_else(|| "failed to attach the pane".to_string());
+                    self.refuse_multiplexer_request(waiter, message, focus);
                     false
                 },
             };
@@ -108,11 +106,17 @@ impl AlacritreeApp {
 
         // Every one of herdr's app clients draws the same focused pane, so a
         // shared view shows a row's pane only while herdr is focused there.
-        // The attach focuses it so the first frame is already right, and
+        // An attach taking focus focuses it so the first frame is right, and
         // `sync_herdr_view_focus` focuses it again whenever the session comes
         // back up, which is what lets a side hold one session per row.
         if let Some(pending) = self.herdr.pending_attach.iter_mut().find(|p| p.key == key) {
             pending.waiters.extend(waiter);
+            if focus.takes() && !pending.focus.takes() {
+                pending.focus = focus;
+                // A background gesture changes nothing in herdr, so dropping
+                // it and asking again with focus is safe.
+                pending.job = None;
+            }
             return true;
         }
         // The gesture is two herdr processes whatever `async_session_spawn`
@@ -122,9 +126,10 @@ impl AlacritreeApp {
             job: None,
             target,
             key,
-            workspace,
-            previous,
+            workspace: switch.to.clone(),
+            previous: switch.from.clone(),
             waiters: waiter.into_iter().collect(),
+            focus,
         });
         ctx.request_repaint();
         true
@@ -169,9 +174,9 @@ impl AlacritreeApp {
             // Naming the pane's own workspace as the one to restore makes
             // both arms of the restore no-ops, so a refusal cannot move a
             // user who navigated while the gesture was still running.
-            let previous = workspace.clone();
+            let switch = WorkspaceSwitch { to: workspace.clone(), from: workspace };
             let unlisted = unlisted_pane_target(&key, &pane_id);
-            self.attach_herdr_agent(ctx, key, unlisted, workspace, previous, None);
+            self.attach_herdr_agent(ctx, key, unlisted, &switch, None, AttachFocus::Take);
         }
     }
 
@@ -218,11 +223,12 @@ impl AlacritreeApp {
         side: herdr::Side,
         workspace: WorkspaceKey,
         waiter: Option<mpsc::Sender<ipc::protocol::IpcResult>>,
+        focus: AttachFocus,
     ) {
         let cwd = match multiplexer_cwd(&side, workspace.as_deref()) {
             Ok(cwd) => cwd,
             Err(e) => {
-                self.refuse_herdr_create(waiter, e);
+                self.refuse_multiplexer_request(waiter, e, focus);
                 return;
             },
         };
@@ -232,9 +238,9 @@ impl AlacritreeApp {
         let multiplexer = Multiplexer::from(Herdr);
         let asked = side.clone();
         let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
-            multiplexer.create_pane(&asked, cwd)
+            multiplexer.create_pane(&asked, cwd, focus.takes())
         });
-        self.herdr.pending_create.push(PendingHerdrCreate { job, side, workspace, waiter });
+        self.herdr.pending_create.push(PendingHerdrCreate { job, side, workspace, waiter, focus });
         ctx.request_repaint();
     }
 
@@ -258,43 +264,47 @@ impl AlacritreeApp {
                     has_agent: false,
                 };
                 let key = herdr::HerdrKey { side: pending.side, terminal_id: pane.terminal_id };
-                let previous =
-                    std::mem::replace(&mut self.current_workspace, pending.workspace.clone());
+                let switch = self.switch_for_attach(&pending.workspace, pending.focus);
                 if !self.attach_herdr_agent(
                     ctx,
                     key,
                     unlisted,
-                    pending.workspace,
-                    previous.clone(),
+                    &switch,
                     pending.waiter,
-                ) {
-                    self.current_workspace = previous;
+                    pending.focus,
+                ) && pending.focus.takes()
+                {
+                    self.current_workspace = switch.from;
                 }
             },
-            Some(Err(e)) => self.refuse_herdr_create(pending.waiter, e),
+            Some(Err(e)) => self.refuse_multiplexer_request(pending.waiter, e, pending.focus),
             None if pending.job.failed() => {
-                self.refuse_herdr_create(
+                self.refuse_multiplexer_request(
                     pending.waiter,
                     "the herdr pane create did not finish".to_string(),
+                    pending.focus,
                 );
             },
             None => self.herdr.pending_create.insert(0, pending),
         }
     }
 
-    /// Report a create that made no pane, whether the multiplexer refused it
-    /// or it was refused before the multiplexer was asked.  Nothing has
-    /// switched workspace yet, since that waits for the pane to land, so a
-    /// refusal leaves the user where they are and only has to be readable.
-    pub(super) fn refuse_herdr_create(
+    /// Report an attach or create that failed to every client waiting on it,
+    /// and to the user. A request that left focus reaches only its clients
+    /// when one is still listening, since it asked not to interrupt the user.
+    pub(super) fn refuse_multiplexer_request(
         &mut self,
-        waiter: Option<mpsc::Sender<ipc::protocol::IpcResult>>,
+        waiters: impl IntoIterator<Item = mpsc::Sender<ipc::protocol::IpcResult>>,
         message: String,
+        focus: AttachFocus,
     ) {
-        if let Some(waiter) = waiter {
-            let _ = waiter.send(Err(message.clone()));
+        let mut answered = false;
+        for waiter in waiters {
+            answered |= waiter.send(Err(message.clone())).is_ok();
         }
-        self.modals.error_dialog = Some(message);
+        if focus.takes() || !answered {
+            self.modals.error_dialog = Some(message);
+        }
     }
 
     /// Adopt the shared-view attaches whose herdr calls have landed.  Each
@@ -318,9 +328,9 @@ impl AlacritreeApp {
                         ctx,
                         pending.key,
                         pending.workspace,
-                        launch.program,
-                        launch.argv,
+                        launch,
                         true,
+                        pending.focus,
                     ) {
                         Some(id) => {
                             for waiter in waiters {
@@ -329,27 +339,19 @@ impl AlacritreeApp {
                         },
                         None => {
                             self.restore_after_failed_attach(&switched_to, pending.previous);
-                            let message = self.modals.error_dialog.clone().unwrap_or_default();
-                            for waiter in waiters {
-                                let _ = waiter.send(Err(message.clone()));
-                            }
+                            let message = self.modals.error_dialog.take().unwrap_or_default();
+                            self.refuse_multiplexer_request(waiters, message, pending.focus);
                         },
                     }
                 },
                 Some(Err(e)) => {
                     self.restore_after_failed_attach(&pending.workspace, pending.previous);
-                    for waiter in std::mem::take(&mut pending.waiters) {
-                        let _ = waiter.send(Err(e.clone()));
-                    }
-                    self.modals.error_dialog = Some(e);
+                    self.refuse_multiplexer_request(pending.waiters, e, pending.focus);
                 },
                 None if job.failed() => {
                     self.restore_after_failed_attach(&pending.workspace, pending.previous);
                     let message = "the herdr attach did not finish".to_string();
-                    for waiter in std::mem::take(&mut pending.waiters) {
-                        let _ = waiter.send(Err(message.clone()));
-                    }
-                    self.modals.error_dialog = Some(message);
+                    self.refuse_multiplexer_request(pending.waiters, message, pending.focus);
                 },
                 None => self.herdr.pending_attach.insert(0, pending),
             }
@@ -360,14 +362,30 @@ impl AlacritreeApp {
                 .find_herdr_agent(&side, &pending.key.terminal_id)
                 .map_or_else(|| pending.target.clone(), |agent| agent.target(&side));
             let multiplexer = Multiplexer::owning(&pending.key);
+            let focus = pending.focus.takes();
             pending.job = Some(jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
-                multiplexer.shared_view_gesture(&target, name)
+                multiplexer.shared_view_gesture(&target, name, focus)
             }));
             self.herdr.pending_attach.insert(0, pending);
         }
         if self.herdr.pending_attach.first().is_some_and(|pending| pending.job.is_none()) {
             ctx.request_repaint();
         }
+    }
+
+    /// Switch to where an attach lands when it takes focus. An attach that
+    /// leaves focus stays put, the same way the batch attach avoids moving
+    /// the user.
+    pub(super) fn switch_for_attach(
+        &mut self,
+        workspace: &WorkspaceKey,
+        focus: AttachFocus,
+    ) -> WorkspaceSwitch {
+        let from = match focus {
+            AttachFocus::Take => std::mem::replace(&mut self.current_workspace, workspace.clone()),
+            AttachFocus::Leave => workspace.clone(),
+        };
+        WorkspaceSwitch { to: workspace.clone(), from }
     }
 
     pub(super) fn restore_after_failed_attach(
@@ -391,23 +409,31 @@ impl AlacritreeApp {
         ctx: &Context,
         key: herdr::HerdrKey,
         workspace: WorkspaceKey,
-        program: String,
-        argv: Vec<String>,
+        launch: Launch,
         shared_view: bool,
+        focus: AttachFocus,
     ) -> Option<SessionId> {
-        let (argv, probe) = match herdr_attach_probe(&key.side, &program, &argv) {
+        let (argv, probe) = match herdr_attach_probe(&key.side, &launch.program, &launch.argv) {
             Some((wrapped, probe)) => (wrapped, Some(probe)),
-            None => (argv, None),
+            None => (launch.argv, None),
         };
         // `alacritty_terminal::tty::Shell`'s fields are crate-private, so
         // this goes through the constructor rather than a struct literal.
-        let shell = Shell::new(program, argv);
-        match self.spawn_session_with_shell(ctx, workspace, Some(shell), probe) {
+        let shell = Shell::new(launch.program, argv);
+        let kept_tab = self
+            .active_session
+            .get(&workspace)
+            .copied()
+            .filter(|id| !focus.takes() && self.sessions.iter().any(|s| s.id == *id));
+        match self.spawn_session_with_shell(ctx, workspace.clone(), Some(shell), probe) {
             Ok(id) => {
+                if let Some(kept) = kept_tab {
+                    self.active_session.insert(workspace, kept);
+                }
                 if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
                     session.bind_herdr(key.clone(), shared_view);
                 }
-                if shared_view {
+                if shared_view && focus.takes() {
                     self.herdr.focused_view.attached(id, Some(&key), Instant::now());
                 }
                 Some(id)
@@ -549,20 +575,27 @@ impl AlacritreeApp {
         }
         let workspace = self.herdr_row_workspace(&key.side, &key.terminal_id)?;
         let shared_view = !self.herdr_attaches_directly(key);
-        let (program, argv) = if !shared_view {
+        let launch = if !shared_view {
             let agent = self.find_herdr_agent(&key.side, &key.terminal_id)?;
             let attach = self.config.integrations.herdr.attach;
             // The branch already asked the question the multiplexer answers
             // here, so the `None` is unreachable; not following the pane is
             // the right answer anyway if the two ever disagree.
-            let launch = Multiplexer::owning(key)
-                .open_multiplexer_session(&agent.target(&key.side), attach)?;
-            (launch.program, launch.argv)
+            Multiplexer::owning(key).open_multiplexer_session(&agent.target(&key.side), attach)?
         } else {
             let name = self.herdr_session_name(&key.side)?;
-            key.side.command(&herdr::program(&key.side), &["session", "attach", &name])
+            let (program, argv) =
+                key.side.command(&herdr::program(&key.side), &["session", "attach", &name]);
+            Launch { program, argv }
         };
-        self.open_herdr_session(ctx, key.clone(), workspace, program, argv, shared_view)?;
+        self.open_herdr_session(
+            ctx,
+            key.clone(),
+            workspace,
+            launch,
+            shared_view,
+            AttachFocus::Take,
+        )?;
         self.herdr_session_for(key)
     }
 
@@ -803,6 +836,7 @@ impl AlacritreeApp {
         side: &str,
         terminal_id: &str,
         reply_tx: mpsc::Sender<ipc::protocol::IpcResult>,
+        focus: AttachFocus,
     ) {
         if !self.config.integrations.herdr.enabled {
             let _ = reply_tx.send(Err(HERDR_DISABLED.to_string()));
@@ -824,11 +858,12 @@ impl AlacritreeApp {
         let workspaces = herdr_workspaces(&self.projects, |path| self.liveness.missing(path));
         let workspace = Multiplexer::owning(&key).match_workspace(agent, &parsed_side, &workspaces);
 
-        let previous = std::mem::replace(&mut self.current_workspace, workspace.clone());
+        let switch = self.switch_for_attach(&workspace, focus);
         let unlisted = unlisted_pane_target(&key, &pane_id);
-        if !self.attach_herdr_agent(ctx, key, unlisted, workspace, previous.clone(), Some(reply_tx))
+        if !self.attach_herdr_agent(ctx, key, unlisted, &switch, Some(reply_tx), focus)
+            && focus.takes()
         {
-            self.current_workspace = previous;
+            self.current_workspace = switch.from;
         }
     }
 
@@ -843,6 +878,7 @@ impl AlacritreeApp {
         side: Option<&str>,
         workspace: Option<PathBuf>,
         reply_tx: mpsc::Sender<ipc::protocol::IpcResult>,
+        focus: AttachFocus,
     ) {
         if !self.config.integrations.herdr.enabled {
             let _ = reply_tx.send(Err(HERDR_DISABLED.to_string()));
@@ -876,7 +912,7 @@ impl AlacritreeApp {
                 },
             },
         };
-        self.create_multiplexer_pane(ctx, side, workspace, Some(reply_tx));
+        self.create_multiplexer_pane(ctx, side, workspace, Some(reply_tx), focus);
     }
 
     /// The side a create that named none happens on: the one the active
@@ -921,7 +957,7 @@ impl Action for action::NewMultiplexerPane {
         match app.default_multiplexer_side() {
             Ok(side) => {
                 let workspace = app.current_workspace.clone();
-                app.create_multiplexer_pane(ctx, side, workspace, None);
+                app.create_multiplexer_pane(ctx, side, workspace, None, AttachFocus::Take);
             },
             Err(e) => app.modals.error_dialog = Some(e),
         }
@@ -1116,6 +1152,35 @@ pub(super) fn managed_tooltip(managed: &Managed) -> String {
     hint
 }
 
+/// Whether opening a pane's session brings it in front of the user. Every
+/// gesture a person makes takes focus; a script attaching in the background
+/// leaves it, so the workspace on screen, each workspace's active tab and
+/// herdr's own focus all stay where they were.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AttachFocus {
+    Take,
+    Leave,
+}
+
+impl AttachFocus {
+    pub(super) fn requested(no_focus: bool) -> Self {
+        if no_focus { Self::Leave } else { Self::Take }
+    }
+
+    fn takes(self) -> bool {
+        self == Self::Take
+    }
+}
+
+/// The workspace switch an attach makes before anything can refuse it: its
+/// session opens in `to`, and a refusal hands the user back to `from`. An
+/// attach that leaves focus switches nowhere, so both name the same
+/// workspace and every restore after it is a no-op.
+pub(super) struct WorkspaceSwitch {
+    pub(super) to: WorkspaceKey,
+    pub(super) from: WorkspaceKey,
+}
+
 /// A shared-view attach waiting on herdr.  The gesture answers with the argv
 /// its client runs, so everything the session needs is in hand by the time it
 /// opens.
@@ -1134,6 +1199,9 @@ pub(super) struct PendingHerdrAttach {
     /// frames after the request that asked for it, so there is nothing to
     /// answer with until `poll_herdr_attach` resolves.
     pub(super) waiters: Vec<mpsc::Sender<ipc::protocol::IpcResult>>,
+    /// Taken when any request merged into this one asked for it. Always what
+    /// the running gesture was asked with.
+    pub(super) focus: AttachFocus,
 }
 
 /// A pane being created.  The attach it turns into is the ordinary one, so
@@ -1147,6 +1215,7 @@ pub(super) struct PendingHerdrCreate {
     pub(super) side: herdr::Side,
     pub(super) workspace: WorkspaceKey,
     pub(super) waiter: Option<mpsc::Sender<ipc::protocol::IpcResult>>,
+    pub(super) focus: AttachFocus,
 }
 
 /// A pane the listing no longer carries.  Claiming an agent is in it keeps
@@ -1226,6 +1295,7 @@ mod tests {
             workspace: None,
             previous: None,
             waiters: vec![first_tx],
+            focus: AttachFocus::Take,
         });
         herdr.pending_attach.push(PendingHerdrAttach {
             job: None,
@@ -1234,6 +1304,7 @@ mod tests {
             workspace: None,
             previous: None,
             waiters: vec![second_tx],
+            focus: AttachFocus::Take,
         });
         herdr.view_focus = Some(herdr::HerdrViewFocus {
             session: first_id,

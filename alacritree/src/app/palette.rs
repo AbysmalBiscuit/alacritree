@@ -438,19 +438,12 @@ impl AlacritreeApp {
             PaletteAction::AttachHerdrAgent(a) => {
                 // Switches first, same as both sidebar paths: a refusal is only
                 // visible if the workspace it happened in is on screen.
-                let previous = std::mem::replace(&mut self.current_workspace, a.workspace.clone());
+                let switch = self.switch_for_attach(&a.workspace, AttachFocus::Take);
                 let unlisted = unlisted_pane_target(&a.key, &a.pane_id);
-                if self.attach_herdr_agent(
-                    ctx,
-                    a.key,
-                    unlisted,
-                    a.workspace,
-                    previous.clone(),
-                    None,
-                ) {
+                if self.attach_herdr_agent(ctx, a.key, unlisted, &switch, None, AttachFocus::Take) {
                     self.focus_terminal();
                 } else {
-                    self.current_workspace = previous;
+                    self.current_workspace = switch.from;
                 }
             },
         }

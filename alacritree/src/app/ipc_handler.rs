@@ -78,12 +78,24 @@ impl AlacritreeApp {
                     self.defer_create_session(ctx, workspace, reply_tx);
                     continue;
                 },
-                ipc::protocol::IpcRequest::AttachMultiplexerPane { side, terminal_id } => {
-                    self.defer_attach_multiplexer_pane(ctx, &side, &terminal_id, reply_tx);
+                ipc::protocol::IpcRequest::AttachMultiplexerPane {
+                    side,
+                    terminal_id,
+                    no_focus,
+                } => {
+                    let focus = AttachFocus::requested(no_focus);
+                    self.defer_attach_multiplexer_pane(ctx, &side, &terminal_id, reply_tx, focus);
                     continue;
                 },
-                ipc::protocol::IpcRequest::CreateMultiplexerPane { side, workspace } => {
-                    self.defer_create_multiplexer_pane(ctx, side.as_deref(), workspace, reply_tx);
+                ipc::protocol::IpcRequest::CreateMultiplexerPane { side, workspace, no_focus } => {
+                    let focus = AttachFocus::requested(no_focus);
+                    self.defer_create_multiplexer_pane(
+                        ctx,
+                        side.as_deref(),
+                        workspace,
+                        reply_tx,
+                        focus,
+                    );
                     continue;
                 },
                 other => other,

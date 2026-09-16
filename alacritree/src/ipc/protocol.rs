@@ -85,19 +85,28 @@ pub(crate) enum IpcRequest {
     /// sidebar row does.  `side` and `terminal_id` are what
     /// `ListMultiplexerPanes` reports.  The pane id is deliberately not the
     /// target: it is positional and changes when a pane moves.
+    ///
+    /// `no_focus` opens the session behind the scenes: the workspace on
+    /// screen, each workspace's active tab and the multiplexer's own focus
+    /// all stay where they were.
     AttachMultiplexerPane {
         side: String,
         terminal_id: String,
+        #[serde(default)]
+        no_focus: bool,
     },
     /// Open a new pane in the multiplexer and a session on it.  `side` and
     /// `workspace` both default: an omitted side picks the one the active
     /// session already belongs to, and an omitted workspace opens the pane
-    /// in the focused one.
+    /// in the focused one. `no_focus` means what it does for
+    /// `AttachMultiplexerPane`.
     CreateMultiplexerPane {
         #[serde(default)]
         side: Option<String>,
         #[serde(default)]
         workspace: Option<PathBuf>,
+        #[serde(default)]
+        no_focus: bool,
     },
     /// Run a named key-binding action (`FocusLeft`, `ToggleLeftSidebar`, …)
     /// as if its key had been pressed.  `bindings::parse_action` defines the
