@@ -2195,20 +2195,12 @@ impl AlacritreeApp {
                     // Switches first, same as the click path: a refusal is
                     // only visible if the workspace it happened in is on
                     // screen.
-                    let previous =
-                        std::mem::replace(&mut self.current_workspace, workspace.clone());
-                    if self.attach_herdr_agent(
-                        ctx,
-                        key,
-                        unlisted,
-                        workspace,
-                        previous.clone(),
-                        None,
-                        AttachFocus::Take,
-                    ) {
+                    let switch = self.switch_for_attach(&workspace, AttachFocus::Take);
+                    if self.attach_herdr_agent(ctx, key, unlisted, &switch, None, AttachFocus::Take)
+                    {
                         self.focus_terminal();
                     } else {
-                        self.current_workspace = previous;
+                        self.current_workspace = switch.from;
                     }
                 }
             },
@@ -4023,7 +4015,7 @@ mod tests {
         GIT_FILTER_TOGGLES, base_branch_target, branch_diff_row, file_row, git_filter_identity,
         git_path_label, path_header_label,
     };
-    use super::herdr_glue::{PendingHerdrAttach, PendingHerdrCreate};
+    use super::herdr_glue::{PendingHerdrAttach, PendingHerdrCreate, WorkspaceSwitch};
     use super::modals::dirty_warning;
     use super::palette::{PaletteColumns, herdr_palette_content, paint_palette_row};
     use super::sidebar::{
@@ -4411,7 +4403,8 @@ mod tests {
         );
         let asked_from = Some(PathBuf::from("elsewhere"));
         app.current_workspace = asked_from.clone();
-        let tab = app.active_session.get(&None).copied();
+        let tab = app.sessions[0].id;
+        app.active_session.insert(None, tab);
         let id = bind_herdr_fixture(&mut app, side, "term-held");
         let (reply_tx, reply_rx) = mpsc::channel();
 
@@ -4425,7 +4418,7 @@ mod tests {
 
         assert_eq!(reply_rx.try_recv().unwrap(), Ok(json!({ "session_id": id })));
         assert_eq!(app.current_workspace, asked_from);
-        assert_eq!(app.active_session.get(&None).copied(), tab);
+        assert_eq!(app.active_session.get(&None).copied(), Some(tab));
     }
 
     /// A background attach that has to wait on herdr leaves the workspace on
@@ -4789,6 +4782,77 @@ mod tests {
         let id = app.herdr_session_for(&key).expect("the gesture opened a session");
         let session = app.sessions.iter().find(|session| session.id == id).unwrap();
         assert!(session.herdr_shared_view, "the created pane's session was recorded as direct");
+    }
+
+    /// A click on a pane whose background attach is already waiting on herdr
+    /// restarts the gesture with focus, since the running one left herdr where
+    /// it was. A background request joining a click changes nothing.
+    #[test]
+    fn a_click_joining_a_background_attach_asks_herdr_again_with_focus() {
+        let mut app = test_app();
+        let mut created = created_pane_fixture(None, None);
+        created.focus = AttachFocus::Leave;
+        app.herdr.pending_create.push(created);
+        app.poll_herdr_create(&Context::default());
+        let running = || {
+            Some(jobs::Job::ready(Ok(Launch {
+                program: "alacritree-test-no-such-client".into(),
+                argv: Vec::new(),
+            })))
+        };
+        app.herdr.pending_attach[0].job = running();
+        let key = herdr::HerdrKey {
+            side: herdr::Side::Wsl("distro".into()),
+            terminal_id: "term-new".into(),
+        };
+        let unlisted = PaneTarget {
+            side: key.side.clone(),
+            pane_id: "w1:p2".into(),
+            tab_id: Some("w1:t2".into()),
+            has_agent: false,
+        };
+        let switch = WorkspaceSwitch { to: None, from: None };
+        let ctx = Context::default();
+
+        app.attach_herdr_agent(
+            &ctx,
+            key.clone(),
+            unlisted.clone(),
+            &switch,
+            None,
+            AttachFocus::Take,
+        );
+
+        let pending = &app.herdr.pending_attach[0];
+        assert_eq!(pending.focus, AttachFocus::Take);
+        assert!(pending.job.is_none(), "the gesture that left herdr's focus alone was kept");
+
+        app.herdr.pending_attach[0].job = running();
+        app.attach_herdr_agent(&ctx, key, unlisted, &switch, None, AttachFocus::Leave);
+
+        let pending = &app.herdr.pending_attach[0];
+        assert_eq!(pending.focus, AttachFocus::Take);
+        assert!(pending.job.is_some(), "a background request restarted the click's gesture");
+    }
+
+    /// A background create herdr refused answers its client and leaves the
+    /// user's screen alone.
+    #[test]
+    fn a_refused_background_create_answers_only_its_client() {
+        let mut app = test_app();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        app.herdr.pending_create.push(PendingHerdrCreate {
+            job: jobs::Job::ready(Err("boom".to_string())),
+            side: herdr::Side::Native,
+            workspace: None,
+            waiter: Some(reply_tx),
+            focus: AttachFocus::Leave,
+        });
+
+        app.poll_herdr_create(&Context::default());
+
+        assert_eq!(reply_rx.try_recv().unwrap(), Err("boom".to_string()));
+        assert!(app.modals.error_dialog.is_none());
     }
 
     /// A pane created in the background opens its session behind the tab its
@@ -5294,12 +5358,12 @@ mod tests {
         let (reply_tx, reply_rx) = mpsc::channel();
 
         let unlisted = unlisted_pane_target(&key, "w1:p1");
+        let switch = WorkspaceSwitch { to: Some(workspace), from: None };
         let opened = app.attach_herdr_agent(
             &Context::default(),
             key,
             unlisted,
-            Some(workspace),
-            None,
+            &switch,
             Some(reply_tx),
             AttachFocus::Take,
         );

@@ -585,20 +585,12 @@ impl AlacritreeApp {
         if let Some((ws, key, pane_id)) = requests.attach_herdr.take() {
             // Switches first, same as `spawn_shell` below: a refusal
             // is only visible if the workspace it happened in is on screen.
-            let previous = std::mem::replace(&mut self.current_workspace, ws.clone());
+            let switch = self.switch_for_attach(&ws, AttachFocus::Take);
             let unlisted = unlisted_pane_target(&key, &pane_id);
-            if self.attach_herdr_agent(
-                ctx,
-                key,
-                unlisted,
-                ws,
-                previous.clone(),
-                None,
-                AttachFocus::Take,
-            ) {
+            if self.attach_herdr_agent(ctx, key, unlisted, &switch, None, AttachFocus::Take) {
                 workspace_activated = true;
             } else {
-                self.current_workspace = previous;
+                self.current_workspace = switch.from;
             }
         }
         if let Some(ws) = requests.spawn_shell.take() {

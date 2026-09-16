@@ -146,7 +146,7 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "side": { "type": "string", "description": "\"native\" or \"wsl:<distro>\", from list_multiplexer_panes." },
                     "terminal_id": { "type": "string", "description": "Terminal id from list_multiplexer_panes." },
-                    "no_focus": { "type": "boolean", "description": "Open the session without switching the window to it, making it its workspace's active tab, or moving herdr's own focus. Defaults to false." },
+                    "no_focus": { "type": "boolean", "description": "Open the session without switching the window to it, making it its workspace's active tab, or moving the multiplexer's focus. Defaults to false." },
                 },
                 "required": ["side", "terminal_id"],
             },
@@ -159,7 +159,7 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "side": { "type": "string", "description": "\"native\" or \"wsl:<distro>\", from list_multiplexer_panes." },
                     "workspace": { "type": "string", "description": "Worktree path from list_projects; omit for the focused workspace." },
-                    "no_focus": { "type": "boolean", "description": "Open the pane and its session without switching the window to them, making the session its workspace's active tab, or moving herdr's own focus. Defaults to false." },
+                    "no_focus": { "type": "boolean", "description": "Open the pane and its session without switching the window to them, making the session its workspace's active tab, or moving the multiplexer's focus. Defaults to false." },
                 },
             },
         },
