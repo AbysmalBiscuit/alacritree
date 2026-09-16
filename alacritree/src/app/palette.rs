@@ -447,6 +447,7 @@ impl AlacritreeApp {
                     a.workspace,
                     previous.clone(),
                     None,
+                    AttachFocus::Take,
                 ) {
                     self.focus_terminal();
                 } else {

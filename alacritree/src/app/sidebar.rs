@@ -587,7 +587,15 @@ impl AlacritreeApp {
             // is only visible if the workspace it happened in is on screen.
             let previous = std::mem::replace(&mut self.current_workspace, ws.clone());
             let unlisted = unlisted_pane_target(&key, &pane_id);
-            if self.attach_herdr_agent(ctx, key, unlisted, ws, previous.clone(), None) {
+            if self.attach_herdr_agent(
+                ctx,
+                key,
+                unlisted,
+                ws,
+                previous.clone(),
+                None,
+                AttachFocus::Take,
+            ) {
                 workspace_activated = true;
             } else {
                 self.current_workspace = previous;

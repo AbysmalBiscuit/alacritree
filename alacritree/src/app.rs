@@ -64,7 +64,7 @@ mod widgets;
 pub(crate) use actions::{Action, ActionOrigin};
 use focus::DeferredClose;
 use herdr_glue::{
-    HarnessMark, Managed, StateTone, herdr_mark, managed_tooltip, unlisted_pane_target,
+    AttachFocus, HarnessMark, Managed, StateTone, herdr_mark, managed_tooltip, unlisted_pane_target,
 };
 use modals::{BaseBranchPicker, CreateState, DeleteRequest, ProjectRemoveState, RenameState};
 use sidebar::{
@@ -2204,6 +2204,7 @@ impl AlacritreeApp {
                         workspace,
                         previous.clone(),
                         None,
+                        AttachFocus::Take,
                     ) {
                         self.focus_terminal();
                     } else {
@@ -4310,7 +4311,13 @@ mod tests {
         app.config.integrations.herdr.enabled = true;
         let (reply_tx, reply_rx) = mpsc::channel();
 
-        app.defer_attach_multiplexer_pane(&Context::default(), "bogus", "t1", reply_tx);
+        app.defer_attach_multiplexer_pane(
+            &Context::default(),
+            "bogus",
+            "t1",
+            reply_tx,
+            AttachFocus::Take,
+        );
 
         assert_eq!(
             reply_rx.try_recv().unwrap(),
@@ -4324,7 +4331,13 @@ mod tests {
         app.config.integrations.herdr.enabled = true;
         let (reply_tx, reply_rx) = mpsc::channel();
 
-        app.defer_attach_multiplexer_pane(&Context::default(), "native", "missing", reply_tx);
+        app.defer_attach_multiplexer_pane(
+            &Context::default(),
+            "native",
+            "missing",
+            reply_tx,
+            AttachFocus::Take,
+        );
 
         assert_eq!(
             reply_rx.try_recv().unwrap(),
@@ -4338,7 +4351,13 @@ mod tests {
         app.config.integrations.herdr.enabled = false;
         let (reply_tx, reply_rx) = mpsc::channel();
 
-        app.defer_attach_multiplexer_pane(&Context::default(), "native", "t1", reply_tx);
+        app.defer_attach_multiplexer_pane(
+            &Context::default(),
+            "native",
+            "t1",
+            reply_tx,
+            AttachFocus::Take,
+        );
 
         assert_eq!(
             reply_rx.try_recv().unwrap(),
@@ -4364,9 +4383,81 @@ mod tests {
         let id = bind_herdr_fixture(&mut app, side, "term-held");
         let (reply_tx, reply_rx) = mpsc::channel();
 
-        app.defer_attach_multiplexer_pane(&Context::default(), "native", "term-held", reply_tx);
+        app.defer_attach_multiplexer_pane(
+            &Context::default(),
+            "native",
+            "term-held",
+            reply_tx,
+            AttachFocus::Take,
+        );
 
         assert_eq!(reply_rx.try_recv().unwrap(), Ok(json!({ "session_id": id })));
+    }
+
+    /// A background attach to a pane a session already holds answers with
+    /// that session without bringing it on screen.
+    #[test]
+    fn attaching_without_focus_to_a_held_pane_leaves_the_screen_alone() {
+        let mut app = test_app();
+        app.config.integrations.herdr.enabled = true;
+        let side = herdr::Side::Native;
+        adopt_herdr_fixture(
+            &mut app,
+            side.clone(),
+            r#"{"result":{"panes":[
+                {"terminal_id":"term-held","pane_id":"w1:p1","agent":"claude","agent_status":"working","cwd":"/repo"}
+            ]}}"#,
+            Instant::now(),
+        );
+        let asked_from = Some(PathBuf::from("elsewhere"));
+        app.current_workspace = asked_from.clone();
+        let tab = app.active_session.get(&None).copied();
+        let id = bind_herdr_fixture(&mut app, side, "term-held");
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        app.defer_attach_multiplexer_pane(
+            &Context::default(),
+            "native",
+            "term-held",
+            reply_tx,
+            AttachFocus::Leave,
+        );
+
+        assert_eq!(reply_rx.try_recv().unwrap(), Ok(json!({ "session_id": id })));
+        assert_eq!(app.current_workspace, asked_from);
+        assert_eq!(app.active_session.get(&None).copied(), tab);
+    }
+
+    /// A background attach that has to wait on herdr leaves the workspace on
+    /// screen alone, and names its own workspace as the one a refusal
+    /// restores so a late refusal cannot move the user either.
+    #[test]
+    fn attaching_without_focus_queues_an_attach_that_stays_in_the_background() {
+        let mut app = herdr_lifecycle_app();
+        app.config.integrations.herdr.attach = AttachMode::Session;
+        adopt_herdr_fixture(
+            &mut app,
+            herdr::Side::Native,
+            r#"{"result":{"panes":[
+                {"terminal_id":"term-loose","pane_id":"w1:p1","agent":"claude","agent_status":"working","cwd":"/repo"}
+            ]}}"#,
+            Instant::now(),
+        );
+        let asked_from = app.current_workspace.clone();
+        let (reply_tx, _reply_rx) = mpsc::channel();
+
+        app.defer_attach_multiplexer_pane(
+            &Context::default(),
+            "native",
+            "term-loose",
+            reply_tx,
+            AttachFocus::Leave,
+        );
+
+        let pending = app.herdr.pending_attach.first().expect("the pane queued an attach");
+        assert_eq!(pending.focus, AttachFocus::Leave);
+        assert_eq!(pending.previous, pending.workspace, "a refusal restores nothing");
+        assert_eq!(app.current_workspace, asked_from);
     }
 
     /// Naming a side that no herdr server answers on is a different failure
@@ -4378,7 +4469,13 @@ mod tests {
         app.config.integrations.herdr.enabled = true;
         let (reply_tx, reply_rx) = mpsc::channel();
 
-        app.defer_create_multiplexer_pane(&Context::default(), Some("bogus"), None, reply_tx);
+        app.defer_create_multiplexer_pane(
+            &Context::default(),
+            Some("bogus"),
+            None,
+            reply_tx,
+            AttachFocus::Take,
+        );
 
         assert_eq!(
             reply_rx.try_recv().unwrap(),
@@ -4401,7 +4498,13 @@ mod tests {
         adopt_herdr_fixture(&mut app, herdr::Side::Wsl("ubuntu".into()), listing, Instant::now());
         let (reply_tx, reply_rx) = mpsc::channel();
 
-        app.defer_create_multiplexer_pane(&Context::default(), None, None, reply_tx);
+        app.defer_create_multiplexer_pane(
+            &Context::default(),
+            None,
+            None,
+            reply_tx,
+            AttachFocus::Take,
+        );
 
         assert_eq!(
             reply_rx.try_recv().unwrap(),
@@ -4508,6 +4611,7 @@ mod tests {
             Some("native"),
             Some(unknown.clone()),
             reply_tx,
+            AttachFocus::Take,
         );
 
         assert_eq!(reply_rx.try_recv().unwrap(), Err(unknown_worktree(&unknown)));
@@ -4550,6 +4654,7 @@ mod tests {
             side: herdr::Side::Native,
             workspace: Some(PathBuf::from("some/workspace")),
             waiter: Some(reply_tx),
+            focus: AttachFocus::Take,
         });
 
         app.poll_herdr_create(&Context::default());
@@ -4570,6 +4675,7 @@ mod tests {
             side: herdr::Side::Native,
             workspace: None,
             waiter: Some(reply_tx),
+            focus: AttachFocus::Take,
         });
 
         app.poll_herdr_create(&Context::default());
@@ -4596,6 +4702,7 @@ mod tests {
             side: herdr::Side::Wsl("distro".into()),
             workspace,
             waiter,
+            focus: AttachFocus::Take,
         }
     }
 
@@ -4684,13 +4791,54 @@ mod tests {
         assert!(session.herdr_shared_view, "the created pane's session was recorded as direct");
     }
 
+    /// A pane created in the background opens its session behind the tab its
+    /// workspace already shows, and the view tracker never hears it is on
+    /// screen, so nothing asks herdr to focus it until the user goes there.
+    #[test]
+    fn a_pane_created_without_focus_opens_behind_the_active_tab() {
+        let mut app = test_app();
+        app.config.ui.async_session_spawn = true;
+        let tab = app.sessions[0].id;
+        app.active_session.insert(None, tab);
+        let asked_from = Some(PathBuf::from("elsewhere"));
+        app.current_workspace = asked_from.clone();
+        let mut created = created_pane_fixture(None, None);
+        created.focus = AttachFocus::Leave;
+        app.herdr.pending_create.push(created);
+        app.poll_herdr_create(&Context::default());
+        let queued = app.herdr.pending_attach.first_mut().expect("the create queued a shared view");
+        assert_eq!(queued.focus, AttachFocus::Leave);
+        queued.job = Some(jobs::Job::ready(Ok(Launch {
+            program: "alacritree-test-no-such-client".into(),
+            argv: Vec::new(),
+        })));
+
+        app.poll_herdr_attach(&Context::default());
+
+        let key = herdr::HerdrKey {
+            side: herdr::Side::Wsl("distro".into()),
+            terminal_id: "term-new".into(),
+        };
+        let id = app.herdr_session_for(&key).expect("the gesture opened a session");
+        assert_ne!(id, tab);
+        assert_eq!(app.active_session.get(&None).copied(), Some(tab));
+        assert_eq!(app.current_workspace, asked_from);
+        assert_eq!(app.herdr.focused_view.visible, None);
+    }
+
     #[test]
     fn creating_a_pane_while_the_integration_is_disabled_says_so() {
         let mut app = test_app();
         app.config.integrations.herdr.enabled = false;
         let (reply_tx, reply_rx) = mpsc::channel();
 
-        app.defer_create_multiplexer_pane(&Context::default(), None, None, reply_tx);
+        app.defer_create_multiplexer_pane(
+            &Context::default(),
+            None,
+            None,
+            reply_tx,
+            AttachFocus::Take,
+        );
 
         assert_eq!(reply_rx.try_recv().unwrap(), Err(HERDR_DISABLED.to_string()));
     }
@@ -5034,6 +5182,7 @@ mod tests {
             previous: None,
             job: Some(jobs::Job::ready(Ok(Launch { program: "herdr".into(), argv: Vec::new() }))),
             waiters: Vec::new(),
+            focus: AttachFocus::Take,
         });
         adopt_herdr_fixture(&mut app, side, r#"{"result":{"panes":[]}}"#, Instant::now());
 
@@ -5062,6 +5211,7 @@ mod tests {
             workspace: None,
             previous: None,
             waiters: vec![reply_tx],
+            focus: AttachFocus::Take,
         });
 
         app.poll_herdr_attach(&Context::default());
@@ -5083,6 +5233,7 @@ mod tests {
             workspace: None,
             previous: None,
             waiters: vec![reply_tx],
+            focus: AttachFocus::Take,
         });
 
         app.poll_herdr_attach(&Context::default());
@@ -5111,6 +5262,7 @@ mod tests {
             workspace: Some(workspace.clone()),
             previous: None,
             waiters: vec![reply_tx],
+            focus: AttachFocus::Take,
         });
 
         app.poll_herdr_attach(&Context::default());
@@ -5149,6 +5301,7 @@ mod tests {
             Some(workspace),
             None,
             Some(reply_tx),
+            AttachFocus::Take,
         );
 
         assert!(!opened);
@@ -5396,6 +5549,7 @@ mod tests {
             workspace: None,
             previous: None,
             waiters: vec![reply_tx],
+            focus: AttachFocus::Take,
         });
 
         app.close_session(&Context::default(), id);

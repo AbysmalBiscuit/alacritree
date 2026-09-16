@@ -257,6 +257,10 @@ enum MultiplexerCommand {
         /// Terminal id from `multiplexer list`.  Not the pane id, which
         /// changes when a pane moves between workspaces.
         terminal_id: String,
+        /// Open the session without switching to it or moving the
+        /// multiplexer's focus.
+        #[arg(long)]
+        no_focus: bool,
     },
     /// Open a new pane in the multiplexer and a session on it.
     Create {
@@ -267,6 +271,10 @@ enum MultiplexerCommand {
         /// Worktree path; omit for the focused workspace.
         #[arg(long, value_name = "PATH")]
         workspace: Option<PathBuf>,
+        /// Open the pane and its session without switching to them or moving
+        /// the multiplexer's focus.
+        #[arg(long)]
+        no_focus: bool,
     },
 }
 
@@ -534,11 +542,15 @@ fn to_request(command: Command) -> IpcRequest {
         },
         Command::Multiplexer { command } => match command {
             MultiplexerCommand::List => IpcRequest::ListMultiplexerPanes,
-            MultiplexerCommand::Attach { side, terminal_id } => {
-                IpcRequest::AttachMultiplexerPane { side, terminal_id }
+            MultiplexerCommand::Attach { side, terminal_id, no_focus } => {
+                IpcRequest::AttachMultiplexerPane { side, terminal_id, no_focus }
             },
-            MultiplexerCommand::Create { side, workspace } => {
-                IpcRequest::CreateMultiplexerPane { side, workspace: workspace.map(absolute) }
+            MultiplexerCommand::Create { side, workspace, no_focus } => {
+                IpcRequest::CreateMultiplexerPane {
+                    side,
+                    workspace: workspace.map(absolute),
+                    no_focus,
+                }
             },
         },
         Command::Workspace { command } => match command {
@@ -663,6 +675,28 @@ mod tests {
         assert!(matches!(
             request_for(&["alacritree", "action", "FocusLeft"]),
             IpcRequest::RunAction { action } if action == "FocusLeft"
+        ));
+    }
+
+    /// A script attaching in the background says so with `--no-focus`; left
+    /// off, the request takes focus the way a click does.
+    #[test]
+    fn multiplexer_attach_and_create_take_focus_unless_told_not_to() {
+        assert!(matches!(
+            request_for(&["alacritree", "multiplexer", "attach", "native", "t1"]),
+            IpcRequest::AttachMultiplexerPane { no_focus: false, .. }
+        ));
+        assert!(matches!(
+            request_for(&["alacritree", "multiplexer", "attach", "native", "t1", "--no-focus"]),
+            IpcRequest::AttachMultiplexerPane { no_focus: true, .. }
+        ));
+        assert!(matches!(
+            request_for(&["alacritree", "multiplexer", "create"]),
+            IpcRequest::CreateMultiplexerPane { no_focus: false, .. }
+        ));
+        assert!(matches!(
+            request_for(&["alacritree", "multiplexer", "create", "--no-focus"]),
+            IpcRequest::CreateMultiplexerPane { no_focus: true, .. }
         ));
     }
 
