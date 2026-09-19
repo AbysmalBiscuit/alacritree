@@ -139,7 +139,7 @@ uv run sync.local.py
 
 A bare run is the whole round trip and takes no flags to be one: it collects the working documents the feature worktrees hold and the main checkout does not, commits whatever already sits on the branch uncommitted, rebases the branch onto its remote, moves files both ways, commits what landed, copies the instruction files back out to every worktree whose copy differs, and pushes. `-d` (or `-n`) reports all of that and writes nothing. `--no-commit` and `--no-push` stop at the earlier steps.
 
-Direction is decided per file. One side missing it gets a copy; both sides holding different content sends the newer one, so writing a spec here pushes it onto the branch and pulling the branch on a new machine seeds this checkout. After a clone stamps every file at once, `--to-branch` or `--to-main` overrides that. Anything reaching the branch is committed there, one commit per logical change, and `--trailer` adds a `Co-Authored-By` line for an agent's commits.
+Direction is decided per file. One side missing it gets a copy; both sides holding different content sends the newer one, so writing a spec here pushes it onto the branch and pulling the branch on a new machine seeds this checkout. After a clone stamps every file at once, `--to-branch` or `--to-main` overrides that. Anything reaching the branch is committed there, one commit per logical change, and `--trailer` adds a `Co-authored-by` line for an agent's commits.
 
 Both ends of that round trip reach past the two checkouts. Working documents come back from every feature worktree, because an agent writes them where it is standing. A worktree copy of a document the main checkout already has is left where it is: it is as likely to be a leftover from when the worktree was cut as an edit worth keeping. The instruction files go the other way once the run has settled which copy of them wins, which is what keeps an old worktree from reading rules this checkout stopped following.
 
@@ -153,9 +153,9 @@ Issue bodies, PR bodies, review comments and Markdown docs are soft-wrapped: one
 
 ## Git Commits
 
-Git commits you and/or your subagents make must have a commit trailer like: `Co-Authored-By: MODEL <EMAIL>` The `<EMAIL>` should follow standard practices for the model/harness being used.
+Git commits you and/or your subagents make must have a commit trailer like: `Co-authored-by: MODEL <EMAIL>` The `<EMAIL>` should follow standard practices for the model/harness being used.
 
-Example for Claude Opus 5: `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>` or `Co-Authored-By: Claude Opus 5 (1M Context) <noreply@anthropic.com>`
+Example for Claude Opus 5: `Co-authored-by: Claude Opus 5 <noreply@anthropic.com>` or `Co-authored-by: Claude Opus 5 (1M Context) <noreply@anthropic.com>`
 
 ## Opening PRs
 
