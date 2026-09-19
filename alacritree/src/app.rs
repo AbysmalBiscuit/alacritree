@@ -631,7 +631,7 @@ impl AlacritreeApp {
     pub fn new(cc: &CreationContext<'_>, config: Config) -> Self {
         let theme = Theme::from_config(&config);
         let fonts = Self::configure_context(&cc.egui_ctx, &config, &theme);
-        let (ipc_socket, ipc_rx) = Self::start_ipc(&cc.egui_ctx, config.ipc_socket);
+        let (ipc_socket, ipc_rx) = Self::start_ipc(&cc.egui_ctx, &config);
         let (persisted, projects) = Self::load_projects(&config);
 
         // Delegate installation and the permission prompt belong to startup:

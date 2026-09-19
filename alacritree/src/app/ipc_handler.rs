@@ -7,11 +7,11 @@ use super::*;
 impl AlacritreeApp {
     pub(super) fn start_ipc(
         ctx: &Context,
-        enabled: bool,
+        config: &Config,
     ) -> (Option<ipc::server::SocketHandle>, Option<Receiver<ipc::server::AppCall>>) {
         // Before the first PTY spawn so children inherit ALACRITREE_SOCKET.
-        if enabled {
-            match ipc::server::spawn_listener(ctx.clone()) {
+        if config.ipc_socket {
+            match ipc::server::spawn_listener(ctx.clone(), config.workspace.clone()) {
                 Ok((handle, rx)) => {
                     log::info!("IPC socket: {}", handle.path().display());
                     (Some(handle), Some(rx))

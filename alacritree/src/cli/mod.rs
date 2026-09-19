@@ -496,7 +496,7 @@ fn dispatch(
             if let Some(dir) = resolved.state_dir {
                 crate::state::set_dir(dir);
             }
-            offline::handle(request).map_err(SendError::Failed)
+            offline::handle(request, &resolved.workspace).map_err(SendError::Failed)
         },
         result => result,
     }

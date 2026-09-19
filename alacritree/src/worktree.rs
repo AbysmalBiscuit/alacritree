@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 
+use crate::config::WorkspaceConfig;
 use crate::repaint::Repaint;
 use crate::tools::{self, Tool};
 use crate::{command_ext, jobs, wsl};
@@ -20,12 +21,27 @@ pub(crate) enum Progress {
 }
 
 pub(crate) struct CreateRequest {
-    pub project_root: PathBuf,
-    pub default_branch: Option<String>,
-    pub branch: String,
+    project_root: PathBuf,
+    default_branch: Option<String>,
+    branch: String,
     /// Base directory to create the worktree under; `None` uses the built-in
     /// `~/.alacritree/worktrees` default.
-    pub base_dir: Option<PathBuf>,
+    base_dir: Option<PathBuf>,
+}
+
+impl CreateRequest {
+    /// The location comes from `[workspace]` here rather than from each
+    /// caller, so the sidebar, IPC and the offline CLI put a worktree in the
+    /// same place.
+    pub(crate) fn new(
+        project_root: PathBuf,
+        default_branch: Option<String>,
+        branch: String,
+        workspace: &WorkspaceConfig,
+    ) -> Self {
+        let base_dir = workspace.base_dir_for(&project_root);
+        Self { project_root, default_branch, branch, base_dir }
+    }
 }
 
 /// git-check-ref-format rules, abridged: no whitespace/control chars, no
