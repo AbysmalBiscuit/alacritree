@@ -65,7 +65,7 @@ after_worktree_create = [
         "alacritree",
         "project",
         "refresh",
-        "{{ '../' * ((slug | split('/') | length) + 1) }}alacritree",
+        "--all",
     ],
     [
         "zoxide",
@@ -163,35 +163,6 @@ run = [
 ]
 
 [templates]
-# Every PR here has the same shape: a human TL;DR, the issues it closes, then a
-# Claude-written section under a rule. The `Closes` lines have to sit inside the
-# TL;DR rather than at the end, because GitHub only reads them from the body and
-# a reader skimming the top should see what the PR resolves without scrolling
-# past the summary.
-#
-# `{{ input }}` is `--pr-body`, so the Claude summary goes there. The template
-# emits the TL;DR heading and nothing under it. That half is written into the
-# open PR by hand, never rendered from an argument.
-pr_body = '''
-## TL;DR (human written)
-
-{%- set ids = (((issue if issue is defined else "") ~ " " ~ closes) | split) -%}
-{%- if ids %}
-{% for id in ids %}
-Closes {{ issues_repo }}#{{ id }}
-{%- endfor %}
-{%- endif %}
-
-Claude summary below:
-
----
-
-{{ input }}
-
----
-
-Written by {{ model }} in Claude Code.
-'''
 
 [templates.variables]
 # Hooks are spawned without a shell, so `~` stays literal and a bare name is
