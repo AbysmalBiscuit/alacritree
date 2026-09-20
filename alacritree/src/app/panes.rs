@@ -3,8 +3,6 @@
 //! a multiplexer answers comes through [`MultiplexerSession`]; this file only
 //! decides what the app does with the answer.
 
-use strum::IntoEnumIterator;
-
 use super::*;
 use crate::multiplexer::{
     AttachFocus, AttachRequest, CreateRequest, Launch, ListedPane, Managed, MultiplexerKind, Pane,
@@ -177,7 +175,8 @@ impl AlacritreeApp {
     /// the session and any refusal are both readable where they were asked
     /// for.
     pub(super) fn poll_pane_creates(&mut self, ctx: &Context) {
-        for kind in MultiplexerKind::iter() {
+        for at in 0..self.multiplexers.len() {
+            let kind = self.multiplexers.kind_at(at);
             let Some(answer) = self.multiplexers.get_mut(kind).poll_create() else { continue };
             let request = answer.request;
             match answer.pane {
@@ -226,7 +225,8 @@ impl AlacritreeApp {
     /// opens in the workspace its own click came from, which that click
     /// switched to before handing the gesture over.
     pub(super) fn poll_pane_attaches(&mut self, ctx: &Context) {
-        for kind in MultiplexerKind::iter() {
+        for at in 0..self.multiplexers.len() {
+            let kind = self.multiplexers.kind_at(at);
             let (answer, starting) = self.multiplexers.get_mut(kind).poll_attach();
             if starting {
                 ctx.request_repaint();
@@ -822,7 +822,7 @@ pub(super) fn not_a_side(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::herdr_agent;
+    use crate::test_util::listed_agent;
 
     /// The click switched workspace before handing the gesture over, so a
     /// failure puts the user back where the click found them.
@@ -880,7 +880,7 @@ mod tests {
         let workspaces = pane_workspaces(&projects, |path| Some(path == gone));
         assert_eq!(workspaces, vec![PathBuf::from("/a/wt1")]);
 
-        let pane = Pane { cwd: Some(gone.to_string_lossy().into_owned()), ..herdr_agent(None) };
+        let pane = Pane { cwd: Some(gone.to_string_lossy().into_owned()), ..listed_agent(None) };
         let matched = pane.workspace(&Side::Native, &workspaces);
         assert_eq!(matched, None, "a pane under a removed checkout falls back to Home");
     }

@@ -9,6 +9,8 @@
 //! the app.
 
 mod model;
+#[cfg(test)]
+mod scripted;
 
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -24,6 +26,8 @@ pub(crate) use self::model::{
     Managed, StateTone, ViewState, ViewStep,
 };
 pub use self::model::{Pane, PaneKey, PaneStatus};
+#[cfg(test)]
+pub(crate) use self::scripted::Scripted;
 use crate::config::{BakedGlyph, IconStyle, IntegrationsConfig};
 use crate::herdr::Herdr;
 use crate::session::SessionId;
@@ -279,9 +283,28 @@ pub(crate) trait MultiplexerSession {
 pub(crate) enum Multiplexer {
     Herdr(Herdr),
     Zellij(Zellij),
+    /// Answers from a script instead of a server, so app behaviour can be
+    /// tested at this trait rather than through one multiplexer's wire
+    /// format.  Left out of [`MultiplexerKind::real`], so nothing builds it,
+    /// no refusal names it and no request reaches it by name.
+    #[cfg(test)]
+    Scripted(Scripted),
 }
 
 impl MultiplexerKind {
+    /// Every multiplexer that can front a server, which is what a user may
+    /// name and what `Multiplexers` builds.  `iter` also yields the scripted
+    /// one under `cfg(test)`, and that answers for nothing.
+    #[cfg(not(test))]
+    pub(crate) fn real() -> impl Iterator<Item = Self> {
+        Self::iter()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn real() -> impl Iterator<Item = Self> {
+        Self::iter().filter(|kind| *kind != Self::Scripted)
+    }
+
     /// Why a request that named this multiplexer is refused while it is off.
     /// Alone among the refusals, this one is worth retrying after a config
     /// change.
@@ -295,6 +318,10 @@ impl Multiplexer {
         match kind {
             MultiplexerKind::Herdr => Herdr::new(config.herdr.clone()).into(),
             MultiplexerKind::Zellij => Zellij::new(config.zellij.clone()).into(),
+            #[cfg(test)]
+            MultiplexerKind::Scripted => {
+                unreachable!("`Scripted` is held back from `MultiplexerKind::iter`")
+            },
         }
     }
 
@@ -318,7 +345,7 @@ pub(crate) struct Multiplexers(Vec<Multiplexer>);
 
 impl Multiplexers {
     pub(crate) fn new(config: &IntegrationsConfig) -> Self {
-        Self(MultiplexerKind::iter().map(|kind| Multiplexer::new(kind, config)).collect())
+        Self(MultiplexerKind::real().map(|kind| Multiplexer::new(kind, config)).collect())
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = &Multiplexer> {
@@ -327,6 +354,17 @@ impl Multiplexers {
 
     pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut Multiplexer> {
         self.0.iter_mut()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The kind held at `at`.  A frame that has to reach `&mut self` inside
+    /// its own loop walks positions rather than kinds, since the kind list is
+    /// not the set that was built.
+    pub(crate) fn kind_at(&self, at: usize) -> MultiplexerKind {
+        self.0[at].kind()
     }
 
     pub(crate) fn get(&self, kind: MultiplexerKind) -> &Multiplexer {
@@ -347,7 +385,7 @@ impl Multiplexers {
         static REASON: OnceLock<String> = OnceLock::new();
         REASON.get_or_init(|| {
             let tables: Vec<String> =
-                MultiplexerKind::iter().map(|kind| format!("[integrations.{kind}]")).collect();
+                MultiplexerKind::real().map(|kind| format!("[integrations.{kind}]")).collect();
             format!("every multiplexer integration is disabled ({} enabled)", tables.join(" or "))
         })
     }
@@ -363,10 +401,14 @@ impl Multiplexers {
                 Err(self.disabled_reason().to_string())
             };
         };
-        let kind = MultiplexerKind::from_str(name).map_err(|_| {
-            let known: Vec<String> = MultiplexerKind::iter().map(|k| format!("`{k}`")).collect();
-            format!("`{name}` is not a multiplexer, expected {}", known.join(" or "))
-        })?;
+        let kind = MultiplexerKind::from_str(name)
+            .ok()
+            .filter(|kind| MultiplexerKind::real().any(|real| real == *kind))
+            .ok_or_else(|| {
+                let known: Vec<String> =
+                    MultiplexerKind::real().map(|k| format!("`{k}`")).collect();
+                format!("`{name}` is not a multiplexer, expected {}", known.join(" or "))
+            })?;
         if self.get(kind).enabled() { Ok(Some(kind)) } else { Err(kind.disabled_reason()) }
     }
 
@@ -425,6 +467,40 @@ impl Multiplexers {
             let owned = key.filter(|key| key.multiplexer == multiplexer.kind());
             multiplexer.session_closed(id, owned);
         }
+    }
+
+    /// The scripted multiplexer, built on first use.  `new` cannot make one,
+    /// since it iterates the kinds and this one is held back from that.
+    #[cfg(test)]
+    /// Drop every real multiplexer, leaving the scripted one alone in the
+    /// set.  A test about what the app does with a multiplexer then answers
+    /// only for that, rather than also for which real one ships enabled.
+    pub(crate) fn only_scripted(&mut self) -> &mut Scripted {
+        self.0.retain(|m| m.kind() == MultiplexerKind::Scripted);
+        self.scripted_mut()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scripted_mut(&mut self) -> &mut Scripted {
+        if !self.0.iter().any(|m| m.kind() == MultiplexerKind::Scripted) {
+            self.0.push(Multiplexer::Scripted(Scripted::default()));
+        }
+        let Some(Multiplexer::Scripted(scripted)) =
+            self.0.iter_mut().find(|m| m.kind() == MultiplexerKind::Scripted)
+        else {
+            unreachable!("just pushed, and nothing else carries that kind")
+        };
+        scripted
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scripted(&self) -> &Scripted {
+        let Some(Multiplexer::Scripted(scripted)) =
+            self.0.iter().find(|m| m.kind() == MultiplexerKind::Scripted)
+        else {
+            panic!("`scripted_mut` builds it; call that first")
+        };
+        scripted
     }
 
     #[cfg(test)]
@@ -545,12 +621,33 @@ mod tests {
         assert_eq!(Side::Wsl("ubuntu".into()).cwd_for(None), Ok(None));
     }
 
-    /// Each multiplexer is built once, so every kind resolves to one.
+    /// Each multiplexer that fronts a server is built once, so every kind a
+    /// user can name resolves to one.  The scripted kind is the exception and
+    /// is built only where a test asks for it.
     #[test]
-    fn every_kind_has_a_multiplexer() {
+    fn every_real_kind_has_a_multiplexer() {
         let all = Multiplexers::new(&IntegrationsConfig::default());
-        for kind in MultiplexerKind::iter() {
+        for kind in MultiplexerKind::real() {
             assert_eq!(all.get(kind).kind(), kind);
         }
+    }
+
+    /// The scripted kind is a test fixture, not something a config enables or
+    /// a request reaches, so it stays out of both the built set and every
+    /// message that enumerates multiplexers.
+    #[test]
+    fn the_scripted_kind_is_reachable_only_by_asking_for_it() {
+        let mut all = Multiplexers::new(&IntegrationsConfig::default());
+        assert!(!MultiplexerKind::real().any(|kind| kind == MultiplexerKind::Scripted));
+        assert_eq!(all.len(), MultiplexerKind::real().count());
+        assert_eq!(
+            all.requested(Some("scripted")),
+            Err("`scripted` is not a multiplexer, expected `herdr` or `zellij`".to_string())
+        );
+        assert!(!all.disabled_reason().contains("scripted"));
+
+        all.scripted_mut().enable();
+        assert_eq!(all.len(), MultiplexerKind::real().count() + 1);
+        assert!(all.get(MultiplexerKind::Scripted).enabled());
     }
 }
