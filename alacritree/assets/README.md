@@ -2,38 +2,39 @@
 
 ## `alacritree-symbols.ttf`
 
-A subset of DejaVu 2.37 carrying only the glyphs alacritree paints itself,
-so the sidebar renders on systems whose fonts lack them. Registered last in
-each chrome font family, so an installed font that already has a glyph keeps
-rendering it.
+A subset of DejaVu 2.37 carrying only the glyphs alacritree paints itself, so the sidebar renders on systems whose fonts lack them. Registered last in each chrome font family, so an installed font that already has a glyph keeps rendering it.
 
-Built from two faces because neither covers the whole set: `DejaVuSans.ttf`
-lacks `⌕` (U+2315), and `DejaVuSansMono.ttf` lacks `⠿` (U+283F) and `⬤`
-(U+2B24).
+Built from two faces because neither covers the whole set: `DejaVuSans.ttf` lacks `⌕` (U+2315), and `DejaVuSansMono.ttf` lacks `⠿` (U+283F) and `⬤` (U+2B24).
 
-The internal family name is `Alacritree Symbols`, not `DejaVu Sans` — the
-artifact is a derivative and should not be mistaken for the real face.
+The internal family name is `Alacritree Symbols`, not `DejaVu Sans`. The artifact is a derivative and should not be mistaken for the real face.
+
+### Why the multiplexer icons live in plane 16
+
+Registering last is right for a last resort and wrong for an icon this build fits to the row. A Nerd Font maps every private codepoint below U+F1AF0 and most of the geometric shapes besides, so a default spelled as the real character is drawn by whichever `[font] fallback` entry claims it first, at that font's metrics, and the fitting done here is never seen.
+
+Plane 16 is claimed by nothing. Spelling the defaults at U+10FF00 (herdr's ram) and U+10FF01 (zellij's hexagon) leaves this face the only candidate, so it wins from last place with no reordering and no work at the paint sites.
+
+Both are drawn here rather than borrowed from DejaVu. A bisected square was tried for herdr and it reads as a missing-glyph box at row size, however correctly it renders, and U+2B21's hairline stroke closes up once the hexagon is scaled down to a row.
+
+Setting `[integrations.herdr] icon` to an ordinary character is therefore how you opt back into your own fonts for it. The schema publishes the private defaults, so they read as tofu in an editor; each field's documentation names the shape it draws.
+
+A codepoint above U+FFFF needs a format 12 cmap, which `write_cmap` builds beside the format 4 one. `fonts.rs` resolves every private codepoint through `ab_glyph`, the same lookup epaint makes, so a rebuild that dropped format 12 fails the suite instead of the sidebar.
 
 ### Regenerating
 
-Needed whenever a glyph is added to `DEFAULT_ICON_GLYPHS` or
-`CHROME_GLYPHS`. `fonts.rs`'s coverage test fails until this is done, and
-names the missing codepoint.
+Needed whenever a glyph is added to `DEFAULT_ICON_GLYPHS` or `CHROME_GLYPHS`, or one of the SVGs beside the font changes. `fonts.rs`'s coverage test fails until this is done, and names the missing codepoint.
 
-Requires `fonttools` and DejaVu 2.37.
+Add the codepoint to `build_symbols.py`, then run it against DejaVu 2.37. `--dejavu` defaults to `/usr/share/fonts/truetype/dejavu`:
 
-    D=/usr/share/fonts/truetype/dejavu
-    U=U+002B,U+00B7,U+00D7,U+2014,U+2022,U+2026,U+2191,U+2193,U+21BB,U+21C5,U+2302,U+232B,U+258C,U+25AA,U+25B8,U+25BE,U+25C7,U+25CB,U+25CF,U+25D0,U+25EB,U+25EF,U+2713,U+283F,U+2B24
-    python3 -m fontTools.subset $D/DejaVuSans.ttf     --unicodes="$U"     --output-file=sans.ttf --no-hinting --notdef-outline --drop-tables+=MATH
-    python3 -m fontTools.subset $D/DejaVuSansMono.ttf --unicodes="U+2315" --output-file=mono.ttf --no-hinting --notdef-outline
+    uv run alacritree/assets/build_symbols.py --dejavu <dir holding DejaVuSans.ttf and DejaVuSansMono.ttf>
 
-The `MATH` table is dropped from the Sans subset because `fontTools.merge`
-cannot combine it across faces; the symbol font has no use for math layout
-data anyway.
+Use Debian's or Kali's DejaVu, which is what the committed font was built from. The copy Windows ships also calls itself 2.37 but draws `◇` differently.
 
-Then merge with `fontTools.merge.Merger`, set name IDs 1/2/4/6 to
-`Alacritree Symbols` / `Regular` / `Alacritree Symbols` /
-`AlacritreeSymbols-Regular`, and save over `alacritree-symbols.ttf`.
+The script subsets both faces, merges them, adds each SVG in `DRAWN` at its plane 16 codepoint, fits it to the box a capital M takes up in DejaVu Sans, sets the names above, and writes over `alacritree-symbols.ttf`, printing each fitted glyph's transform. An SVG carries no font metrics, so unfitted it does not line up with the text beside it. A `fonts.rs` test fails if a rebuild drops the fit.
+
+## `herdr-ram.svg` and `zellij-hexagon.svg`
+
+The sources of the glyphs `[integrations.herdr] icon` and `[integrations.zellij] icon` default to, at U+10FF00 and U+10FF01. Edit either in any vector editor and rebuild the font. The build reads every path, fills it even-odd, and scales it to fit, so the SVG's size and position do not matter, and a shape meant to read as an outline is drawn as two subpaths rather than a stroke.
 
 ## `FONT-LICENSE.txt`
 

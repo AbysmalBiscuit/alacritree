@@ -526,6 +526,7 @@ pub struct IntegrationsConfig {
     pub gh: GhConfig,
     pub doppler: ToolConfig,
     pub herdr: HerdrConfig,
+    pub zellij: ZellijConfig,
     pub delta: ToolConfig,
     pub tuicr: ToolConfig,
     pub diff_viewer: DiffViewerConfig,
@@ -669,6 +670,34 @@ impl Default for HerdrConfig {
     }
 }
 
+/// `[integrations.zellij]`: whether alacritree lists the panes of running
+/// zellij sessions in the sidebar, where a new one opens, and the glyph that
+/// marks them.  Off unless enabled.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ZellijConfig {
+    /// The native zellij binary.
+    pub path: String,
+    /// The zellij binary inside WSL, or `None` to find it by name there.
+    pub wsl_path: Option<String>,
+    /// The glyph on a zellij pane's sidebar row and palette entry.
+    pub icon: IconStyle,
+    /// Discover zellij sessions and list their panes in the sidebar.
+    pub enabled: bool,
+    /// How often each side's zellij sessions are re-listed.
+    pub poll_interval: Duration,
+    /// List panes whose working directory matches no worktree, under Home.
+    pub show_unmatched: bool,
+    /// The session a new pane opens in.  `None` takes the one session
+    /// running on the side, and refuses when there are several.
+    pub session: Option<String>,
+}
+
+impl Default for ZellijConfig {
+    fn default() -> Self {
+        RawZellij::default().resolve()
+    }
+}
+
 /// Disposable by nature.  Unix keeps captures in the user's cache rather than
 /// a shared fixed-name tmp directory; Windows' `%TEMP%` is already per-user and
 /// remains reachable from WSL through the usual automount.
@@ -741,11 +770,14 @@ baked_glyphs! {
     DEFAULT_WORKTREE_MAIN_ICON = "●";
     DEFAULT_WORKTREE_ICON = "○";
     DEFAULT_SESSION_ICON = "▪";
-    /// A pane a terminal workspace manager owns rather than alacritree.  A
-    /// split square says "multiplexed elsewhere" at row size, where a
-    /// vendor's logo would only say "smudge" — and it stays neutral as more
-    /// than one such manager becomes supportable.
-    DEFAULT_HERDR_ICON = "◫";
+    /// herdr's ram, drawn from `assets/herdr-ram.svg`.  A geometric shape
+    /// reads as a missing glyph at row size, which is what the bisected
+    /// square used here did, so each multiplexer gets its own silhouette.
+    DEFAULT_HERDR_ICON = "\u{10FF00}";
+    /// zellij's hexagon, drawn from `assets/zellij-hexagon.svg`.  DejaVu's
+    /// U+2B21 was used here first and its hairline stroke closes up at row
+    /// size, so this one is drawn with a stroke an eighth of its height.
+    DEFAULT_ZELLIJ_ICON = "\u{10FF01}";
     DEFAULT_HOME_ICON = "⌂";
     DEFAULT_PROJECT_EXPANDED_ICON = "▾";
     DEFAULT_PROJECT_COLLAPSED_ICON = "▸";
@@ -758,6 +790,14 @@ baked_glyphs! {
     DEFAULT_UPSTREAM_GONE_ICON = "⌫";
     DEFAULT_UPSTREAM_UNTRACKED_ICON = "↑";
 }
+
+/// The codepoints the multiplexer icons are spelled at.  Each is drawn from
+/// an SVG beside the font, and nothing else on a machine maps plane 16, so a
+/// default spelled this way reaches the face that fits it to the row instead
+/// of whichever fallback claims a real character first; see
+/// `assets/README.md`.
+#[cfg(test)]
+pub(crate) const PRIVATE_GLYPHS: &[char] = &['\u{10FF00}', '\u{10FF01}'];
 
 baked_glyphs! {
     CHROME_GLYPHS:
@@ -2803,6 +2843,8 @@ struct RawIntegrations {
     doppler: RawDoppler,
     /// Agents running under a herdr server.
     herdr: RawHerdr,
+    /// Panes of running zellij sessions.
+    zellij: RawZellij,
     /// The pager the delta diff viewer runs.
     delta: RawDelta,
     /// The review TUI the tuicr diff viewer runs.
@@ -3014,6 +3056,7 @@ impl RawIntegrations {
             gh: self.gh.resolve(&moved),
             doppler: tool_config(self.doppler.path, self.doppler.wsl_path, Tool::Doppler),
             herdr: self.herdr.resolve(moved.herdr_icon),
+            zellij: self.zellij.resolve(),
             delta: delta_config(self.delta.path, self.delta.wsl_path, moved.delta_path),
             tuicr: tool_config(self.tuicr.path, self.tuicr.wsl_path, Tool::Tuicr),
             diff_viewer: self.diff_viewer.resolve(),
@@ -3083,7 +3126,9 @@ struct RawHerdr {
     wsl_path: String,
     /// The glyph on a herdr pane's sidebar row and palette entry. A bare
     /// string sets the glyph; a table also styles its color, weight, slant
-    /// and size, the way `[ui.icons]` keys do.
+    /// and size, the way `[ui.icons]` keys do. The default draws a ram's head
+    /// from the bundled symbol font. An ordinary character such as `"◫"` is
+    /// drawn by your own fonts instead.
     #[schemars(default = "default_herdr_icon")]
     icon: Option<RawIconStyle>,
     /// Discover herdr servers and list their agents in the sidebar.  Inert
@@ -3162,6 +3207,69 @@ impl RawHerdr {
             show_panes: self.show_panes,
             attach: parse_closed_set("integrations.herdr.attach", &self.attach),
             follow_focus: parse_closed_set("integrations.herdr.follow_focus", &self.follow_focus),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(default)]
+struct RawZellij {
+    /// The program to run on Windows or natively. Its own name is looked up
+    /// on PATH; any other value runs as written.
+    path: String,
+    /// The program to run inside every WSL distro, as written. Empty finds it
+    /// by name through the distro's login shell.
+    wsl_path: String,
+    /// The glyph on a zellij pane's sidebar row and palette entry. A bare
+    /// string sets the glyph; a table also styles its color, weight, slant
+    /// and size, the way `[ui.icons]` keys do. The default draws a hexagon
+    /// from the bundled symbol font. An ordinary character such as `"⬡"` is
+    /// drawn by your own fonts instead.
+    #[schemars(default = "default_zellij_icon")]
+    icon: Option<RawIconStyle>,
+    /// List the panes of every running zellij session in the sidebar.
+    /// Opening one attaches to its whole session with the pane focused, since
+    /// zellij has no attach for a single pane.
+    enabled: bool,
+    /// How often each side's zellij sessions are re-listed.
+    poll_interval_ms: u64,
+    /// List panes whose working directory matches no worktree, under Home.
+    show_unmatched: bool,
+    /// The session a new pane opens in. Empty takes the one session running
+    /// on that side and refuses when there are several.
+    session: String,
+}
+
+impl Default for RawZellij {
+    fn default() -> Self {
+        Self {
+            path: "zellij".to_string(),
+            wsl_path: String::new(),
+            icon: None,
+            enabled: false,
+            poll_interval_ms: 2000,
+            show_unmatched: true,
+            session: String::new(),
+        }
+    }
+}
+
+fn default_zellij_icon() -> RawIconStyle {
+    raw_glyph(DEFAULT_ZELLIJ_ICON)
+}
+
+impl RawZellij {
+    fn resolve(self) -> ZellijConfig {
+        ZellijConfig {
+            path: Some(self.path)
+                .filter(|path| !path.trim().is_empty())
+                .unwrap_or_else(|| RawZellij::default().path),
+            wsl_path: Some(self.wsl_path).filter(|path| !path.trim().is_empty()),
+            icon: self.icon.unwrap_or_else(default_zellij_icon).into(),
+            enabled: self.enabled,
+            poll_interval: Duration::from_millis(self.poll_interval_ms),
+            show_unmatched: self.show_unmatched,
+            session: Some(self.session).filter(|session| !session.trim().is_empty()),
         }
     }
 }
@@ -5570,8 +5678,9 @@ program = "second"
     fn the_icon_slice_carries_exactly_the_default_icon_glyphs() {
         let mut icons: Vec<&str> = DEFAULT_ICON_GLYPHS.iter().map(|g| g.as_str()).collect();
         icons.sort_unstable();
-        let mut expected =
-            ["⌕", "●", "○", "▪", "◫", "⌂", "▾", "▸", "⬤", "◯", "⬤", "⬤", "✓", "⇅", "⌫", "↑"];
+        let expected = ["⌕", "●", "○", "▪", "⌂", "▾", "▸", "⬤", "◯", "⬤", "⬤", "✓", "⇅", "⌫", "↑"];
+        // herdr and zellij, at the plane 16 codepoints only the baked face maps.
+        let mut expected = [expected.as_slice(), &["\u{10FF00}", "\u{10FF01}"]].concat();
         expected.sort_unstable();
         assert_eq!(icons, expected);
     }

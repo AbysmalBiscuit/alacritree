@@ -2486,7 +2486,49 @@ mod tests {
 
     #[test]
     fn the_baked_glyph_set_is_the_documented_size() {
-        assert_eq!(baked_glyphs().len(), 26, "assets/README.md lists the codepoints");
+        assert_eq!(baked_glyphs().len(), 27, "assets/build_symbols.py lists the codepoints");
+    }
+
+    /// A default icon is spelled at a plane 16 codepoint so no installed face
+    /// can shadow it, which only works if the whole stack carries a `char`
+    /// past the BMP.  `glyph_id` is the call epaint makes, and it treats zero
+    /// as "this face cannot draw it", so a cmap that silently dropped the
+    /// entry reads here exactly as it would on screen.
+    #[test]
+    fn epaint_resolves_the_private_codepoints_the_defaults_use() {
+        use ab_glyph::Font as _;
+        let font = ab_glyph::FontRef::try_from_slice(SYMBOLS_FONT).expect("the baked face parses");
+        for private in crate::config::PRIVATE_GLYPHS {
+            assert_ne!(
+                font.glyph_id(*private).0,
+                0,
+                "U+{:04X} is not reachable through the lookup epaint uses",
+                *private as u32
+            );
+        }
+    }
+
+    /// Every private glyph comes from an SVG carrying no font metrics at all,
+    /// so the build fits each to a capital M's box.  M is not in the baked
+    /// face, so its cap height comes from the metrics the face carries over.
+    /// Driving this from `PRIVATE_GLYPHS` rather than a list of its own keeps
+    /// it from drifting against the set `build_symbols.py` actually fits.
+    #[test]
+    fn the_fitted_glyphs_fill_a_capital_m_s_box() {
+        let face = ttf_parser::Face::parse(SYMBOLS_FONT, 0).expect("the baked face parses");
+        // DejaVu Sans 2.37's capital M spans 0..1493 units.
+        const M_CAP_HEIGHT: i16 = 1493;
+        for c in crate::config::PRIVATE_GLYPHS {
+            let c = *c;
+            let id = face.glyph_index(c).expect("the baked face maps the glyph");
+            let bbox = face.glyph_bounding_box(id).expect("the glyph has an outline");
+            assert!(bbox.y_min.abs() <= 2, "{c} sits on the baseline: {bbox:?}");
+            assert!((bbox.y_max - M_CAP_HEIGHT).abs() <= 4, "{c} reaches M's cap height: {bbox:?}");
+            let advance = face.glyph_hor_advance(id).expect("the glyph has an advance") as i16;
+            let (left, right) = (bbox.x_min, advance - bbox.x_max);
+            assert!(left >= 0 && right >= 0, "{c} stays inside its advance: {bbox:?}");
+            assert!((left - right).abs() <= 2, "{c} is centered in its advance: {bbox:?}");
+        }
     }
 
     /// Last position is the whole guarantee: an earlier face that already draws
