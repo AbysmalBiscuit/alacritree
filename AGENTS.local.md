@@ -56,6 +56,8 @@ The slug is the whole branch name, type prefix included, and the GitHub issue nu
 devkit issue setup 41 --summary --slug feat/decoration-metrics
 ```
 
+`origin` is Arnaud's repo, `mathix420/alacritree`, and the fork answers to `fork`. That is backwards from the usual fork checkout on purpose: `devkit issue pr create` pushes `-u origin` with the remote name spelled into devkit, and a stacked PR needs its head and the base it targets in the repository the PR is opened against.
+
 `devkit issue setup` cuts every branch from `origin/master` and takes no base flag, so a stacked branch is re-pointed once, before it has any commits of its own:
 
 ```sh
@@ -159,7 +161,7 @@ Example for Claude Opus 5: `Co-authored-by: Claude Opus 5 <noreply@anthropic.com
 
 ## Opening PRs
 
-Whenever I ask to open a PR, or push open PR, etc. You need to push the branch to the upstream repo (mathix420/Arnaud's repo).
+Whenever I ask to open a PR, or push open PR, etc. You need to push the branch to `origin`, which is Arnaud's repo.
 
 The base/target branch should be `master`, unless you're setting up/working with stacked PRs, then it should be the preceding PR's branch.
 
@@ -169,17 +171,16 @@ Open the PR with `devkit issue pr create`, not `gh pr create`. Its `pr_body` tem
 devkit issue pr create --ready \
   --pr-title 'feat(render): draw the grid on the GPU [3]' \
   --pr-body "$(cat summary.md)" \
-  --arg closes="12 41" \
-  --arg stacked_on=203
+  --arg closes="12 41"
 ```
 
-The TL;DR is mine and it is never yours to write. The template emits the heading with nothing under it, and I fill it in myself once the PR is open. There is no `--arg tldr` to pass. The variable does not exist and the template never renders one. Pass only `--pr-body`, `--arg closes` and `--arg stacked_on`.
+The TL;DR is mine and it is never yours to write. The template emits the heading with nothing under it, and I fill it in myself once the PR is open. There is no `--arg tldr` to pass. The variable does not exist and the template never renders one. Pass only `--pr-body` and `--arg closes`.
 
 `devkit issue review request` is a different command. It requests review on a PR that already exists, and it is mine to run, not yours. Never pass `--to` to `pr create` either: without it the command adds no reviewer and sends no Slack, so it opens the PR and stops.
 
 `--ready` opens a real PR. Without it devkit opens a draft, and drafts get no review-bot coverage. Add `--no-push` only when the branch is already pushed.
 
-`--pr-body` carries the Claude summary; pass it through a file rather than inline, since it can run long. The first `Closes` line comes from the worktree's own issue, so `--arg closes` carries only the extra ones, whitespace separated. `--arg stacked_on` takes the PR number this branch sits on and emits the review-order note; leave it off for a branch that really does descend from `master`. `--arg model` overrides the attribution when a different model did the work.
+`--pr-body` carries the Claude summary; pass it through a file rather than inline, since it can run long. The first `Closes` line comes from the worktree's own issue, so `--arg closes` carries only the extra ones, whitespace separated. `--arg agent_model` overrides the attribution when a different model did the work.
 
 The template renders only when the command creates a PR. Editing an open one is still `gh pr edit`, and the shape has to be preserved by hand there.
 
@@ -209,7 +210,7 @@ When adding new entries to the config, always add default values so they are inc
 
 `.agents/skills/` holds the skills this repository ships to its own agents, and every worktree reaches them at `.claude/skills/` through a link `sync.local.py` makes. They ride on `docs/specs-and-plans` with the other untracked local files.
 
-`/rebase-propagate-alacritree` replays the whole open `[n]` stack onto `upstream/master` after a PR merges and pushes every branch to the fork.
+`/rebase-propagate-alacritree` replays the whole open `[n]` stack onto `origin/master` after a PR merges and pushes every branch back to `origin`.
 
 ### Issue tracker
 
