@@ -1042,6 +1042,13 @@ impl<R: Repaint> Session<R> {
         self.probe.signals().nav_tui
     }
 
+    /// The shell this session's probe reads, for a test that drives a real
+    /// one through the PTY.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn shell_pid(&self) -> Option<u32> {
+        self.probe.shell_pid()
+    }
+
     /// Text dump of the visible screen plus up to `scrollback_lines` of
     /// history above it.  Reads the live (unscrolled) screen regardless of
     /// the user's display offset so IPC clients always see where output and

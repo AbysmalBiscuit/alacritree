@@ -46,6 +46,12 @@ impl ProbeHandle {
         self.cache.set(AgentCache::default());
     }
 
+    /// The shell the probe reads, for a test that drives a real one.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn shell_pid(&self) -> Option<u32> {
+        self.shell_pid
+    }
+
     /// Pretend the probe just saw a split-managing TUI, so a test about
     /// what a session does with that answer needs no process to run.
     #[cfg(test)]
@@ -773,6 +779,8 @@ mod windows_process_probe {
 }
 
 #[cfg(test)]
+// Fixtures drive real processes and wait on them; no frame is pending.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
@@ -913,6 +921,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_real_shells_foreground_job_flips_the_probe() {
+        use crate::config::Config;
+        use crate::repaint::Recorder;
+        use crate::session::{Session, SessionKind, TermSize};
+
         let mut config = Config::default();
         config.env.insert("TERM".to_string(), "xterm-256color".to_string());
 
@@ -930,7 +942,7 @@ mod tests {
             SessionKind::Shell,
         )
         .unwrap();
-        let shell_pid = session.shell_pid.expect("unix PTYs always report the child pid");
+        let shell_pid = session.shell_pid().expect("unix PTYs always report the child pid");
 
         // The shell owning its terminal (tpgid == pgid) is exactly the state
         // the probe reads as "not busy".
