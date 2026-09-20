@@ -1,19 +1,19 @@
 ---
 name: rebase-propagate-alacritree
-description: Replay the alacritree [n] PR stack onto upstream/master after a merge and push every branch to the fork [rpa]
+description: Replay the alacritree [n] PR stack onto origin/master after a merge and push every branch back to origin [rpa]
 disable-model-invocation: true
 user-invocable: true
 allowed-tools: Bash, Read, Glob, Grep, TaskCreate, TaskUpdate, TaskList, TaskGet
 ---
-Rebase every open alacritree PR onto the merged upstream master and push the whole stack to the fork.
+Rebase every open alacritree PR onto the merged upstream master and push the whole stack back to it. Upstream is Arnaud's repository, where the PR heads live, and it answers to the remote name `origin` here.
 
 Takes no arguments. `--dry-run` prints the plan and writes nothing; `--test` runs each rebased branch's suite before any push; `--old-base REV` names the commit to cut below on the lowest branch when no merged PR does.
 
 ## What already happened
 
-`.claude/skills/rebase-propagate-alacritree/scripts/rebase_propagate_alacritree.py` has **already run**. It fetched both remotes, read the stack off the `[n]` markers in the open upstream PR titles, checked every branch against the fork and against its cut-below commit, replayed each one with `--onto`, and pushed them all under leases. Its output is below. Invoking `/rebase-propagate-alacritree` authorizes those force-pushes.
+`.claude/skills/rebase-propagate-alacritree/scripts/rebase_propagate_alacritree.py` has **already run**. It fetched upstream, read the stack off the `[n]` markers in the open upstream PR titles, checked every branch against upstream and against its cut-below commit, replayed each one with `--onto`, and pushed them all under leases. Its output is below. Invoking `/rebase-propagate-alacritree` authorizes those force-pushes.
 
-Nothing is pushed until every rebase succeeds, so a `CONFLICT` means the fork is untouched and the run is resumable.
+Nothing is pushed until every rebase succeeds, so a `CONFLICT` means upstream is untouched and the run is resumable.
 
 Everything you need about repo, worktree and PR state is in that output. Do not re-run `git status`, `git log`, `gh pr list`, or `gh pr view` to orient yourself or to double-check a result the script already reported.
 
@@ -27,11 +27,11 @@ Everything you need about repo, worktree and PR state is in that output. Do not 
 
 Every PR here targets `master` on GitHub even though the branches stack on each other, so GitHub's base field records nothing about the order. The `[n]` marker in the PR title is the only record, which is why the script reads titles rather than bases.
 
-Upstream squash-merges. Once PR `[n]` lands, its commits are gone from `master`'s history, the merge base collapses to the commit the whole stack was cut from, and a plain `git rebase upstream/master` on `[n+1]` replays work `master` already carries, hunk by conflicting hunk. So every branch is replayed with `git rebase --onto <new parent> <old base>`, cutting below the tip its parent held before this run. For the lowest open branch, that tip is the merged PR's head branch on the fork, which the fork keeps after the squash.
+Upstream squash-merges. Once PR `[n]` lands, its commits are gone from `master`'s history, the merge base collapses to the commit the whole stack was cut from, and a plain `git rebase origin/master` on `[n+1]` replays work `master` already carries, hunk by conflicting hunk. So every branch is replayed with `git rebase --onto <new parent> <old base>`, cutting below the tip its parent held before this run. For the lowest open branch, that tip is the merged PR's head branch on upstream, which upstream keeps after the squash.
 
 The middle argument must be a true ancestor of the branch. When it is not, git does not error: it silently falls back to the real merge base and queues the entire divergent history. The script asserts the ancestry first, which is the difference between an 18-commit replay and a 93-commit conflict storm.
 
-Local branches go stale. Several worktrees here hold pre-sweep copies that are both ahead of and behind `origin/<branch>`: ahead with commits that belong to branches further up the stack, behind by the rebase the fork already has. The fork is the authority. The script refuses to touch a branch in that state and prints the backup-and-reset pair for it.
+Local branches go stale. Several worktrees here hold pre-sweep copies that are both ahead of and behind `origin/<branch>`: ahead with commits that belong to branches further up the stack, behind by the rebase upstream already has. Upstream is the authority. The script refuses to touch a branch in that state and prints the backup-and-reset pair for it.
 
 ## Act on the status
 
@@ -47,7 +47,7 @@ Local branches go stale. Several worktrees here hold pre-sweep copies that are b
 | `DIRTY` | Uncommitted changes predate the command. Report them and ask whether to commit or drop. Don't decide. |
 | `IN-PROGRESS` | A rebase was already running in a worktree. Report the state and ask how to proceed. |
 | `TEST-FAILED` | Read the tail of the output, fix the break on that branch, commit, re-run. Nothing was pushed. |
-| `REJECTED` | The fork moved under a branch. Do not override. Show `git log <branch>..origin/<branch>` and ask. |
+| `REJECTED` | Upstream moved under a branch. Do not override. Show `git log <branch>..origin/<branch>` and ask. |
 | `PUSH-FAILED` | Read the output, fix the cause, re-run. Note which branches already pushed. |
 | `ERROR` | Read the message, fix the precondition, re-run. |
 

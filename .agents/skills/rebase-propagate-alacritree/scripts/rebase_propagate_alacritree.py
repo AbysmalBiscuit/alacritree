@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Replay the alacritree PR stack onto `upstream/master` after a merge, and
-push every branch to the fork.
+push every branch to upstream.
 
 Usage: rebase_propagate_alacritree.py [--dry-run] [--test] [--old-base REV]
 
 The stack is the open PRs on the upstream repository whose titles carry an
 `[n]` marker, ordered by that marker.  Each branch lives in its own worktree,
-is replayed with `--onto` because upstream squash-merges, and is pushed to the
-fork under a lease.  Nothing is pushed until every rebase lands.
+is replayed with `--onto` because upstream squash-merges, and is pushed back
+to upstream under a lease.  Nothing is pushed until every rebase lands.
 
 The last line of output is always `RPA-RESULT: <STATUS>`.  Why `--onto`, what
 the preflight guards against, and what to do about each status: the SKILL.md
@@ -24,8 +24,9 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-FORK = "origin"
-UPSTREAM = "upstream"
+# Arnaud's repository, where the PRs live. It answers to `origin` in this
+# checkout, and the fork answers to `fork`.
+UPSTREAM = "origin"
 BASE = "master"
 
 #: Where a branch with no worktree of its own is replayed.  One reused
@@ -123,19 +124,19 @@ class Branch:
     #: The tip this branch had when the run started, which is what the branch
     #: above it cuts below.
     old_tip: str = ""
-    #: The fork's tip at fetch time, which becomes the push lease.
+    #: Upstream's tip at fetch time, which becomes the push lease.
     lease: str = ""
     old_base: str = ""
     parent: str = ""
     rebased: bool = False
-    #: No local ref yet, so the run creates one from the fork.
+    #: No local ref yet, so the run creates one from upstream.
     create: bool = False
     note: str = ""
 
     @property
     def ref(self) -> str:
         """What to read the branch through before `prepare` has created it."""
-        return f"{FORK}/{self.name}" if self.create else self.name
+        return f"{UPSTREAM}/{self.name}" if self.create else self.name
 
 
 @dataclass
@@ -199,7 +200,7 @@ class Run:
     def cut_below(self, below: dict, bottom: Branch) -> tuple[str, str]:
         """The tip the merged PR's branch had when the branch above was cut.
 
-        GitHub deletes the head branch when it squash-merges, so the fork's
+        GitHub deletes the head branch when it squash-merges, so upstream's
         copy is usually gone by the time this runs.  The local branch often
         disagrees too, because it was rebased after its child was cut from it.
         Its reflog still holds every tip it ever had, and the one the child
@@ -207,7 +208,7 @@ class Run:
         """
         head = below["headRefName"]
         found = f"merged [{bottom.marker - 1}] #{below['number']}"
-        candidates = [f"{FORK}/{head}", head]
+        candidates = [f"{UPSTREAM}/{head}", head]
         candidates += [
             line.split()[0]
             for line in run("git", "-C", str(self.root), "reflog", "show", head)[1].splitlines()
@@ -217,7 +218,7 @@ class Run:
             if not git_ok("-C", str(self.root), "rev-parse", "--verify", f"{rev}^{{commit}}"):
                 continue
             if git_ok("-C", str(self.root), "merge-base", "--is-ancestor", rev, bottom.ref):
-                where = "the fork" if rev.startswith(f"{FORK}/") else "locally" if rev == head else "in its reflog"
+                where = "upstream" if rev.startswith(f"{UPSTREAM}/") else "locally" if rev == head else "in its reflog"
                 return rev, f"{found}, found {where}"
         return "", f"{found}, but no tip of {head} is an ancestor of this branch"
 
@@ -238,10 +239,10 @@ class Run:
                 checkouts.setdefault(name, tree)
         for b in self.stack:
             b.worktree = checkouts.get(b.name)
-            code, tip = run("git", "-C", str(self.root), "rev-parse", "--verify", f"{FORK}/{b.name}")
+            code, tip = run("git", "-C", str(self.root), "rev-parse", "--verify", f"{UPSTREAM}/{b.name}")
             if code != 0:
                 say("")
-                say(f"[{b.marker}] PR #{b.pr} names head branch {b.name}, which {FORK} does not have")
+                say(f"[{b.marker}] PR #{b.pr} names head branch {b.name}, which {UPSTREAM} does not have")
                 self.finish("ERROR", 3)
             b.lease = tip
             code, tip = run("git", "-C", str(self.root), "rev-parse", "--verify", b.name)
@@ -293,8 +294,8 @@ class Run:
         """Create the refs and the scratch worktree the rebase needs."""
         for b in self.stack:
             if b.create:
-                git("-C", str(self.root), "branch", b.name, f"{FORK}/{b.name}")
-                say(f"[{b.marker}] {b.name}: created at {FORK}/{b.name} ({b.lease[:9]})")
+                git("-C", str(self.root), "branch", b.name, f"{UPSTREAM}/{b.name}")
+                say(f"[{b.marker}] {b.name}: created at {UPSTREAM}/{b.name} ({b.lease[:9]})")
         if any(b.worktree is None for b in self.stack) and not self.scratch.is_dir():
             git(
                 "-C", str(self.root), "worktree", "add", "--detach",
@@ -315,11 +316,11 @@ class Run:
             run("git", "-C", str(self.scratch), "checkout", "--detach", "--quiet")
 
     def check_freshness(self) -> None:
-        """Make every local branch agree with the fork before anything replays.
+        """Make every local branch agree with upstream before anything replays.
 
         Several local copies here predate the last sweep: they carry commits
         belonging to branches further up the stack and are missing the rebase
-        the fork already has.  Replaying one of those is the conflict storm
+        upstream already has.  Replaying one of those is the conflict storm
         this guards against.
         """
         stale = []
@@ -328,10 +329,10 @@ class Run:
                 continue
             ahead, behind = git(
                 "-C", str(self.root), "rev-list", "--left-right", "--count",
-                f"{b.name}...{FORK}/{b.name}",
+                f"{b.name}...{UPSTREAM}/{b.name}",
             ).split()
             if int(ahead) and not int(behind):
-                b.note = f"{ahead} local commit(s) the fork has not seen"
+                b.note = f"{ahead} local commit(s) upstream has not seen"
                 continue
             stale.append((b, ahead, behind))
 
@@ -340,16 +341,16 @@ class Run:
         say("")
         say("== stale locals ==")
         for b, ahead, behind in stale:
-            say(f"[{b.marker}] {b.name}: {ahead} ahead / {behind} behind {FORK}/{b.name}")
-            say(f"      local {b.old_tip[:9]}   fork {b.lease[:9]}")
+            say(f"[{b.marker}] {b.name}: {ahead} ahead / {behind} behind {UPSTREAM}/{b.name}")
+            say(f"      local {b.old_tip[:9]}   upstream {b.lease[:9]}")
         say("")
-        say("The fork carries the swept branch, so a local copy that is behind it is a")
+        say("Upstream carries the swept branch, so a local copy that is behind it is a")
         say("pre-sweep leftover whose extra commits belong to branches above it.")
-        say("Keep a backup ref and take the fork's copy, per branch:")
+        say("Keep a backup ref and take upstream's copy, per branch:")
         for b, _, _ in stale:
             backup = b.name.replace("/", "-")
             say(f"  git -C {self.root} branch backup/{backup}-stale {b.old_tip[:9]}")
-            say(f"  git -C {b.worktree} reset --hard {FORK}/{b.name}")
+            say(f"  git -C {b.worktree} reset --hard {UPSTREAM}/{b.name}")
         say("")
         say("then re-run this script.")
         self.finish("STALE", 6)
@@ -377,7 +378,7 @@ class Run:
             say("")
             say("git would ignore that argument and replay the whole divergent history")
             say("instead of erroring. Find the commit this branch was really cut above")
-            say(f"({FORK}/<parent>, or the parent's reflog) and pass it: --old-base <rev>")
+            say(f"({UPSTREAM}/<parent>, or the parent's reflog) and pass it: --old-base <rev>")
             self.finish("BADBASE", 7)
 
     # ------------------------------------------------------------ rebase
@@ -449,7 +450,7 @@ class Run:
         waiting = [f"[{x.marker}] {x.name}" for x in self.stack[self.stack.index(b) + 1:]]
         say(f"still queued behind it: {', '.join(waiting) or 'none'}")
         say("")
-        say("NOTHING HAS BEEN PUSHED. The fork is untouched.")
+        say("NOTHING HAS BEEN PUSHED. Upstream is untouched.")
         say(f"resolve, 'git -C {b.worktree} add <files>', then")
         say(f"'git -C {b.worktree} rebase --continue', then re-run this script; it resumes")
         say("from its state file and pushes once every branch has landed.")
@@ -484,10 +485,10 @@ class Run:
         pushed: list[str] = []
         for b in self.stack:
             if git("-C", str(self.root), "rev-parse", b.name) == b.lease:
-                say(f"[{b.marker}] {b.name}: fork already matches")
+                say(f"[{b.marker}] {b.name}: upstream already matches")
                 continue
             code, out = run(
-                "git", "-C", str(self.root), "push", FORK, b.name,
+                "git", "-C", str(self.root), "push", UPSTREAM, b.name,
                 f"--force-with-lease={b.name}:{b.lease}",
             )
             say(f"[{b.marker}] {b.name}: {out.splitlines()[-1] if out else 'pushed'}")
@@ -497,7 +498,7 @@ class Run:
                 say("")
                 say(f"pushed so far: {', '.join(pushed) or 'none'}")
                 if any(hint in out for hint in ("stale info", "fetch first", "non-fast-forward")):
-                    say(f"the fork moved since the fetch, so the lease refused {b.name}")
+                    say(f"upstream moved since the fetch, so the lease refused {b.name}")
                     self.finish("REJECTED", 20)
                 self.finish("PUSH-FAILED", 21)
             pushed.append(b.name)
@@ -552,8 +553,7 @@ def main() -> None:
     # A dry run fetches too: every check below weighs a local branch against a
     # remote one, and stale remote refs make the plan a guess.
     say("== fetch ==")
-    for remote in (FORK, UPSTREAM):
-        say(f"{remote}: {run('git', '-C', str(root), 'fetch', '--prune', remote)[1] or 'ok'}")
+    say(f"{UPSTREAM}: {run('git', '-C', str(root), 'fetch', '--prune', UPSTREAM)[1] or 'ok'}")
 
     repo = upstream_repo(root)
     session.discover(repo)
@@ -571,7 +571,7 @@ def main() -> None:
         cut = f"  cut below {b.old_base}" if b.old_base else ""
         say(f"  [{b.marker}] #{b.pr} {b.name} -> {b.parent}{cut}")
         if b.create:
-            say(f"        no local branch, taking {FORK}/{b.name} ({b.lease[:9]})")
+            say(f"        no local branch, taking {UPSTREAM}/{b.name} ({b.lease[:9]})")
         if b.note:
             say(f"        {b.note}")
 
