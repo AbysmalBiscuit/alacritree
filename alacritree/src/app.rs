@@ -2058,17 +2058,26 @@ impl AlacritreeApp {
         }
     }
 
+    /// The cursor, when `rows` still holds it.
+    ///
+    /// A worktree removed, a project collapsed by mouse, or a filter toggle
+    /// narrowing the rows out from under it all leave a cursor pointing at a
+    /// row that is gone.  That cursor lands on the first row and the caller
+    /// stops, so the next press acts from there; unfiltered rows always lead
+    /// with Home.
+    fn sidebar_cursor_within(&mut self, rows: &[SidebarRow]) -> Option<SidebarRow> {
+        if let Some(cursor) = self.sidebar.cursor.clone().filter(|c| rows.contains(c)) {
+            return Some(cursor);
+        }
+        if let Some(first) = rows.first() {
+            self.set_sidebar_cursor(first.clone());
+        }
+        None
+    }
+
     fn move_sidebar_cursor(&mut self, delta: i32) {
         let rows = self.current_project_rows();
-        let cursor = match self.sidebar.cursor.clone() {
-            Some(c) if rows.contains(&c) => c,
-            _ => {
-                if let Some(first) = rows.first() {
-                    self.set_sidebar_cursor(first.clone());
-                }
-                return;
-            },
-        };
+        let Some(cursor) = self.sidebar_cursor_within(&rows) else { return };
         self.set_sidebar_cursor(sidebar_nav::step(&rows, &cursor, delta));
     }
 
@@ -2083,16 +2092,10 @@ impl AlacritreeApp {
     }
 
     /// PageUp/PageDown for the sidebar cursor: the nearest project header
-    /// above/below, clamped at the extremes.  A stale cursor reseats on the
-    /// first row, same as `apply_sidebar_nav`.
+    /// above/below, clamped at the extremes.
     fn sidebar_cursor_project_jump(&mut self, delta: i32) {
         let rows = self.current_project_rows();
-        let Some(cursor) = self.sidebar.cursor.clone().filter(|c| rows.contains(c)) else {
-            if let Some(first) = rows.first() {
-                self.set_sidebar_cursor(first.clone());
-            }
-            return;
-        };
+        let Some(cursor) = self.sidebar_cursor_within(&rows) else { return };
         let target = if delta > 0 {
             sidebar_nav::next_project(&rows, &cursor)
         } else {
