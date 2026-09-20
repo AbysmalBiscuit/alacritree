@@ -9,9 +9,8 @@ worktree_root = "../alacritree-worktrees"
 # in the slug rather than in a fixed prefix.
 branch_prefix = ""
 
-# `issue setup` cuts every branch from this ref; a stacked branch is re-pointed
-# at its real base afterwards. See "Working on features/bugfixes" in
-# AGENTS.local.md.
+# `issue setup` cuts every branch from this ref. A stacked branch is re-pointed
+# at its real base afterwards, per AGENTS.local.md.
 baseline_ref = "origin/master"
 
 # PRs go to Arnaud's repo, whose default branch is master, not devkit's staging.
@@ -25,6 +24,9 @@ baseline_dir = "../alacritree-baselines"
 worktree_include = ["AGENTS.local.md", "CLAUDE.local.md"]
 
 
+# `pr create` pushes `-u origin`, with the remote name spelled into devkit, so
+# `origin` is Arnaud's repo here and the fork answers to `fork`. A stacked PR
+# needs its head and its base in the repository it is opened against.
 [github]
 issues_repo = "AbysmalBiscuit/alacritree"
 pr_repo = "mathix420/alacritree"
@@ -163,6 +165,36 @@ run = [
 ]
 
 [templates]
+# Each `Closes` line spells `issues_repo` out because devkit's built-in
+# template writes a bare `#41`, which resolves against Arnaud's numbering
+# instead of the fork's. The TL;DR heading renders empty, to be filled by hand.
+pr_body = '''
+{%- set ids = (((issue if issue is defined else "") ~ " " ~ closes) | split) -%}
+{%- set agent = agent_model or agent_harness -%}
+## TL;DR (human written)
+{{ human_tldr }}
+{%- if ids %}
+
+---
+{% for id in ids %}
+Closes {{ issues_repo }}#{{ id }}
+{%- endfor %}
+{%- endif %}
+{%- if agent %}
+
+---
+
+## Agent summary
+{%- endif %}
+
+{{ input | trim }}
+{%- if agent %}
+
+---
+
+🤖 Generated with {{ agent_model }}{% if agent_model and agent_harness %} via {% endif %}{{ agent_harness }}
+{%- endif %}
+'''
 
 [templates.variables]
 # Hooks are spawned without a shell, so `~` stays literal and a bare name is
@@ -175,15 +207,10 @@ herdr_session = "herdr-session.cmd"
 # for the extra ones a PR closes, whitespace separated: `--arg closes="12 41"`.
 closes = ""
 
-# PR number this branch is stacked on, which renders the review-order note.
-# Empty for a branch that really does sit on master.
-stacked_on = ""
-
 # Issues live on the fork, PRs go to Arnaud's repo, so a bare `#41` in the body
 # would resolve against the wrong one. Spelled out again here because the
 # template context does not carry `[github] issues_repo`; keep the two in sync.
 issues_repo = "AbysmalBiscuit/alacritree"
 
-# Attribution line. Override per PR when a different model did the work:
-# `--arg model="Claude Opus 5 (1M Context)"`.
-model = "Claude Opus 5"
+# devkit fills `agent_model` and `agent_harness` from the calling agent.
+# Override per PR: `--arg agent_model="Claude Opus 5 (1M Context)"`.
