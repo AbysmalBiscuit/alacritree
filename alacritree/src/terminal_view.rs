@@ -148,6 +148,14 @@ pub(crate) fn show(
         // (alacritty hides it the same way, display/content.rs).
         ime.preedit().is_some(),
     );
+    // Between the capture and the paint that reads it: the glide is this
+    // session's, and it needs the cell the capture just recorded.
+    let cursor_at = session.cursor_anim.place(
+        &config.cursor.motion,
+        snapshot.cursor.as_ref().map(|c| (c.column as f32, c.row as f32)),
+        snapshot.display_offset,
+        std::time::Instant::now(),
+    );
     match gpu.filter(|gpu| config.ui.gpu_grid && !gpu.unavailable()) {
         Some(gpu) => {
             paint_grid_gpu(
@@ -169,9 +177,6 @@ pub(crate) fn show(
                 glyphs,
                 ui.ctx(),
             );
-            if let Some(cursor) = &snapshot.cursor {
-                paint_cursor(&painter, rect, cursor, cell_w, cell_h, &font_id);
-            }
         },
         None => paint_grid(
             &painter,
@@ -188,6 +193,13 @@ pub(crate) fn show(
             glyphs,
             ui.ctx(),
         ),
+    }
+    if let (Some(cursor), Some(at)) = (&snapshot.cursor, cursor_at) {
+        paint_cursor(&painter, rect, cursor, at, cell_w, cell_h, &font_id);
+    }
+    // Nothing else wakes egui while the cursor moves on its own.
+    if !session.cursor_anim.settled() {
+        ui.ctx().request_repaint();
     }
 
     let preedit_caret = ime.preedit().map(|p| p.to_owned()).and_then(|p| {
@@ -882,6 +894,10 @@ pub(crate) struct GridSnapshot {
     /// The terminal's background as of the last capture, and the configured
     /// one before the first.
     default_bg: Color32,
+    /// Scrollback position of the last capture.  Scrolling renumbers every row
+    /// at once, which is how the cursor animation tells a jump the screen made
+    /// from one the cursor made.
+    display_offset: i32,
     /// Rows the last capture rewrote, merged into one span.
     dirty_rows: std::ops::Range<usize>,
     /// Scratch for the rows a capture is about to walk, reused so reading
@@ -939,6 +955,7 @@ impl GridSnapshot {
             cursor: None,
             caret: None,
             default_bg: colors.bg,
+            display_offset: 0,
             dirty_rows: 0..0,
             damaged: Vec::new(),
             context: CaptureContext::default(),
@@ -1071,6 +1088,7 @@ impl GridSnapshot {
         self.caret = None;
 
         let display_offset = term.grid().display_offset() as i32;
+        self.display_offset = display_offset;
         let screen_lines = term.grid().screen_lines();
         let cols = term.grid().columns();
         let selection_range = term.selection.as_ref().and_then(|s| s.to_range(term));
@@ -1448,10 +1466,6 @@ fn paint_grid(
             ctx,
         );
     }
-
-    if let Some(cursor) = &snapshot.cursor {
-        paint_cursor(painter, rect, cursor, cell_w, cell_h, font_id);
-    }
 }
 
 /// The cursor shape the terminal wants drawn, mirroring alacritty's
@@ -1604,18 +1618,21 @@ fn paint_run_glyphs(
     }
 }
 
+/// Draw the cursor at `at`, the fractional cell the animation placed it in.
+/// With the animation off that is always the cell the snapshot recorded.
 fn paint_cursor(
     painter: &egui::Painter,
     rect: Rect,
     cursor: &CursorSnapshot,
+    at: crate::cursor_anim::CellPos,
     cell_w: f32,
     cell_h: f32,
     font_id: &FontId,
 ) {
     use alacritty_terminal::vte::ansi::CursorShape::*;
 
-    let x = rect.min.x + cursor.column as f32 * cell_w;
-    let y = rect.min.y + cursor.row as f32 * cell_h;
+    let x = rect.min.x + at.0 * cell_w;
+    let y = rect.min.y + at.1 * cell_h;
     let cursor_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell_w, cell_h));
 
     match cursor.shape {
