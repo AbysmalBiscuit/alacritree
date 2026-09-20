@@ -40,6 +40,7 @@ pub struct Config {
     pub workspace: WorkspaceConfig,
     pub font: FontConfig,
     pub cursor: CursorConfig,
+    pub mouse: MouseConfig,
     pub scrolling: ScrollingConfig,
     pub window: WindowConfig,
     #[serde(serialize_with = "redacted_env")]
@@ -272,6 +273,12 @@ pub struct CursorConfig {
     pub shape: CursorShape,
     pub blinking: bool,
     pub unfocused_hollow: bool,
+}
+
+/// The part of alacritty's `[mouse]` section alacritree acts on.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct MouseConfig {
+    pub hide_when_typing: bool,
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -1544,6 +1551,7 @@ impl Default for Config {
             workspace: WorkspaceConfig::default(),
             font: FontConfig::default(),
             cursor: CursorConfig::default(),
+            mouse: MouseConfig::default(),
             scrolling: ScrollingConfig::default(),
             window: WindowConfig::default(),
             env: HashMap::new(),
@@ -1980,6 +1988,8 @@ struct RawConfig {
     font: RawFont,
     /// Cursor shape, blinking, and how it renders when unfocused.
     cursor: RawCursor,
+    /// What the mouse pointer does around the grid.
+    mouse: RawMouse,
     /// Scrollback depth and mouse-wheel step.
     scrolling: RawScrolling,
     /// Window padding and background opacity.
@@ -2260,6 +2270,20 @@ enum RawCursorStyle {
         /// mode, so `On` and `Always` both blink and the other two do not.
         blinking: Option<String>,
     },
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(default)]
+struct RawMouse {
+    /// Hide the mouse pointer while typing.  The next pointer motion, click
+    /// or wheel tick brings it back.
+    hide_when_typing: bool,
+}
+
+impl RawMouse {
+    fn resolve(self) -> MouseConfig {
+        MouseConfig { hide_when_typing: self.hide_when_typing }
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -3901,6 +3925,7 @@ impl RawConfig {
             workspace,
             font,
             cursor,
+            mouse: self.mouse.resolve(),
             scrolling,
             window,
             env: self.env,
@@ -5367,6 +5392,12 @@ program = "second"
     fn reap_descendants_on_close_parses() {
         let ui = ui_from_toml("[ui]\nreap_descendants_on_close = true");
         assert!(ui.reap_descendants_on_close);
+    }
+
+    #[test]
+    fn hide_when_typing_defaults_off_and_parses_on() {
+        assert!(!config_from("").mouse.hide_when_typing);
+        assert!(config_from("[mouse]\nhide_when_typing = true").mouse.hide_when_typing);
     }
 
     #[test]

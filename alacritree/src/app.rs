@@ -50,8 +50,8 @@ use crate::worktree::{self as wt, CreateRequest, Progress};
 use crate::wsl::{self, ShellChoice};
 use crate::wsl_helper::{self, WslProbe};
 use crate::{
-    clipboard_image, doppler, file_drop, ipc, jobs, notify, paste, path_style, scratchpad,
-    sidebar_focus, terminal_view, worktree_liveness,
+    clipboard_image, doppler, file_drop, ipc, jobs, mouse_hide, notify, paste, path_style,
+    scratchpad, sidebar_focus, terminal_view, worktree_liveness,
 };
 
 mod actions;
@@ -456,6 +456,9 @@ pub struct AlacritreeApp {
     /// `last_input`, which also advances on bare pointer motion, and which
     /// the liveness probe reads as its grace period.
     last_direct_input: Option<Instant>,
+    /// Whether typing has hidden the mouse pointer, under `[mouse]
+    /// hide_when_typing`.
+    mouse_hide: mouse_hide::MouseHide,
 }
 
 impl AlacritreeApp {
@@ -537,6 +540,7 @@ impl AlacritreeApp {
             liveness_probe: None,
             last_input: Instant::now(),
             last_direct_input: None,
+            mouse_hide: Default::default(),
         }
     }
 
@@ -2939,8 +2943,10 @@ impl AlacritreeApp {
             .as_ref()
             .map(|_| (std::time::Instant::now(), crate::frame_log::output_wait()));
         self.grid_paint = std::time::Duration::ZERO;
-        let (any_event, direct_input) =
-            ctx.input(|i| (!i.events.is_empty(), i.events.iter().any(is_direct_input)));
+        let (any_event, direct_input) = ctx.input(|i| {
+            self.mouse_hide.observe(self.config.mouse.hide_when_typing, &i.events);
+            (!i.events.is_empty(), i.events.iter().any(is_direct_input))
+        });
         if any_event {
             self.last_input = Instant::now();
         }
@@ -3188,6 +3194,13 @@ impl AlacritreeApp {
         // request has already scheduled.
         self.reconcile_sidebar_focus(ctx);
         self.phases.mark("reap");
+
+        // After paint, so it outlasts the hover cursors the widgets set while
+        // they drew.  egui clears the icon every frame, so this reasserts it
+        // for as long as the pointer stays hidden.
+        if self.mouse_hide.hidden() {
+            ctx.set_cursor_icon(egui::CursorIcon::None);
+        }
         self.phases.report_if_slow();
 
         if let (Some(log), Some((started, waited))) = (self.frame_log.as_mut(), frame_started) {
