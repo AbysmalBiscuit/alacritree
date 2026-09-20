@@ -624,6 +624,56 @@ mod tests {
         b.finish(ObservedInputs::default())
     }
 
+    /// `capture` banks every input and `matches` compares them, so an input
+    /// one of them learns about and the other does not makes `matches` answer
+    /// "unchanged" forever, and the sidebar cursor stops repairing.  Vary each
+    /// field on its own and the pair has to disagree about it.
+    #[test]
+    fn matches_compares_every_input_capture_banks() {
+        let home = std::path::PathBuf::from("/w/home");
+        let other = std::path::PathBuf::from("/w/other");
+        let baseline = || UiInputs {
+            session_rows_always: false,
+            sessions_filter_counts_detached: false,
+            query: "",
+            toggles: 0,
+            toggles_apply: false,
+            pr_generation: 0,
+            active_workspace: Some(home.as_path()),
+            active_branch: Some("main"),
+            panes_generation: 0,
+        };
+        let captured = ObservedInputs::capture(&[], std::iter::empty(), baseline());
+        assert!(
+            captured.matches(&[], std::iter::empty(), baseline()),
+            "the inputs it was captured from must read as unchanged"
+        );
+
+        let variants: Vec<(&str, UiInputs<'_>)> = vec![
+            ("session_rows_always", UiInputs { session_rows_always: true, ..baseline() }),
+            ("sessions_filter_counts_detached", UiInputs {
+                sessions_filter_counts_detached: true,
+                ..baseline()
+            }),
+            ("query", UiInputs { query: "ala", ..baseline() }),
+            ("toggles", UiInputs { toggles: 1, ..baseline() }),
+            ("toggles_apply", UiInputs { toggles_apply: true, ..baseline() }),
+            ("pr_generation", UiInputs { pr_generation: 1, ..baseline() }),
+            ("active_workspace", UiInputs {
+                active_workspace: Some(other.as_path()),
+                ..baseline()
+            }),
+            ("active_branch", UiInputs { active_branch: Some("release"), ..baseline() }),
+            ("panes_generation", UiInputs { panes_generation: 1, ..baseline() }),
+        ];
+        for (name, varied) in variants {
+            assert!(
+                !captured.matches(&[], std::iter::empty(), varied),
+                "a change to {name} is banked by capture and ignored by matches"
+            );
+        }
+    }
+
     #[test]
     fn find_matches_across_snapshots_by_stable_key() {
         let s = snapshot();
