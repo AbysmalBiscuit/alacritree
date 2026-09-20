@@ -23,37 +23,47 @@ impl SidebarFocusState {
 }
 
 impl AlacritreeApp {
-    pub(super) fn sidebar_snapshot(
-        &mut self,
-        skip_worktree: Option<&Path>,
-    ) -> sidebar_focus::TreeSnapshot {
+    /// Everything outside the tree that decides what the sidebar projects.
+    ///
+    /// `ObservedInputs::capture` and `ObservedInputs::matches` answer for the
+    /// same frame, so they have to be fed the same inputs.  Spelled out at
+    /// both call sites that was a matter of discipline: add an input to one
+    /// copy and not the other, and `matches` returns `true` forever, the
+    /// reconciler early-returns, and the cursor never repairs again.  No test
+    /// in `sidebar_focus.rs` can see that, because the defect is in the call.
+    ///
+    /// Borrows rather than clones, because the reconciler calls it on every
+    /// frame and `tests/steady_state.rs` holds the unchanged path to no
+    /// allocation at all.
+    fn sidebar_ui_inputs(&self) -> sidebar_focus::UiInputs<'_> {
         let active_workspace = self.current_workspace.as_deref();
         let active_branch = active_workspace
             .and_then(|p| self.git_panel.status.get(p))
             .and_then(|c| c.current_branch());
+        sidebar_focus::UiInputs {
+            session_rows_always: self.session_rows_always,
+            sessions_filter_counts_detached: self.sessions_filter_counts_detached,
+            query: self.sidebar.filter.query(),
+            toggles: self.sidebar.filter.toggle_bits(),
+            toggles_apply: self.sidebar.filter.toggles_apply(self.sidebar_focus_state.search_scope),
+            pr_generation: pr_generation_for(
+                self.pr_cache.generation(),
+                any_pr_toggle_active(&self.sidebar.filter, self.sidebar_focus_state.search_scope),
+            ),
+            active_workspace,
+            active_branch,
+            panes_generation: self.panes_generation(),
+        }
+    }
+
+    pub(super) fn sidebar_snapshot(
+        &mut self,
+        skip_worktree: Option<&Path>,
+    ) -> sidebar_focus::TreeSnapshot {
         let inputs = sidebar_focus::ObservedInputs::capture(
             &self.projects,
             self.session_inputs(self.observes_session_titles()),
-            sidebar_focus::UiInputs {
-                session_rows_always: self.session_rows_always,
-                sessions_filter_counts_detached: self.sessions_filter_counts_detached,
-                query: self.sidebar.filter.query(),
-                toggles: self.sidebar.filter.toggle_bits(),
-                toggles_apply: self
-                    .sidebar
-                    .filter
-                    .toggles_apply(self.sidebar_focus_state.search_scope),
-                pr_generation: pr_generation_for(
-                    self.pr_cache.generation(),
-                    any_pr_toggle_active(
-                        &self.sidebar.filter,
-                        self.sidebar_focus_state.search_scope,
-                    ),
-                ),
-                active_workspace,
-                active_branch,
-                panes_generation: self.panes_generation(),
-            },
+            self.sidebar_ui_inputs(),
         );
         let rows = self.current_project_rows();
         let live = self.session_pairs();
@@ -86,34 +96,11 @@ impl AlacritreeApp {
         let skip = deferred.as_ref().and_then(|d| d.removed_worktree.clone());
 
         if deferred.is_none() {
-            let active_workspace = self.current_workspace.as_deref();
-            let active_branch = active_workspace
-                .and_then(|p| self.git_panel.status.get(p))
-                .and_then(|c| c.current_branch());
             if let Some(prev) = &self.sidebar_focus_state.previous {
                 let unchanged = prev.inputs.matches(
                     &self.projects,
                     self.session_inputs(self.observes_session_titles()),
-                    sidebar_focus::UiInputs {
-                        session_rows_always: self.session_rows_always,
-                        sessions_filter_counts_detached: self.sessions_filter_counts_detached,
-                        query: self.sidebar.filter.query(),
-                        toggles: self.sidebar.filter.toggle_bits(),
-                        toggles_apply: self
-                            .sidebar
-                            .filter
-                            .toggles_apply(self.sidebar_focus_state.search_scope),
-                        pr_generation: pr_generation_for(
-                            self.pr_cache.generation(),
-                            any_pr_toggle_active(
-                                &self.sidebar.filter,
-                                self.sidebar_focus_state.search_scope,
-                            ),
-                        ),
-                        active_workspace,
-                        active_branch,
-                        panes_generation: self.panes_generation(),
-                    },
+                    self.sidebar_ui_inputs(),
                 );
                 if unchanged {
                     return;
@@ -184,19 +171,7 @@ impl AlacritreeApp {
     pub(super) fn apply_sidebar_nav(&mut self, ctx: &Context, key: egui::Key) {
         use egui::Key;
         let rows = self.current_project_rows();
-        let cursor = match self.sidebar.cursor.clone() {
-            Some(c) if rows.contains(&c) => c,
-            // Stale or unseeded cursor (worktree removed, project collapsed
-            // by mouse, or a filter toggle narrowing the rows out from under
-            // it): land on the first row and let the next press act from
-            // there. Unfiltered `rows` always leads with Home.
-            _ => {
-                if let Some(first) = rows.first() {
-                    self.set_sidebar_cursor(first.clone());
-                }
-                return;
-            },
-        };
+        let Some(cursor) = self.sidebar_cursor_within(&rows) else { return };
         match key {
             Key::ArrowUp => self.set_sidebar_cursor(sidebar_nav::step(&rows, &cursor, -1)),
             Key::ArrowDown => self.set_sidebar_cursor(sidebar_nav::step(&rows, &cursor, 1)),
