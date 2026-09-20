@@ -971,9 +971,12 @@ impl AlacritreeApp {
                 error = Some(msg);
                 return Some(CreateState::Prompt { project_idx, branch, error });
             }
-            let base_dir = self.config.workspace.base_dir_for(&project_root);
-            let req =
-                CreateRequest { project_root, default_branch, branch: canonical.clone(), base_dir };
+            let req = CreateRequest::new(
+                project_root,
+                default_branch,
+                canonical.clone(),
+                &self.config.workspace,
+            );
             let (rx, job) = wt::spawn_create(req, ctx.clone());
             return Some(CreateState::Running {
                 project_idx,

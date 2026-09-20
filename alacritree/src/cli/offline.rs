@@ -13,20 +13,21 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
+use crate::config::WorkspaceConfig;
 use crate::ipc::protocol::{self, IpcRequest, IpcResult};
 use crate::projects::{self, Project, project_json};
 use crate::state::{self, PersistedProject, PersistedState};
 use crate::worktree::{self as wt, CreateRequest};
 use crate::{git_status, jobs, scratchpad};
 
-pub(super) fn handle(request: &IpcRequest) -> IpcResult {
+pub(super) fn handle(request: &IpcRequest, workspace: &WorkspaceConfig) -> IpcResult {
     let Some(path) = state::config_path() else {
         return Err("could not locate alacritree's state file".to_string());
     };
-    handle_at(&path, request)
+    handle_at(&path, request, workspace)
 }
 
-fn handle_at(state_path: &Path, request: &IpcRequest) -> IpcResult {
+fn handle_at(state_path: &Path, request: &IpcRequest, workspace: &WorkspaceConfig) -> IpcResult {
     match request {
         IpcRequest::ListProjects => Ok(json!({
             // No window means no focused workspace — the same value the app
@@ -63,7 +64,7 @@ fn handle_at(state_path: &Path, request: &IpcRequest) -> IpcResult {
             })))
         },
         IpcRequest::CreateWorktree { project_root, branch } => {
-            create_worktree(project_root.clone(), branch.clone())
+            create_worktree(project_root.clone(), branch.clone(), workspace)
         },
         IpcRequest::ReadScratchpad { workspace } => match workspace.as_deref() {
             None | Some("current") => {
@@ -140,9 +141,13 @@ fn discover_all(state_path: &Path) -> Vec<Project> {
 /// The app's create also asks the sidebar to re-scan afterwards; here there is
 /// no sidebar to tell, and the next `project list` discovers the new worktree
 /// from git anyway.
-fn create_worktree(project_root: PathBuf, branch: String) -> IpcResult {
+fn create_worktree(
+    project_root: PathBuf,
+    branch: String,
+    workspace: &WorkspaceConfig,
+) -> IpcResult {
     wt::validate_branch_name(&branch)?;
-    let request = CreateRequest { project_root, default_branch: None, branch, base_dir: None };
+    let request = CreateRequest::new(project_root, None, branch, workspace);
     let mut steps = Vec::new();
     let path = jobs::on_this_thread(|blocking| {
         wt::create(&request, |step| steps.push(step.to_string()), blocking)
@@ -159,6 +164,11 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::test_util::{clone_with_origin, workspace_under};
+
+    fn serve(state_path: &Path, request: &IpcRequest) -> IpcResult {
+        handle_at(state_path, request, &WorkspaceConfig::default())
+    }
 
     fn state_file(dir: &TempDir) -> PathBuf {
         dir.path().join("state.toml")
@@ -174,11 +184,11 @@ mod tests {
     }
 
     fn add_project(state_path: &Path, root: &Path) -> IpcResult {
-        handle_at(state_path, &IpcRequest::AddProject { path: root.to_path_buf() })
+        serve(state_path, &IpcRequest::AddProject { path: root.to_path_buf() })
     }
 
     fn list_projects(state_path: &Path) -> Value {
-        handle_at(state_path, &IpcRequest::ListProjects).expect("list succeeds")
+        serve(state_path, &IpcRequest::ListProjects).expect("list succeeds")
     }
 
     /// The point of the whole offline path: an agent can set alacritree up
@@ -218,13 +228,13 @@ mod tests {
         std::fs::create_dir(&project).unwrap();
         add_project(&state, &project).expect("add");
 
-        handle_at(&state, &IpcRequest::RemoveProject { root: project.clone() }).expect("remove");
+        serve(&state, &IpcRequest::RemoveProject { root: project.clone() }).expect("remove");
 
         assert!(roots(&list_projects(&state)).is_empty());
     }
 
     fn rename_project(state_path: &Path, root: &Path, label: Option<&str>) -> IpcResult {
-        handle_at(state_path, &IpcRequest::RenameProject {
+        serve(state_path, &IpcRequest::RenameProject {
             root: root.to_path_buf(),
             label: label.map(str::to_string),
         })
@@ -295,8 +305,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let state = state_file(&dir);
 
-        let result =
-            handle_at(&state, &IpcRequest::RemoveProject { root: PathBuf::from("/nowhere") });
+        let result = serve(&state, &IpcRequest::RemoveProject { root: PathBuf::from("/nowhere") });
 
         assert!(result.is_err(), "removing a project that was never added reported success");
     }
@@ -326,8 +335,25 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let state = state_file(&dir);
 
-        let result = handle_at(&state, &IpcRequest::ListSessions);
+        let result = serve(&state, &IpcRequest::ListSessions);
 
         assert_eq!(result, Err("alacritree is not running".to_string()));
+    }
+
+    /// The CLI with no window running puts a worktree where `[workspace]`
+    /// says, the same place the sidebar's "+" does.
+    #[test]
+    fn an_offline_create_lands_under_the_configured_worktree_dir() {
+        let dir = TempDir::new().unwrap();
+        let project = clone_with_origin(dir.path());
+        let base = dir.path().join("worktrees");
+        let request = IpcRequest::CreateWorktree { project_root: project, branch: "topic".into() };
+
+        let reply = handle_at(&state_file(&dir), &request, &workspace_under(&base))
+            .expect("create succeeds");
+
+        let path = PathBuf::from(reply["path"].as_str().expect("a path"));
+        assert!(path.starts_with(&base), "{} is not under {}", path.display(), base.display());
+        assert!(path.is_dir());
     }
 }

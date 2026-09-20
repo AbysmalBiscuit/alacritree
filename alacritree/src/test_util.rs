@@ -83,6 +83,22 @@ pub(crate) fn init_repo(dir: &Path) -> Repository {
     repo
 }
 
+/// A clone of a one-commit repository, both under `dir`, so a worktree create
+/// has an `origin` to resolve and fetch from without touching the network.
+/// Returns the clone's root.
+pub(crate) fn clone_with_origin(dir: &Path) -> PathBuf {
+    let origin = dir.join("origin");
+    drop(init_repo(&origin));
+    let project = dir.join("project");
+    Repository::clone(origin.to_str().unwrap(), &project).unwrap();
+    project
+}
+
+/// `[workspace]` with its global worktree directory set to `base`.
+pub(crate) fn workspace_under(base: &Path) -> crate::config::WorkspaceConfig {
+    crate::config::WorkspaceConfig { worktree_dir: Some(base.to_path_buf()), ..Default::default() }
+}
+
 /// Add a linked worktree named `name` (git2 also creates a branch `name`).
 /// Returns the worktree's checkout path, a sibling of the repo directory.
 pub(crate) fn add_worktree(repo: &Repository, name: &str) -> PathBuf {
