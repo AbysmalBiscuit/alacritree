@@ -121,6 +121,9 @@
     }
   },
   "ipc_socket": true,
+  "mouse": {
+    "hide_when_typing": false
+  },
   "palette": {
     "bg": {
       "b": 24,

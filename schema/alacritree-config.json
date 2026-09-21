@@ -1053,6 +1053,16 @@
       },
       "type": "object"
     },
+    "RawMouse": {
+      "properties": {
+        "hide_when_typing": {
+          "default": false,
+          "description": "Hide the mouse pointer while typing.  The next pointer motion, click\nor wheel tick brings it back.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "RawNormalSet": {
       "properties": {
         "black": {
@@ -2005,6 +2015,10 @@
     "keyboard": {
       "$ref": "#/$defs/RawKeyboard",
       "description": "Key bindings.  Arrays concatenate across the two files, so bindings\nwritten in `alacritree.toml` add to the shared ones rather than\nreplacing them."
+    },
+    "mouse": {
+      "$ref": "#/$defs/RawMouse",
+      "description": "What the mouse pointer does around the grid."
     },
     "scrolling": {
       "$ref": "#/$defs/RawScrolling",
