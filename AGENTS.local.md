@@ -191,6 +191,23 @@ The all-featurse integration only applies when not doing major refactors. While 
 Before opening PR or whenever I ask you, cherry-pick your changes/features into the `all-features` branch (it's normally checked out in a worktree). Then run the `install.local.py` script inside the `all-features` worktree.
 This is important so I test features before a PR.
 
+## Merging a stack
+
+A stacked PR targets the branch below it, not `master`, so merging it merges into that branch and `master` never sees the work. GitHub reports it as merged either way, and a merged PR cannot be reopened: its number and its head branch are both spent, so the work has to come back as a new PR on a renamed branch.
+
+Merge the lowest PR first, and retarget the next one before merging it:
+
+```sh
+gh pr merge <lowest> --repo mathix420/alacritree --squash --delete-branch
+gh pr edit <next> --repo mathix420/alacritree --base master
+```
+
+`--delete-branch` is what makes GitHub retarget the rest of the stack on its own, so the `gh pr edit` line is the belt to its braces. Check the base before merging anything:
+
+```sh
+gh pr view <number> --repo mathix420/alacritree --json baseRefName
+```
+
 ## Tracking features
 
 Features I plan to work are tracked via GitHub issues on my fork: `https://github.com/AbysmalBiscuit/alacritree/issues`
