@@ -150,22 +150,20 @@ pub(super) fn path_text(
 }
 
 pub(super) fn row_status_icon_size(theme: &Theme) -> egui::Vec2 {
-    egui::vec2(ROW_STATUS_ICON_W, 14.0) * theme.ui_scale
+    egui::vec2(ROW_STATUS_ICON_W, ROW_STATUS_ICON_H) * theme.ui_scale
 }
 
 const LOADER_FRAME: Duration = Duration::from_millis(120);
 
-/// Draw the attention dot into an already-allocated slot.
-pub(super) fn paint_attention_dot(ui: &egui::Ui, rect: egui::Rect, theme: &Theme) {
-    let radius = 3.0 * theme.ui_scale;
-    ui.painter().circle_filled(rect.center(), radius, theme.attention);
-}
-
-/// Painted (rather than `RichText("●")`) so its size is independent of font
-/// metrics — `RichText("●")` renders inconsistently across fallback fonts.
-pub(super) fn attention_dot(ui: &mut egui::Ui, theme: &Theme) -> egui::Response {
+/// The pinged mark in a slot of its own, for a row whose only status is that
+/// something under it rang.
+pub(super) fn attention_mark(
+    ui: &mut egui::Ui,
+    icons: &Icons<Color32>,
+    theme: &Theme,
+) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
-    paint_attention_dot(ui, rect, theme);
+    paint_status_mark(ui, ShownState::Pinged, icons, rect, theme);
     resp
 }
 
@@ -194,70 +192,120 @@ pub(super) fn braille_loader(ui: &mut egui::Ui, size: f32, color: Color32) -> eg
     response
 }
 
-/// What the status slot draws for an agent's live state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum AgentMark {
-    /// Live work animates.  A static glyph would have to blink to say as much.
-    Loader,
-    Glyph(BakedGlyph, Color32),
-}
-
+/// The glyph a state draws when `[ui.icons]` leaves it unset, its colour, and
+/// whether it paints bold.  `None` is the braille loader.
+///
 /// Colour comes from the state, not from the row: an idle agent reads the
-/// same on a selected row as on a quiet one, and the same as a harness-backed
-/// row reporting the same state.  Working animates because a static glyph
-/// would have to blink to say as much.
-pub(super) fn agent_mark(live: LiveState, theme: &Theme) -> AgentMark {
-    match live {
-        LiveState::Idle => {
-            AgentMark::Glyph(DEFAULT_AGENT_ICON, theme.harness_state.of(StateTone::Idle))
-        },
-        LiveState::Working => AgentMark::Loader,
-        LiveState::Blocked => {
-            AgentMark::Glyph(DEFAULT_BLOCKED_ICON, theme.harness_state.of(StateTone::Blocked))
-        },
+/// same on a selected row as on a quiet one, and a native session reads the
+/// same as a multiplexer pane in the same state.
+fn default_mark(
+    state: ShownState,
+    set: StatusIndicators,
+    theme: &Theme,
+) -> (Option<&'static str>, Color32, bool) {
+    let dots = set == StatusIndicators::Dots;
+    let colors = &theme.state_colors;
+    match state {
+        ShownState::Idle => (Some(DEFAULT_HOLLOW_MARK.as_str()), colors.idle, false),
+        ShownState::Working => (None, theme.accent, false),
+        ShownState::Pinged => (Some(DEFAULT_FILLED_MARK.as_str()), theme.attention, false),
+        ShownState::Blocked if dots => (Some(DEFAULT_FILLED_MARK.as_str()), colors.blocked, false),
+        ShownState::Blocked => (Some(DEFAULT_BLOCKED_SYMBOL.as_str()), colors.blocked, false),
+        ShownState::Done if dots => (Some(DEFAULT_FILLED_MARK.as_str()), colors.done, false),
+        ShownState::Done => (Some(DEFAULT_DONE_SYMBOL.as_str()), colors.done, false),
+        ShownState::Unknown if dots => (Some(DEFAULT_HOLLOW_MARK.as_str()), colors.unknown, false),
+        // ASCII, so every UI font draws it and the baked face need not.
+        // Bold, since a thin `?` reads as a speck even at the circle's size.
+        ShownState::Unknown => (Some("?"), colors.unknown, true),
     }
 }
 
-/// Draw a harness's own state mark into an already-allocated slot.  A harness
-/// that has stopped reporting leaves the slot empty rather than inventing a
-/// state for it.
-pub(super) fn paint_harness_mark(
-    ui: &mut egui::Ui,
-    mark: Option<HarnessMark>,
-    rect: egui::Rect,
-    theme: &Theme,
-) {
-    let Some(mark) = mark else { return };
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        mark.glyph,
-        egui::FontId::new(10.0 * theme.ui_scale, crate::fonts::ui_variant_family(false, false)),
-        theme.harness_state.of(mark.tone),
-    );
+fn state_icon(state: ShownState, icons: &Icons<Color32>) -> &IconStyle<Color32> {
+    match state {
+        ShownState::Unknown => &icons.agent_unknown,
+        ShownState::Idle => &icons.agent_idle,
+        ShownState::Working => &icons.agent_working,
+        ShownState::Pinged => &icons.attention,
+        ShownState::Done => &icons.agent_done,
+        ShownState::Blocked => &icons.agent_blocked,
+    }
 }
 
-/// Draw one agent mark into an already-allocated slot.
-pub(super) fn paint_agent_mark(
+const MARK_PX: f32 = 10.0;
+
+/// How much of the circle's height a symbol's ink spans.  A cross or tick
+/// reaching into the corners of the circle's box reads larger than the
+/// circle, so it stops short of it.
+const SYMBOL_FILL: f32 = 0.9;
+
+/// Size the symbols are measured at.  Ink boxes snap to whole pixels, so a
+/// large size keeps that rounding out of the ratio.
+const MEASURE_PX: f32 = 64.0;
+
+/// A state's mark as it paints: the glyph (`None` for the loader), its font
+/// and its colour.  A glyph set in `[ui.icons]` wins over both indicator sets,
+/// and on the working state it replaces the loader.
+fn resolve_mark<'a>(
+    state: ShownState,
+    icons: &'a Icons<Color32>,
+    theme: &Theme,
+) -> (Option<&'a str>, egui::FontId, Color32) {
+    let style = state_icon(state, icons);
+    let (default_glyph, default_color, bold) = default_mark(state, theme.status_indicators, theme);
+    let glyph = style.glyph.as_deref().map(str::trim).filter(|g| !g.is_empty()).or(default_glyph);
+    let size = style.size.unwrap_or(MARK_PX).min(ROW_STATUS_ICON_H) * theme.ui_scale;
+    let family = crate::fonts::ui_variant_family(style.bold || bold, style.italic);
+    (glyph, egui::FontId::new(size, family), style.color.unwrap_or(default_color))
+}
+
+/// Whether a state paints one of the symbols set's own shapes at its default
+/// size, the only marks sized against the circle.  A glyph or size set in
+/// `[ui.icons]` is taken as written.
+fn sized_to_the_circle(state: ShownState, icons: &Icons<Color32>, theme: &Theme) -> bool {
+    let style = state_icon(state, icons);
+    theme.status_indicators == StatusIndicators::Symbols
+        && matches!(state, ShownState::Blocked | ShownState::Done | ShownState::Unknown)
+        && style.glyph.as_deref().is_none_or(|g| g.trim().is_empty())
+        && style.size.is_none()
+}
+
+/// The size at which `glyph`'s ink spans `SYMBOL_FILL` of the filled circle's
+/// height at `font`'s size.  Measured from the laid-out ink rather than the
+/// baked face, since the UI font ahead of it in the chain may draw the glyph.
+fn size_to_the_circle(ui: &egui::Ui, glyph: &str, font: &egui::FontId, theme: &Theme) -> f32 {
+    let ink = |text: &str, family: egui::FontFamily| {
+        let font = egui::FontId::new(MEASURE_PX, family);
+        let galley = ui.fonts(|f| f.layout_no_wrap(text.to_owned(), font, Color32::WHITE));
+        galley.rows.first().and_then(|row| row.glyphs.first()).map(|g| g.uv_rect.size)
+    };
+    let circle = ink(DEFAULT_FILLED_MARK.as_str(), egui::FontFamily::Proportional);
+    let own = ink(glyph, font.family.clone());
+    match (circle, own) {
+        (Some(circle), Some(own)) if own.max_elem() > 0.0 => {
+            let size = font.size * SYMBOL_FILL * circle.y / own.max_elem();
+            size.min(ROW_STATUS_ICON_H * theme.ui_scale)
+        },
+        _ => font.size,
+    }
+}
+
+/// Draw a state's mark into an already-allocated slot.
+pub(super) fn paint_status_mark(
     ui: &mut egui::Ui,
-    mark: AgentMark,
+    state: ShownState,
+    icons: &Icons<Color32>,
     rect: egui::Rect,
     theme: &Theme,
 ) {
-    let s = theme.ui_scale;
-    match mark {
-        AgentMark::Loader => {
-            paint_braille_loader(ui, rect, 10.0 * s, theme.accent);
+    let (glyph, mut font, color) = resolve_mark(state, icons, theme);
+    match glyph {
+        Some(glyph) => {
+            if sized_to_the_circle(state, icons, theme) {
+                font.size = size_to_the_circle(ui, glyph, &font, theme);
+            }
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, glyph, font, color);
         },
-        AgentMark::Glyph(glyph, color) => {
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                glyph.as_str(),
-                egui::FontId::proportional(10.0 * s),
-                color,
-            );
-        },
+        None => paint_braille_loader(ui, rect, font.size, color),
     }
 }
 
@@ -267,23 +315,17 @@ pub(super) fn paint_agent_mark(
 pub(super) fn paint_row_status_icon(
     ui: &mut egui::Ui,
     theme: &Theme,
+    icons: &Icons<Color32>,
     status: RowStatus<'_>,
     style: &IconStyle<Color32>,
     default_glyph: BakedGlyph,
     is_active: bool,
 ) -> Option<(egui::Rect, String)> {
     match session_status_mark(&status) {
-        Some((SessionMark::Attention, hint)) => Some((attention_dot(ui, theme).rect, hint)),
-        Some((SessionMark::Harness(mark), hint)) => {
+        Some((state, hint)) => {
             let (rect, _) =
                 ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
-            paint_harness_mark(ui, Some(mark), rect, theme);
-            Some((rect, hint))
-        },
-        Some((SessionMark::Agent(live), hint)) => {
-            let (rect, _) =
-                ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
-            paint_agent_mark(ui, agent_mark(live, theme), rect, theme);
+            paint_status_mark(ui, state, icons, rect, theme);
             Some((rect, hint))
         },
         None => {
@@ -420,6 +462,7 @@ pub(super) fn paint_cursor_outline(ui: &egui::Ui, rect: egui::Rect, theme: &Them
 /// drawing. Markers vary wildly in intrinsic width (`·` vs `✳`), so sizing the
 /// slot to the glyph would start each row's label at a different x.
 pub(super) const ROW_STATUS_ICON_W: f32 = 10.0;
+const ROW_STATUS_ICON_H: f32 = 14.0;
 
 pub(super) const ATTENTION_HINT: &str = "needs attention";
 const CODEX_LOADER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -444,60 +487,58 @@ fn loader_glyph(frame: usize) -> &'static str {
 
 /// What the status slot says on hover.  A named agent is named, so a
 /// workspace running several can be told apart without opening any of them.
-pub(super) fn agent_hint(live: LiveState, name: Option<&str>) -> String {
-    let doing = match live {
-        LiveState::Idle => "is running",
-        LiveState::Working => "is working",
-        LiveState::Blocked => "is waiting for you",
-    };
-    format!("{} {doing}", name.unwrap_or("agent"))
+pub(super) fn agent_hint(state: ShownState, name: Option<&str>) -> String {
+    let name = name.unwrap_or("agent");
+    match state {
+        ShownState::Pinged => ATTENTION_HINT.to_owned(),
+        ShownState::Unknown => format!("{name}, state unknown"),
+        ShownState::Idle => format!("{name} is running"),
+        ShownState::Working => format!("{name} is working"),
+        ShownState::Done => format!("{name} is done"),
+        ShownState::Blocked => format!("{name} is waiting for you"),
+    }
 }
 
-/// What a row knows about its own state, in the order the status slot ranks
-/// it.  Grouped rather than passed loose because the three answer one
-/// question between them, and the slot draws whichever ranks highest.
+/// What a row knows about its own state.  Grouped rather than passed loose
+/// because the four answer one question between them, and the slot draws
+/// whichever ranks highest.
+#[derive(Clone, Copy)]
 pub(super) struct RowStatus<'a> {
-    pub(super) attention: bool,
+    /// The terminal rang while nobody was looking.
+    pub(super) pinged: bool,
+    /// The agent finished a turn while nobody was looking.
+    pub(super) done: bool,
+    /// The live reading, with a multiplexer's status already folded in.
     pub(super) activity: SessionActivity,
     pub(super) managed: Option<&'a Managed>,
 }
 
-/// A session's status mark, independent of where it paints — the sidebar's
-/// fixed slot and the palette's row both ask `session_status_mark` for the
-/// identical session, so the two can never disagree about its state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SessionMark {
-    Attention,
-    Harness(HarnessMark),
-    Agent(LiveState),
+impl RowStatus<'_> {
+    /// A row with nothing to report beyond its live reading.
+    pub(super) fn live(activity: SessionActivity) -> Self {
+        Self { pinged: false, done: false, activity, managed: None }
+    }
 }
 
-/// Priority: attention dot > the harness's own state mark > the agent's live
-/// state.  A harness outranks the live axis because it watches the pane from
-/// outside and alacritree only reads its title, so where both have a reading
-/// the harness's is the better one — and drawing it in the harness's
-/// vocabulary is what keeps a pane looking the same listed and attached.
+/// A session's status mark and the words it explains on hover, independent
+/// of where it paints.  The sidebar's fixed slot and the palette's row both
+/// ask here for the identical session, so the two can never disagree.
 ///
-/// Returns the word the mark explains on hover alongside it.  `None` covers a
-/// shell session, which has no state to mark.
-pub(super) fn session_status_mark(status: &RowStatus<'_>) -> Option<(SessionMark, String)> {
-    if status.attention {
-        return Some((SessionMark::Attention, ATTENTION_HINT.to_owned()));
-    }
-    if let Some(managed) = status.managed
-        && let Some(mark) = managed.mark
-    {
-        return Some((
-            SessionMark::Harness(mark),
-            format!("{} says {}", managed.multiplexer, mark.label),
-        ));
-    }
-    match status.activity {
-        SessionActivity::Agent { name, live } => {
-            Some((SessionMark::Agent(live), agent_hint(live, name)))
+/// A multiplexer that reports `done` has latched it on its own side, so it
+/// counts the same as alacritree's own latch.  The hover names the
+/// multiplexer when the mark is the state it reported.  `None` covers a
+/// plain shell with nothing latched.
+pub(super) fn session_status_mark(status: &RowStatus<'_>) -> Option<(ShownState, String)> {
+    let pane_status = status.managed.and_then(|managed| managed.status);
+    let pane_done = pane_status == Some(PaneStatus::Done);
+    let state = ShownState::of(status.activity.live(), status.done || pane_done, status.pinged)?;
+    let hint = match (status.managed, pane_status) {
+        (Some(managed), Some(reported)) if ShownState::from(reported) == state => {
+            format!("{} says {}", managed.multiplexer, reported.label())
         },
-        SessionActivity::Shell => None,
-    }
+        _ => agent_hint(state, status.activity.name()),
+    };
+    Some((state, hint))
 }
 
 #[cfg(test)]
@@ -506,37 +547,124 @@ mod tests {
     use crate::multiplexer::{Pane, PaneStatus, Side};
     use crate::test_util::{listed_agent, managed};
 
-    /// A native agent's mark is coloured by the state it reports, the same
-    /// way a harness-backed row's mark is, so two rows in one state never
-    /// disagree about what that state looks like.
-    #[test]
-    fn an_agent_mark_takes_its_colour_from_the_state_it_reports() {
-        let theme = Theme::from_config(&Config::default());
-        assert_eq!(
-            agent_mark(LiveState::Idle, &theme),
-            AgentMark::Glyph(DEFAULT_AGENT_ICON, theme.harness_state.of(StateTone::Idle))
-        );
-        assert_eq!(
-            agent_mark(LiveState::Blocked, &theme),
-            AgentMark::Glyph(DEFAULT_BLOCKED_ICON, theme.harness_state.of(StateTone::Blocked))
-        );
-        assert_eq!(agent_mark(LiveState::Working, &theme), AgentMark::Loader);
+    const EVERY_STATE: [ShownState; 6] = [
+        ShownState::Unknown,
+        ShownState::Idle,
+        ShownState::Working,
+        ShownState::Pinged,
+        ShownState::Done,
+        ShownState::Blocked,
+    ];
+
+    fn theme_with(set: StatusIndicators) -> Theme {
+        let mut config = Config::default();
+        config.ui.status_indicators = set;
+        Theme::from_config(&config)
     }
 
-    /// Attention outranks every other reading a row could have, a harness's
-    /// included — a state that wants a human cannot also be quiet.
+    fn glyphs(set: StatusIndicators) -> Vec<(ShownState, Option<String>)> {
+        let theme = theme_with(set);
+        let icons = Icons::default().map_colors(rgb_to_color32);
+        EVERY_STATE
+            .iter()
+            .map(|&state| (state, resolve_mark(state, &icons, &theme).0.map(str::to_owned)))
+            .collect()
+    }
+
+    /// Symbols tells every state apart by shape alone, so no two share a
+    /// glyph, and working keeps the loader.
     #[test]
-    fn session_status_mark_puts_attention_first() {
-        let agent = listed_agent(Some("claude"));
-        let managed = managed(&agent, &Side::Native, false);
-        let status = RowStatus {
-            attention: true,
-            activity: SessionActivity::Shell,
-            managed: Some(&managed),
+    fn every_symbols_state_has_a_glyph_of_its_own() {
+        let marks = glyphs(StatusIndicators::Symbols);
+        for (i, (a, ga)) in marks.iter().enumerate() {
+            for (b, gb) in &marks[i + 1..] {
+                assert_ne!(ga, gb, "{a:?} and {b:?} draw the same mark");
+            }
+        }
+        assert_eq!(marks[2], (ShownState::Working, None));
+    }
+
+    /// Dots draws every state but working as one of two same-sized circles,
+    /// hollow or filled, and leaves the rest to colour.
+    #[test]
+    fn dots_draw_two_circles_and_tell_states_apart_by_colour() {
+        let marks = glyphs(StatusIndicators::Dots);
+        let glyph = |state| marks.iter().find(|(s, _)| *s == state).unwrap().1.clone();
+        let hollow = Some(DEFAULT_HOLLOW_MARK.as_str().to_owned());
+        let filled = Some(DEFAULT_FILLED_MARK.as_str().to_owned());
+        assert_eq!(glyph(ShownState::Idle), hollow);
+        assert_eq!(glyph(ShownState::Unknown), hollow);
+        assert_eq!(glyph(ShownState::Pinged), filled);
+        assert_eq!(glyph(ShownState::Blocked), filled);
+        assert_eq!(glyph(ShownState::Done), filled);
+        assert_eq!(glyph(ShownState::Working), None);
+
+        let theme = theme_with(StatusIndicators::Dots);
+        let icons = Icons::default().map_colors(rgb_to_color32);
+        let colors: Vec<Color32> =
+            EVERY_STATE.iter().map(|&state| resolve_mark(state, &icons, &theme).2).collect();
+        for (i, a) in colors.iter().enumerate() {
+            for (j, b) in colors.iter().enumerate().skip(i + 1) {
+                assert_ne!(a, b, "{:?} and {:?} share a colour", EVERY_STATE[i], EVERY_STATE[j]);
+            }
+        }
+    }
+
+    /// Colour comes from the state, so a native session and a multiplexer
+    /// pane in one state never disagree about what it looks like.
+    #[test]
+    fn a_mark_takes_its_colour_from_its_state() {
+        let theme = theme_with(StatusIndicators::Dots);
+        let icons = Icons::default().map_colors(rgb_to_color32);
+        let color = |state| resolve_mark(state, &icons, &theme).2;
+        assert_eq!(color(ShownState::Blocked), theme.state_colors.blocked);
+        assert_eq!(color(ShownState::Done), theme.state_colors.done);
+        assert_eq!(color(ShownState::Idle), theme.state_colors.idle);
+        assert_eq!(color(ShownState::Unknown), theme.state_colors.unknown);
+        assert_eq!(color(ShownState::Working), theme.accent);
+        assert_eq!(color(ShownState::Pinged), theme.attention);
+    }
+
+    /// A glyph set in `[ui.icons]` wins in both sets, and on working it
+    /// replaces the loader.
+    #[test]
+    fn a_configured_glyph_overrides_both_indicator_sets() {
+        let mut icons = Icons::default().map_colors(rgb_to_color32);
+        icons.agent_done.glyph = Some("D".into());
+        icons.agent_working.glyph = Some("W".into());
+        for set in [StatusIndicators::Dots, StatusIndicators::Symbols] {
+            let theme = theme_with(set);
+            assert_eq!(resolve_mark(ShownState::Done, &icons, &theme).0, Some("D"));
+            assert_eq!(resolve_mark(ShownState::Working, &icons, &theme).0, Some("W"));
+        }
+    }
+
+    /// Symbols' unknown is an ASCII `?`, which reads as a speck unless it
+    /// paints bold.
+    #[test]
+    fn the_unknown_symbol_paints_bold() {
+        let theme = theme_with(StatusIndicators::Symbols);
+        let icons = Icons::default().map_colors(rgb_to_color32);
+        let (glyph, font, _) = resolve_mark(ShownState::Unknown, &icons, &theme);
+        assert_eq!(glyph, Some("?"));
+        assert_eq!(font.family, crate::fonts::ui_variant_family(true, false));
+    }
+
+    /// Blocked and done outrank a ping; a ping outranks working and idle.
+    /// The ping stays latched underneath either way.
+    #[test]
+    fn a_louder_state_hides_a_ping_and_a_quieter_one_does_not() {
+        let pinged = |live| RowStatus {
+            pinged: true,
+            ..RowStatus::live(SessionActivity::agent(Some("claude"), live))
         };
-        let (mark, hint) = session_status_mark(&status).expect("attention always has a mark");
-        assert_eq!(mark, SessionMark::Attention);
-        assert_eq!(hint, ATTENTION_HINT);
+        let mark = |status: RowStatus<'_>| session_status_mark(&status).unwrap().0;
+        assert_eq!(mark(pinged(LiveState::Blocked)), ShownState::Blocked);
+        assert_eq!(mark(pinged(LiveState::Working)), ShownState::Pinged);
+        assert_eq!(mark(pinged(LiveState::Idle)), ShownState::Pinged);
+        let done = RowStatus { done: true, ..pinged(LiveState::Idle) };
+        assert_eq!(mark(done), ShownState::Done);
+        assert_eq!(session_status_mark(&done).unwrap().1, "claude is done");
     }
 
     /// A pane-backed session's mark and hover come from the same call the
@@ -546,13 +674,25 @@ mod tests {
     fn session_status_mark_matches_the_sidebar_for_a_pane_backed_session() {
         let agent = Pane { status: Some(PaneStatus::Working), ..listed_agent(Some("claude")) };
         let managed = managed(&agent, &Side::Native, false);
-        let activity = SessionActivity::agent(Some("claude"), LiveState::Idle);
-        let status = RowStatus { attention: false, activity, managed: Some(&managed) };
+        let activity = SessionActivity::agent(Some("claude"), LiveState::Working);
+        let status = RowStatus { managed: Some(&managed), ..RowStatus::live(activity) };
         let (mark, hint) =
             session_status_mark(&status).expect("a listed pane with an agent has a mark");
-        let harness_mark = managed.mark.expect("a listed agent always has one");
-        assert_eq!(mark, SessionMark::Harness(harness_mark));
-        assert_eq!(hint, format!("{} says {}", managed.multiplexer, harness_mark.label));
+        assert_eq!(mark, ShownState::Working);
+        assert_eq!(hint, format!("{} says working", managed.multiplexer));
+    }
+
+    /// A multiplexer that reports `done` has latched it itself, so the row
+    /// shows done with no latch of alacritree's own.
+    #[test]
+    fn a_pane_reporting_done_shows_done() {
+        let agent = Pane { status: Some(PaneStatus::Done), ..listed_agent(Some("claude")) };
+        let managed = managed(&agent, &Side::Native, false);
+        let activity = SessionActivity::agent(Some("claude"), LiveState::Idle);
+        let status = RowStatus { managed: Some(&managed), ..RowStatus::live(activity) };
+        let (mark, hint) = session_status_mark(&status).unwrap();
+        assert_eq!(mark, ShownState::Done);
+        assert_eq!(hint, format!("{} says done", managed.multiplexer));
     }
 
     #[test]
@@ -727,32 +867,42 @@ mod tests {
 
     #[test]
     fn the_status_hint_names_the_agent_and_what_it_is_doing() {
-        assert_eq!(agent_hint(LiveState::Idle, Some("claude")), "claude is running");
-        assert_eq!(agent_hint(LiveState::Working, Some("codex")), "codex is working");
-        assert_eq!(agent_hint(LiveState::Blocked, Some("claude")), "claude is waiting for you");
-        assert_eq!(agent_hint(LiveState::Blocked, None), "agent is waiting for you");
+        assert_eq!(agent_hint(ShownState::Idle, Some("claude")), "claude is running");
+        assert_eq!(agent_hint(ShownState::Working, Some("codex")), "codex is working");
+        assert_eq!(agent_hint(ShownState::Blocked, Some("claude")), "claude is waiting for you");
+        assert_eq!(agent_hint(ShownState::Blocked, None), "agent is waiting for you");
+        assert_eq!(agent_hint(ShownState::Done, Some("claude")), "claude is done");
+        assert_eq!(agent_hint(ShownState::Unknown, None), "agent, state unknown");
+        assert_eq!(agent_hint(ShownState::Pinged, Some("claude")), ATTENTION_HINT);
     }
 
     /// A shell session has no state axis to mark. The sidebar draws its own
     /// icon here instead of a status mark, and the palette leaves the slot
     /// empty, so both must read this as "no mark" rather than picking one.
+    /// A finished turn belongs to an agent, so a shell cannot be done either;
+    /// it can only be pinged.
     #[test]
-    fn session_status_mark_picks_none_for_a_shell() {
-        let status =
-            RowStatus { attention: false, activity: SessionActivity::Shell, managed: None };
-        assert!(session_status_mark(&status).is_none());
+    fn a_shell_has_no_mark_unless_it_rang() {
+        let shell = RowStatus::live(SessionActivity::Shell);
+        assert!(session_status_mark(&shell).is_none());
+        assert!(session_status_mark(&RowStatus { done: true, ..shell }).is_none());
+        let rang = RowStatus { pinged: true, ..shell };
+        assert_eq!(
+            session_status_mark(&rang).unwrap(),
+            (ShownState::Pinged, ATTENTION_HINT.into())
+        );
     }
 
     /// The palette paints the identical mark and hover the sidebar would for
-    /// a local agent, whichever of the three live states it is in.
+    /// a local agent, whichever live state it is in.
     #[test]
     fn session_status_mark_picks_each_live_state_for_a_local_agent() {
-        for live in [LiveState::Idle, LiveState::Working, LiveState::Blocked] {
+        for live in [LiveState::Unknown, LiveState::Idle, LiveState::Working, LiveState::Blocked] {
             let activity = SessionActivity::agent(Some("claude"), live);
-            let status = RowStatus { attention: false, activity, managed: None };
-            let (mark, hint) = session_status_mark(&status).expect("an agent always has a mark");
-            assert_eq!(mark, SessionMark::Agent(live));
-            assert_eq!(hint, agent_hint(live, Some("claude")));
+            let (mark, hint) = session_status_mark(&RowStatus::live(activity))
+                .expect("an agent always has a mark");
+            assert_eq!(mark, ShownState::from(live));
+            assert_eq!(hint, agent_hint(mark, Some("claude")));
         }
     }
 
