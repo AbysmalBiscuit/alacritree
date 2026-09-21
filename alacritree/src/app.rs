@@ -4850,10 +4850,8 @@ mod tests {
             Instant::now(),
         );
 
-        app.multiplexers.herdr_mut_for_test().caches_mut_for_test()[0].fail_listing_for_test(
-            herdr::PollError::Absent("spawn_failed"),
-            Duration::from_secs(2),
-        );
+        app.multiplexers.herdr_mut_for_test().caches_mut_for_test()[0]
+            .fail_listing_for_test(herdr::PollError::Absent("spawn_failed"));
 
         assert_eq!(app.create_target(None, None), Ok((MultiplexerKind::Herdr, Side::Native)));
     }
@@ -5019,12 +5017,7 @@ mod tests {
             .expect("the create queued a shared view");
         let side = Side::Wsl("distro".into());
         assert_eq!(queued.key, herdr_pane_key(side.clone(), "term-new"));
-        assert_eq!(queued.target, PaneTarget {
-            side,
-            pane_id: "w1:p2".into(),
-            tab_id: Some("w1:t2".into()),
-            has_agent: false,
-        });
+        assert_eq!(queued.target, PaneTarget { side, pane_id: "w1:p2".into(), has_agent: false });
         assert_eq!(queued.request.workspace, workspace);
         assert_eq!(app.current_workspace, workspace);
         assert!(app.multiplexers.herdr_for_test().pending_create_for_test().is_empty());
@@ -5110,12 +5103,8 @@ mod tests {
         };
         app.multiplexers.herdr_mut_for_test().pending_attach_mut_for_test()[0].job = running();
         let key = herdr_pane_key(Side::Wsl("distro".into()), "term-new");
-        let unlisted = PaneTarget {
-            side: key.side.clone(),
-            pane_id: "w1:p2".into(),
-            tab_id: Some("w1:t2".into()),
-            has_agent: false,
-        };
+        let unlisted =
+            PaneTarget { side: key.side.clone(), pane_id: "w1:p2".into(), has_agent: false };
         let switch = WorkspaceSwitch { to: None, from: None };
         let ctx = Context::default();
 
@@ -5453,10 +5442,8 @@ mod tests {
         );
         let id = bind_herdr_fixture(&mut app, side, "term-kept");
 
-        app.multiplexers.herdr_mut_for_test().caches_mut_for_test()[0].fail_listing_for_test(
-            herdr::PollError::Absent("spawn_failed"),
-            Duration::from_secs(2),
-        );
+        app.multiplexers.herdr_mut_for_test().caches_mut_for_test()[0]
+            .fail_listing_for_test(herdr::PollError::Absent("spawn_failed"));
 
         assert_eq!(app.session_pane_status(&app.sessions[0]), Some(PaneStatus::Working));
         let items = app.palette_items();

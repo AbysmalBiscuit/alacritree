@@ -8,8 +8,8 @@ use serde_json::{Value, json};
 
 use super::view::{HerdrViewAction, HerdrViewFocus, HerdrViewSync, ViewInputs};
 use super::{
-    EndpointCache, Endpoints, Listing, Settings, attaches_directly, cli, focus_args, focus_pane,
-    pane_key, program, unattached,
+    EndpointCache, Endpoints, Listing, Settings, attaches_directly, cli, focus_pane, pane_key,
+    program, unattached,
 };
 use crate::config::{BakedGlyph, DEFAULT_HERDR_ICON, HerdrConfig, IconStyle};
 use crate::jobs;
@@ -71,6 +71,32 @@ impl Herdr {
     /// landed.
     fn settings(&self, side: &Side) -> Settings {
         self.cache(side).map(EndpointCache::settings).unwrap_or_default()
+    }
+
+    /// A gesture that timed out is the only sign of a herdr that hung with
+    /// its streams still open, so that side's streams start over.
+    fn note_gesture<T>(&mut self, side: &Side, result: &Result<T, String>) {
+        if result.as_ref().is_err_and(|e| e.starts_with(cli::NO_ANSWER))
+            && let Some(cache) = self.endpoints.cache_mut(side)
+        {
+            cache.restart();
+        }
+    }
+
+    /// Tells the side's cache that alacritree just moved herdr's focus to
+    /// `target`, so focus events older than the move are not followed.
+    fn note_own_focus(&mut self, target: &PaneTarget) {
+        if let Some(cache) = self.endpoints.cache_mut(&target.side) {
+            cache.focus_moved(target.pane_id.clone(), Instant::now());
+        }
+    }
+
+    /// A user reaching for a side is the moment its herdr being up matters,
+    /// so a side waiting out its backoff reconnects now.
+    fn reconnect_now(&mut self, side: &Side) {
+        if let Some(cache) = self.endpoints.cache_mut(side) {
+            cache.reconnect_now();
+        }
     }
 
     /// Where herdr's focus goes for the pane a session is bound to.  The
@@ -162,11 +188,7 @@ impl MultiplexerSession for Herdr {
         if !self.config.enabled {
             return;
         }
-        self.endpoints.poll(
-            self.config.poll_interval,
-            Listing::wanted(self.config.show_panes),
-            attached,
-        );
+        self.endpoints.poll(Listing::wanted(self.config.show_panes), attached);
     }
 
     fn generation(&self) -> u64 {
@@ -307,6 +329,7 @@ impl MultiplexerSession for Herdr {
     /// Every one of herdr's app clients draws the same focused pane, so a
     /// shared view shows a row's pane only while herdr is focused there.
     fn queue_attach(&mut self, key: PaneKey, target: PaneTarget, request: AttachRequest) {
+        self.reconnect_now(&key.side);
         if let Some(pending) = self.pending_attach.iter_mut().find(|p| p.key == key) {
             pending.request.waiters.extend(request.waiters);
             if request.focus.takes() && !pending.request.focus.takes() {
@@ -342,8 +365,8 @@ impl MultiplexerSession for Herdr {
                 let focus = pending.request.focus.takes();
                 pending.job =
                     Some(jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
-                        let focus = focus.then(|| focus_args(&target));
-                        cli::herdr_attach_gesture(&target.side, focus.as_deref(), name)
+                        let focus = focus.then_some(target.pane_id.as_str());
+                        cli::herdr_attach_gesture(&target.side, focus, name)
                             .map(|(program, argv)| Launch { program, argv })
                     }));
                 None
@@ -351,6 +374,10 @@ impl MultiplexerSession for Herdr {
         };
         let answer = match answer {
             Some(launch) => {
+                self.note_gesture(&pending.key.side, &launch);
+                if launch.is_ok() && pending.request.focus.takes() {
+                    self.note_own_focus(&pending.target);
+                }
                 Some(AttachAnswer { key: pending.key, request: pending.request, launch })
             },
             None => {
@@ -363,6 +390,7 @@ impl MultiplexerSession for Herdr {
     }
 
     fn queue_create(&mut self, side: Side, cwd: Option<String>, request: CreateRequest) {
+        self.reconnect_now(&side);
         let asked = side.clone();
         let focus = request.focus.takes();
         let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
@@ -384,6 +412,7 @@ impl MultiplexerSession for Herdr {
                 return None;
             },
         };
+        self.note_gesture(&pending.side, &pane);
         Some(CreateAnswer { side: pending.side, request: pending.request, pane })
     }
 
@@ -406,12 +435,16 @@ impl MultiplexerSession for Herdr {
             }
             match pending.job.poll() {
                 Some(result) => {
+                    self.note_gesture(&pending.key.side, &result);
                     let succeeded = result.is_ok();
                     if let Err(e) = result {
                         log::warn!("{e}");
                     }
                     if succeeded {
                         self.focused_view.moved_focus(&pending.key, Instant::now());
+                        if let Some(target) = self.focus_target(&pending.key) {
+                            self.note_own_focus(&target);
+                        }
                     }
                     self.focused_view.settled(pending.session, succeeded, Instant::now());
                 },
@@ -428,10 +461,10 @@ impl MultiplexerSession for Herdr {
                     return ViewStep::default();
                 };
                 let Some(target) = self.focus_target(key) else { return ViewStep::default() };
-                let focus = focus_args(&target);
                 let side = key.side.clone();
-                let job = jobs::pool()
-                    .spawn(jobs::Priority::Interactive, move |_blocking| focus_pane(&side, &focus));
+                let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
+                    focus_pane(&side, &target.pane_id)
+                });
                 self.view_focus = Some(HerdrViewFocus { session: id, key: key.clone(), job });
                 ViewStep::default()
             },
@@ -484,7 +517,7 @@ mod tests {
     }
 
     fn pane(side: Side, has_agent: bool) -> PaneTarget {
-        PaneTarget { side, pane_id: "w1:p1".into(), tab_id: Some("w1:t1".into()), has_agent }
+        PaneTarget { side, pane_id: "w1:p1".into(), has_agent }
     }
 
     fn request(waiters: Vec<mpsc::Sender<crate::ipc::protocol::IpcResult>>) -> AttachRequest {
@@ -582,19 +615,19 @@ mod tests {
         assert!(second_rx.try_recv().is_err());
     }
 
-    /// A created pane runs a shell, and the displayed listing drops a pane
-    /// with no agent in it unless panes are shown.  Coming back to that pane's
-    /// session has to find its tab through the side's full listing, or herdr
-    /// goes on showing whatever it last focused.
+    /// A shell pane, left out of the displayed listing, is found through the
+    /// side's full one, and by its own id rather than its tab's, which would
+    /// land on whichever of the tab's panes herdr last focused.
     #[test]
-    fn a_bound_shell_pane_is_refocused_through_its_tab() {
+    fn a_bound_shell_pane_sharing_a_tab_is_refocused_by_its_own_id() {
         let mut herdr = herdr(AttachMode::Agent);
         assert!(!herdr.config.show_panes, "the default display");
         let side = Side::Native;
         herdr.adopt_listing_for_test(
             &side,
             r#"{"result":{"panes":[
-            {"terminal_id":"term-shell","pane_id":"w1:p2","tab_id":"w1:t2","agent_status":"unknown"}
+            {"terminal_id":"term-shell","pane_id":"w1:p2","tab_id":"w1:t2","agent_status":"unknown"},
+            {"terminal_id":"term-other","pane_id":"w1:p3","tab_id":"w1:t2","focused":true,"agent_status":"unknown"}
         ]}}"#,
             Instant::now(),
         );
@@ -603,7 +636,7 @@ mod tests {
 
         let target = herdr.focus_target(&key).expect("a bound shell pane has nowhere to focus");
 
-        assert_eq!(focus_args(&target), ["tab", "focus", "w1:t2"]);
+        assert_eq!(target.pane_id, "w1:p2");
     }
 
     /// A session alacritree still holds open after herdr stopped listing its
