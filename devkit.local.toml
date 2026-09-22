@@ -77,8 +77,8 @@ after_worktree_create = [
     [
         "{{ herdr_session }}",
         "open",
-        "--path",
         "--no-focus",
+        "--path",
         "{{ worktree }}",
     ],
 ]
