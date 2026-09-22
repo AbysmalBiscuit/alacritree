@@ -333,6 +333,11 @@ impl EndpointCache {
         tx
     }
 
+    #[cfg(test)]
+    pub(super) fn stream_up_for_test(&self) -> bool {
+        matches!(self.link, Link::Up(_))
+    }
+
     /// Ages the current run of failures past its grace period, so a test
     /// reaches the state a side that stopped answering ends up in without
     /// waiting the polls out.
@@ -449,10 +454,10 @@ impl EndpointCache {
             return;
         }
         let side = self.side.clone();
-        self.session_name = Read::Pending(
-            jobs::pool()
-                .spawn(jobs::Priority::Background, move |_| running_session_name(&side).ok()),
-        );
+        self.session_name =
+            Read::Pending(jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
+                running_session_name(&side, blocking).ok()
+            }));
     }
 
     /// Adopt a landed config read.  Both halves are part of what a row
@@ -568,17 +573,6 @@ impl EndpointCache {
         }
     }
 
-    /// Drops this side's streams and reconnects at once.  For a herdr that
-    /// stopped answering commands without closing its streams, which is the
-    /// one way a hung server can be noticed.
-    pub fn restart(&mut self) {
-        if matches!(self.link, Link::Abandoned) {
-            return;
-        }
-        self.status = None;
-        self.link = Link::Down { failures: 0, retry_at: Instant::now() };
-    }
-
     /// Reads the lifecycle stream, and starts one when a reconnect is due.
     fn advance_link(&mut self, now: Instant) {
         let messages = match &mut self.link {
@@ -598,15 +592,22 @@ impl EndpointCache {
                 Message::Started => {
                     let link = std::mem::replace(&mut self.link, Link::Abandoned);
                     self.link = match link {
-                        Link::Connecting { stream, .. } => Link::Up(stream),
+                        Link::Connecting { stream, failures } => {
+                            log::info!(
+                                "herdr ({:?}): event stream connected after {failures} failed \
+                                 attempts",
+                                self.side
+                            );
+                            Link::Up(stream)
+                        },
                         other => other,
                     };
                     self.note_success();
                     self.listing_due = Some(now);
                 },
                 Message::Event(event) => self.receive(event, now),
-                Message::Ended(reason) => {
-                    self.link_ended(reason, now);
+                Message::Ended { reason, stderr } => {
+                    self.link_ended(reason, &stderr, now);
                     return;
                 },
             }
@@ -617,7 +618,7 @@ impl EndpointCache {
     /// herdr went away, so the reconnect starts at once; one that never
     /// started backs off, or gives the side up when nothing herdr-shaped
     /// answered there.
-    fn link_ended(&mut self, reason: Option<PollError>, now: Instant) {
+    fn link_ended(&mut self, reason: Option<PollError>, stderr: &str, now: Instant) {
         let failures = match &self.link {
             Link::Connecting { failures, .. } => failures + 1,
             Link::Down { .. } | Link::Up(_) | Link::Abandoned => 0,
@@ -625,6 +626,7 @@ impl EndpointCache {
         // Only a stream that was up has a listing behind it to retire; a
         // reconnect that failed found everything already retired.
         if matches!(self.link, Link::Up(_)) {
+            log::warn!("herdr ({:?}): event stream dropped; bridge said {stderr:?}", self.side);
             self.status = None;
             self.inventory = None;
             self.session_name = Read::Unread;
@@ -658,16 +660,21 @@ impl EndpointCache {
                 // again.
                 Message::Started => self.listing_due = Some(now),
                 Message::Event(event) => self.receive(event, now),
-                Message::Ended(reason) => {
-                    if let Some(link) = self.status.take()
-                        && let Some(error) = reason
-                    {
-                        log::debug!(
-                            "herdr ({:?}): status stream refused: {}",
-                            self.side,
-                            error.code()
-                        );
-                        self.status_refused = Some(link.pane_ids);
+                Message::Ended { reason, stderr } => {
+                    let Some(link) = self.status.take() else { return };
+                    match reason {
+                        Some(error) => {
+                            log::debug!(
+                                "herdr ({:?}): status stream refused: {}",
+                                self.side,
+                                error.code()
+                            );
+                            self.status_refused = Some(link.pane_ids);
+                        },
+                        None => log::info!(
+                            "herdr ({:?}): status stream dropped; bridge said {stderr:?}",
+                            self.side
+                        ),
                     }
                     return;
                 },
@@ -860,16 +867,13 @@ impl EndpointCache {
         self.blank_at = None;
     }
 
-    /// Says a poll produced no agents, once.  A novel code that is not the
-    /// ordinary "no server here" is a warning; giving up on an endpoint is a
-    /// debug line, so a herdr that is installed but never answers can still be
-    /// explained from a log rather than only by an empty sidebar.  A code that
-    /// repeats is logged the first time only, so an endpoint retried for the
-    /// whole session still costs one line.
+    /// Says a poll produced no agents, once per run of the same code.  "No
+    /// server here" is ordinary only on a side where herdr never answered;
+    /// anywhere else it is the outage a log has to show.
     fn log_failure(&mut self, error: &PollError) {
         let code = error.code();
         let novel = self.reach.record_failure(error);
-        if novel && code != "server_not_running" {
+        if novel && (code != "server_not_running" || self.reach.ever_answered) {
             log::warn!("herdr ({:?}): {code}", self.side);
         }
         if novel && self.reach.abandoned() {
@@ -1015,12 +1019,19 @@ impl Endpoints {
         let before = self.caches.len();
         self.caches.retain(|cache| match cache.side() {
             Side::Native => true,
-            Side::Wsl(distro) => running.iter().any(|name| name == distro),
+            Side::Wsl(distro) => {
+                let kept = running.iter().any(|name| name == distro);
+                if !kept {
+                    log::info!("herdr: {distro} stopped running; dropping its endpoint");
+                }
+                kept
+            },
         });
         let mut changed = self.caches.len() != before;
         for distro in running {
             let side = Side::Wsl(distro.clone());
             if !self.caches.iter().any(|cache| *cache.side() == side) {
+                log::info!("herdr: {distro} is running; adding its endpoint");
                 self.caches.push(EndpointCache::new(side));
                 changed = true;
             }
@@ -1435,7 +1446,7 @@ mod tests {
     fn a_closed_stream_reconnects_at_once_and_keeps_the_rows() {
         let (tx, mut cache) = live(TWO_AGENTS);
 
-        tx.send(Message::Ended(None)).unwrap();
+        tx.send(Message::Ended { reason: None, stderr: String::new() }).unwrap();
         cache.poll(Listing::Panes, true);
 
         assert!(
@@ -1452,7 +1463,11 @@ mod tests {
         let mut cache = EndpointCache::new(Side::Native);
         let tx = cache.connect_for_test();
 
-        tx.send(Message::Ended(Some(PollError::Server("server_not_running".into())))).unwrap();
+        tx.send(Message::Ended {
+            reason: Some(PollError::Server("server_not_running".into())),
+            stderr: String::new(),
+        })
+        .unwrap();
         cache.poll(Listing::Panes, true);
 
         let Link::Down { failures, retry_at } = cache.link else { panic!("not down") };

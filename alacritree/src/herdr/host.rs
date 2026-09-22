@@ -73,13 +73,15 @@ impl Herdr {
         self.cache(side).map(EndpointCache::settings).unwrap_or_default()
     }
 
-    /// A gesture that timed out is the only sign of a herdr that hung with
-    /// its streams still open, so that side's streams start over.
+    /// Logs a failed gesture.  One that timed out says the call was slow to
+    /// reach herdr, which on a loaded WSL side is the `wsl.exe` launch rather
+    /// than herdr, so a live stream is left alone and only a side already
+    /// down skips the rest of its backoff.
     fn note_gesture<T>(&mut self, side: &Side, result: &Result<T, String>) {
-        if result.as_ref().is_err_and(|e| e.starts_with(cli::NO_ANSWER))
-            && let Some(cache) = self.endpoints.cache_mut(side)
-        {
-            cache.restart();
+        let Err(error) = result else { return };
+        log::warn!("herdr ({side:?}): {error}");
+        if error.starts_with(cli::NO_ANSWER) {
+            self.reconnect_now(side);
         }
     }
 
@@ -364,9 +366,9 @@ impl MultiplexerSession for Herdr {
                     .map_or_else(|| pending.target.clone(), |agent| agent.target(&side));
                 let focus = pending.request.focus.takes();
                 pending.job =
-                    Some(jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
+                    Some(jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
                         let focus = focus.then_some(target.pane_id.as_str());
-                        cli::herdr_attach_gesture(&target.side, focus, name)
+                        cli::herdr_attach_gesture(&target.side, focus, name, blocking)
                             .map(|(program, argv)| Launch { program, argv })
                     }));
                 None
@@ -393,8 +395,8 @@ impl MultiplexerSession for Herdr {
         self.reconnect_now(&side);
         let asked = side.clone();
         let focus = request.focus.takes();
-        let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
-            cli::create_pane(&asked, cwd, focus)
+        let job = jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
+            cli::create_pane(&asked, cwd, focus, blocking)
         });
         self.pending_create.push(PendingCreate { job, side, request });
     }
@@ -437,9 +439,6 @@ impl MultiplexerSession for Herdr {
                 Some(result) => {
                     self.note_gesture(&pending.key.side, &result);
                     let succeeded = result.is_ok();
-                    if let Err(e) = result {
-                        log::warn!("{e}");
-                    }
                     if succeeded {
                         self.focused_view.moved_focus(&pending.key, Instant::now());
                         if let Some(target) = self.focus_target(&pending.key) {
@@ -462,8 +461,8 @@ impl MultiplexerSession for Herdr {
                 };
                 let Some(target) = self.focus_target(key) else { return ViewStep::default() };
                 let side = key.side.clone();
-                let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
-                    focus_pane(&side, &target.pane_id)
+                let job = jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
+                    focus_pane(&side, &target.pane_id, blocking)
                 });
                 self.view_focus = Some(HerdrViewFocus { session: id, key: key.clone(), job });
                 ViewStep::default()
@@ -613,6 +612,28 @@ mod tests {
             Err("the session behind this pane was closed before the attach finished".to_string())
         );
         assert!(second_rx.try_recv().is_err());
+    }
+
+    /// A gesture that times out says the call was slow to reach herdr, which
+    /// on a loaded WSL side is the `wsl.exe` launch, not herdr.  A stream
+    /// herdr is still feeding stays up rather than being torn down and
+    /// relaunched through the same stall.
+    #[test]
+    fn a_timed_out_gesture_leaves_a_live_stream_up() {
+        let side = Side::Wsl("d".into());
+        let mut herdr = herdr(AttachMode::Session);
+        let mut cache = EndpointCache::new(side.clone());
+        let stream = cache.connect_for_test();
+        stream.send(super::super::events::Message::Started).unwrap();
+        cache.poll(Listing::Panes, false);
+        assert!(cache.stream_up_for_test());
+        herdr.caches_mut_for_test().push(cache);
+
+        let timed_out: Result<(), String> =
+            Err(format!("{} while focusing the pane", cli::NO_ANSWER));
+        herdr.note_gesture(&side, &timed_out);
+
+        assert!(herdr.cache(&side).unwrap().stream_up_for_test(), "a live stream was restarted");
     }
 
     /// A shell pane, left out of the displayed listing, is found through the
