@@ -87,7 +87,6 @@ after_worktree_remove = [
     [
         "{{ herdr_session }}",
         "close",
-        "--no-focus",
         "--path",
         "{{ worktree }}",
     ],
