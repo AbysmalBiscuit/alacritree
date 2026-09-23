@@ -32,6 +32,7 @@
 3. **A command hook defined in `alacritty.toml` and switched off in `alacritree.toml`.** After the merge, the hook must not run. Task 8 pins this against the real config merge.
 4. **Removing a worktree reached through a relative or symlinked path.** `on_removed` must receive the path canonicalized before git deleted the directory. Task 6 pins this.
 5. **Doppler installed but printing something other than JSON** (an old CLI, a login banner). The hook must report nothing and must not panic or block the create. Task 5 pins this.
+6. **A configured Windows program path and a WSL checkout.** The distro must look the program up by its bare name, never receive `C:\...\tool.exe`, which would exit 127 and skip the hook without a word. Tasks 3 and 8 pin this.
 
 ---
 
@@ -40,11 +41,11 @@
 **Files:**
 - Create: `crates/alacritree_common/Cargo.toml`, `crates/alacritree_common/src/lib.rs`, `crates/clippy.toml`
 - Move (git mv): `alacritree/src/{command_ext,jobs,wsl,wsl_helper,tools}.rs` → `crates/alacritree_common/src/`
-- Modify: `Cargo.toml` (root), `alacritree/Cargo.toml`, `alacritree/src/lib.rs`, `alacritree/src/multiplexer/mod.rs` (receives one test), `alacritree/src/app/git_panel.rs:1441-1451`, `.github/workflows/ci.yml:30,33,46`, `alacritree/tools/ui-thread-audit.py:54,100,104,134`, `alacritree/clippy.toml` (comment only)
+- Modify: `Cargo.toml` (root), `alacritree/Cargo.toml`, `alacritree/src/lib.rs`, `alacritree/src/multiplexer/mod.rs` (receives one test), `alacritree/src/app/git_panel.rs:1441-1451`, `.github/workflows/ci.yml:30,33,46,81,100,103`, `alacritree/tools/ui-thread-audit.py:54,100,104,134,188`, `alacritree/clippy.toml` (comment only)
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: crate `alacritree_common` with public modules `command_ext`, `jobs`, `wsl`, `wsl_helper`, `tools`. The feature `test-support` exposes `tools::test_configuration()` and `tools::test_configuration_lock()`. The app keeps its `crate::jobs`, `crate::wsl` (and so on) paths through re-exports.
+- Produces: crate `alacritree_common` with public modules `command_ext`, `jobs`, `wsl`, `wsl_helper`, `tools`. The feature `test-support` exposes `tools::test_configuration()`, `tools::test_configuration_lock()`, `jobs::Job::ready()` and `jobs::Job::panicked()`. The app keeps its `crate::jobs`, `crate::wsl` (and so on) paths through re-exports.
 
 This task is a move. Its test is that the existing suite passes unchanged, apart from the one test that moves.
 
@@ -72,8 +73,8 @@ rust-version.workspace = true
 publish = false
 
 [features]
-# Exposes the tool-table test helpers to other crates' tests; `cfg(test)`
-# only covers this crate's own.
+# Exposes the tool-table and ready-made `Job` test helpers to other crates'
+# tests; `cfg(test)` only covers this crate's own.
 test-support = []
 
 [dependencies]
@@ -113,15 +114,23 @@ The app reaches items that were `pub(crate)`. They must be `pub` now.
 sed -i 's/\bpub(crate) /pub /g' crates/alacritree_common/src/{jobs,wsl_helper,tools}.rs
 ```
 
-Then gate the two tool-table test helpers in `tools.rs` so other crates' tests can use them. Replace each `#[cfg(test)]` that directly precedes `pub fn test_configuration` and `pub fn test_configuration_lock` with:
+Then gate the test helpers that the app's tests use, so they survive the move. `cfg(test)` is only true while this crate's own tests compile, so without this the app's test build loses them. Replace each of these `#[cfg(test)]` attributes:
+
+- the one directly before `pub fn test_configuration` in `tools.rs` (old line 78),
+- the one directly before `pub fn test_configuration_lock` in `tools.rs` (old line 83),
+- the one on `impl<T> Job<T>` in `jobs.rs` (old line 270), which holds `Job::ready` and `Job::panicked`. The app's tests call them about 20 times, in `app.rs`, `herdr/poll.rs`, `herdr/host.rs` and `in_flight.rs`.
+
+with:
 
 ```rust
 #[cfg(any(test, feature = "test-support"))]
 ```
 
+Check that no other test-only item crosses the boundary: `grep -n 'cfg(test)\|cfg(any(windows, test))' crates/alacritree_common/src/*.rs`, then grep `alacritree/src` for each item those lines gate. The review found none beyond the three above (`wsl_helper.rs` `over` and `set_cached_comm`, and the `any(windows, test)` items in `wsl.rs`, are used only inside the new crate).
+
 - [ ] **Step 5: Move the multiplexer test out of `wsl_helper.rs`**
 
-Cut the whole `multiplexer_command_keeps_the_probe_pid` test (the `#[test] #[ignore = "requires WSL"]` block at the old `wsl_helper.rs:1599-1617`) out of `crates/alacritree_common/src/wsl_helper.rs`. It exercises `multiplexer::Side::command`, which is app code. Paste it into the `#[cfg(test)] mod tests` of `alacritree/src/multiplexer/mod.rs` with the paths rewritten:
+Cut the whole `multiplexer_command_keeps_the_probe_pid` test (the `#[test] #[ignore = "requires WSL"]` block at the old `wsl_helper.rs:1600-1617`) out of `crates/alacritree_common/src/wsl_helper.rs`. It exercises `multiplexer::Side::command`, which is app code. Paste it into the `#[cfg(test)] mod tests` of `alacritree/src/multiplexer/mod.rs` with the paths rewritten:
 
 ```rust
     #[test]
@@ -178,7 +187,7 @@ Run: `cargo check --workspace --all-targets --exclude alacritty --exclude alacri
 
 Expected failures and their fixes:
 - An item still private to the new crate that the app uses: make it `pub`.
-- `alacritree/src/app/git_panel.rs:1441-1451` and any other test that calls `crate::tools::test_configuration*`: they resolve through the re-export once `test-support` is on. No change should be needed.
+- `alacritree/src/app/git_panel.rs:1441-1451` and any other test that calls `crate::tools::test_configuration*` or `Job::ready`/`Job::panicked`: they resolve through the re-export once `test-support` is on. If they do not, Step 4's gating was missed.
 - `#![warn(unreachable_pub)]` does not apply to the new crate. Do not add it there.
 
 Repeat until it compiles cleanly.
@@ -210,11 +219,13 @@ for path in (p for src in SRCS for p in (ROOT / src).rglob("*.rs")):
 
 Update the `scan_failed` message at line 188 to use `", ".join(SRCS)`. Functions are keyed by file stem, and the moved files keep their stems (`jobs`, `wsl`, ...), so `jobs::pool().spawn` extents and `module::name` resolution keep working.
 
-`.github/workflows/ci.yml`: replace `-p alacritree` in the Build, Test and Clippy steps (lines 30, 33, 46) with:
+`.github/workflows/ci.yml`: replace `-p alacritree` with the line below in every job that builds, tests or lints the app. That is the Linux Build, Test and Clippy steps (lines 30, 33, 46), the macOS Clippy step (line 81), and the Windows Clippy and Test steps (lines 100, 103).
 
 ```
 --workspace --exclude alacritty --exclude alacritty_terminal --exclude alacritty_config --exclude alacritty_config_derive
 ```
+
+The Windows job exists to lint and test the `#[cfg(windows)]` arms of `wsl.rs` and `wsl_helper.rs` (see its comment at lines 93-97). After the move those arms live in `alacritree_common`, and `-p alacritree` would no longer reach them. Update that comment to name the files' new crate.
 
 - [ ] **Step 9: Run the workspace tests, clippy and the audit**
 
@@ -240,7 +251,7 @@ git commit -m "refactor(common): move process, job, WSL and tool modules into al
 ### Task 2: `Tool` as a strum enum, and tool config in `common`
 
 **Files:**
-- Modify: `crates/alacritree_common/src/tools.rs`, `crates/alacritree_common/Cargo.toml`, `alacritree/src/config.rs:598-672,3390-3395,4758`, `alacritree/src/cli/doctor.rs:184,248,277,321,364-367,865,897,907`, `alacritree/src/app/git_panel.rs:1444-1451`
+- Modify: `crates/alacritree_common/src/tools.rs` (including its `the_helper_hello_probes_the_registry_in_order` test at old line 276), `crates/alacritree_common/Cargo.toml`, `alacritree/src/config.rs:598-672,3388-3395,4758`, `alacritree/src/cli/doctor.rs:184,248,277,321,364-367,865,897,907`, `alacritree/src/app/git_panel.rs:1444-1451`
 
 **Interfaces:**
 - Consumes: Task 1's `alacritree_common::tools`.
@@ -276,24 +287,23 @@ Add to the `tests` module of `crates/alacritree_common/src/tools.rs`:
         }
     }
 
-    /// The resident helper resolves a fixed list at startup; a tool missing
-    /// from it would always fall back to a slow login-shell probe.
-    #[test]
-    fn every_tool_is_in_the_helper_hello_list() {
-        for tool in Tool::VARIANTS {
-            assert!(
-                crate::wsl_helper::HELLO_TOOLS.contains(&tool.name()),
-                "{tool} is missing from HELLO_TOOLS"
-            );
-        }
-    }
-
     #[test]
     fn an_empty_path_falls_back_to_the_tool_name() {
         let config = tool_config("  ".into(), "".into(), Tool::Doppler);
         assert_eq!(config, ToolConfig { path: "doppler".into(), wsl_path: None });
         let config = tool_config("/opt/doppler".into(), "/usr/bin/doppler".into(), Tool::Doppler);
         assert_eq!(config.wsl_path.as_deref(), Some("/usr/bin/doppler"));
+    }
+```
+
+Rewrite the existing `the_helper_hello_probes_the_registry_in_order` test in the same module, which still names `Tool::ALL`. It checks order as well as membership, so keep it rather than adding a weaker membership-only test:
+
+```rust
+    #[test]
+    fn the_helper_hello_probes_the_registry_in_order() {
+        let (registry, rest) = crate::wsl_helper::HELLO_TOOLS.split_at(Tool::COUNT);
+        assert_eq!(registry, Tool::table(Tool::name));
+        assert_eq!(rest, ["zellij"]);
     }
 ```
 
@@ -349,7 +359,7 @@ impl Tool {
 
 Add `use strum::{EnumCount, VariantArray};` to the file's imports. Replace every `[ToolPaths; 7]` in `tools.rs` with `[ToolPaths; Tool::COUNT]`, and replace `Tool::ALL.map(ToolPaths::named)` in `configured()` with `Tool::table(ToolPaths::named)`.
 
-Move `ToolConfig` (with its doc comments) and `tool_config` from `alacritree/src/config.rs` (lines 661-670 and 3390-3395) into `tools.rs`, both `pub`:
+Move `ToolConfig` (with its doc comments) and `tool_config` from `alacritree/src/config.rs` (lines 659-670 and 3388-3395) into `tools.rs`, both `pub`. Keep the original doc comments; the block below only shows the shape:
 
 ```rust
 /// `[integrations.<tool>]` for a tool with nothing to configure but where
@@ -396,7 +406,7 @@ Add `use strum::{EnumCount, VariantArray};` wherever `COUNT`/`VARIANTS` are now 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: the workspace tests.
-Expected: PASS, including the four new tests. `cli::doctor` tests that snapshot `--json` output still pass, because `Tool`'s serde output is unchanged.
+Expected: PASS, including the three new tests and the rewritten hello-list test. `cli::doctor` tests that snapshot `--json` output still pass, because `Tool`'s serde output is unchanged.
 
 - [ ] **Step 5: Commit**
 
@@ -415,13 +425,13 @@ git commit -m "refactor(tools): derive Tool's names and count with strum"
 - Modify: `crates/alacritree_common/src/lib.rs`
 
 **Interfaces:**
-- Consumes: `wsl::{classify, Location}`, `command_ext::hidden`, `jobs::Blocking::run_cancellable`.
+- Consumes: `wsl::{classify, Location, command}`, `command_ext::hidden`, `jobs::Blocking::run_cancellable`.
 - Produces (all in `alacritree_common::side`):
   - `enum Side { Native, Wsl { distro: String } }`, with `Side::of(path: &Path) -> Side` and `Side::from_location(&wsl::Location) -> Side`.
   - `fn spelling(location: &wsl::Location) -> String`: the path as a program on that side spells it.
-  - `struct Program { pub native: String, pub wsl: Option<String> }`.
-  - `struct Invocation { pub program: String, pub args: Vec<String>, pub via_login_shell: bool }`.
-  - `fn invocation(side: &Side, program: &Program, cwd: Option<&Path>, args: &[String]) -> Invocation`.
+  - `struct Program { pub native: String, pub wsl: Option<String>, pub name: String }`. `name` is the bare program name a distro's login shell looks up when `wsl` is `None`. It is never a Windows path.
+  - `struct Invocation { pub program: String, pub args: Vec<String>, pub via_login_shell: bool }`: the program and argv to run on the side itself. For a distro, that is what follows `wsl.exe -d <distro> [--cd <dir>] --exec`.
+  - `fn invocation(side: &Side, program: &Program, args: &[String]) -> Invocation`.
   - `enum Ran { Missing, Finished(std::process::Output) }`.
   - `fn run(side: &Side, program: &Program, cwd: Option<&Path>, args: &[String], blocking: &Blocking) -> std::io::Result<Ran>`.
 
@@ -459,10 +469,13 @@ mod tests {
         assert_eq!(spelling(&wsl::Location::Windows(PathBuf::from("/srv/wt"))), "/srv/wt");
     }
 
+    fn program(native: &str, wsl: Option<&str>, name: &str) -> Program {
+        Program { native: native.into(), wsl: wsl.map(Into::into), name: name.into() }
+    }
+
     #[test]
     fn a_native_program_runs_as_configured() {
-        let program = Program { native: "mise".into(), wsl: None };
-        let inv = invocation(&Side::Native, &program, None, &["trust".into()]);
+        let inv = invocation(&Side::Native, &program("mise", None, "mise"), &["trust".into()]);
         assert_eq!(inv.program, "mise");
         assert_eq!(inv.args, ["trust"]);
         assert!(!inv.via_login_shell);
@@ -471,28 +484,39 @@ mod tests {
     #[test]
     fn a_configured_wsl_path_is_executed_directly() {
         let side = Side::Wsl { distro: "Ubuntu".into() };
-        let program = Program { native: "mise".into(), wsl: Some("/usr/bin/mise".into()) };
-        let inv = invocation(&side, &program, Some(Path::new("/home/u/wt")), &["trust".into()]);
-        assert_eq!(inv.program, "wsl.exe");
-        assert_eq!(inv.args, ["-d", "Ubuntu", "--cd", "/home/u/wt", "--exec", "/usr/bin/mise", "trust"]);
+        let inv = invocation(&side, &program("mise", Some("/usr/bin/mise"), "mise"), &["trust".into()]);
+        assert_eq!(inv.program, "/usr/bin/mise");
+        assert_eq!(inv.args, ["trust"]);
         assert!(!inv.via_login_shell);
     }
 
     #[test]
     fn an_unconfigured_wsl_program_goes_through_the_login_shell() {
         let side = Side::Wsl { distro: "Ubuntu".into() };
-        let program = Program { native: "mise".into(), wsl: None };
-        let inv = invocation(&side, &program, None, &["trust".into(), "/home/u/wt".into()]);
-        assert_eq!(inv.program, "wsl.exe");
-        assert_eq!(&inv.args[..5], ["-d", "Ubuntu", "--exec", "sh", "-c"]);
-        assert!(inv.args[5].contains(r#"-lc 'exec "$@"'"#), "{}", inv.args[5]);
-        assert_eq!(&inv.args[6..], ["sh", "mise", "trust", "/home/u/wt"]);
+        let inv = invocation(&side, &program("mise", None, "mise"), &[
+            "trust".into(),
+            "/home/u/wt".into(),
+        ]);
+        assert_eq!(inv.program, "sh");
+        assert_eq!(inv.args[0], "-c");
+        assert!(inv.args[1].contains(r#"-lc 'exec "$@"'"#), "{}", inv.args[1]);
+        assert_eq!(&inv.args[2..], ["sh", "mise", "trust", "/home/u/wt"]);
         assert!(inv.via_login_shell);
+    }
+
+    /// A configured Windows path means nothing inside a distro; handing it to
+    /// the login shell would exit 127 and silently skip the hook.
+    #[test]
+    fn a_native_path_is_not_handed_to_the_distro() {
+        let side = Side::Wsl { distro: "Ubuntu".into() };
+        let inv = invocation(&side, &program(r"C:\Tools\doppler.exe", None, "doppler"), &[]);
+        assert_eq!(&inv.args[2..], ["sh", "doppler"]);
+        assert!(!inv.args.iter().any(|a| a.contains(r"C:\Tools")), "{:?}", inv.args);
     }
 
     #[test]
     fn a_missing_native_program_is_missing_not_an_error() {
-        let program = Program { native: "alacritree-no-such-program".into(), wsl: None };
+        let program = program("alacritree-no-such-program", None, "alacritree-no-such-program");
         let ran = jobs::on_this_thread(|b| run(&Side::Native, &program, None, &[], b)).unwrap();
         assert!(matches!(ran, Ran::Missing));
     }
@@ -500,7 +524,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_native_program_finishes_with_its_output() {
-        let program = Program { native: "sh".into(), wsl: None };
+        let program = program("sh", None, "sh");
         let args = ["-c".into(), "echo out; echo err >&2; exit 3".into()];
         let ran = jobs::on_this_thread(|b| run(&Side::Native, &program, None, &args, b)).unwrap();
         let Ran::Finished(output) = ran else { panic!("sh is installed") };
@@ -518,7 +542,7 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
         let job = jobs::pool().spawn(jobs::Priority::Interactive, move |b| {
             let _ = started_tx.send(());
-            let program = Program { native: "sleep".into(), wsl: None };
+            let program = program("sleep", None, "sleep");
             let _ = tx.send(run(&Side::Native, &program, None, &["30".into()], b).is_ok());
         });
         started_rx.recv_timeout(Duration::from_secs(5)).expect("the job never started");
@@ -591,13 +615,17 @@ pub fn spelling(location: &wsl::Location) -> String {
 pub struct Program {
     /// The name or path to run natively.
     pub native: String,
-    /// The path to run inside a distro as written.  `None` finds the native
-    /// name through the distro user's login shell, which has their PATH.
+    /// The path to run inside a distro as written.  `None` finds `name`
+    /// through the distro user's login shell, which has their PATH.
     pub wsl: Option<String>,
+    /// The bare name a distro looks up.  Separate from `native`, which may be
+    /// a Windows path that means nothing inside the distro.
+    pub name: String,
 }
 
-/// A command line, and whether it passes through a login shell, whose exit
-/// status 127 means the program was not found.
+/// A command line on the program's own side, and whether it passes through
+/// a login shell, whose exit status 127 means the program was not found.
+/// Inside a distro this is what follows `wsl.exe -d <distro> --exec`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invocation {
     pub program: String,
@@ -621,33 +649,17 @@ const NOT_FOUND: i32 = 127;
 const LOGIN_SHELL: &str =
     r#"s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); [ -x "$s" ] || s=${SHELL:-/bin/sh}"#;
 
-pub fn invocation(side: &Side, program: &Program, cwd: Option<&Path>, args: &[String]) -> Invocation {
-    let Side::Wsl { distro } = side else {
-        return Invocation {
-            program: program.native.clone(),
-            args: args.to_vec(),
-            via_login_shell: false,
-        };
-    };
-    let mut wsl_args = vec!["-d".to_string(), distro.clone()];
-    if let Some(dir) = cwd {
-        wsl_args.push("--cd".into());
-        wsl_args.push(dir.to_string_lossy().into_owned());
-    }
-    wsl_args.push("--exec".into());
-    let via_login_shell = program.wsl.is_none();
-    match &program.wsl {
-        Some(path) => wsl_args.push(path.clone()),
-        None => {
-            wsl_args.push("sh".into());
-            wsl_args.push("-c".into());
-            wsl_args.push(format!(r#"{LOGIN_SHELL}; exec "$s" -lc 'exec "$@"' "$s" "$@""#));
-            wsl_args.push("sh".into());
-            wsl_args.push(program.native.clone());
+pub fn invocation(side: &Side, program: &Program, args: &[String]) -> Invocation {
+    let (program, mut argv, via_login_shell) = match (side, &program.wsl) {
+        (Side::Native, _) => (program.native.clone(), Vec::new(), false),
+        (Side::Wsl { .. }, Some(path)) => (path.clone(), Vec::new(), false),
+        (Side::Wsl { .. }, None) => {
+            let script = format!(r#"{LOGIN_SHELL}; exec "$s" -lc 'exec "$@"' "$s" "$@""#);
+            ("sh".to_string(), vec!["-c".into(), script, "sh".into(), program.name.clone()], true)
         },
-    }
-    wsl_args.extend(args.iter().cloned());
-    Invocation { program: "wsl.exe".into(), args: wsl_args, via_login_shell }
+    };
+    argv.extend(args.iter().cloned());
+    Invocation { program, args: argv, via_login_shell }
 }
 
 /// Run `program` on `side`, killing it if the job is cancelled.  Blocks, so
@@ -659,12 +671,24 @@ pub fn run(
     args: &[String],
     blocking: &Blocking,
 ) -> io::Result<Ran> {
-    let inv = invocation(side, program, cwd, args);
-    let mut cmd = command_ext::hidden(&inv.program);
+    let inv = invocation(side, program, args);
+    // `wsl::command` sets WSL_UTF8, without which wsl.exe's own errors (a
+    // stopped or missing distro) arrive as UTF-16LE and read as garbage.
+    let mut cmd = match side {
+        Side::Native => {
+            let mut cmd = command_ext::hidden(&inv.program);
+            if let Some(dir) = cwd {
+                cmd.current_dir(dir);
+            }
+            cmd
+        },
+        Side::Wsl { distro } => {
+            let mut cmd = wsl::command(distro, cwd);
+            cmd.arg(&inv.program);
+            cmd
+        },
+    };
     cmd.args(&inv.args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    if let (Side::Native, Some(dir)) = (side, cwd) {
-        cmd.current_dir(dir);
-    }
     match blocking.run_cancellable(&mut cmd) {
         Err(e) if e.kind() == io::ErrorKind::NotFound && *side == Side::Native => Ok(Ran::Missing),
         Err(e) => Err(e),
@@ -702,7 +726,7 @@ git commit -m "feat(common): run a program on a checkout's own side of WSL"
 - Produces (in `alacritree_checkout_hooks`):
   - `struct Checkout<'a> { pub main: &'a Path, pub checkout: &'a Path }`
   - `type Outcome = Result<Option<String>, HookError>`
-  - `enum HookError { Failed { program: String, status: ExitStatus, stderr: String }, Spawn { program: String, source: io::Error } }`
+  - `enum HookError { Failed { hook: String, status: ExitStatus, stderr: String }, Spawn { hook: String, source: io::Error } }`. `hook` is the hook's name (`doppler`, or a command hook's table key), which is what the user configured and can look up.
   - `trait CheckoutHook` (`#[ambassador::delegatable_trait]`) with `on_created`, `on_opened`, `on_removed`, each `(&self, event: &Checkout, blocking: &Blocking) -> Outcome`, defaulting to `Ok(None)`.
   - `trait CheckoutHooks` with `created`, `opened`, `removed`, each `(&self, event: &Checkout, blocking: &Blocking) -> Vec<Outcome>`, implemented for `[H]` where `H: CheckoutHook`.
   - Under the `test-support` feature, `fake::{FakeHook, Event}`: `FakeHook::silent()`, `FakeHook::reporting(line: &str)`, `FakeHook::failing()`, `FakeHook::events(&self) -> Vec<Event>`. `Event::{Created, Opened, Removed} { main: PathBuf, checkout: PathBuf }`.
@@ -731,10 +755,9 @@ alacritree_common.workspace = true
 ambassador.workspace = true
 thiserror.workspace = true
 log = "0.4"
-
-[dev-dependencies]
-alacritree_checkout_hooks = { path = ".", features = ["test-support"] }
 ```
+
+No self dev-dependency is needed for the fake: `fake` is compiled under `cfg(test)` as well as `test-support`.
 
 Root `Cargo.toml` `[workspace.dependencies]`: add `alacritree_checkout_hooks = { path = "crates/alacritree_checkout_hooks" }`.
 
@@ -794,8 +817,8 @@ mod tests {
     }
 
     #[test]
-    fn a_spawn_error_names_the_program() {
-        let err = HookError::Spawn { program: "mise".into(), source: std::io::Error::other("boom") };
+    fn a_spawn_error_names_the_hook() {
+        let err = HookError::Spawn { hook: "mise".into(), source: std::io::Error::other("boom") };
         assert_eq!(err.to_string(), "could not run mise");
         assert!(std::error::Error::source(&err).is_some());
     }
@@ -878,13 +901,15 @@ pub struct Checkout<'a> {
 /// A line for the progress UI, or nothing when the hook had nothing to do.
 pub type Outcome = Result<Option<String>, HookError>;
 
+/// `hook` is the hook's name as configured, not the program it runs: a
+/// command hook's table key is what the user can find in their config.
 #[derive(Debug, thiserror::Error)]
 pub enum HookError {
-    #[error("{program} failed ({status}): {stderr}")]
-    Failed { program: String, status: ExitStatus, stderr: String },
-    #[error("could not run {program}")]
+    #[error("{hook} failed ({status}): {stderr}")]
+    Failed { hook: String, status: ExitStatus, stderr: String },
+    #[error("could not run {hook}")]
     Spawn {
-        program: String,
+        hook: String,
         #[source]
         source: std::io::Error,
     },
@@ -997,7 +1022,7 @@ impl FakeHook {
         self.events.lock().unwrap_or_else(|e| e.into_inner()).push(event);
         if self.fails {
             return Err(HookError::Spawn {
-                program: "fake".into(),
+                hook: "fake".into(),
                 source: std::io::Error::other("scripted failure"),
             });
         }
@@ -1038,9 +1063,11 @@ git commit -m "feat(checkout-hooks): add the CheckoutHook trait with cross-crate
 ### Task 5: `alacritree_doppler` as a native checkout hook
 
 **Files:**
-- Create: `crates/alacritree_doppler/Cargo.toml`, `crates/alacritree_doppler/src/lib.rs`, `crates/alacritree_doppler/src/config.rs`
+- Create: `crates/alacritree_doppler/Cargo.toml`, `crates/alacritree_doppler/src/lib.rs`, `crates/alacritree_doppler/src/settings.rs`
 - Move (git mv): `alacritree/src/doppler.rs` → `crates/alacritree_doppler/src/scopes.rs`
-- Modify: root `Cargo.toml`, `alacritree/Cargo.toml`, `alacritree/src/lib.rs` (drop `mod doppler`), `alacritree/src/config.rs:603,645,3142,3238,3357`
+- Modify: root `Cargo.toml`, `alacritree/Cargo.toml`, `alacritree/src/lib.rs` (drop `mod doppler`), `alacritree/src/config.rs:603,645,3142,3238,3357`, `alacritree/src/app.rs:53` (drop `doppler` from the `use crate::{…}` list), `alacritree/src/cli/doctor.rs:207-209,819-821` (comments naming `doppler.rs`), `alacritree/tests/stock-config.json` (regenerated), `schema/alacritree-config.json`, `docs/config-reference.md`
+
+The config module is `settings.rs`, not `config.rs`. The UI-thread audit keys functions by file stem, and a second `config` stem would collide with `alacritree/src/config.rs` when it resolves `config::…` calls.
 
 **Interfaces:**
 - Consumes: `alacritree_common::{tools::{self, Tool, ToolConfig, tool_config}, jobs::Blocking, command_ext}`; `alacritree_checkout_hooks::{CheckoutHook, Checkout, Outcome}`.
@@ -1235,7 +1262,7 @@ mod tests {
 }
 ```
 
-`crates/alacritree_doppler/src/config.rs` tests:
+`crates/alacritree_doppler/src/settings.rs` tests:
 
 ```rust
 #[cfg(test)]
@@ -1268,7 +1295,7 @@ Expected: FAIL to compile (`DopplerHook`, `RawDoppler`, `DopplerConfig` not foun
 
 - [ ] **Step 4: Implement**
 
-`crates/alacritree_doppler/src/config.rs`:
+`crates/alacritree_doppler/src/settings.rs`:
 
 ```rust
 use alacritree_common::tools::{Tool, tool_config};
@@ -1317,13 +1344,13 @@ impl RawDoppler {
 //! scopes, a removed one gives them back.  See `scopes` for why doppler needs
 //! this at all.
 
-mod config;
 mod scopes;
+mod settings;
 
 use alacritree_checkout_hooks::{Checkout, CheckoutHook, Outcome};
 use alacritree_common::jobs::Blocking;
 
-pub use config::{DopplerConfig, RawDoppler};
+pub use settings::{DopplerConfig, RawDoppler};
 
 /// Best-effort throughout: no doppler binary, or nothing to copy, reports
 /// nothing rather than an error, as the create flow always has.
@@ -1364,7 +1391,9 @@ In `alacritree/src/config.rs`:
 - `RawIntegrations::resolve` (line 3357): `doppler: self.doppler.resolve(),`.
 - `IntegrationsConfig::paths` keeps `Tool::Doppler => (&self.doppler.path, &self.doppler.wsl_path)`, which still type-checks.
 
-`alacritree/Cargo.toml` `[dependencies]`: add `alacritree_doppler.workspace = true`. `alacritree/src/lib.rs`: delete `pub(crate) mod doppler;`.
+`alacritree/Cargo.toml` `[dependencies]`: add `alacritree_doppler.workspace = true`. `alacritree/src/lib.rs`: delete `pub(crate) mod doppler;`. `alacritree/src/app.rs:53`: drop `doppler` from the `use crate::{…}` list.
+
+`alacritree/src/cli/doctor.rs`: the comments on `doppler_need` (line 209) and on `doppler_is_only_worth_warning_about_once_it_has_been_set_up` (line 821) say "`doppler.rs` reads scopes". Change them to "`alacritree_doppler` reads scopes".
 
 The three `doppler::` call sites (`worktree.rs:173,587`, `app.rs:1155`) no longer compile. Task 6 replaces them. For this task only, make them compile through the hook so the tree stays green:
 - `worktree.rs:173-176` → `if let Ok(Some(line)) = alacritree_doppler::DopplerHook.on_created(&alacritree_checkout_hooks::Checkout { main: &req.project_root, checkout: &target }, blocking) { send(&line); }`
@@ -1376,7 +1405,12 @@ Import `alacritree_checkout_hooks::CheckoutHook` in those two files.
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p alacritree_doppler`, then the workspace tests.
-Expected: PASS. `config_schema` fails only if the schema changed. It has: `enabled` is a new key. Regenerate with `ALACRITREE_UPDATE_SCHEMA=1 cargo test -p alacritree --test config_schema` and read the diff. It must show only `[integrations.doppler] enabled` added (to `schema/alacritree-config.json` and `docs/config-reference.md`).
+Expected: two fixture tests fail, because both fixtures change on purpose.
+
+- `config_schema`: `enabled` is a new key. Regenerate with `ALACRITREE_UPDATE_SCHEMA=1 cargo test -p alacritree --test config_schema` and read the diff. It must show only two changes. The `RawDoppler` definition gains `enabled` and a `description` from the new struct doc comment (`[integrations.doppler].`; the old `raw_tool_table!` struct had none). `docs/config-reference.md` gains the matching `enabled` line and the table's description line.
+- `config::tests::the_stock_config_is_unchanged` (`config.rs:6199`): the resolved stock config now carries `integrations.doppler.enabled`. Regenerate with `ALACRITREE_UPDATE_STOCK=1 cargo test -p alacritree --lib the_stock_config_is_unchanged` and read the diff of `alacritree/tests/stock-config.json`. It must add only `"enabled": true` under `integrations.doppler`.
+
+Then run the workspace tests again. Expected: PASS.
 
 - [ ] **Step 6: Commit**
 
@@ -1392,7 +1426,7 @@ git commit -m "refactor(doppler): move doppler into its own crate as a checkout 
 
 **Files:**
 - Create: `alacritree/src/checkout_hooks.rs`
-- Modify: `alacritree/src/lib.rs`, `alacritree/src/worktree.rs:24-32,85-103,111-116,173-176,560-592,601-622,700-715,848,910`, `alacritree/src/app.rs:383,507,1040,1135-1159`, `alacritree/src/app/modals.rs:480,988`, `alacritree/src/app/ipc_handler.rs:15`, `alacritree/src/ipc/server.rs:78-83,132-215,235-245,316,381,417`, `alacritree/src/cli/offline.rs:23-30,67,144-156`, `alacritree/src/cli/mod.rs:542-546`
+- Modify: `alacritree/src/lib.rs`, `alacritree/src/worktree.rs:24-32,85-103,111-116,173-176,560-592,601-622,700-715,848,910`, `alacritree/src/app.rs:383,507,1040,1135-1159`, `alacritree/src/app/modals.rs:455,480,988`, `alacritree/src/app/ipc_handler.rs:15`, `alacritree/src/ipc/server.rs:78-83,132-215,235-245,316,381,417`, `alacritree/src/cli/offline.rs:23-30,67,144-156`, `alacritree/src/cli/mod.rs:542-547`
 
 **Interfaces:**
 - Consumes: `CheckoutHook`, `CheckoutHooks` (Task 4), `DopplerHook`, `DopplerConfig` (Task 5), `FakeHook`/`Event` (Task 4, test-support).
@@ -1473,7 +1507,7 @@ In `alacritree/src/worktree.rs` tests:
     }
 ```
 
-If `git worktree remove` refuses the symlinked path (git compares worktree paths after resolving them, so it should accept it), reach the worktree through a `..` component instead: `repo_dir.join("..").join("wt-linked")`. The assertion stays the same: the hook receives the canonical path.
+`git worktree remove --force` accepts the symlinked path (checked against git 2.43, which resolves real paths), and `delete_worktree` already canonicalizes before removal (`worktree.rs:573-576`), so this test pins existing behavior through the new hook path.
 
 Update the existing callers in the same test module so they compile: lines 848 and 910 become `create(&req, &[] as &[FakeHook], |_| {}, blocking)`, and line 707 becomes `spawn_delete(repo_dir, job, Vec::<FakeHook>::new(), repaint.clone())`.
 
@@ -1498,7 +1532,7 @@ mod tests {
         let outcomes = vec![
             Ok(Some("Linked 2 Doppler scope(s)".to_string())),
             Ok(None),
-            Err(HookError::Spawn { program: "mise".into(), source: std::io::Error::other("x") }),
+            Err(HookError::Spawn { hook: "mise".into(), source: std::io::Error::other("x") }),
         ];
         let mut lines = Vec::new();
         report(outcomes, |l| lines.push(l.to_string()));
@@ -1596,7 +1630,10 @@ and inside the job closure call `create(&req, hooks.as_slice(), |step| { ... }, 
     });
 ```
 
-`spawn_delete` gains `hooks: Vec<H>` (with `H: CheckoutHook + Send + 'static`) after `job`, and passes `hooks.as_slice()` to `delete_worktree`. `prune_worktree` is unchanged: its directory is already gone, and the pilot keeps today's behavior of running no cleanup there. Update the `DeleteJob`/`spawn_delete` doc comments that mention "doppler cleanup" to say "checkout hooks".
+`spawn_delete` gains `hooks: Vec<H>` (with `H: CheckoutHook + Send + 'static`) after `job`, and passes `hooks.as_slice()` to `delete_worktree`. `prune_worktree` is unchanged: its directory is already gone, and the pilot keeps today's behavior of running no cleanup there. Three comments still name doppler cleanup; change each to "checkout hooks":
+- `worktree.rs:573-574`: "the doppler cleanup below runs after git has deleted it".
+- `worktree.rs:602`: the `spawn_delete` doc, "The git shellouts and doppler cleanup are slow enough to stutter paint".
+- `app/modals.rs:455`: "The git removal (shellouts, branch delete, doppler cleanup) is slow".
 
 Imports in `worktree.rs`: `use alacritree_checkout_hooks::{Checkout, CheckoutHook, CheckoutHooks};`. Remove the Task 5 interim `DopplerHook` import.
 
@@ -1607,7 +1644,7 @@ Imports in `worktree.rs`: `use alacritree_checkout_hooks::{Checkout, CheckoutHoo
 - `ipc/server.rs`: `spawn_listener(repaint, workspace, hooks: Vec<Hook>)` passes `hooks` to `listen_at(path, repaint, workspace, hooks)`, which wraps it in `Arc<Vec<Hook>>` next to `workspace` and clones the `Arc` into each connection thread. `handle_connection` and `dispatch` gain `hooks: &[Hook]`. `create_worktree` gains `hooks: &[Hook]` and calls `wt::spawn_create(req, hooks.to_vec(), repaint.clone())`. Line 316: `dispatch(request.clone(), &self.app_tx, &self.repaint, &WorkspaceConfig::default(), &[])`. Lines 381 and 417: pass `Vec::new()` as the new last argument.
 - `app/ipc_handler.rs:15`: `ipc::server::spawn_listener(ctx.clone(), config.workspace.clone(), crate::checkout_hooks::from_config(&config.integrations))`.
 - `cli/offline.rs`: `handle(request, workspace, hooks: &[Hook])` and `handle_at(state_path, request, workspace, hooks)` thread `hooks` to `create_worktree(project_root, branch, workspace, hooks)`, which calls `wt::create(&request, hooks, |step| steps.push(step.to_string()), blocking)`. Update this module's tests that call `handle_at` to pass `&[]`.
-- `cli/mod.rs:546`: `offline::handle(request, &resolved.workspace, &crate::checkout_hooks::from_config(&resolved.integrations))`.
+- `cli/mod.rs:547`: `offline::handle(request, &resolved.workspace, &crate::checkout_hooks::from_config(&resolved.integrations))`.
 
 Import `crate::checkout_hooks::Hook` where the signatures name it.
 
@@ -1646,7 +1683,9 @@ Import `crate::checkout_hooks::Hook` where the signatures name it.
     }
 ```
 
-`hooks` is a `Vec<Hook>`; `hooks.opened` resolves through the `[H]` impl via auto-deref. If the compiler does not find it, write `hooks.as_slice().opened(...)`.
+`hooks` is a `Vec<Hook>`; `hooks.opened` resolves through the `[H]` impl via auto-deref.
+
+Imports in `app.rs`: add `use alacritree_checkout_hooks::{Checkout, CheckoutHooks};`, and remove the `CheckoutHook` import Task 5 added for its interim call.
 
 Add an app test next to the existing session-spawn tests in `app.rs` (search for `fn test_app()` to find them):
 
@@ -1681,7 +1720,7 @@ git commit -m "refactor(worktree): run checkout hooks where doppler was called d
 ### Task 7: Doppler on the checkout's WSL side
 
 **Files:**
-- Modify: `crates/alacritree_doppler/src/scopes.rs`
+- Modify: `crates/alacritree_doppler/src/scopes.rs`, `alacritree/src/cli/doctor.rs:268-275,340-361,887-909`
 
 **Interfaces:**
 - Consumes: `alacritree_common::side::{Side, Program, Ran, run}`, `alacritree_common::wsl::{classify, Location}`, `alacritree_common::tools::{program, wsl_located, Tool}`.
@@ -1763,7 +1802,7 @@ fn doppler_on(side: &Side, blocking: &jobs::Blocking) -> Program {
         Side::Native => None,
         Side::Wsl { distro } => tools::wsl_located(Tool::Doppler, distro, blocking),
     };
-    Program { native: tools::program(Tool::Doppler), wsl }
+    Program { native: tools::program(Tool::Doppler), wsl, name: Tool::Doppler.name().into() }
 }
 
 /// Run doppler on `side`, returning stdout on success and `None` on any
@@ -1794,10 +1833,17 @@ In `forget_scopes`: `let wt_at = locate(worktree); let side = side_for(&wt_at); 
 
 Delete the old `canonical` and the old `run` (with its `#[allow(clippy::disallowed_methods)]`). The spawn now goes through `side::run`.
 
+`alacritree doctor` still says the distro's doppler is never used, which this task makes false. In `alacritree/src/cli/doctor.rs`:
+- Delete `wsl_doppler_check` (lines 340-361) and its call at line 269. The per-distro line from `wsl_distro_check` already lists where doppler resolves inside each distro, and that is now the path the hook runs.
+- Delete its two tests, `doppler_inside_a_distro_is_reported_as_unused` and `no_distro_has_doppler_and_nothing_is_said` (lines 887-909).
+- Rewrite the `probe_distros` doc comment (lines 273-274), which says nothing runs doppler inside a distro: "Probes every registry tool, since each is one alacritree runs for a project inside the distro."
+
+`README.md:197-201` already describes the distro paths as the ones alacritree uses, which is now true for doppler too. It needs no change.
+
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p alacritree_doppler`
-Expected: PASS: the three new tests plus Task 5's end-to-end tests, which exercise the native path through `side::run`.
+Run: `cargo test -p alacritree_doppler`, then the workspace tests.
+Expected: PASS: the three new tests plus Task 5's end-to-end tests, which exercise the native path through `side::run`, and `cli::doctor` without the two deleted tests.
 
 Run: `cargo clippy -p alacritree_doppler --all-targets --no-deps -- -D clippy::disallowed_methods`
 Expected: PASS.
@@ -1806,7 +1852,7 @@ Expected: PASS.
 
 ```bash
 cargo fmt
-git add crates/alacritree_doppler
+git add crates/alacritree_doppler alacritree/src/cli/doctor.rs
 git commit -m "fix(doppler): mirror scopes with the distro's doppler for WSL worktrees"
 ```
 
@@ -1816,7 +1862,7 @@ git commit -m "fix(doppler): mirror scopes with the distro's doppler for WSL wor
 
 **Files:**
 - Create: `crates/alacritree_checkout_hooks/src/command.rs`
-- Modify: `crates/alacritree_checkout_hooks/src/lib.rs`, `crates/alacritree_checkout_hooks/Cargo.toml`, `alacritree/src/config.rs:3135-3155,598-612,3353-3366`, `alacritree/src/checkout_hooks.rs`, `alacritree/tests/schema-defaults-allowlist.txt`
+- Modify: `crates/alacritree_checkout_hooks/src/lib.rs`, `crates/alacritree_checkout_hooks/Cargo.toml`, `alacritree/src/config.rs:3135-3155,598-612,3353-3366`, `alacritree/src/checkout_hooks.rs`, `alacritree/src/cli/config_reference.rs:38-61`, `alacritree/tests/schema-defaults-allowlist.txt`, `alacritree/tests/stock-config.json` (regenerated), `schema/alacritree-config.json`, `docs/config-reference.md`
 
 **Interfaces:**
 - Consumes: `side::{Side, Program, Ran, run, spelling}`, `wsl::classify`, `HookError`, `CheckoutHook`.
@@ -1824,7 +1870,7 @@ git commit -m "fix(doppler): mirror scopes with the distro's doppler for WSL wor
   - `pub struct RawCheckoutHooks { pub command: BTreeMap<String, RawCommandHook> }` (`Default, Deserialize, JsonSchema`, `#[serde(default)]`).
   - `pub struct RawCommandHook` with `enabled: bool` (default `true`), `path: String` (required), `wsl_path: String`, `on_created`, `on_opened`, `on_removed: Vec<String>`.
   - `pub struct CommandHook { pub name: String, pub program: Program, pub on_created: Vec<String>, pub on_opened: Vec<String>, pub on_removed: Vec<String> }` (`Debug, Clone, PartialEq, Eq, serde::Serialize`), implementing `CheckoutHook`.
-  - `RawCheckoutHooks::resolve(self) -> Vec<CommandHook>`: enabled hooks only, sorted by name.
+  - `RawCheckoutHooks::resolve(self) -> Vec<CommandHook>`: enabled hooks only, sorted by name. `program.name` is the file stem of `path` (so `C:\Tools\mise.exe` looks up `mise` inside a distro), or `path` itself when it has none.
   - `pub fn expand(template: &[String], event: &Checkout<'_>) -> Vec<String>`.
   - The app: `IntegrationsConfig.checkout_hooks: Vec<CommandHook>`, `Hook::Command(CommandHook)`.
 
@@ -1842,7 +1888,7 @@ mod tests {
     fn hook(program: &str, on_created: &[&str]) -> CommandHook {
         CommandHook {
             name: "test".into(),
-            program: Program { native: program.into(), wsl: None },
+            program: Program { native: program.into(), wsl: None, name: program.into() },
             on_created: on_created.iter().map(|s| s.to_string()).collect(),
             on_opened: Vec::new(),
             on_removed: Vec::new(),
@@ -1893,8 +1939,8 @@ mod tests {
         let h = hook("sh", &["-c", "echo 'not trusted' >&2; echo more >&2; exit 2"]);
         let err = created(&h, Path::new("/m"), tmp.path()).unwrap_err();
         match err {
-            HookError::Failed { program, status, stderr } => {
-                assert_eq!(program, "test");
+            HookError::Failed { hook, status, stderr } => {
+                assert_eq!(hook, "test");
                 assert_eq!(status.code(), Some(2));
                 assert_eq!(stderr, "not trusted");
             },
@@ -1920,8 +1966,17 @@ mod tests {
         let hooks = raw.resolve();
         let names: Vec<_> = hooks.iter().map(|h| h.name.as_str()).collect();
         assert_eq!(names, ["alpha", "zeta"]);
-        assert_eq!(hooks[0].program, Program { native: "a".into(), wsl: None });
+        assert_eq!(hooks[0].program, Program { native: "a".into(), wsl: None, name: "a".into() });
         assert_eq!(hooks[0].on_created, ["{checkout}"]);
+    }
+
+    /// Inside a distro the login shell looks the program up by name; a
+    /// Windows path handed to it would never be found.
+    #[test]
+    fn a_path_is_looked_up_in_a_distro_by_its_file_stem() {
+        let raw: RawCheckoutHooks =
+            toml::from_str("[command.mise]\npath = '/opt/tools/mise.exe'").unwrap();
+        assert_eq!(raw.resolve()[0].program.name, "mise");
     }
 
     #[test]
@@ -1962,7 +2017,11 @@ This follows `font_fallback_arrays_concatenate_across_files` (`config.rs:~5293`)
         let mut integrations = crate::config::IntegrationsConfig::default();
         integrations.checkout_hooks = vec![alacritree_checkout_hooks::CommandHook {
             name: "mise".into(),
-            program: alacritree_common::side::Program { native: "mise".into(), wsl: None },
+            program: alacritree_common::side::Program {
+                native: "mise".into(),
+                wsl: None,
+                name: "mise".into(),
+            },
             on_created: vec!["trust".into()],
             on_opened: Vec::new(),
             on_removed: Vec::new(),
@@ -2015,8 +2074,9 @@ pub struct RawCommandHook {
     /// on PATH.
     pub path: String,
     /// The program to run inside a WSL distro for a worktree there, as
-    /// written. Empty runs `path` through the distro's login shell, and a
-    /// distro where that finds nothing skips the hook.
+    /// written. Empty looks up the file name of `path`, without directory or
+    /// extension, through the distro's login shell, and a distro where that
+    /// finds nothing skips the hook.  A Windows `path` is never run there.
     #[serde(default)]
     pub wsl_path: String,
     /// Arguments when alacritree creates a worktree. `{checkout}` is the new
@@ -2038,6 +2098,14 @@ fn enabled_by_default() -> bool {
     true
 }
 
+/// The name a distro's login shell finds `path` by: a native path, possibly
+/// a Windows one, means nothing inside the distro.
+fn lookup_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_stem()
+        .map_or_else(|| path.to_string(), |stem| stem.to_string_lossy().into_owned())
+}
+
 impl RawCheckoutHooks {
     /// Enabled hooks only, in name order, so the progress steps read the
     /// same on every create.
@@ -2048,6 +2116,7 @@ impl RawCheckoutHooks {
             .map(|(name, raw)| CommandHook {
                 name,
                 program: Program {
+                    name: lookup_name(&raw.path),
                     native: raw.path,
                     wsl: Some(raw.wsl_path).filter(|p| !p.trim().is_empty()),
                 },
@@ -2089,14 +2158,14 @@ impl CommandHook {
         let cwd_spelled = std::path::PathBuf::from(side::spelling(&wsl::classify(cwd)));
         let cwd = if side == Side::Native { cwd } else { cwd_spelled.as_path() };
         match side::run(&side, &self.program, Some(cwd), &expand(template, event), blocking) {
-            Err(source) => Err(HookError::Spawn { program: self.name.clone(), source }),
+            Err(source) => Err(HookError::Spawn { hook: self.name.clone(), source }),
             Ok(Ran::Missing) => {
-                log::debug!("checkout hook {}: {} is not installed on this side", self.name, self.program.native);
+                log::debug!("checkout hook {}: {} is not installed on this side", self.name, self.program.name);
                 Ok(None)
             },
             Ok(Ran::Finished(output)) if output.status.success() => Ok(Some(format!("Ran {}", self.name))),
             Ok(Ran::Finished(output)) => Err(HookError::Failed {
-                program: self.name.clone(),
+                hook: self.name.clone(),
                 status: output.status,
                 stderr: first_line(&output.stderr),
             }),
@@ -2159,12 +2228,58 @@ pub(crate) fn from_config(integrations: &IntegrationsConfig) -> Vec<Hook> {
 }
 ```
 
-`alacritree/tests/schema-defaults-allowlist.txt`: add `RawCommandHook.path` in sorted position. Its reason is already covered by the header's "the field is required".
+`alacritree/tests/schema-defaults-allowlist.txt`: two new lines, in sorted position.
+- `RawCommandHook.path`: the header's "the field is required" covers it.
+- `RawCheckoutHooks.command`: schemars 1.2 publishes a field's default only when the field type is `Serialize` (`schemars-1.2.2/src/_private/mod.rs:169-193`), and `RawCommandHook` is not, so the map gets none. The header's "a collection whose element type implements no `Serialize`" covers it, as it does `RawKeyboard.bindings`.
+
+Regenerate with `ALACRITREE_UPDATE_ALLOWLIST=1 cargo test -p alacritree --test schema_defaults` (the allowlist header's `devkit run task test --env ALACRITREE_UPDATE_ALLOWLIST=1` does the same) and confirm the diff is exactly those two lines.
+
+`alacritree/src/cli/config_reference.rs`: the renderer descends only through `properties` and `items`, so a map of tables renders as one line, `command (table)`, and `RawCommandHook`'s fields never reach `docs/config-reference.md`. Teach `Reference::table` to follow `additionalProperties`. In its loop over `properties(schema)`, before the plain-key branch, add:
+
+```rust
+            } else if let Some(entry) = self.map_entry(child) {
+                // A table of named tables: document the key, then one
+                // `<name>` table for the shape every entry takes.
+                self.key(key, &path, child);
+                nested.push((format!("{path}.<name>"), entry, false));
+```
+
+and the helper:
+
+```rust
+    /// The entry schema of a map whose values are tables, such as named
+    /// command hooks.
+    fn map_entry(&self, prop: &'a Value) -> Option<&'a Value> {
+        let entry = self.resolve(prop).get("additionalProperties")?;
+        self.is_table(entry).then_some(entry)
+    }
+```
+
+Add a test module to `config_reference.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    /// Named tables are a map in the schema; their fields must still reach
+    /// the reference, or command hooks are undocumented.
+    #[test]
+    fn a_map_of_tables_documents_its_entry_fields() {
+        let doc = super::document();
+        assert!(doc.contains("`[integrations.checkout_hooks.command.<name>]`"), "{doc}");
+        assert!(doc.contains("- `on_created` (array of string"), "{doc}");
+    }
+}
+```
+
+Run it before the renderer change and confirm it fails.
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `ALACRITREE_UPDATE_SCHEMA=1 cargo test -p alacritree --test config_schema`, then the workspace tests.
-Expected: PASS. Read the diff of `schema/alacritree-config.json` and `docs/config-reference.md`. It adds `[integrations.checkout_hooks]` and `[integrations.checkout_hooks.command.<name>]` with the doc comments above and nothing else. `schema_defaults` passes with the one new allowlist line and no other allowlist change.
+Run: `ALACRITREE_UPDATE_SCHEMA=1 cargo test -p alacritree --test config_schema`, then `ALACRITREE_UPDATE_STOCK=1 cargo test -p alacritree --lib the_stock_config_is_unchanged`, then the workspace tests.
+Expected: PASS. Read three diffs:
+- `schema/alacritree-config.json` and `docs/config-reference.md` add `[integrations.checkout_hooks]`, the `command` key, and `[integrations.checkout_hooks.command.<name>]` with the six fields and the doc comments above, and nothing else. If another section's rendering changed, the renderer change reached a map it should not have; check which.
+- `alacritree/tests/stock-config.json` adds only `"checkout_hooks": []` under `integrations`.
+- `schema-defaults-allowlist.txt` adds only `RawCheckoutHooks.command` and `RawCommandHook.path`.
 
 - [ ] **Step 6: Commit**
 

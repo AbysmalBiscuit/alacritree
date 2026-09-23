@@ -85,9 +85,10 @@ roadmap or a command backend users can configure.
 ### Dispatch
 
 - Every integration trait is marked `#[ambassador::delegatable_trait]`. The
-  app derives `Delegate` on an enum with one variant per backend. Test fakes
-  are variants behind `#[cfg(test)]`, and command backends are ordinary
-  variants carrying their config.
+  app derives `Delegate` on an enum with one variant per backend. Command
+  backends are ordinary variants carrying their config. Code that runs the
+  backends is generic over the trait, so tests hand it a fake directly
+  rather than through a test-only variant.
 - `enum_dispatch` cannot link a trait and an enum that live in different
   crates. It keeps its trait registry in a static inside the proc macro,
   which does not survive between crate compilations
@@ -145,11 +146,12 @@ the app is #135.
 - Add the user-defined command hook.
 - Run doppler in the checkout's WSL distro when the checkout is in WSL. This
   is a behavior change: today doppler does nothing useful for WSL worktrees.
+  `alacritree doctor` drops its warning that a distro's doppler goes unused.
 - Extend CI and lint coverage to `crates/`.
 
 Out of scope:
 
-- Moving the Claude Code bell step (`worktree.rs:181`) into a hook.
+- Moving the Claude Code bell step (`worktree.rs:167-171`) into a hook.
 - Running hooks when a worktree whose directory is already gone is pruned
   (`prune_worktree`). Today doppler cleanup does not run there, and the pilot
   keeps that.
@@ -172,28 +174,42 @@ Moves from `alacritree/src/` unchanged except where noted:
 
 - `command_ext.rs`, `jobs.rs`, `wsl.rs`, `wsl_helper.rs`, `tools.rs`.
 - The `wsl_helper.rs` test that builds a command through
-  `multiplexer::Side` (`wsl_helper.rs:1602`) is rewritten against a plain
-  command, removing the only reference back into the app.
+  `multiplexer::Side` (`wsl_helper.rs:1600-1617`) moves into the app's
+  `multiplexer` tests, removing the only reference back into the app.
+- Test helpers the app's tests use (`Job::ready`, `Job::panicked`,
+  `tools::test_configuration*`) are gated on
+  `any(test, feature = "test-support")`, because `cfg(test)` stops reaching
+  them once they live in another crate.
 - `Tool` gains `strum` derives. `VariantArray` replaces `Tool::ALL`, and
   `IntoStaticStr`/`Display` with `serialize_all = "lowercase"` replace
   `name()`. The path table becomes `[ToolPaths; Tool::COUNT]`, indexed by
   `tool as usize`. `Tool`'s `serde::Serialize` output does not change.
 - `HELLO_TOOLS` stays a hand-kept list, because it includes `zellij`, which
-  is not a `Tool`. A new test asserts every `Tool` name appears in it.
+  is not a `Tool`. The existing test that it starts with every `Tool` name in
+  order is rewritten against `Tool::COUNT` and `Tool::table`.
 - A side-aware runner that the hook crates share:
 
 ```rust
-pub enum Side<'a> { Native, Wsl { distro: &'a str } }
+pub enum Side { Native, Wsl { distro: String } }
 
-/// Where a program runs for `path`: the native side, or the distro that
-/// holds a `\\wsl.localhost\<distro>\...` path.
-pub fn side_of(path: &Path) -> Side<'_>;
+impl Side {
+    /// Where a program runs for `path`: the native side, or the distro that
+    /// holds a `\\wsl.localhost\<distro>\...` path.
+    pub fn of(path: &Path) -> Side;
+}
+
+/// `native` may be a Windows path; `name` is what a distro looks up.
+pub struct Program { pub native: String, pub wsl: Option<String>, pub name: String }
 ```
 
 The runner resolves the program for that side. Natively it is the configured
-path. In a distro it is the configured `wsl_path`, then the resident
-helper's lookup, then the distro's login shell. A Windows binary is never
-used for a WSL checkout.
+path. In a distro it is the configured `wsl_path`, else `name` through the
+distro's login shell. Doppler also asks the resident helper, which already
+knows where each `Tool` lives in each distro, before falling back to the
+login shell. Command hooks have no helper entry and go straight to the login
+shell. A Windows binary or path is never used for a WSL checkout. The
+runner spawns through `wsl::command`, which sets `WSL_UTF8=1` so wsl.exe's own
+errors are readable.
 
 The alacritree crate re-exports the moved modules from its own root for now.
 Call sites change their imports as they are touched, not all at once.
@@ -218,12 +234,13 @@ pub struct Checkout<'a> { pub main: &'a Path, pub checkout: &'a Path }
 /// A line for the progress UI, or nothing when the hook had nothing to do.
 pub type Outcome = Result<Option<String>, HookError>;
 
+/// `hook` is the hook's configured name, such as a command hook's table key.
 #[derive(Debug, thiserror::Error)]
 pub enum HookError {
-    #[error("{program} failed ({status}): {stderr}")]
-    Failed { program: String, status: std::process::ExitStatus, stderr: String },
-    #[error("could not run {program}")]
-    Spawn { program: String, #[source] source: std::io::Error },
+    #[error("{hook} failed ({status}): {stderr}")]
+    Failed { hook: String, status: std::process::ExitStatus, stderr: String },
+    #[error("could not run {hook}")]
+    Spawn { hook: String, #[source] source: std::io::Error },
 }
 
 /// A set of hooks that runs every event on each member in order.
@@ -232,7 +249,15 @@ pub trait CheckoutHooks {
     fn opened(&self, event: &Checkout, blocking: &Blocking) -> Vec<Outcome>;
     fn removed(&self, event: &Checkout, blocking: &Blocking) -> Vec<Outcome>;
 }
+
+impl<H: CheckoutHook> CheckoutHooks for [H] { /* each event on each hook, in order */ }
 ```
+
+The real signatures name types by absolute path
+(`::alacritree_checkout_hooks::Checkout`), and the crate declares
+`extern crate self as alacritree_checkout_hooks;`. ambassador copies the
+signatures into the crate that derives `Delegate`, where bare names would not
+resolve.
 
 A missing program is not an error. The hook returns `Ok(None)` and logs at
 debug level. A program that runs and exits non-zero is `HookError::Failed`.
@@ -264,8 +289,8 @@ on_removed = []
 - An empty template skips that event.
 - The command runs on the checkout's side. Its working directory is the
   checkout, or the main checkout for `on_removed`.
-- In a distro without a configured `wsl_path`, the program runs through the
-  login shell, as custom diff viewers do. Exit code 127 from the shell means
+- In a distro without a configured `wsl_path`, the file stem of `path` runs
+  through the login shell, as custom diff viewers do. Exit code 127 from the shell means
   the program was not found and the hook is skipped. Any other non-zero exit
   is `Failed` with the first line of stderr.
 - Exit 0 reports `Ran <name>`. Standard output is ignored.
@@ -281,34 +306,39 @@ on_removed = []
   doppler, with scope paths translated through `wsl::windows_to_linux`, so
   scopes land in the distro's own doppler config.
 - Owns `RawDoppler`: `path`, `wsl_path`, and a new `enabled` defaulting to
-  `true`. It replaces the `raw_tool_table!(RawDoppler, "doppler")` line.
+  `true`. It replaces the `raw_tool_table!(RawDoppler, "doppler")` line. The
+  module is `settings.rs`, not `config.rs`, because the UI-thread audit keys
+  functions by file stem and would confuse it with the app's `config.rs`.
+- `alacritree doctor` loses `wsl_doppler_check`, which warns that a
+  distro's doppler is never used. The per-distro line already shows where
+  doppler resolves there.
 
 ### App changes
 
 A new `alacritree/src/checkout_hooks.rs`:
 
 ```rust
-#[derive(Delegate)]
+#[derive(Debug, Clone, Delegate)]
 #[delegate(CheckoutHook)]
-enum Hook {
+pub(crate) enum Hook {
     Doppler(DopplerHook),
     Command(CommandHook),
-    #[cfg(test)]
-    Fake(FakeHook),
 }
 
 /// Built-in hooks first, then command hooks sorted by name.
-pub(crate) struct Hooks(Vec<Hook>);
+pub(crate) fn from_config(integrations: &IntegrationsConfig) -> Vec<Hook>;
 
-impl Hooks {
-    pub(crate) fn from_config(config: &IntegrationsConfig) -> Self;
-}
-
-impl CheckoutHooks for Hooks { /* each event on each hook, in order */ }
+/// Each outcome as a progress line; an error reads "Hook failed: {e}".
+pub(crate) fn report(outcomes: Vec<Outcome>, line: impl FnMut(&str));
 ```
 
-`Hooks` is rebuilt from the current config wherever an event fires, so a
-config reload takes effect on the next event.
+`Vec<Hook>` gets `CheckoutHooks` from the blanket `[H]` impl, so there is no
+newtype. Tests pass `&[FakeHook]` through the same generic parameter instead
+of a test-only `Hook` variant.
+
+The GUI and IPC use the config loaded at startup. The app has no config
+reload, and the IPC listener takes its hook list once, as it already does
+with `workspace`. The offline CLI loads config on each invocation.
 
 Call sites:
 
@@ -318,12 +348,12 @@ Call sites:
 | `worktree.rs:587`, in `delete_worktree` | `hooks.removed(..)`, each outcome logged |
 | `app.rs:1140`, `sync_doppler_scopes` | `sync_checkout_hooks` runs `hooks.opened(..)` on a background job; `doppler_synced` becomes `hooks_opened` |
 
-`worktree::create` and `delete_worktree` take `hooks: &impl CheckoutHooks`
-rather than the app's `Hooks`, so the git code keeps no dependency on the
-app's dispatch enum when it moves to its own crate. Their three callers build
-`Hooks` from resolved config: the GUI modal (`app/modals.rs:988`), IPC
-(`ipc/server.rs:244`), and the offline CLI (`cli/offline.rs:153`, with config
-loaded at `cli/mod.rs:542`).
+`worktree::create` and `delete_worktree` take `hooks: &H` with
+`H: CheckoutHooks + ?Sized` rather than the app's `Hook`, so the git code keeps no dependency on the
+app's dispatch enum when it moves to its own crate. Their callers build
+the list from resolved config: the GUI modals (`app/modals.rs:480,988`), IPC
+(`ipc/server.rs:244`, list built in `app/ipc_handler.rs:15`), and the offline
+CLI (`cli/offline.rs:153`, with config loaded at `cli/mod.rs:542`).
 
 ### Config and schema
 
@@ -335,18 +365,30 @@ loaded at `cli/mod.rs:542`).
 
 - Defaults live in each type's `Default` impl. `enabled` is `true`, and the
   `on_*` templates and `wsl_path` are empty.
-- `RawCommandHook.path` has no default and is required. It is the one new
-  line in `schema-defaults-allowlist.txt`.
+- `RawCommandHook.path` has no default and is required.
+  `RawCheckoutHooks.command` publishes no default either, because schemars
+  emits one only for a `Serialize` field type and `RawCommandHook` is not.
+  Both go in `schema-defaults-allowlist.txt`, under reasons its header already
+  gives.
 - `schema/alacritree-config.json` and `docs/config-reference.md` are
   regenerated with
   `ALACRITREE_UPDATE_SCHEMA=1 cargo test -p alacritree --test config_schema`.
+  The reference renderer (`cli/config_reference.rs`) learns to follow
+  `additionalProperties`, so a map of named tables documents its entry fields
+  under `[integrations.checkout_hooks.command.<name>]`.
+- `alacritree/tests/stock-config.json` is regenerated with
+  `ALACRITREE_UPDATE_STOCK=1`, once for doppler's `enabled` and once for the
+  empty `checkout_hooks` list.
 
 ### Build, CI and lints
 
 - The root `Cargo.toml` gains `crates/*` in `members`, and `ambassador` and
   `thiserror` as workspace dependencies.
-- CI build, test and clippy (`ci.yml:30,33,46`) switch from `-p alacritree`
-  to `--workspace` with the vendored crates excluded.
+- CI build, test and clippy switch from `-p alacritree` to `--workspace`
+  with the vendored crates excluded, in all three jobs: Linux
+  (`ci.yml:30,33,46`), macOS (`:81`) and Windows (`:100,103`). The Windows job
+  is the only lint of the `cfg(windows)` arms of `wsl.rs` and `wsl_helper.rs`,
+  which now live in `alacritree_common`.
 - `crates/clippy.toml` carries the same `disallowed-methods` list as
   `alacritree/clippy.toml`, because clippy reads the nearest config walking up
   from a crate. Each file has a comment pointing at the other.
@@ -361,11 +403,11 @@ loaded at `cli/mod.rs:542`).
 
 | Crate | Coverage |
 |---|---|
-| `alacritree_common` | Moved tests move with their modules. The `wsl_helper` test is rewritten without `multiplexer::Side`. New: `Tool` strum names match the old `name()`, `Tool::COUNT` matches `VARIANTS`, every `Tool` is in `HELLO_TOOLS`, and `side_of` handles native paths, `\\wsl.localhost\` paths and `\\wsl$\` paths. |
-| `alacritree_checkout_hooks` | Command hook: placeholder expansion, empty template skips, exit 0 reports `Ran <name>`, exit 127 skips, other non-zero is `Failed` with the first stderr line, Linux path expansion for a WSL checkout. Unix tests use `sh -c` scripts. |
+| `alacritree_common` | Moved tests move with their modules. The `wsl_helper` test is rewritten without `multiplexer::Side`. New: `Tool` strum names match the old `name()`, `Tool::COUNT` matches `VARIANTS`, `HELLO_TOOLS` starts with every `Tool` in order, `Side::from_location` maps native and distro locations, a configured Windows path never reaches a distro, and cancelling the job kills a hanging program. |
+| `alacritree_checkout_hooks` | Command hook: placeholder expansion, empty template skips, exit 0 reports `Ran <name>`, a missing program skips, other non-zero is `Failed` with the first stderr line, a path is looked up in a distro by its file stem. Unix tests use `sh -c` scripts. |
 | `alacritree_doppler` | Existing `rebase_scope` tests. Side selection and path translation as pure functions. Mirror and forget end to end on Unix against a fake `doppler` script set through the tool path. |
-| App | `Hooks` dispatches through ambassador across crates, runs hooks in order, continues after a failure, and returns every outcome. `worktree::create` and `delete_worktree` deliver events to a recording `FakeHook` (using `test_util::init_repo` and `add_worktree`). `sync_checkout_hooks` fires `on_opened` once per worktree per process. |
-| Existing | `config_schema`, `schema_defaults` and `steady_state` pass after regeneration, and the allowlist diff is the one new line. |
+| App | `Hook` dispatches through ambassador across crates, runs hooks in order, continues after a failure, and returns every outcome. `worktree::create` and `delete_worktree` deliver events to a recording `FakeHook` (using `test_util::init_repo` and `add_worktree`). `sync_checkout_hooks` fires `on_opened` once per worktree per process. The reference renderer documents a map's entry fields. |
+| Existing | `config_schema`, `schema_defaults`, `the_stock_config_is_unchanged` and `steady_state` pass after regeneration. The allowlist diff is the two lines above. `doctor`'s two `wsl_doppler_check` tests go with the check. |
 
 ### Order of work
 
@@ -376,7 +418,8 @@ loaded at `cli/mod.rs:542`).
 3. `alacritree_checkout_hooks` with the trait, the error type and the fake.
    First, a cross-crate `Delegate` derive compiles in the app. That proves
    ambassador works across these crates before anything is built on it.
-4. `alacritree_doppler`, native behavior only. Call sites switch to `Hooks`.
+4. `alacritree_doppler`, native behavior only. Call sites switch to the hook
+   list.
 5. The WSL side rule for doppler, as its own commit.
 6. The command hook and its config.
 7. Schema regeneration and docs.
