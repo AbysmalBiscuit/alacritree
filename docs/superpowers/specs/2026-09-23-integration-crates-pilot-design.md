@@ -57,7 +57,9 @@ roadmap or a command backend users can configure.
 ### Layout and naming
 
 - New crates live in `crates/`. The workspace lists them with one glob,
-  `crates/*`.
+  `crates/alacritree_*`. Not `crates/*`: release-please's cargo-workspace
+  plugin matches files as well as directories, and would take
+  `crates/clippy.toml` for a crate.
 - `alacritree/` stays at the root. Release tooling spells its path in
   `release-please-config.json`, `dist-workspace.toml`, CI, the scoop bucket,
   and the macOS bundle script.
@@ -382,7 +384,7 @@ CLI (`cli/offline.rs:153`, with config loaded at `cli/mod.rs:542`).
 
 ### Build, CI and lints
 
-- The root `Cargo.toml` gains `crates/*` in `members`, and `ambassador` and
+- The root `Cargo.toml` gains `crates/alacritree_*` in `members`, and `ambassador` and
   `thiserror` as workspace dependencies.
 - CI build, test and clippy switch from `-p alacritree` to `--workspace`
   with the vendored crates excluded, in all three jobs: Linux
@@ -394,8 +396,10 @@ CLI (`cli/offline.rs:153`, with config loaded at `cli/mod.rs:542`).
   from a crate. Each file has a comment pointing at the other.
 - The UI-thread audit (`alacritree/tools/ui-thread-audit.py:54`, which
   hardcodes `alacritree/src`) also scans `crates/*/src`.
-- The PR confirms that release-please's `cargo-workspace` plugin accepts new
-  unpublished workspace members that are missing from `packages`.
+- release-please's `cargo-workspace` plugin (16.18.0) reads every workspace
+  member it can glob and needs only a string `[package.version]`; members
+  missing from `packages` are not released, as the vendored crates already
+  show.
 - AGENTS.md describes `crates/`, the crate model, and the thiserror and
   ambassador conventions.
 
@@ -434,10 +438,10 @@ for this work is opened against the fork itself.
 
 ### Risks
 
-- **The release-please `cargo-workspace` plugin.** Its handling of new
-  members that are missing from `packages` is unverified. If it rejects them,
-  either list the crates with `skip-github-release` or configure the plugin to
-  ignore them.
+- **The release-please `cargo-workspace` plugin.** Checked against its
+  16.18.0 source rather than a live run: unlisted members are read and left
+  unreleased, and the members glob must match only crate directories. The
+  first release PR after merge is the real test.
 - **Re-exports hiding the boundary.** While the app re-exports common modules,
   new code could keep importing through `crate::`. Call sites switch to the
   crate paths as they are touched, and the last roadmap step deletes whatever
