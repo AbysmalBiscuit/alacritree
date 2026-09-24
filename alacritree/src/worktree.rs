@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 
-use crate::config::WorkspaceConfig;
+use alacritree_checkout_hooks::{Checkout, CheckoutHook, CheckoutHooks};
+
+use crate::checkout_hooks::Hook;
+use crate::config::{Config, WorkspaceConfig};
 use crate::default_branch::{self, Evidence, WellKnown};
 use crate::repaint::Repaint;
 use crate::tools::{self, Tool};
@@ -19,6 +22,23 @@ use crate::{command_ext, jobs, wsl};
 pub(crate) enum Progress {
     Step(String),
     Done(Result<PathBuf, String>),
+}
+
+/// What a create from IPC or the offline CLI reads from config: where the
+/// worktree goes, and the hooks that run once it exists.
+#[derive(Clone, Default)]
+pub(crate) struct CreateConfig {
+    pub(crate) workspace: WorkspaceConfig,
+    pub(crate) hooks: Vec<Hook>,
+}
+
+impl CreateConfig {
+    pub(crate) fn new(config: &Config) -> Self {
+        Self {
+            workspace: config.workspace.clone(),
+            hooks: crate::checkout_hooks::from_config(&config.integrations),
+        }
+    }
 }
 
 pub(crate) struct CreateRequest {
@@ -78,19 +98,21 @@ pub(crate) fn validate_branch_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Run [`create`] on the pool, waking the UI for each step.  A worktree
-/// create is user-initiated, so it runs at interactive priority.  The
+/// Run [`create`] on the pool, waking the UI for each step. A worktree
+/// create is user-initiated, so it runs at interactive priority. The
 /// streamed progress travels over the channel; the returned `Job` carries no
-/// result of its own and exists only to be held — dropping it would cancel
+/// result of its own and exists only to be held. Dropping it would cancel
 /// the create before it starts.
-pub(crate) fn spawn_create(
+pub(crate) fn spawn_create<H: CheckoutHook + Send + 'static>(
     req: CreateRequest,
+    hooks: Vec<H>,
     repaint: impl Repaint,
 ) -> (Receiver<Progress>, jobs::Job<()>) {
     let (tx, rx) = mpsc::channel();
     let job = jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
         let result = create(
             &req,
+            hooks.as_slice(),
             |step| {
                 let _ = tx.send(Progress::Step(step.to_string()));
                 repaint.wake();
@@ -108,8 +130,9 @@ pub(crate) fn spawn_create(
 /// Nothing here needs a window, so callers without one (the CLI, with no
 /// running app to talk to) drive this directly through [`jobs::on_this_thread`]
 /// rather than through [`spawn_create`].
-pub(crate) fn create(
+pub(crate) fn create<H: CheckoutHooks + ?Sized>(
     req: &CreateRequest,
+    hooks: &H,
     mut on_step: impl FnMut(&str),
     blocking: &jobs::Blocking,
 ) -> Result<PathBuf, String> {
@@ -170,10 +193,9 @@ pub(crate) fn create(
         send("Enabled Claude Code terminal bell");
     }
 
-    let linked = crate::doppler::mirror_scopes(&req.project_root, &target, blocking);
-    if linked > 0 {
-        send(&format!("Linked {linked} Doppler scope(s)"));
-    }
+    bail_if_cancelled!();
+    let event = Checkout { main: &req.project_root, checkout: &target };
+    crate::checkout_hooks::report(hooks.created(&event, blocking), |_, line| send(line));
 
     Ok(target)
 }
@@ -289,7 +311,7 @@ pub(crate) fn list_branches(cwd: &Path, _blocking: &jobs::Blocking) -> Result<Ve
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .map(str::trim)
-        // `origin/HEAD` shortens to plain `origin` — an alias, not a branch.
+        // `origin/HEAD` shortens to plain `origin`, an alias, not a branch.
         .filter(|l| !l.is_empty() && *l != "origin")
         .map(str::to_string)
         .collect())
@@ -562,16 +584,17 @@ fn copy_path(src: &Path, dst: &Path) -> std::io::Result<()> {
     }
 }
 
-pub(crate) fn delete_worktree(
+pub(crate) fn delete_worktree<H: CheckoutHooks + ?Sized>(
     project_root: &Path,
     worktree_path: &Path,
     branch: Option<&str>,
     force: bool,
+    hooks: &H,
     blocking: &jobs::Blocking,
 ) -> Result<(), String> {
     let path_arg = git_path_arg(project_root, worktree_path)?;
     // Resolve before removal: canonicalize needs the directory to still
-    // exist, and the doppler cleanup below runs after git has deleted it.
+    // exist, and the checkout hooks below run after git has deleted it.
     let scope_root =
         std::fs::canonicalize(worktree_path).unwrap_or_else(|_| worktree_path.to_path_buf());
     let mut args: Vec<&str> = vec!["worktree", "remove"];
@@ -581,13 +604,13 @@ pub(crate) fn delete_worktree(
     args.push(&path_arg);
     run_git(project_root, &args)?;
     if let Some(branch) = branch {
-        // Branch may already be gone (e.g. detached HEAD) — ignore errors here.
+        // Branch may already be gone (e.g. detached HEAD), so ignore errors.
         let _ = run_git(project_root, &["branch", "-D", branch]);
     }
-    let cleaned = crate::doppler::forget_scopes(&scope_root, blocking);
-    if cleaned > 0 {
-        log::info!("dropped {cleaned} doppler scope(s) under {}", scope_root.display());
-    }
+    let event = Checkout { main: project_root, checkout: &scope_root };
+    crate::checkout_hooks::report(hooks.removed(&event, blocking), |level, line| {
+        log::log!(level, "{line} (removed {})", scope_root.display())
+    });
     Ok(())
 }
 
@@ -600,19 +623,28 @@ pub(crate) enum DeleteJob {
 }
 
 /// Run a [`DeleteJob`] on the pool, waking the window when it finishes. The
-/// git shellouts and doppler cleanup are slow enough to stutter paint, so the
+/// git shellouts and checkout hooks are slow enough to stutter paint, so the
 /// caller confirms the dialog, hands the work here, and adopts the result (an
-/// error to surface, or nothing) from the returned handle — the sidebar row
+/// error to surface, or nothing) from the returned handle. The sidebar row
 /// shows a spinner until it lands, so this runs at interactive priority.
-pub(crate) fn spawn_delete(
+pub(crate) fn spawn_delete<H: CheckoutHook + Send + 'static>(
     project_root: PathBuf,
     job: DeleteJob,
+    hooks: Vec<H>,
     repaint: impl Repaint,
 ) -> jobs::Job<Result<(), String>> {
     jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
         let result = match job {
             DeleteJob::Remove { worktree_path, branch, force } => {
-                delete_worktree(&project_root, &worktree_path, branch.as_deref(), force, blocking)
+                let hooks = hooks.as_slice();
+                delete_worktree(
+                    &project_root,
+                    &worktree_path,
+                    branch.as_deref(),
+                    force,
+                    hooks,
+                    blocking,
+                )
             },
             DeleteJob::Prune { worktree_name, branch, delete_branch } => {
                 prune_worktree(&project_root, &worktree_name, branch.as_deref(), delete_branch)
@@ -638,13 +670,13 @@ fn prune_worktree(
     let wt = repo
         .find_worktree(worktree_name)
         .map_err(|e| format!("failed to find worktree `{worktree_name}`: {}", e.message()))?;
-    // Default prune options refuse valid or locked worktrees — exactly the
-    // safety we want if the directory reappeared since discovery; the error
-    // surfaces to the caller.
+    // Default prune options refuse valid or locked worktrees. That is exactly
+    // the safety we want if the directory reappeared since discovery; the
+    // error surfaces to the caller.
     wt.prune(None).map_err(|e| format!("failed to prune: {}", e.message()))?;
     if delete_branch {
         if let Some(branch) = branch {
-            // Branch may already be gone — ignore errors, as delete_worktree does.
+            // Ignore errors as delete_worktree does. The branch may be gone.
             let _ = run_git(project_root, &["branch", "-D", branch]);
         }
     }
@@ -663,6 +695,7 @@ mod tests {
     use super::*;
     use crate::repaint::Recorder;
     use crate::test_util::{add_worktree, init_repo};
+    use alacritree_checkout_hooks::fake::{Event, FakeHook};
 
     fn abs(tail: &str) -> PathBuf {
         if cfg!(windows) {
@@ -704,7 +737,7 @@ mod tests {
             force: false,
         };
         let repaint = Recorder::default();
-        let handle = spawn_delete(repo_dir, job, repaint.clone());
+        let handle = spawn_delete(repo_dir, job, Vec::<FakeHook>::new(), repaint.clone());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let result = loop {
             if let Some(result) = handle.poll() {
@@ -845,7 +878,7 @@ mod tests {
             // missing remote instead.
             let _ = started_tx.send(());
             let _ = gate_rx.recv();
-            let _ = tx.send(create(&req, |_| {}, blocking));
+            let _ = tx.send(create(&req, &[] as &[FakeHook], |_| {}, blocking));
         });
         started_rx.recv_timeout(Duration::from_secs(5)).expect("the job never started");
         drop(job);
@@ -876,7 +909,7 @@ mod tests {
             if let Ok((mut stream, _)) = listener.accept() {
                 let _ = conn_tx.send(());
                 // Drain whatever the client sends without ever replying,
-                // until it closes the connection (killed or otherwise) — a
+                // until it closes the connection (killed or otherwise). A
                 // single short read returns as soon as *any* bytes arrive
                 // and would drop the connection right after the client's
                 // request, well before the read it actually blocks on.
@@ -907,7 +940,7 @@ mod tests {
         };
         let (tx, rx) = mpsc::channel();
         let job = jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
-            let _ = tx.send(create(&req, |_| {}, blocking));
+            let _ = tx.send(create(&req, &[] as &[FakeHook], |_| {}, blocking));
         });
         // Cancelling only once the fake remote has observed a connection
         // proves the job is genuinely blocked in `ls-remote`, not merely
@@ -922,5 +955,102 @@ mod tests {
             Ok(Ok(path)) => panic!("create finished a worktree nobody was waiting for: {path:?}"),
             Err(e) => panic!("create never returned: {e}"),
         }
+    }
+
+    /// A caller that gave up before the hooks must not have them started only
+    /// for the cancel to kill each one.
+    #[test]
+    fn create_runs_no_hook_once_cancelled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = crate::test_util::clone_with_origin(tmp.path());
+        let req = CreateRequest {
+            project_root: project,
+            default_branch: None,
+            branch: "abandoned".into(),
+            base_dir: Some(tmp.path().join("worktrees")),
+        };
+        let hook = FakeHook::reporting("Linked 1 fake scope");
+        let job_hook = hook.clone();
+        let (tx, rx) = mpsc::channel();
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let job = jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
+            // Park on the last step before the hooks until the handle is gone.
+            let on_step = |step: &str| {
+                if step.starts_with("Enabled Claude Code") {
+                    let _ = reached_tx.send(());
+                    let _ = gate_rx.recv();
+                }
+            };
+            let _ = tx.send(create(&req, &[job_hook][..], on_step, blocking));
+        });
+        reached_rx.recv_timeout(Duration::from_secs(30)).expect("create never reached the hooks");
+        drop(job);
+        let _ = gate_tx.send(());
+        let result = rx.recv_timeout(Duration::from_secs(10)).expect("create never returned");
+        assert!(matches!(result, Err(ref msg) if msg.contains("cancelled")), "{result:?}");
+        assert_eq!(hook.events(), []);
+    }
+
+    #[test]
+    fn create_hands_the_new_checkout_to_every_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = crate::test_util::clone_with_origin(tmp.path());
+        let req = CreateRequest {
+            project_root: project.clone(),
+            default_branch: None,
+            branch: "hooked".into(),
+            base_dir: Some(tmp.path().join("worktrees")),
+        };
+        let hook = FakeHook::reporting("Linked 1 fake scope");
+        let mut steps = Vec::new();
+        let target = jobs::on_this_thread(|b| {
+            create(&req, &[hook.clone()][..], |s| steps.push(s.to_string()), b)
+        })
+        .expect("create succeeds");
+        assert_eq!(hook.events(), [Event::Created { main: project, checkout: target }]);
+        assert!(steps.iter().any(|s| s == "Linked 1 fake scope"), "{steps:?}");
+    }
+
+    #[test]
+    fn a_failing_hook_shows_in_the_steps_and_does_not_fail_the_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = crate::test_util::clone_with_origin(tmp.path());
+        let req = CreateRequest {
+            project_root: project,
+            default_branch: None,
+            branch: "hook-fails".into(),
+            base_dir: Some(tmp.path().join("worktrees")),
+        };
+        let mut steps = Vec::new();
+        let result = jobs::on_this_thread(|b| {
+            create(&req, &[FakeHook::failing()][..], |s| steps.push(s.to_string()), b)
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            steps.iter().any(|s| s.starts_with("Hook failed: could not run fake")),
+            "{steps:?}"
+        );
+    }
+
+    /// A hook may key its state by canonical path, and a removed directory
+    /// can no longer be canonicalized, so the hook must get the path resolved
+    /// first.
+    #[cfg(unix)]
+    #[test]
+    fn removal_hands_hooks_the_path_resolved_before_git_deleted_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        let repo = crate::test_util::init_repo(&repo_dir);
+        let wt_path = crate::test_util::add_worktree(&repo, "linked");
+        let canonical = wt_path.canonicalize().unwrap();
+        let link = tmp.path().join("via-link");
+        std::os::unix::fs::symlink(&wt_path, &link).unwrap();
+        let hook = FakeHook::silent();
+        jobs::on_this_thread(|b| {
+            delete_worktree(&repo_dir, &link, Some("linked"), true, &[hook.clone()][..], b)
+        })
+        .expect("delete succeeds");
+        assert_eq!(hook.events(), [Event::Removed { main: repo_dir, checkout: canonical }]);
     }
 }

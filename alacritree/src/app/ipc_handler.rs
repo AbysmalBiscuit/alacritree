@@ -12,7 +12,8 @@ impl AlacritreeApp {
     ) -> (Option<ipc::server::SocketHandle>, Option<Receiver<ipc::server::AppCall>>) {
         // Before the first PTY spawn so children inherit ALACRITREE_SOCKET.
         if config.ipc_socket {
-            match ipc::server::spawn_listener(ctx.clone(), config.workspace.clone()) {
+            let create = crate::worktree::CreateConfig::new(config);
+            match ipc::server::spawn_listener(ctx.clone(), create) {
                 Ok((handle, rx)) => {
                     log::info!("IPC socket: {}", handle.path().display());
                     (Some(handle), Some(rx))
@@ -297,7 +298,7 @@ impl AlacritreeApp {
     }
 
     /// Like [`Self::known_worktree_path`], but a path anywhere *inside* a
-    /// worktree's subtree counts — a mover reports its cwd, which is usually
+    /// worktree's subtree counts. A mover reports its cwd, which is usually
     /// a subdirectory, not the worktree root itself.
     fn workspace_for_path(&self, path: &Path) -> Option<PathBuf> {
         let worktrees: Vec<PathBuf> =

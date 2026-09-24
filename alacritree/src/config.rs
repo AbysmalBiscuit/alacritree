@@ -1,9 +1,9 @@
 //! Read user configuration from alacritty.toml + alacritree.toml.
 //!
-//! `alacritty.toml` is alacritty's own config — we share the file so the user
-//! gets matching colors/cursor in both terminals.  `alacritree.toml` lives in
+//! `alacritty.toml` is alacritty's own config. We share the file so the user
+//! gets matching colors/cursor in both terminals. `alacritree.toml` lives in
 //! the same directory and overrides anything in `alacritty.toml` via a
-//! deep-merge.  alacritree-specific options live under the `[ui]` (sidebar
+//! deep-merge. alacritree-specific options live under the `[ui]` (sidebar
 //! colors, etc.) and `[workspace]` (worktree location) tables and are only
 //! valid in `alacritree.toml`.
 //!
@@ -20,12 +20,12 @@ use std::time::Duration;
 use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle, Rgb};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use strum::{EnumIter, IntoEnumIterator, IntoStaticStr};
+use strum::{EnumCount, EnumIter, IntoEnumIterator, IntoStaticStr};
 
 use crate::bindings::{self, KeyBinding};
 use crate::diff_viewer::{Program, Templates, Viewer};
 use crate::path_style::PathStyle;
-use crate::tools::{Tool, ToolPaths};
+use crate::tools::{Tool, ToolConfig, ToolPaths, tool_config};
 
 /// `[env]` carries whatever the user's environment carries, and a config dump
 /// ends up attached to bug reports.  Key names survive: that `FOO` was set is
@@ -558,8 +558,8 @@ impl Default for DropConfig {
     }
 }
 
-/// `[ui.paste]`: what Paste does when the clipboard holds no text.  Both
-/// fallbacks are independent — one can be off without affecting the other, and
+/// `[ui.paste]`: what Paste does when the clipboard holds no text. Both
+/// fallbacks are independent. One can be off without affecting the other, and
 /// both off leaves Paste exactly as it was.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PasteConfig {
@@ -601,7 +601,8 @@ impl PasteConfig {
 pub struct IntegrationsConfig {
     pub git: ToolConfig,
     pub gh: GhConfig,
-    pub doppler: ToolConfig,
+    pub doppler: alacritree_doppler::DopplerConfig,
+    pub checkout_hooks: Vec<alacritree_checkout_hooks::CommandHook>,
     pub herdr: HerdrConfig,
     pub zellij: ZellijConfig,
     pub delta: ToolConfig,
@@ -650,21 +651,10 @@ impl IntegrationsConfig {
         ToolPaths { native: native.clone(), wsl: wsl.clone() }
     }
 
-    /// Indexed like [`Tool::ALL`], the shape `tools::configure` takes.
-    pub fn tool_paths(&self) -> [ToolPaths; 7] {
-        Tool::ALL.map(|tool| self.paths(tool))
+    /// Indexed by [`Tool`] discriminant, the shape `tools::configure` takes.
+    pub fn tool_paths(&self) -> [ToolPaths; Tool::COUNT] {
+        Tool::table(|tool| self.paths(tool))
     }
-}
-
-/// `[integrations.<tool>]` for a tool with nothing to configure but where
-/// it lives.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct ToolConfig {
-    /// The tool's own name, or a native path that runs as written.
-    pub path: String,
-    /// A path that runs as written inside every WSL distro, or `None` to
-    /// find the tool by name there.
-    pub wsl_path: Option<String>,
 }
 
 /// `[integrations.gh]`: where the GitHub CLI lives and whether the sidebar
@@ -814,7 +804,7 @@ pub fn default_image_dir() -> PathBuf {
 #[strum(serialize_all = "snake_case")]
 pub enum ScrollbarStyle {
     /// egui's default: a thin bar overlaying the content edge, expanding on
-    /// hover — which covers the icons at the right end of sidebar rows.
+    /// hover, which covers the icons at the right end of sidebar rows.
     #[default]
     Floating,
     /// A reserved gutter right of the content; the bar never covers icons.
@@ -825,10 +815,10 @@ fn text_emphasis(raw: &RawTextEmphasis) -> TextEmphasis {
     TextEmphasis { color: raw.color.map(|v| v.0), bold: raw.bold, italic: raw.italic }
 }
 
-/// A glyph alacritree ships and guarantees coverage for.  Paint helpers take
+/// A glyph alacritree ships and guarantees coverage for. Paint helpers take
 /// this rather than `&str` so a built-in glyph cannot be introduced as a bare
-/// literal that the baked subset never learns about.  User-configured
-/// `[ui.icons]` overrides stay plain strings — they are outside the guarantee.
+/// literal that the baked subset never learns about. User-configured
+/// `[ui.icons]` overrides stay plain strings, outside the guarantee.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BakedGlyph(&'static str);
 
@@ -854,7 +844,7 @@ baked_glyphs! {
     /// resolves through the system fallback chain `fonts.rs` registers.
     DEFAULT_SEARCH_ICON = "⌕";
     /// Default glyphs for every other `[ui.icons]` key, shared between
-    /// `Icons::default()` and the paint sites' `resolve_icon` fallback — a
+    /// `Icons::default()` and the paint sites' `resolve_icon` fallback. A
     /// table override that styles a key without setting `glyph` still needs
     /// the real default to fall back to, not a blank string.
     DEFAULT_WORKTREE_MAIN_ICON = "●";
@@ -911,15 +901,15 @@ baked_glyphs! {
     DEFAULT_CLOSE_ICON = "×";
     DEFAULT_REFRESH_ICON = "↻";
     DEFAULT_REORDER_ICON = "⇅";
-    /// Painted directly as literals at their call sites — labels, hover text —
-    /// rather than through these constants, so nothing in ordinary builds
-    /// reads them.  They are declared here only to give the coverage check
+    /// Painted directly as literals at their call sites, such as labels and
+    /// hover text, rather than through these constants, so nothing in ordinary
+    /// builds reads them. They are declared here only to give the coverage check
     /// something to assert against, hence gated to test builds; the glyphs
     /// themselves ship in the app regardless of that gate.
     #[cfg(test)]
     DEFAULT_MIDDOT_GLYPH = "·";
     #[cfg(test)]
-    DEFAULT_EMDASH_GLYPH = "—";
+    DEFAULT_EMDASH_GLYPH = "\u{2014}";
     #[cfg(test)]
     DEFAULT_BULLET_GLYPH = "•";
     #[cfg(test)]
@@ -938,7 +928,7 @@ baked_glyphs! {
 #[serde(into = "&'static str")]
 #[strum(serialize_all = "snake_case")]
 pub enum LastSessionClose {
-    /// Recycle a shell in place — the workspace always has a live session,
+    /// Recycle a shell in place. The workspace always has a live session,
     /// so the last session is by design unclosable.
     #[default]
     Respawn,
@@ -989,8 +979,8 @@ pub enum HoldExitedSessions {
 }
 
 impl HoldExitedSessions {
-    /// Whether an exit with this status is held on screen.  A herdr refusal is
-    /// held regardless — see [`crate::session::Session::should_reap`].
+    /// Whether an exit with this status is held on screen. A herdr refusal is
+    /// held regardless, as [`crate::session::Session::should_reap`] explains.
     pub fn holds(self, clean_exit: bool) -> bool {
         match self {
             Self::Never => false,
@@ -1094,13 +1084,13 @@ pub struct SessionReorder {
 }
 
 /// `[ui] sidebar_tooltips`: when a sidebar row offers its full name on hover.
-/// Governs both sidebars — a git panel row's path answers to it the same way a
+/// Governs both sidebars. A git panel row's path answers to it the same way a
 /// worktree or session name does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
 #[serde(into = "&'static str")]
 #[strum(serialize_all = "snake_case")]
 pub enum SidebarTooltips {
-    /// Never — a name the panel cut off stays cut off.
+    /// Never. A name the panel cut off stays cut off.
     Off,
     /// Only where the row had to ellipsize the name.
     #[default]
@@ -1433,16 +1423,16 @@ pub struct UiTheme {
     /// Ask before the sidebar's `×` detaches from a harness-managed pane, and
     /// once before `DetachAllMultiplexerPanes` detaches from all of them.
     /// Its own switch rather than a mode of [`Self::confirm_session_close`]:
-    /// a detach destroys nothing — the pane keeps running under its harness
-    /// and its row comes back — so the busy question a close asks has no
+    /// a detach destroys nothing. The pane keeps running under its harness
+    /// and its row comes back, so the busy question a close asks has no
     /// answer here, and a user who wants no close prompt may still want to
     /// be asked before losing the view.
     pub confirm_session_detach: bool,
     /// Whether the sidebar's sessions toggle also counts a listed but
-    /// unattached herdr row as occupying a workspace — an agent nothing is
-    /// attached to, and, once `show_panes` is on, an agentless pane. Such a
-    /// row is a `WorkspaceEntry::Pane`, not a [`crate::session::Session`], so
-    /// `false` reproduces the toggle's original session-only behavior.
+    /// unattached herdr row as occupying a workspace. Such a row is an agent
+    /// nothing is attached to, and, once `show_panes` is on, an agentless
+    /// pane. It is a `WorkspaceEntry::Pane`, not a [`crate::session::Session`],
+    /// so `false` reproduces the toggle's original session-only behavior.
     pub sessions_filter_counts_detached: bool,
     /// What closing the last session in the on-screen workspace does.
     pub last_session_close: LastSessionClose,
@@ -1462,8 +1452,8 @@ pub struct UiTheme {
     pub search_depth: SearchDepth,
     /// When a sidebar row spells its full name out on hover.
     pub sidebar_tooltips: SidebarTooltips,
-    /// Whether a sidebar icon explains itself on hover — what a button does,
-    /// what a status badge reports.  A separate axis from
+    /// Whether a sidebar icon explains itself on hover, such as what a button
+    /// does or what a status badge reports. A separate axis from
     /// [`Self::sidebar_tooltips`], which reveals a name the row had to cut off:
     /// an icon's hint never depends on the panel's width.
     pub icon_tooltips: bool,
@@ -1485,9 +1475,9 @@ pub struct UiTheme {
     /// a straight rule at a fixed offset either way.
     pub decorations: Decorations,
     /// Paint a badge showing each worktree branch's upstream state. An
-    /// unmodified config does no extra ref work.  The state comes
-    /// from local refs only — nothing fetches, so a branch deleted on the remote
-    /// still reads as tracked until something prunes.
+    /// unmodified config does no extra ref work. The state comes from local
+    /// refs only. Nothing fetches, so a branch deleted on the remote still
+    /// reads as tracked until something prunes.
     pub upstream_status: bool,
     /// Re-check on a 1.5 s tick whether each listed worktree's checkout is
     /// still on disk, so a `git worktree remove` typed into one of our own
@@ -1505,10 +1495,10 @@ pub struct UiTheme {
     /// config keeps click-through-to-terminal behavior.
     pub sidebar_click_focus: bool,
     /// `[ui] focus_priority_boost`: put the session on screen one scheduling
-    /// class above normal — its shell and every process that shell starts, at
-    /// any depth — so a build saturating the machine cannot starve what the
-    /// user is typing into.  Follows focus, and raises nothing while the
-    /// window is in the background. Windows only.
+    /// class above normal. That covers its shell and every process that shell
+    /// starts, at any depth, so a build saturating the machine cannot starve
+    /// what the user is typing into. Follows focus, and raises nothing while
+    /// the window is in the background. Windows only.
     pub focus_priority_boost: bool,
     /// `[ui] async_session_spawn`: open a session's PTY on a worker instead
     /// of inside the frame that asked for it.  Creating a console process
@@ -1518,10 +1508,10 @@ pub struct UiTheme {
     /// PTY attaches; anything typed in between is replayed.
     pub async_session_spawn: bool,
     /// `[ui] reap_descendants_on_close`: end everything a session started when
-    /// that session closes, at any depth.  The console reaps only the clients
-    /// attached to it, so a process that left the console — an editor's search
-    /// helper, anything started detached — otherwise outlives the terminal.  A
-    /// process that means to survive can still say so with
+    /// that session closes, at any depth. The console reaps only the clients
+    /// attached to it, so a process that left the console, such as an editor's
+    /// search helper or anything started detached, otherwise outlives the
+    /// terminal. A process that means to survive can still say so with
     /// `CREATE_BREAKAWAY_FROM_JOB`. Windows only.
     pub reap_descendants_on_close: bool,
     /// `[ui] vsync`: block each present until the display's next refresh, as
@@ -1531,8 +1521,8 @@ pub struct UiTheme {
     pub vsync: bool,
     /// `[ui] worktree_name`: template for worktree row labels (subst syntax:
     /// `$name`, `$branch`, `$path`, `${var:fallback}`; `$pr` is the branch's
-    /// PR number as `#123`, absent when none is known — it needs
-    /// `pr_status = true`, which is what polls `gh`).  `None` keeps the
+    /// PR number as `#123`, absent when none is known, and needs
+    /// `pr_status = true`, which is what polls `gh`). `None` keeps the
     /// plain worktree name.
     pub worktree_name: Option<String>,
     /// `[ui] project_name`: template for project row labels (`$name`, `$path`).
@@ -1592,9 +1582,9 @@ impl Default for UiTheme {
     }
 }
 
-/// Where new git worktrees are created.  alacritree-only, lives under
-/// `[workspace]` in `alacritree.toml`.  Every base directory — default,
-/// global, or override — gets the `<project>-<hash>/<branch>` layout beneath
+/// Where new git worktrees are created. alacritree-only, lives under
+/// `[workspace]` in `alacritree.toml`. Every base directory, whether default,
+/// global, or override, gets the `<project>-<hash>/<branch>` layout beneath
 /// it; changing these options never moves existing worktrees because
 /// discovery goes through `git worktree list`.
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -1848,7 +1838,7 @@ pub fn load(config_dir: Option<&Path>, overrides: &[toml::Value]) -> (Config, Ve
             // `stock_config`, not `Config::default`: the built-in key bindings
             // are filled in on the way through `RawConfig`, so falling back to
             // the bare struct default would answer a typo in the config with a
-            // terminal that has no bindings at all — no paste, no copy, no font
+            // terminal that has no bindings at all: no paste, no copy, no font
             // size, and no way to reach the config to fix it.
             log::warn!("invalid alacritty/alacritree config, using defaults: {e}");
             return (stock_config(), files);
@@ -2083,8 +2073,8 @@ struct RawConfig {
     /// selection pairs.
     colors: RawColors,
     /// alacritree's own presentation: sidebar colors, icons, tooltips, shell
-    /// profiles, and everything else the terminal grid does not own.  Belongs
-    /// in `alacritree.toml` — upstream alacritty warns about it.
+    /// profiles, and everything else the terminal grid does not own. Belongs
+    /// in `alacritree.toml`, since upstream alacritty warns about it.
     ui: RawUi,
     /// Where alacritree creates git worktrees.  `alacritree.toml` only.
     workspace: RawWorkspace,
@@ -2124,9 +2114,9 @@ struct RawConfig {
     integrations: RawIntegrations,
 }
 
-/// Subset of alacritty's `[general]` section that alacritree honors.  It
+/// Subset of alacritty's `[general]` section that alacritree honors. It
 /// lives in the shared `alacritty.toml`, so disabling alacritty's socket
-/// disables ours too — the two sockets are separate files, but the intent
+/// disables ours too. The two sockets are separate files, but the intent
 /// ("no IPC") is the same.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
@@ -2723,8 +2713,8 @@ struct RawIndexed {
     color: RgbStr,
 }
 
-/// Top-level `[wsl]`: platform-integration options.  Lives outside `[ui]`
-/// because nothing here is presentation — it governs how the app talks to
+/// Top-level `[wsl]`: platform-integration options. Lives outside `[ui]`
+/// because nothing here is presentation. It governs how the app talks to
 /// distros.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
@@ -2837,7 +2827,7 @@ struct RawIcons {
     attention: Option<RawIconStyle>,
 }
 
-/// A default icon is the glyph alone — no colour, no weight, no size.
+/// A default icon is the glyph alone, with no colour, weight, or size.
 fn raw_glyph(g: BakedGlyph) -> RawIconStyle {
     RawIconStyle::Glyph(g.as_str().to_string())
 }
@@ -3139,7 +3129,9 @@ struct RawIntegrations {
     /// The GitHub CLI behind PR badges and diff base branches.
     gh: RawGh,
     /// The Doppler CLI behind scope mirroring for new worktrees.
-    doppler: RawDoppler,
+    doppler: alacritree_doppler::RawDoppler,
+    /// Programs to run when a worktree is created, first opened, or removed.
+    checkout_hooks: alacritree_checkout_hooks::RawCheckoutHooks,
     /// Agents running under a herdr server.
     herdr: RawHerdr,
     /// Panes of running zellij sessions.
@@ -3235,7 +3227,6 @@ impl RawGh {
         }
     }
 }
-raw_tool_table!(RawDoppler, "doppler");
 raw_tool_table!(RawDelta, "delta");
 raw_tool_table!(RawTuicr, "tuicr");
 
@@ -3354,7 +3345,8 @@ impl RawIntegrations {
         IntegrationsConfig {
             git: tool_config(self.git.path, self.git.wsl_path, Tool::Git),
             gh: self.gh.resolve(&moved),
-            doppler: tool_config(self.doppler.path, self.doppler.wsl_path, Tool::Doppler),
+            doppler: self.doppler.resolve(),
+            checkout_hooks: self.checkout_hooks.resolve(),
             herdr: self.herdr.resolve(moved.herdr_icon),
             zellij: self.zellij.resolve(),
             delta: delta_config(self.delta.path, self.delta.wsl_path, moved.delta_path),
@@ -3383,15 +3375,6 @@ fn moved_key<T>(new: Option<T>, old: Option<T>, from: &str, to: &str) -> Option<
         log::warn!("{from} is deprecated; set {to}");
     }
     new.or(old)
-}
-
-/// A blank path means the side's default: the tool's name natively, and
-/// discovery inside WSL.
-fn tool_config(path: String, wsl_path: String, tool: Tool) -> ToolConfig {
-    ToolConfig {
-        path: if path.trim().is_empty() { tool.name().to_string() } else { path },
-        wsl_path: Some(wsl_path).filter(|path| !path.trim().is_empty()),
-    }
 }
 
 /// `[ui] delta_path` was one path used on both sides. It still fills each
@@ -3655,7 +3638,8 @@ struct RawUi {
     /// rendered: "preserve" | "follow".
     sidebar_focus: ClosedSet<SidebarFocus>,
     /// Whether the projects sidebar scrolls to the session on screen whenever
-    /// it changes — a cycling key, a click, the palette, an IPC request.
+    /// it changes, whether by a cycling key, a click, the palette, or an IPC
+    /// request.
     /// The sidebar cursor is left where it was.
     sidebar_follow_active: bool,
     /// Where a row the sidebar scrolled to is parked: "minimal" | "center".
@@ -4400,9 +4384,9 @@ mod tests {
     }
 
     /// A config that parses as TOML but does not fit the schema drops *every*
-    /// setting in *both* files.  The fallback has to be the config a fresh
+    /// setting in *both* files. The fallback has to be the config a fresh
     /// install runs, or one mistyped value answers with a terminal that cannot
-    /// paste, copy, or resize its font — and cannot reach the file to fix it.
+    /// paste, copy, or resize its font, and cannot reach the file to fix it.
     #[test]
     fn a_config_that_fails_the_schema_still_leaves_the_built_in_bindings() {
         let dir = config_dir(&[("alacritree.toml", "[ui]\nasync_session_spawn = \"yes\"\n")]);
@@ -4755,7 +4739,8 @@ show_panes = true
     #[test]
     fn tool_paths_default_to_their_names_and_discovery_inside_wsl() {
         let config = config_from("");
-        for tool in Tool::ALL {
+        use strum::VariantArray;
+        for &tool in Tool::VARIANTS {
             assert_eq!(config.integrations.paths(tool), ToolPaths::named(tool), "{tool:?}");
         }
     }
@@ -4926,7 +4911,7 @@ wsl_path =              '/usr/bin/task'
 
         // `RgbStr` rejects a blank string and a raw-schema error discards the
         // whole merged config, so an empty color is a mistake to fix, not a way
-        // to say "absent" — omit the key instead.
+        // to say "absent". Omit the key instead.
         let value: toml::Value =
             toml::from_str("[ui.path_style.filename]\ncolor = \"\"").expect("valid toml");
         let raw: Result<RawConfig, _> = value.try_into();
@@ -5291,6 +5276,21 @@ wsl_path =              '/usr/bin/task'
         assert!(parse("").font.fallback.is_empty());
     }
 
+    /// alacritty.toml is shared with alacritty and loaded first; a hook it
+    /// defines must be switchable off from alacritree.toml.
+    #[test]
+    fn a_command_hook_can_be_disabled_by_the_later_file() {
+        let base: toml::Value = toml::from_str(
+            "[integrations.checkout_hooks.command.mise]\npath = \"mise\"\non_created = [\"trust\"]",
+        )
+        .unwrap();
+        let over: toml::Value =
+            toml::from_str("[integrations.checkout_hooks.command.mise]\nenabled = false").unwrap();
+        let merged = merge(base, over);
+        let raw: RawConfig = merged.try_into().unwrap();
+        assert!(raw.into_config().integrations.checkout_hooks.is_empty());
+    }
+
     #[test]
     fn font_fallback_arrays_concatenate_across_files() {
         // alacritty merge semantics: an array in alacritree.toml appends to
@@ -5494,7 +5494,7 @@ program = "second"
     }
 
     /// The face is appended last, so enabling it cannot disturb a font that
-    /// already renders a glyph — which is why it is on unless refused.
+    /// already renders a glyph, which is why it is on unless refused.
     #[test]
     fn builtin_symbols_defaults_on_and_can_be_refused() {
         assert!(parse("").ui_font.builtin_symbols);
@@ -5536,7 +5536,7 @@ program = "second"
     #[test]
     fn blank_icon_override_falls_back() {
         // `build_icons` stores a blank override's glyph as-is (blank, not
-        // `None`) and defers filtering to `or_glyph` at the paint site — the
+        // `None`) and defers filtering to `or_glyph` at the paint site, the
         // same deferral a table with no `glyph` key gets. A sentinel default
         // that differs from both the raw blank input and every built-in
         // glyph makes the assertion fail if that filtering ever breaks.
@@ -5949,7 +5949,7 @@ program = "second"
     }
 
     /// A directory the user chose may hold files alacritree never wrote, so it is
-    /// never swept — that is what makes pointing this at a pictures folder safe.
+    /// never swept. That is what makes pointing this at a pictures folder safe.
     #[test]
     fn a_configured_image_dir_is_not_owned() {
         let ui = ui_from_toml("[ui.paste]\nimage_dir = \"~/shots\"");
@@ -6016,7 +6016,7 @@ program = "second"
     #[test]
     fn the_chrome_slice_carries_the_action_and_decorative_glyphs() {
         let chrome: Vec<&str> = CHROME_GLYPHS.iter().map(|g| g.as_str()).collect();
-        for g in ["+", "×", "↻", "⇅", "·", "—", "•", "…", "↓", "⠿", "▌"] {
+        for g in ["+", "×", "↻", "⇅", "·", "\u{2014}", "•", "…", "↓", "⠿", "▌"] {
             assert!(chrome.contains(&g), "{g} is missing from CHROME_GLYPHS");
         }
         // The status marks share codepoints with icons in the other slice, so
@@ -6028,7 +6028,7 @@ program = "second"
 
     /// A derived `Default` on a bare `bool` would make this false and silently
     /// invert the intended default, so the raw field is an `Option` resolved with
-    /// `unwrap_or` — the same shape `wsl.resident_helper` uses.
+    /// `unwrap_or`, the same shape `wsl.resident_helper` uses.
     #[test]
     fn crash_logging_is_on_unless_asked_otherwise() {
         let raw: RawConfig = toml::from_str("").unwrap();
@@ -6222,7 +6222,7 @@ program = "second"
             .find(|(_, (a, b))| a != b)
             .map_or((0, "", ""), |(i, (a, b))| (i + 1, a, b));
         panic!(
-            "a config default moved — regenerate with `devkit run task test --env \
+            "a config default moved. Regenerate with `devkit run task test --env \
              ALACRITREE_UPDATE_STOCK=1` only if you meant to change it\n\nfirst difference at \
              line {line}:\n  was: {was}\n  is:  {is}"
         );

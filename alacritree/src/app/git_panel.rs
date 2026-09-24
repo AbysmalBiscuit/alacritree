@@ -309,7 +309,7 @@ impl AlacritreeApp {
             .or_insert_with(|| StatusCache::new(path.clone()));
 
         // Use whatever branch the cache already knows to query the PR
-        // cache without waiting for a fresh compute — first frame may
+        // cache without waiting for a fresh compute. The first frame may
         // be `None`, which `pr_cache.poll` handles by returning early.
         let cached_branch = cache.current_branch().map(str::to_string);
         let pr_info = self.pr_cache.poll(&path, cached_branch.as_deref(), ctx);
@@ -1029,8 +1029,8 @@ pub(super) fn branch_diff_row(
     resp
 }
 
-/// The git panel's header path.  It stays selectable although the panel turns
-/// label selection off, and — being a header rather than a row — keeps
+/// The git panel's header path. It stays selectable although the panel turns
+/// label selection off. Being a header rather than a row, it keeps
 /// `egui::Label`'s own elided-text tooltip instead of answering to
 /// `[ui] sidebar_tooltips`.
 pub(super) fn path_header_label(
@@ -1441,14 +1441,15 @@ mod tests {
         let _lock = crate::tools::test_configuration_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        struct RestoreToolConfiguration([crate::tools::ToolPaths; 7]);
+        use strum::EnumCount;
+        struct RestoreToolConfiguration([crate::tools::ToolPaths; crate::tools::Tool::COUNT]);
         impl Drop for RestoreToolConfiguration {
             fn drop(&mut self) {
                 crate::tools::configure(self.0.clone());
             }
         }
         let _restore = RestoreToolConfiguration(crate::tools::test_configuration());
-        let mut configured = crate::tools::Tool::ALL.map(crate::tools::ToolPaths::named);
+        let mut configured = crate::tools::Tool::table(crate::tools::ToolPaths::named);
         configured[crate::tools::Tool::Git as usize] = crate::tools::ToolPaths {
             native: "C:/native/git.exe".to_string(),
             wsl: Some("/opt/wsl/bin/git".to_string()),

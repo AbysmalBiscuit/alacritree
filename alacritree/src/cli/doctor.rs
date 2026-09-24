@@ -1,13 +1,13 @@
-//! `alacritree doctor` — a look at everything alacritree needs but never
+//! `alacritree doctor` looks at everything alacritree needs but never
 //! complains about.
 //!
 //! Most of what alacritree depends on is deliberately best-effort: a missing
 //! `gh` falls back to the repo's default branch, a missing `doppler` skips
 //! scope mirroring, a malformed `alacritty.toml` loads defaults, and a corrupt
-//! `state.toml` opens an empty sidebar.  Every one of those is the right call in
-//! the app — none of them should stop a terminal from opening — but together
-//! they mean a broken setup looks exactly like a working one.  This is the one
-//! place that says so out loud.
+//! `state.toml` opens an empty sidebar. Every one of those is the right call in
+//! the app, since none of them should stop a terminal from opening. Together,
+//! though, they mean a broken setup looks exactly like a working one. This is the
+//! one place that says so out loud.
 //!
 //! It answers without a running instance, because "nothing happens when I run
 //! it" is precisely when it gets used.
@@ -18,6 +18,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use strum::VariantArray;
 
 use crate::config::{self, Config, ConfigDiagnosis, ConfigFile, Profile, ShellConfig};
 use crate::crash_log::{Verdict, classify};
@@ -110,7 +111,7 @@ fn report(
     tools::configure(config.integrations.tool_paths());
 
     // Rows are grouped by section on the way out, so each section has to be
-    // added in one run — a section split in two prints its header twice.
+    // added in one run. A section split in two prints its header twice.
     let mut checks = binary_checks();
     checks.extend(gh_auth_check());
     checks.extend(diff_viewer_check(&config.integrations.diff_viewer.viewer));
@@ -143,7 +144,7 @@ fn tools() -> Vec<Tool> {
         Tool {
             program: "doppler",
             consequence: "new worktrees do not inherit the main checkout's scopes",
-            need: doppler_need(doppler_configured()),
+            need: doppler_need(alacritree_doppler::is_set_up()),
         },
     ];
     if cfg!(target_os = "linux") {
@@ -181,8 +182,9 @@ fn diff_viewer_check(viewer: &Viewer) -> Option<Check> {
 /// A registry tool's configured path, which `locate` resolves as a path when
 /// it is one; other programs are looked up by their own name.
 fn configured_program(program: &str) -> String {
-    tools::Tool::ALL
-        .into_iter()
+    tools::Tool::VARIANTS
+        .iter()
+        .copied()
         .find(|tool| tool.name() == program)
         .map_or_else(|| program.to_string(), tools::program)
 }
@@ -195,8 +197,8 @@ fn tool_check(tool: &Tool, found: Option<Found>) -> Check {
         },
         None => {
             let (status, detail) = match tool.need {
-                Need::Required => (Status::Fail, format!("not on PATH — {}", tool.consequence)),
-                Need::Optional => (Status::Warn, format!("not on PATH — {}", tool.consequence)),
+                Need::Required => (Status::Fail, format!("not on PATH, so {}", tool.consequence)),
+                Need::Optional => (Status::Warn, format!("not on PATH, so {}", tool.consequence)),
                 Need::Unused => (Status::Ok, "not installed, and unused here".to_string()),
             };
             check("binaries", tool.program, status, detail)
@@ -204,19 +206,13 @@ fn tool_check(tool: &Tool, found: Option<Found>) -> Check {
     }
 }
 
-/// Doppler scope mirroring only matters to someone who uses Doppler, and the
-/// only evidence of that is its config file — the CLI writes one on first
-/// `doppler setup`, and `doppler.rs` reads scopes straight out of it.
+/// Doppler scope mirroring only matters to someone who has set Doppler up.
 fn doppler_need(configured: bool) -> Need {
     if configured { Need::Optional } else { Need::Unused }
 }
 
-fn doppler_configured() -> bool {
-    home::home_dir().is_some_and(|home| home.join(".doppler").join(".doppler.yaml").is_file())
-}
-
-/// `gh` present but logged out fails exactly the way a missing `gh` does —
-/// silently — so it needs saying separately.
+/// `gh` present but logged out fails exactly the way a missing `gh` does,
+/// silently, so it needs saying separately.
 // The report's job is to run the tools it reports on, from a CLI with no
 // window to stall.
 #[allow(clippy::disallowed_methods)]
@@ -234,7 +230,7 @@ fn gh_auth_check() -> Option<Check> {
     Some(if authenticated {
         check("binaries", "gh auth", Status::Ok, "authenticated")
     } else {
-        let detail = "not authenticated — PR base branches fall back to the repo default";
+        let detail = "not authenticated, so PR base branches fall back to the repo default";
         check("binaries", "gh auth", Status::Warn, detail)
     })
 }
@@ -245,7 +241,7 @@ fn gh_auth_check() -> Option<Check> {
 /// tell.
 const WSL_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// What a probe of one distro found. It has a path per entry of [`tools::Tool::ALL`], or
+/// What a probe of one distro found. It has a path per [`tools::Tool`], by discriminant, or
 /// why the distro could not be asked.
 type Probe = Result<Vec<Option<String>>, String>;
 
@@ -266,15 +262,14 @@ fn wsl_checks(distros: &[wsl::WslDistro]) -> Vec<Check> {
     let probes = probe_distros(distros);
     let mut checks = vec![check("wsl", "distros", Status::Ok, names.join(", "))];
     checks.extend(probes.iter().map(|(name, probe)| wsl_distro_check(name, probe)));
-    checks.extend(wsl_doppler_check(&probes));
     checks
 }
 
-/// Probes every registry tool. doppler is among them even though nothing runs
-/// it inside a distro, because [`wsl_doppler_check`] is the only place that says so.
+/// Probes every registry tool, since each is one alacritree runs for a project
+/// inside the distro.
 fn probe_distros(distros: &[wsl::WslDistro]) -> Vec<(String, Probe)> {
     let (tx, rx) = std::sync::mpsc::channel();
-    let names = tools::Tool::ALL.map(tools::Tool::name);
+    let names = tools::Tool::table(tools::Tool::name);
     for distro in distros {
         let tx = tx.clone();
         let name = distro.name.clone();
@@ -313,12 +308,12 @@ fn wsl_distro_check(name: &str, probe: &Probe) -> Check {
         Ok(found) => found,
         // Not alacritree's fault, but every project inside the distro is
         // unreadable until it starts.
-        Err(e) => return check("wsl", name, Status::Warn, format!("unreachable — {e}")),
+        Err(e) => return check("wsl", name, Status::Warn, format!("unreachable: {e}")),
     };
 
     let mut present = Vec::new();
     let mut missing = Vec::new();
-    for tool in tools::Tool::ALL {
+    for &tool in tools::Tool::VARIANTS {
         match tool_path(found, tool) {
             Some(path) => present.push(format!("{} {path}", tool.name())),
             None => missing.push(tool.name()),
@@ -337,35 +332,11 @@ fn wsl_distro_check(name: &str, probe: &Probe) -> Check {
     check("wsl", name, status, detail)
 }
 
-/// Scope mirroring runs the Windows `doppler` against Windows paths, so a
-/// distro's own doppler is never consulted and a WSL project's worktrees come
-/// out unscoped however well doppler is set up inside the distro.  Someone
-/// who installed it there did so expecting otherwise.
-fn wsl_doppler_check(probes: &[(String, Probe)]) -> Option<Check> {
-    let distros: Vec<&str> = probes
-        .iter()
-        .filter(|(_, probe)| {
-            probe.as_ref().is_ok_and(|found| tool_path(found, tools::Tool::Doppler).is_some())
-        })
-        .map(|(name, _)| name.as_str())
-        .collect();
-    if distros.is_empty() {
-        return None;
-    }
-    let detail = format!(
-        "installed in {} — scope mirroring only runs the Windows doppler, so worktrees of a \
-         project inside a distro are not scoped",
-        distros.join(", ")
-    );
-    Some(check("wsl", "doppler", Status::Warn, detail))
-}
-
 /// Where a probe put `tool`, by tool rather than by index, so
-/// [`tools::Tool::ALL`] can be reordered without silently renaming
+/// [`tools::Tool`]'s variants can be reordered without silently renaming
 /// everyone's results.
 fn tool_path(found: &[Option<String>], tool: tools::Tool) -> Option<&str> {
-    let slot = tools::Tool::ALL.iter().position(|t| *t == tool)?;
-    found.get(slot)?.as_deref()
+    found.get(tool as usize)?.as_deref()
 }
 
 /// A configured shell that cannot be resolved takes every session with it: the
@@ -377,7 +348,7 @@ fn shell_check(shell: Option<&ShellConfig>) -> Check {
     match locate(&shell.program) {
         Some(path) => check("binaries", "shell", Status::Ok, path.display().to_string()),
         None => {
-            let detail = format!("{} is not on PATH — sessions cannot start", shell.program);
+            let detail = format!("{} is not on PATH, so sessions cannot start", shell.program);
             check("binaries", "shell", Status::Fail, detail)
         },
     }
@@ -403,13 +374,13 @@ fn config_file_check(file: &ConfigFile) -> Check {
             check("config", name, Status::Fail, detail)
         },
         (Some(path), None) => check("config", name, Status::Ok, path.display().to_string()),
-        (None, _) => check("config", name, Status::Ok, "not found — built-in defaults"),
+        (None, _) => check("config", name, Status::Ok, "not found, using built-in defaults"),
     }
 }
 
 fn persisted_state_checks(config: &Config) -> Vec<Check> {
     let Some(path) = state::config_path() else {
-        let detail = "no config directory — the sidebar cannot persist";
+        let detail = "no config directory, so the sidebar cannot persist";
         return vec![check("state", "state.toml", Status::Fail, detail)];
     };
     let distros: Vec<String> = wsl::distros().into_iter().map(|d| d.name).collect();
@@ -458,18 +429,18 @@ fn state_checks(path: &Path, distros: &[String], profiles: &[Profile]) -> Vec<Ch
 /// override that had already been passed over.
 fn ignored_override(raw: &str, distros: &[String], profiles: &[Profile]) -> Option<String> {
     let Some(choice) = ShellChoice::parse(raw) else {
-        return Some(format!("`{raw}` is not a shell override — the automatic shell is used"));
+        return Some(format!("`{raw}` is not a shell override, so the automatic shell is used"));
     };
 
     match (&choice, shell_decision(Some(&choice), None, distros, profiles, None)) {
         // Pinning to Windows *is* a decision to use the config shell.
         (ShellChoice::Windows, _) => None,
         (ShellChoice::Wsl(distro), ShellDecision::ConfigShell) => {
-            Some(format!("WSL distro `{distro}` is not installed — the automatic shell is used"))
+            Some(format!("WSL distro `{distro}` is not installed, so the automatic shell is used"))
         },
-        (ShellChoice::Profile(name), ShellDecision::ConfigShell) => {
-            Some(format!("no `[[ui.profiles]]` entry named `{name}` — the automatic shell is used"))
-        },
+        (ShellChoice::Profile(name), ShellDecision::ConfigShell) => Some(format!(
+            "no `[[ui.profiles]]` entry named `{name}`, so the automatic shell is used"
+        )),
         _ => None,
     }
 }
@@ -478,7 +449,7 @@ fn ipc_checks(socket: Option<&Path>, enabled: bool) -> Vec<Check> {
     let mut checks = Vec::new();
 
     if !enabled {
-        let detail = "disabled in config — the CLI and MCP cannot reach a running window";
+        let detail = "disabled in config, so the CLI and MCP cannot reach a running window";
         checks.push(check("ipc", "ipc_socket", Status::Warn, detail));
     }
     checks.push(check(
@@ -493,7 +464,7 @@ fn ipc_checks(socket: Option<&Path>, enabled: bool) -> Vec<Check> {
         // Nothing running is not a fault: the CLI serves projects, git status
         // and worktrees from disk when no window is up.
         Err(SendError::NoInstance) => {
-            check("ipc", "instance", Status::Ok, "none running — offline commands still work")
+            check("ipc", "instance", Status::Ok, "none running, but offline commands still work")
         },
         Err(SendError::Failed(e)) => {
             check("ipc", "instance", Status::Warn, format!("running but not answering: {e}"))
@@ -568,9 +539,9 @@ struct AlacritreeProcess {
     bridge: bool,
 }
 
-/// Running processes pin their exe images.  Builds and installs rename a
+/// Running processes pin their exe images. Builds and installs rename a
 /// pinned exe aside rather than fail, so a pin is not a fault and the rows
-/// are informational — but when a rename does fail (antivirus, a read-only
+/// are informational. When a rename does fail (antivirus, a read-only
 /// volume), this section turns "Access is denied (os error 5)" into a pid
 /// worth closing.
 #[cfg(windows)]
@@ -748,6 +719,7 @@ fn to_json(checks: &[Check]) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use strum::EnumCount;
     use tempfile::TempDir;
 
     use super::*;
@@ -809,17 +781,16 @@ mod tests {
     }
 
     /// Doppler drives one optional feature, and most people have never wanted
-    /// it.  Warning that it is absent would put a permanent warning on every
-    /// machine that simply does not use Doppler — and a report that always has
+    /// it. Warning that it is absent would put a permanent warning on every
+    /// machine that simply does not use Doppler, and a report that always has
     /// a warning in it is a report nobody reads.
     #[test]
     fn a_tool_this_machine_does_not_use_is_not_worth_warning_about() {
         assert_eq!(tool_check(&DOPPLER, None).status, Status::Ok);
     }
 
-    /// The evidence is Doppler's own config file: it is written on `doppler
-    /// setup`, and it is where `doppler.rs` reads scopes from.  Someone who has
-    /// set Doppler up and then lost the binary does want to hear about it.
+    /// Someone who has set Doppler up and then lost the binary does want to
+    /// hear about it.
     #[test]
     fn doppler_is_only_worth_warning_about_once_it_has_been_set_up() {
         assert_eq!(doppler_need(true), Need::Optional);
@@ -831,7 +802,7 @@ mod tests {
     }
 
     /// Nothing to say on a machine without WSL, which includes every
-    /// non-Windows one — a section of rows about an absent subsystem is noise
+    /// non-Windows one. A section of rows about an absent subsystem is noise
     /// in the report that has to stay readable.
     #[test]
     fn no_distros_means_no_wsl_section() {
@@ -862,7 +833,10 @@ mod tests {
     /// error is ever shown.
     #[test]
     fn a_distro_without_git_warns() {
-        assert_eq!(wsl_distro_check("Ubuntu", &probe(&[None; 7])).status, Status::Warn);
+        assert_eq!(
+            wsl_distro_check("Ubuntu", &probe(&[None; tools::Tool::COUNT])).status,
+            Status::Warn
+        );
         let git_only = probe(&[Some("/usr/bin/git"), None, None, None, None, None]);
         assert_eq!(wsl_distro_check("Ubuntu", &git_only).status, Status::Ok);
     }
@@ -885,29 +859,6 @@ mod tests {
         assert!(check.detail.contains("no answer in 15s"), "{:?}", check.detail);
     }
 
-    /// Doppler inside a distro is set up by someone who expects worktrees
-    /// there to inherit its scopes.  They do not, and the app never says so.
-    #[test]
-    fn doppler_inside_a_distro_is_reported_as_unused() {
-        let probes = vec![
-            (
-                "Ubuntu".to_string(),
-                probe(&[None, None, None, Some("/usr/bin/doppler"), None, None]),
-            ),
-            ("kali-linux".to_string(), probe(&[None; 7])),
-        ];
-        let check = wsl_doppler_check(&probes).expect("a warning about the unused doppler");
-        assert_eq!(check.status, Status::Warn);
-        assert!(check.detail.contains("Ubuntu"), "{:?}", check.detail);
-        assert!(!check.detail.contains("kali-linux"), "{:?}", check.detail);
-    }
-
-    #[test]
-    fn no_distro_has_doppler_and_nothing_is_said() {
-        let probes = vec![("Ubuntu".to_string(), probe(&[None; 7]))];
-        assert!(wsl_doppler_check(&probes).is_none());
-    }
-
     /// A missing optional tool has to say what it costs, or the reader has no
     /// way to judge whether to install it.
     #[test]
@@ -920,7 +871,8 @@ mod tests {
     }
 
     /// The version and the path are the two things worth knowing when a tool is
-    /// present but misbehaving — an old git, or a shim ahead of the real one.
+    /// present but misbehaving, such as an old git or a shim ahead of the real
+    /// one.
     #[test]
     fn a_found_tool_reports_its_version_and_path() {
         let found =
@@ -985,7 +937,8 @@ mod tests {
 
     /// Both files can parse and still be thrown away wholesale: a value of the
     /// wrong type sends `load` down its defaults path, discarding every setting
-    /// in both files.  That deserves its own check — the per-file ones are green.
+    /// in both files. That deserves its own check, since the per-file ones are
+    /// green.
     #[test]
     fn a_config_that_does_not_fit_the_schema_fails() {
         let d = diagnosis(
@@ -1095,7 +1048,7 @@ mod tests {
         assert_eq!(ignored_override("windows", &[], &[]), None);
     }
 
-    /// A project with no override at all has nothing to report — most projects
+    /// A project with no override at all has nothing to report. Most projects
     /// are this, and a row each would bury the real warnings.
     #[test]
     fn a_project_with_no_override_is_not_reported() {
@@ -1110,7 +1063,7 @@ mod tests {
     }
 
     /// `load_from` hands back an empty state on a parse error, so a corrupt file
-    /// presents as a first run — with the project list quietly gone.  A user
+    /// presents as a first run, with the project list quietly gone. A user
     /// staring at an empty sidebar needs to be told the file is broken, not
     /// shown a cheerful "0 projects".
     #[test]
@@ -1201,8 +1154,8 @@ mod tests {
         }
     }
 
-    /// A bridge lives as long as its MCP client, not as long as the window —
-    /// telling them apart tells the user which program to close.
+    /// A bridge lives as long as its MCP client, not as long as the window.
+    /// Telling them apart tells the user which program to close.
     #[cfg(windows)]
     #[test]
     fn a_bridge_and_a_window_are_told_apart() {
@@ -1212,9 +1165,9 @@ mod tests {
     }
 
     /// The row has to name the pid and the file, or the reader knows neither
-    /// what to close nor which file is pinned.  It stays `ok`, not `warn`:
+    /// what to close nor which file is pinned. It stays `ok`, not `warn`:
     /// builds and installs rename a pinned exe aside rather than fail, so a
-    /// running process is the normal state of a working machine — and a
+    /// running process is the normal state of a working machine, and a
     /// report that always has a warning in it stops being read.
     #[cfg(windows)]
     #[test]
@@ -1276,7 +1229,7 @@ mod tests {
     }
 
     /// A record written after the exit marker means a detached worker outlived the
-    /// shutdown — a real defect, even though the process exited cleanly.
+    /// shutdown. That is a real defect, even though the process exited cleanly.
     #[test]
     fn a_record_after_the_exit_marker_warns() {
         let dir = tempfile::tempdir().expect("a temp dir");

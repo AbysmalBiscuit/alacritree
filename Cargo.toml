@@ -5,6 +5,9 @@ members = [
     "alacritty_terminal",
     "alacritty_config",
     "alacritty_config_derive",
+    # Not `crates/*`: release-please's cargo-workspace plugin globs files too,
+    # and would take crates/clippy.toml for a crate.
+    "crates/alacritree_*",
 ]
 resolver = "2"
 
@@ -23,6 +26,11 @@ inherits = "release"
 lto = "thin"
 
 [workspace.dependencies]
+alacritree_checkout_hooks = { path = "crates/alacritree_checkout_hooks" }
+alacritree_common = { path = "crates/alacritree_common" }
+alacritree_doppler = { path = "crates/alacritree_doppler" }
+ambassador = "0.5.1"
+thiserror = "2"
 toml = "0.9.11"
 toml_edit = "0.24.0"
 
@@ -30,6 +38,6 @@ toml_edit = "0.24.0"
 [patch.crates-io]
 x11-clipboard = { git = "https://github.com/quininer/x11-clipboard.git", rev = "19ab2163cf0bd0db607e827a5214571990307866" }
 # Vendored egui-winit with a one-liner so Ctrl+V falls through to a Key event
-# when the clipboard isn't text (e.g. holds an image) — matches alacritty's
-# raw 0x16 forwarding and lets TUIs like Claude Code do their own wl-paste.
+# when the clipboard isn't text (e.g. holds an image), matching alacritty's
+# raw 0x16 forwarding and letting TUIs like Claude Code do their own wl-paste.
 egui-winit = { path = "egui-winit" }

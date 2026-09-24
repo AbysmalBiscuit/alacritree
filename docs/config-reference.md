@@ -172,6 +172,23 @@ Options that fit no other table.
 The other tools alacritree can notice and cooperate with. `alacritree.toml` only.
 
 
+### `[integrations.checkout_hooks]`
+
+Programs to run when a worktree is created, first opened, or removed.
+
+- `command` (table): Programs to run when a worktree is created, first opened, or removed, keyed by a name of your choice. A table rather than a list, so a hook defined in alacritty.toml can be changed or disabled by name from alacritree.toml.
+
+### `[integrations.checkout_hooks.command.<name>]`
+
+One hook: the program to run, and its arguments for each worktree event.
+
+- `enabled` (boolean, default `true`): Run this hook.
+- `on_created` (array of string, default `[]`): Arguments when alacritree creates a worktree. `{checkout}` is the new worktree and `{main}` the project's main checkout. Empty skips it.
+- `on_opened` (array of string, default `[]`): Arguments the first time this process opens a shell in a worktree, including ones created outside alacritree. Runs again after a restart, so the command must be safe to repeat. Empty skips it.
+- `on_removed` (array of string, default `[]`): Arguments after a worktree is removed. Runs in the main checkout, since the worktree is gone. Empty skips it.
+- `path` (string): The program to run on Windows or natively. A bare name is looked up on PATH.
+- `wsl_path` (string, default `""`): The program to run inside a WSL distro for a worktree there, as written. Empty looks up the file name of `path`, without directory or extension, through the distro's login shell, and a distro where that finds nothing skips the hook. A Windows `path` is never run there.
+
 ### `[integrations.delta]`
 
 The pager the delta diff viewer runs.
@@ -207,6 +224,7 @@ The viewer `preset = "custom"` runs.
 
 The Doppler CLI behind scope mirroring for new worktrees.
 
+- `enabled` (boolean, default `true`): Copy the main checkout's Doppler scopes into each new worktree, and drop them again when the worktree is removed.
 - `path` (string, default `"doppler"`): The program to run on Windows or natively. Its own name is looked up on PATH; any other value runs as written.
 - `wsl_path` (string, default `""`): The program to run inside every WSL distro, as written. Empty finds it by name through the distro's login shell.
 
@@ -320,7 +338,7 @@ The program each session runs.
 
 ## `[ui]`
 
-alacritree's own presentation: sidebar colors, icons, tooltips, shell profiles, and everything else the terminal grid does not own. Belongs in `alacritree.toml` — upstream alacritty warns about it.
+alacritree's own presentation: sidebar colors, icons, tooltips, shell profiles, and everything else the terminal grid does not own. Belongs in `alacritree.toml`, since upstream alacritty warns about it.
 
 - `async_session_spawn` (boolean, default `false`): Open a session's PTY on a worker rather than in the frame that asked for it, so spawning does not stutter.
 - `attention_grace_ms` (integer, default `0`): Grace window in milliseconds before an attention trigger pings; a session that resumes work inside it swallows the ping.
@@ -348,7 +366,7 @@ alacritree's own presentation: sidebar colors, icons, tooltips, shell profiles, 
 - `sidebar_border` (string): Color of the line between a sidebar and the terminal.
 - `sidebar_click_focus` (boolean, default `false`): Clicking a sidebar moves keyboard focus to it.
 - `sidebar_focus` ("preserve" | "follow", default `"preserve"`): How far the projects sidebar goes when the cursor's row stops being rendered: "preserve" | "follow".
-- `sidebar_follow_active` (boolean, default `false`): Whether the projects sidebar scrolls to the session on screen whenever it changes — a cycling key, a click, the palette, an IPC request. The sidebar cursor is left where it was.
+- `sidebar_follow_active` (boolean, default `false`): Whether the projects sidebar scrolls to the session on screen whenever it changes, whether by a cycling key, a click, the palette, or an IPC request. The sidebar cursor is left where it was.
 - `sidebar_foreground` (string): Sidebar text color. Unset derives it from the terminal palette.
 - `sidebar_scroll_align` ("minimal" | "center", default `"minimal"`): Where a row the sidebar scrolled to is parked: "minimal" | "center". Under "center" every cursor step re-centres the list, and clicking a row near the panel edge scrolls it out from under the pointer.
 - `sidebar_tooltips` ("off" | "elided" | "always", default `"elided"`): When a sidebar row spells its full name out on hover: "elided" | "always" | "off".

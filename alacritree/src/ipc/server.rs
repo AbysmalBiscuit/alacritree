@@ -24,17 +24,16 @@ use super::protocol::{
     IpcRequest, IpcResult, SOCKET_ENV, git_status_json, socket_dir, unlink_socket,
 };
 use super::route::{AppRequest, ConnectionRequest, DeferredRequest, Route};
-use crate::config::WorkspaceConfig;
 use crate::repaint::Repaint;
-use crate::worktree::{self as wt, CreateRequest, Progress};
+use crate::worktree::{self as wt, CreateConfig, CreateRequest, Progress};
 use crate::{git_status, jobs};
 
-/// Absolute path to the running binary.  A shell can exec the CLI through it
-/// without a PATH lookup — which is the only reliable way in a distro, where
+/// Absolute path to the running binary. A shell can exec the CLI through it
+/// without a PATH lookup, which is the only reliable way in a distro, where
 /// the Windows binary is reachable through interop but is not on `$PATH`.
 const EXE_ENV: &str = "ALACRITREE_EXE";
 
-/// How long a connection waits for the UI thread before giving up — long
+/// How long a connection waits for the UI thread before giving up. It is long
 /// enough for a busy frame, short enough that a wedged app doesn't hang
 /// clients forever.
 const APP_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -77,9 +76,9 @@ impl Drop for SocketHandle {
 
 pub(crate) fn spawn_listener(
     repaint: impl Repaint,
-    workspace: WorkspaceConfig,
+    config: CreateConfig,
 ) -> std::io::Result<(SocketHandle, Receiver<AppCall>)> {
-    let listener = listen_at(socket_path(), repaint, workspace)?;
+    let listener = listen_at(socket_path(), repaint, config)?;
 
     // Advertise the socket to child PTYs, like alacritty does with
     // ALACRITTY_SOCKET.  Startup runs before the first session spawns, so
@@ -91,8 +90,8 @@ pub(crate) fn spawn_listener(
         Err(e) => log::warn!("cannot advertise {EXE_ENV}: {e}"),
     }
 
-    // Only WSLENV-listed variables cross the wsl.exe boundary — in either
-    // direction.  Listing the socket lets programs in a distro find this
+    // Only WSLENV-listed variables cross the wsl.exe boundary, in either
+    // direction. Listing the socket lets programs in a distro find this
     // instance, whether they read the variable themselves or exec the
     // Windows CLI through interop (which inherits the distro's view); the
     // session id lets them name their own session in requests; the binary
@@ -109,13 +108,13 @@ pub(crate) fn spawn_listener(
     Ok(listener)
 }
 
-/// `WSLENV` extended with the variables alacritree exports — [`SOCKET_ENV`],
-/// [`crate::session::SESSION_ID_ENV`] and [`EXE_ENV`] — preserving whatever
-/// the user already shares across the boundary.
+/// `WSLENV` extended with [`SOCKET_ENV`], [`crate::session::SESSION_ID_ENV`]
+/// and [`EXE_ENV`], the variables alacritree exports. Whatever the user
+/// already shares across the boundary is preserved.
 ///
 /// Only the binary path carries a conversion flag: `/p` has WSL rewrite it
 /// into the distro's view of the drive, honouring whatever automount root
-/// that distro uses.  A pipe name and an id are not paths.
+/// that distro uses. A pipe name and an id are not paths.
 #[cfg(any(test, windows))]
 fn wslenv_with_alacritree_vars(current: Option<&str>) -> String {
     let mut wslenv = current.unwrap_or("").to_string();
@@ -137,7 +136,7 @@ fn wslenv_with_alacritree_vars(current: Option<&str>) -> String {
 fn listen_at(
     path: PathBuf,
     repaint: impl Repaint,
-    workspace: WorkspaceConfig,
+    config: CreateConfig,
 ) -> std::io::Result<(SocketHandle, Receiver<AppCall>)> {
     // A leftover socket file at our pid (crashed predecessor) blocks bind; only
     // remove it once we've confirmed nothing is listening.
@@ -149,7 +148,7 @@ fn listen_at(
     let listener = ListenerOptions::new().name(name).create_sync()?;
 
     let (tx, rx) = mpsc::channel();
-    let workspace = Arc::new(workspace);
+    let config = Arc::new(config);
     std::thread::Builder::new().name("alacritree-ipc".into()).spawn(move || {
         // A Windows pipe accepts new connections only while the listener is
         // between accepts, so this loop must never stop calling `accept`; the
@@ -158,10 +157,10 @@ fn listen_at(
             let Ok(stream) = listener.accept() else { continue };
             let tx = tx.clone();
             let repaint = repaint.clone();
-            let workspace = Arc::clone(&workspace);
+            let config = Arc::clone(&config);
             std::thread::Builder::new()
                 .name("alacritree-ipc-conn".into())
-                .spawn(move || handle_connection(stream, tx, repaint, &workspace))
+                .spawn(move || handle_connection(stream, tx, repaint, &config))
                 .ok();
         }
     })?;
@@ -173,7 +172,7 @@ fn handle_connection(
     stream: Stream,
     app_tx: Sender<AppCall>,
     repaint: impl Repaint,
-    workspace: &WorkspaceConfig,
+    config: &CreateConfig,
 ) {
     let mut reader = BufReader::new(&stream);
     let mut line = String::new();
@@ -182,7 +181,7 @@ fn handle_connection(
         Ok(_) => {},
     }
     let result = match serde_json::from_str::<IpcRequest>(&line) {
-        Ok(request) => dispatch(request, &app_tx, &repaint, workspace),
+        Ok(request) => dispatch(request, &app_tx, &repaint, config),
         Err(e) => Err(format!("invalid IPC request: {e}")),
     };
     let reply = match &result {
@@ -199,11 +198,11 @@ fn dispatch(
     request: IpcRequest,
     app_tx: &Sender<AppCall>,
     repaint: &impl Repaint,
-    workspace: &WorkspaceConfig,
+    config: &CreateConfig,
 ) -> IpcResult {
     match Route::from(request) {
-        // `compute` walks the working tree — the same work StatusCache
-        // pushes to a background thread — so keep it off the UI thread.
+        // `compute` walks the working tree, the same work StatusCache
+        // pushes to a background thread, so keep it off the UI thread.
         // This is already the connection thread, not the UI thread; the
         // token just proves that plainly rather than adding a real wait.
         Route::Connection(ConnectionRequest::GitStatus { path }) => {
@@ -212,7 +211,7 @@ fn dispatch(
             })))
         },
         Route::Connection(ConnectionRequest::CreateWorktree { project_root, branch }) => {
-            create_worktree(project_root, branch, app_tx, repaint, workspace)
+            create_worktree(project_root, branch, app_tx, repaint, config)
         },
         Route::App(request) => call_app(request, app_tx, repaint),
     }
@@ -237,11 +236,11 @@ fn create_worktree(
     branch: String,
     app_tx: &Sender<AppCall>,
     repaint: &impl Repaint,
-    workspace: &WorkspaceConfig,
+    config: &CreateConfig,
 ) -> IpcResult {
     wt::validate_branch_name(&branch)?;
-    let req = CreateRequest::new(project_root.clone(), None, branch, workspace);
-    let (rx, job) = wt::spawn_create(req, repaint.clone());
+    let req = CreateRequest::new(project_root.clone(), None, branch, &config.workspace);
+    let (rx, job) = wt::spawn_create(req, config.hooks.clone(), repaint.clone());
     let outcome = drain_create(&rx, IPC_CREATE_BUDGET);
     // Dropping on every path, including the deadline, is what ends the fetch
     // and returns the worker.  Holding it would leave the pool one worker
@@ -313,7 +312,7 @@ impl<R: Repaint> super::protocol::Transport for InMemory<R> {
         request: &IpcRequest,
         _timeout: Duration,
     ) -> Result<serde_json::Value, super::protocol::SendError> {
-        dispatch(request.clone(), &self.app_tx, &self.repaint, &WorkspaceConfig::default())
+        dispatch(request.clone(), &self.app_tx, &self.repaint, &CreateConfig::default())
             .map_err(super::protocol::SendError::Failed)
     }
 }
@@ -333,7 +332,7 @@ mod tests {
         assert_eq!(wslenv_with_alacritree_vars(None), ours);
         assert_eq!(wslenv_with_alacritree_vars(Some("")), ours);
         assert_eq!(wslenv_with_alacritree_vars(Some("LESS:FOO/p")), format!("LESS:FOO/p:{ours}"));
-        // Already listed — with or without conversion flags — is not repeated.
+        // Already listed, with or without conversion flags, is not repeated.
         assert_eq!(wslenv_with_alacritree_vars(Some(&ours)), ours);
         let flagged = format!("{SOCKET_ENV}/u:LESS");
         assert_eq!(
@@ -371,14 +370,14 @@ mod tests {
     }
 
     /// The client/server round trip over whatever transport the platform uses:
-    /// framing, dispatch to the app thread, and the reply.  Discovery by
-    /// scanning the socket directory is deliberately not tested — the scan
+    /// framing, dispatch to the app thread, and the reply. Discovery by
+    /// scanning the socket directory is deliberately not tested. The scan
     /// would happily find a real alacritree running on the same machine.
     #[test]
     fn round_trip_over_the_socket() {
         let repaint = Recorder::default();
         let (handle, rx) =
-            spawn_listener(repaint.clone(), WorkspaceConfig::default()).expect("listener");
+            spawn_listener(repaint.clone(), CreateConfig::default()).expect("listener");
 
         let app = std::thread::spawn(move || {
             let call = rx.recv().expect("request reached the app thread");
@@ -413,9 +412,11 @@ mod tests {
         let path = socket_dir().join(format!("alacritree-create-test-{}.sock", std::process::id()));
         // With no app thread on the other end, the refresh after the create
         // fails at once instead of waiting out the reply timeout.
-        let (handle, rx) =
-            listen_at(path, Recorder::default(), crate::test_util::workspace_under(&base))
-                .expect("listener");
+        let (handle, rx) = listen_at(path, Recorder::default(), CreateConfig {
+            workspace: crate::test_util::workspace_under(&base),
+            ..CreateConfig::default()
+        })
+        .expect("listener");
         drop(rx);
 
         let request = IpcRequest::CreateWorktree { project_root: project, branch: "topic".into() };
