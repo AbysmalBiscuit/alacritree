@@ -115,10 +115,10 @@ Without `DEVKIT_SESSION` the holder falls back to the parent pid, which differs 
 
 This checkout is a devkit project. `devkit.local.toml` configures it and is untracked, so it rides on the `docs/specs-and-plans` branch with the other local files.
 
-`worktree_include` names the untracked instructions copied into each new worktree, so an agent working there reads the same rules as one working here. It seeds them when the worktree is cut and nothing refreshes them afterwards, so after editing `AGENTS.local.md` or `CLAUDE.local.md` the change has to be pushed into the worktrees that already exist. A bare `sync.local.py` run does that as its last step; `devkit issue sync-includes --overwrite` does it on its own:
+`worktree_include` names the untracked instructions copied into each new worktree, so an agent working there reads the same rules as one working here. It seeds them when the worktree is cut and nothing refreshes them afterwards, so after editing `AGENTS.local.md` or `CLAUDE.local.md` the change has to be pushed into the worktrees that already exist. A bare `sync.local.py` run does that as its last step, and `devkit issue sync-includes` does it on its own. It prompts per worktree, and a non-interactive shell reads the prompt as no, so pass `--yes`:
 
 ```sh
-devkit issue sync-includes --overwrite
+devkit issue sync-includes --overwrite --all --yes
 ```
 
 `docm` resolves alacritty, kitty, ghostty, wezterm and zed at the versions this project pins; read those checkouts rather than recalling how they behave.
@@ -183,13 +183,6 @@ The TL;DR is mine and it is never yours to write. The template emits the heading
 `--pr-body` carries the Claude summary; pass it through a file rather than inline, since it can run long. The first `Closes` line comes from the worktree's own issue, so `--arg closes` carries only the extra ones, whitespace separated. `--arg agent_model` overrides the attribution when a different model did the work.
 
 The template renders only when the command creates a PR. Editing an open one is still `gh pr edit`, and the shape has to be preserved by hand there.
-
-
-<critical>
-The all-featurse integration only applies when not doing major refactors. While working on issue #70 or any of its children DO NOT INTEGRATE INTO all-features. A new branch for all-features will be cut from master after the refactor is done.
-</critical>
-Before opening PR or whenever I ask you, cherry-pick your changes/features into the `all-features` branch (it's normally checked out in a worktree). Then run the `install.local.py` script inside the `all-features` worktree.
-This is important so I test features before a PR.
 
 ## Merging a stack
 
