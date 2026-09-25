@@ -145,18 +145,22 @@ description = "Build alacritree"
 run = ["cargo", "build", "-p", "alacritree", "--locked"]
 
 [tasks.clippy]
-# `--no-deps` keeps clippy off the vendored crates: they are
-# `#![deny(clippy::all)]`, so a lint a newer toolchain adds becomes an error
-# nothing here may fix. `-D clippy::disallowed_methods` is on the stacked
-# branches but not yet on master, making this stricter than master's CI and
-# aligned with where the fork is going.
+# Mirrors CI's clippy step. The vendored crates are `#![deny(clippy::all)]`,
+# so `--exclude` and `--no-deps` keep a newer toolchain's lints off them.
 env = { ZCCACHE_PATH_REMAP = "off" }
-description = "Lint alacritree the way CI does"
+description = "Lint every alacritree crate the way CI does"
 run = [
     "cargo",
     "clippy",
-    "-p",
-    "alacritree",
+    "--workspace",
+    "--exclude",
+    "alacritty",
+    "--exclude",
+    "alacritty_terminal",
+    "--exclude",
+    "alacritty_config",
+    "--exclude",
+    "alacritty_config_derive",
     "--all-targets",
     "--locked",
     "--no-deps",
