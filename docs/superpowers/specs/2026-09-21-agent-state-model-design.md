@@ -27,17 +27,25 @@ One mark, the highest-ranked `ShownState` that applies:
 
 A latch that a louder state hides stays set, and shows once that state clears, unless the user looks at the session first.
 
-| shown state | glyph | colour | hover |
-|---|---|---|---|
-| blocked | `!` | Blocked tone (palette red) | `<agent> is waiting for you` |
-| done | `✓` | Done tone (palette cyan) | `<agent> is done` |
-| pinged | `•` (the painted attention dot) | attention colour (palette yellow) | `needs attention` |
-| working | braille loader, unchanged | accent (palette blue), unchanged | `<agent> is working` |
-| idle | `◇` | Idle tone (palette green) | `<agent> is running`, unchanged |
-| unknown | `?` | Unclear tone (muted text) | `<agent>, state unknown` |
-| no agent | row's session icon, unchanged | unchanged | none |
+Two indicator sets, chosen by `[ui] status_indicators = "dots" | "symbols"`, default `"dots"`. Native and multiplexer rows draw the same set.
 
-`•` means pinged and nothing else. Blocked moves off `●` because at sidebar size `●` and `•` read as the same mark, and `×` is already the row's close button.
+| shown state | dots (default) | symbols | colour | hover |
+|---|---|---|---|---|
+| blocked | `⬤` | `×` | Blocked tone (palette red) | `<agent> is waiting for you` |
+| done | `⬤` | `✓` | Done tone (palette cyan) | `<agent> is done` |
+| pinged | `⬤` | `⬤` | attention colour (palette yellow) | `needs attention` |
+| working | braille loader | braille loader | accent (palette blue), unchanged | `<agent> is working` |
+| idle | `◯` | `◯` | Idle tone (palette green) | `<agent> is running`, unchanged |
+| unknown | `◯` | `?`, bold and larger | Unclear tone (muted text) | `<agent>, state unknown` |
+| no agent | row's session icon, unchanged | same | unchanged | none |
+
+Every circle is one of two large, same-sized glyphs: hollow `◯` and filled `⬤`. In dots mode idle and unknown share the hollow one, and pinged, blocked and done share the filled one, so colour tells them apart. That is the trade the dots set makes.
+
+A bigger question mark would need the bundled symbol font rebuilt from Debian's DejaVu, so symbols mode paints ASCII `?` bold at a larger size instead. Every other glyph above is already in the baked face.
+
+### Custom glyphs
+
+`[ui.icons]` gains `agent_idle`, `agent_working`, `agent_blocked`, `agent_done`, `agent_unknown` and `attention`. Each is an ordinary icon style (a bare glyph or a table with colour, weight, slant and size). A key that is set overrides both indicator sets and applies to native and multiplexer rows alike. A glyph set on `agent_working` replaces the loader. An unset key follows `status_indicators`.
 
 ## Where each state comes from
 
@@ -67,16 +75,11 @@ The harness's own status still outranks alacritree's reading of the title. `Pane
 ## Rendering
 
 - `widgets.rs`: `SessionMark::Attention` and `SessionMark::Agent(LiveState)` become one `SessionMark::State(ShownState)`. `session_status_mark` computes the shown state from the rank above instead of putting attention first. `agent_mark` gains arms for done and unknown. The sidebar row and the palette row both call `session_status_mark`, so they stay in agreement.
-- Glyph constants in `config.rs`: `DEFAULT_BLOCKED_ICON` becomes `!`, and `DEFAULT_DONE_ICON = "✓"` and `DEFAULT_UNKNOWN_ICON = "?"` are added. The baked-glyph coverage test covers them.
+- Glyph constants in `config.rs`: `DEFAULT_AGENT_ICON` and `DEFAULT_BLOCKED_ICON` give way to one constant per state and set. The baked-glyph coverage test covers them.
 
-### Harness marks and `use_integration_icons`
+### Multiplexer rows
 
-`[integrations.herdr] use_integration_icons`, default `false`.
-
-- `false`: herdr rows draw the table above, the same as native rows.
-- `true`: herdr rows draw herdr's own marks, following herdr's `status_indicators` (dots or symbols), as they do today. With herdr's default dots set, working, blocked and done all draw `●`. The field's doc comment says so.
-
-The scripted multiplexer has no vocabulary of its own (it draws `*`), so it always uses the table above.
+A multiplexer reports a `PaneStatus`, and the row draws it in the set above. herdr's own `status_indicators` is no longer read: alacritree's set decides, so a pane looks the same as a native session in the same state. `HarnessMark` shrinks to the status and the multiplexer's word for it, and `StateTone` goes away. zellij reports no agent state, so its panes show unknown.
 
 ## Workspace and project rows
 
@@ -100,11 +103,12 @@ Tests go through the real entry points wherever the behaviour lives there.
   - viewing the session clears both latches.
 - Debounce: a pending trigger on a herdr pane reporting working is cancelled, one reporting blocked is not.
 - Native unknown: a decorative-glyph title with a probe that could not ask shows unknown; the same title with an answered probe shows idle.
-- `session_status_mark` for a herdr row with `use_integration_icons` on and off.
-- Glyph uniqueness: no two shown states share a glyph, and none use the attention dot except pinged.
+- The mark for every shown state in both sets, and a `[ui.icons]` override winning over both.
+- Glyph uniqueness in symbols mode: no two shown states share a glyph. In dots mode every state but working is one of the two circles, and no two states share a colour.
+- The hollow and filled circles have the same bounding box in the baked face.
 
 ## Out of scope
 
 - Native `blocked` detection.
 - Notifications for `blocked`.
-- A separate `use_integration_icons` for zellij or other harnesses. The key lives under herdr until another harness brings a vocabulary of its own.
+- Following herdr's own `status_indicators`.
