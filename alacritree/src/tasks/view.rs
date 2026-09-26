@@ -4,6 +4,7 @@
 //! the same store, so the tab re-lists while visible instead of trusting its
 //! own copy.
 
+use alacritree_vcs::Checkout;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -17,7 +18,7 @@ use alacritree_tasks::scope::{GLOBAL, Place, node};
 use alacritree_tasks::tree::{self, Row, Section};
 use alacritree_tasks::{Edit, Filter, NodeMatch, Status, Task, TaskBackend, TaskError};
 
-use crate::projects::{Project, Worktree};
+use crate::projects::Project;
 use crate::tasks::backend::{self, Backend};
 use crate::tasks::facts;
 
@@ -34,13 +35,13 @@ pub(crate) struct Scope {
 impl Scope {
     /// The names the sidebar already has, so the tab opens without waiting
     /// on git. `adopt` replaces them once git has answered.
-    pub(crate) fn for_workspace(project: Option<&Project>, worktree: Option<&Worktree>) -> Self {
+    pub(crate) fn for_workspace(project: Option<&Project>, worktree: Option<&Checkout>) -> Self {
         let side = match project.map(|p| wsl::classify(&p.root)) {
             Some(wsl::Location::Wsl { distro, .. }) => Side::Wsl(distro),
             _ => Side::Native,
         };
         let workspace = project.zip(worktree).map(|(p, wt)| {
-            let branch = wt.branch.clone().unwrap_or_else(|| wt.name.clone());
+            let branch = wt.head.label().map_or_else(|| wt.name.clone(), str::to_string);
             node(&Place::Workspace { repo: p.name.clone(), branch }, None)
         });
         let repo = project.map(|p| node(&Place::Project { repo: p.name.clone() }, None));
@@ -117,9 +118,15 @@ pub(crate) struct TasksView {
 impl TasksView {
     /// Shows `scope` at once, and switches to the names git gives `worktree`
     /// once they are read.
-    pub(crate) fn new(backend: Backend, scope: Scope, worktree: Option<PathBuf>) -> Self {
+    pub(crate) fn new(
+        backend: Backend,
+        scope: Scope,
+        worktree: Option<PathBuf>,
+        backends: Vec<crate::vcs::Vcs>,
+    ) -> Self {
         let resolving = worktree.map(|dir| {
-            jobs::pool().spawn(Priority::Interactive, move |b| facts::place_for(&dir, b).1)
+            jobs::pool()
+                .spawn(Priority::Interactive, move |b| facts::place_for(&dir, &backends, b).1)
         });
         Self {
             backend,
@@ -525,21 +532,22 @@ mod tests {
             root: PathBuf::from(root),
             name: name.into(),
             label: None,
-            default_branch: None,
-            worktrees: Vec::new(),
+            vcs: None,
+            trunk: None,
+            checkouts: Vec::new(),
             expanded: false,
             shell_override: None,
             home: None,
         }
     }
 
-    fn worktree(path: &str, name: &str, branch: Option<&str>) -> Worktree {
-        Worktree {
+    fn worktree(path: &str, name: &str, branch: Option<&str>) -> Checkout {
+        Checkout {
             name: name.into(),
             path: PathBuf::from(path),
-            branch: branch.map(Into::into),
+            head: alacritree_vcs::Head { name: branch.map(Into::into), ..Default::default() },
             is_main: false,
-            prunable: false,
+            gone: false,
             upstream: None,
         }
     }
@@ -569,17 +577,17 @@ mod tests {
     #[test]
     fn a_detached_checkout_names_the_node_task_scope_names() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("review");
-        let repo = git2::Repository::init(&root).unwrap();
-        let sig = git2::Signature::now("t", "t@t").unwrap();
-        let tree = repo.find_tree(repo.treebuilder(None).unwrap().write().unwrap()).unwrap();
-        let oid = repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
-        repo.set_head_detached(oid).unwrap();
+        let root = alacritree_git::test_support::init_repo(&dir.path().join("review"));
+        alacritree_git::test_support::detach(&root);
 
-        let project = jobs::on_this_thread(|b| Project::discover(root.clone(), false, b)).project;
-        let worktree = &project.worktrees[0];
+        let project = jobs::on_this_thread(|b| {
+            Project::discover(root.clone(), &crate::vcs::backends(&Default::default()), false, b)
+        })
+        .project;
+        let worktree = &project.checkouts[0];
+        let backends = crate::vcs::backends(&Default::default());
         let (_, place) =
-            jobs::on_this_thread(|b| crate::tasks::facts::place_for(&worktree.path, b));
+            jobs::on_this_thread(|b| crate::tasks::facts::place_for(&worktree.path, &backends, b));
         let mut scope = Scope::for_workspace(Some(&project), Some(worktree));
         scope.adopt(&place);
         assert_eq!(scope.workspace.as_deref(), Some("review.review"));
@@ -652,7 +660,8 @@ mod tests {
         fn new(tasks: Vec<Task>) -> Self {
             let ctx = egui::Context::default();
             let scope = Scope::for_workspace(None, None);
-            let mut view = TasksView::new(Backend::from_config(&Default::default()), scope, None);
+            let mut view =
+                TasksView::new(Backend::from_config(&Default::default()), scope, None, Vec::new());
             view.tasks = tasks;
             let mut h =
                 Self { ctx, view, ops: Vec::new(), texts: Vec::new(), background_clicked: false };

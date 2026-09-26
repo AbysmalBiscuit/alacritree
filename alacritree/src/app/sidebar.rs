@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::multiplexer::{MultiplexerKind, Pane};
+use alacritree_vcs::Checkout;
 
 pub(super) struct Sidebar {
     /// Reveals the project rows' drag grips.  A transient mode, not persisted:
@@ -97,15 +98,15 @@ impl AlacritreeApp {
             let filter = &mut self.sidebar.filter;
             self.projects
                 .iter()
-                .flat_map(|p| p.worktrees.iter())
+                .flat_map(|p| p.checkouts.iter())
                 .map(|wt| (wt.path.clone(), filter.matches(&wt.name)))
                 .collect()
         };
-        let live_branch = self
+        let live_head = self
             .current_workspace
             .as_deref()
             .and_then(|p| self.git_panel.status.get(p))
-            .and_then(|c| c.current_branch());
+            .and_then(|c| c.live_head());
         let current_workspace = self.current_workspace.as_deref();
         // Skipped outright while the PR dimension is inert: `worktree_pr_passes`
         // would not read the map, and building it costs a path clone per
@@ -113,9 +114,9 @@ impl AlacritreeApp {
         let pr_matches: HashMap<PathBuf, bool> = if any_pr {
             self.projects
                 .iter()
-                .flat_map(|p| p.worktrees.iter())
+                .flat_map(|p| p.checkouts.iter())
                 .map(|wt| {
-                    let branch = pr_status::effective_branch(wt, current_workspace, live_branch);
+                    let branch = pr_status::effective_branch(wt, current_workspace, live_head);
                     let state = self.pr_cache.state(&wt.path, branch);
                     (
                         wt.path.clone(),
@@ -187,7 +188,7 @@ impl AlacritreeApp {
         let project_self =
             |p: &Project| !any_toggle && project_matches.get(&p.root).copied().unwrap_or(false);
         let mut name =
-            |_p: &Project, wt: &Worktree| worktree_matches.get(&wt.path).copied().unwrap_or(false);
+            |_p: &Project, wt: &Checkout| worktree_matches.get(&wt.path).copied().unwrap_or(false);
         let children_tested = !child_matches.is_empty();
         let mut child = |entry: &sidebar_nav::WorkspaceEntry| {
             child_matches.get(&entry.row()).copied().unwrap_or(false)
@@ -439,17 +440,17 @@ impl AlacritreeApp {
         let any_pr_toggle =
             any_pr_toggle_active(&self.sidebar.filter, self.sidebar_focus_state.search_scope);
         let current_workspace = self.current_workspace.as_deref();
-        let live_branch = current_workspace
+        let live_head = current_workspace
             .and_then(|p| self.git_panel.status.get(p))
-            .and_then(|cache| cache.current_branch());
+            .and_then(|cache| cache.live_head());
         // The same path can be a worktree of two projects, and `PrCache` is
         // keyed by path alone, so a second poller would only invalidate the
         // first's lookup and burn a `gh` process every frame.
         let mut polled: HashMap<PathBuf, Option<PrInfo>> = HashMap::new();
         let mut views = Vec::with_capacity(self.projects.len());
         for project in &self.projects {
-            let mut worktrees = Vec::with_capacity(project.worktrees.len());
-            for wt in &project.worktrees {
+            let mut worktrees = Vec::with_capacity(project.checkouts.len());
+            for wt in &project.checkouts {
                 let ws = Some(wt.path.clone());
                 let rows = self.workspace_rows(&ws, listed);
                 // Aggregates apply only while the session list is hidden, as
@@ -460,9 +461,9 @@ impl AlacritreeApp {
                     &wt.path,
                     should_poll_pr(pr_enabled, project.expanded, any_pr_toggle),
                     || {
-                        let branch =
-                            pr_status::effective_branch(wt, current_workspace, live_branch);
-                        self.pr_cache.poll(&wt.path, branch, ctx)
+                        let branch = pr_status::effective_branch(wt, current_workspace, live_head);
+                        let vcs = project.vcs.as_ref()?;
+                        self.pr_cache.poll(&wt.path, branch, vcs, ctx)
                     },
                 );
                 // Rendered up front: the panel closure borrows `projects` mutably, and
@@ -481,8 +482,13 @@ impl AlacritreeApp {
                     rows,
                 });
             }
+            let integrations = &self.config.integrations;
             views.push(ProjectView {
                 label: self.row_labels.project_label(project),
+                backend_icon: project
+                    .vcs
+                    .as_ref()
+                    .is_some_and(|v| shows_backend_icon(v, integrations)),
                 attention: self.project_needs_attention(project),
                 worktrees,
             });
@@ -749,6 +755,8 @@ impl FilterMembership {
 
 struct ProjectView {
     label: String,
+    /// Draw the project's version control icon before its name.
+    backend_icon: bool,
     attention: bool,
     worktrees: Vec<WorktreeView>,
 }
@@ -1074,6 +1082,9 @@ fn project_row_title(
         theme.icon_tooltips,
     )
     .clicked();
+    if paint.view.projects.get(idx).is_some_and(|p| p.backend_icon) {
+        paint_backend_icon(ui, theme, &icons.vcs_git);
+    }
     let name = paint.view.projects.get(idx).map_or(project.display_name(), |p| p.label.as_str());
     let (resp, galley) = truncating_label(
         ui,
@@ -1082,6 +1093,27 @@ fn project_row_title(
         egui::Sense::click(),
     );
     (expand_clicked, name_tooltip(resp, name, galley.elided, theme.sidebar_tooltips))
+}
+
+/// Whether a project row draws its backend's icon. Only git has one, and
+/// only when its section asks for it.
+fn shows_backend_icon(
+    vcs: &crate::vcs::Vcs,
+    integrations: &crate::config::IntegrationsConfig,
+) -> bool {
+    match vcs {
+        crate::vcs::Vcs::Git(_) => integrations.git.show_icon,
+        #[cfg(test)]
+        crate::vcs::Vcs::Fake(_) => false,
+    }
+}
+
+/// Centered into the row's icon slot, as the worktree rows' icons are.
+fn paint_backend_icon(ui: &mut egui::Ui, theme: &Theme, style: &IconStyle<Color32>) {
+    let (rect, _) = ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
+    let (glyph, font, color) =
+        resolve_icon(style, crate::config::DEFAULT_VCS_GIT_ICON, theme.text_dim, 10.0, 10.0, theme);
+    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, glyph, font, color);
 }
 
 /// The project row's trailing buttons: remove, refresh, new worktree, and the
@@ -1213,7 +1245,7 @@ fn paint_worktrees(
     requests: &mut SidebarRequests,
 ) {
     let states = paint.view.projects.get(idx).map_or(&[][..], |p| p.worktrees.as_slice());
-    for (wt, state) in project.worktrees.iter().zip(states) {
+    for (wt, state) in project.checkouts.iter().zip(states) {
         if paint.view.filtering && !paint.view.membership.worktrees.contains(&wt.path) {
             continue;
         }
@@ -1227,7 +1259,7 @@ fn paint_worktrees(
 fn paint_worktree(
     ui: &mut egui::Ui,
     paint: SidebarPaint<'_>,
-    wt: &Worktree,
+    wt: &Checkout,
     state: &WorktreeView,
     requests: &mut SidebarRequests,
 ) {
@@ -1482,9 +1514,9 @@ const WORKTREE_MENU_MAX_WIDTH: f32 = 220.0;
 
 /// What one worktree row paints from.
 pub(super) struct WorktreeRowView<'a> {
-    pub(super) wt: &'a Worktree,
+    pub(super) wt: &'a Checkout,
     // What the liveness probe has seen since discovery ran, if anything.
-    // `Some` overrides `wt.prunable` in both directions; `None` leaves it
+    // `Some` overrides `wt.gone` in both directions; `None` leaves it
     // standing.  Kept out of the flag itself because that also picks between
     // `git worktree remove` and a prune, and a probe must never decide that.
     pub(super) missing: Option<bool>,
@@ -2476,6 +2508,21 @@ fn drag_handle(ui: &mut egui::Ui, theme: &Theme) -> egui::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_rows_draw_no_backend_icon_by_default() {
+        let integrations = crate::config::IntegrationsConfig::default();
+        let vcs = crate::vcs::backends(&integrations).remove(0);
+        assert!(!shows_backend_icon(&vcs, &integrations));
+    }
+
+    #[test]
+    fn show_icon_draws_the_git_icon() {
+        let mut integrations = crate::config::IntegrationsConfig::default();
+        integrations.git.show_icon = true;
+        let vcs = crate::vcs::backends(&integrations).remove(0);
+        assert!(shows_backend_icon(&vcs, &integrations));
+    }
 
     #[test]
     fn a_session_row_takes_no_drop_of_its_own_session() {

@@ -26,7 +26,7 @@ use strum::{EnumCount, EnumIter, IntoStaticStr};
 
 use crate::bindings::{self, KeyBinding};
 use crate::path_style::PathStyle;
-use crate::tools::{Tool, ToolConfig, ToolPaths, tool_config};
+use crate::tools::{Tool, ToolConfig, ToolPaths};
 
 /// `[env]` carries whatever the user's environment carries, and a config dump
 /// ends up attached to bug reports.  Key names survive: that `FOO` was set is
@@ -600,7 +600,7 @@ impl PasteConfig {
 /// buttons. General sidebar and terminal appearance stays under `[ui]`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct IntegrationsConfig {
-    pub git: ToolConfig,
+    pub git: alacritree_git::GitConfig,
     pub gh: alacritree_gh::GhConfig,
     pub doppler: alacritree_doppler::DopplerConfig,
     pub checkout_hooks: Vec<alacritree_checkout_hooks::CommandHook>,
@@ -737,6 +737,7 @@ baked_glyphs! {
     DEFAULT_UPSTREAM_DIVERGED_ICON = "⇅";
     DEFAULT_UPSTREAM_GONE_ICON = "⌫";
     DEFAULT_UPSTREAM_UNTRACKED_ICON = "↑";
+    DEFAULT_VCS_GIT_ICON = "⎇";
 }
 
 /// The codepoints the multiplexer icons are spelled at.  Each is drawn from
@@ -1041,6 +1042,7 @@ pub struct Icons<C = Rgb> {
     pub upstream_diverged: IconStyle<C>,
     pub upstream_gone: IconStyle<C>,
     pub upstream_untracked: IconStyle<C>,
+    pub vcs_git: IconStyle<C>,
     pub add_project: IconStyle<C>,
     pub new_worktree: IconStyle<C>,
     pub new_session: IconStyle<C>,
@@ -1077,6 +1079,7 @@ impl<C: Copy> Icons<C> {
             upstream_diverged: self.upstream_diverged.map_color(f),
             upstream_gone: self.upstream_gone.map_color(f),
             upstream_untracked: self.upstream_untracked.map_color(f),
+            vcs_git: self.vcs_git.map_color(f),
             add_project: self.add_project.map_color(f),
             new_worktree: self.new_worktree.map_color(f),
             new_session: self.new_session.map_color(f),
@@ -2534,6 +2537,9 @@ struct RawIcons {
     upstream_gone: RawIconStyle,
     /// A branch that tracks nothing.
     upstream_untracked: RawIconStyle,
+    /// Before a git repository's name, when `[integrations.git] show_icon`
+    /// is set.
+    vcs_git: RawIconStyle,
     /// The "add project" button.
     add_project: RawIconStyle,
     /// The "new worktree" button.
@@ -2600,6 +2606,7 @@ impl Default for RawIcons {
             upstream_diverged: raw_glyph(DEFAULT_UPSTREAM_DIVERGED_ICON),
             upstream_gone: raw_glyph(DEFAULT_UPSTREAM_GONE_ICON),
             upstream_untracked: raw_glyph(DEFAULT_UPSTREAM_UNTRACKED_ICON),
+            vcs_git: raw_glyph(DEFAULT_VCS_GIT_ICON),
             add_project: raw_glyph(DEFAULT_ADD_ICON),
             new_worktree: raw_glyph(DEFAULT_ADD_ICON),
             new_session: raw_glyph(DEFAULT_ADD_ICON),
@@ -2635,6 +2642,7 @@ fn build_icons(raw: RawIcons) -> Icons {
         upstream_diverged: raw.upstream_diverged.into(),
         upstream_gone: raw.upstream_gone.into(),
         upstream_untracked: raw.upstream_untracked.into(),
+        vcs_git: raw.vcs_git.into(),
         add_project: raw.add_project.into(),
         new_worktree: raw.new_worktree.into(),
         new_session: raw.new_session.into(),
@@ -2831,7 +2839,7 @@ impl Default for RawUiPaste {
 struct RawIntegrations {
     /// The git CLI, for the commands alacritree spawns. Repository reads go
     /// through libgit2, and scripts inside WSL find git on that distro's PATH.
-    git: RawGit,
+    git: alacritree_git::RawGit,
     /// The GitHub CLI behind PR badges and diff base branches.
     gh: alacritree_gh::RawGh,
     /// The Doppler CLI behind scope mirroring for new worktrees.
@@ -2854,35 +2862,10 @@ struct RawIntegrations {
     diff_viewer: alacritree_diff_viewer::RawDiffViewer,
 }
 
-/// Declares an `[integrations.<tool>]` table whose only keys name it on each
-/// side of a Windows and WSL installation.
-macro_rules! raw_tool_table {
-    ($raw:ident, $program:literal) => {
-        #[derive(Debug, Deserialize, JsonSchema)]
-        #[serde(default)]
-        struct $raw {
-            /// The program to run on Windows or natively. Its own name is
-            /// looked up on PATH; any other value runs as written.
-            path: String,
-            /// The program to run inside every WSL distro, as written. Empty
-            /// finds it by name through the distro's login shell.
-            wsl_path: String,
-        }
-
-        impl Default for $raw {
-            fn default() -> Self {
-                Self { path: $program.to_string(), wsl_path: String::new() }
-            }
-        }
-    };
-}
-
-raw_tool_table!(RawGit, "git");
-
 impl RawIntegrations {
     fn resolve(self, moved: MovedUiKeys) -> IntegrationsConfig {
         IntegrationsConfig {
-            git: tool_config(self.git.path, self.git.wsl_path, Tool::Git),
+            git: self.git.resolve(),
             gh: self.gh.resolve(moved.gh),
             doppler: self.doppler.resolve(),
             checkout_hooks: self.checkout_hooks.resolve(),
@@ -4779,6 +4762,11 @@ program = "second"
         assert_eq!(ui.icons.upstream_untracked.or_glyph(""), "↑");
     }
 
+    #[test]
+    fn the_git_icon_has_a_default() {
+        assert_eq!(ui_from_toml("").icons.vcs_git.or_glyph(""), "⎇");
+    }
+
     /// Three buttons paint the same glyph for three different actions, one of
     /// which deletes a branch.  Separate keys are what let the destructive one
     /// be marked without touching the others.
@@ -5229,7 +5217,8 @@ program = "second"
     fn the_icon_slice_carries_exactly_the_default_icon_glyphs() {
         let mut icons: Vec<&str> = DEFAULT_ICON_GLYPHS.iter().map(|g| g.as_str()).collect();
         icons.sort_unstable();
-        let expected = ["⌕", "●", "○", "▪", "⌂", "▾", "▸", "⬤", "◯", "⬤", "⬤", "✓", "⇅", "⌫", "↑"];
+        let expected =
+            ["⌕", "●", "○", "▪", "⌂", "▾", "▸", "⬤", "◯", "⬤", "⬤", "✓", "⇅", "⌫", "↑", "⎇"];
         // herdr and zellij, at the plane 16 codepoints only the baked face maps.
         let mut expected = [expected.as_slice(), &["\u{10FF00}", "\u{10FF01}"]].concat();
         expected.sort_unstable();

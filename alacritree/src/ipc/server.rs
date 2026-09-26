@@ -14,19 +14,18 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
+use alacritree_vcs::{Status, VcsError, VersionControl};
 use interprocess::local_socket::traits::Listener as _;
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, Stream, ToFsName};
 use serde_json::json;
 
 #[cfg(unix)]
 use super::protocol::connect;
-use super::protocol::{
-    IpcRequest, IpcResult, SOCKET_ENV, git_status_json, socket_dir, unlink_socket,
-};
+use super::protocol::{IpcRequest, IpcResult, SOCKET_ENV, socket_dir, status_json, unlink_socket};
 use super::route::{AppRequest, ConnectionRequest, DeferredRequest, Route};
+use crate::jobs;
 use crate::repaint::Repaint;
 use crate::worktree::{self as wt, CreateConfig, CreateRequest, Progress};
-use crate::{git_status, jobs};
 
 /// Absolute path to the running binary. A shell can exec the CLI through it
 /// without a PATH lookup, which is the only reliable way in a distro, where
@@ -201,14 +200,21 @@ fn dispatch(
     config: &CreateConfig,
 ) -> IpcResult {
     match Route::from(request) {
-        // `compute` walks the working tree, the same work StatusCache
+        // A status walks the working tree, the same work StatusCache
         // pushes to a background thread, so keep it off the UI thread.
         // This is already the connection thread, not the UI thread; the
         // token just proves that plainly rather than adding a real wait.
         Route::Connection(ConnectionRequest::GitStatus { path }) => {
-            Ok(git_status_json(&jobs::on_this_thread(|blocking| {
-                git_status::compute(&path, None, blocking)
-            })))
+            match crate::vcs::for_path(&config.vcs, &path) {
+                Some(vcs) => {
+                    let result = jobs::on_this_thread(|blocking| vcs.status(&path, None, blocking));
+                    Ok(match result {
+                        Ok(status) => status_json(&status, None),
+                        Err(e) => status_json(&Status::default(), Some(&e.to_string())),
+                    })
+                },
+                None => Ok(status_json(&Status::default(), Some("version control is disabled"))),
+            }
         },
         Route::Connection(ConnectionRequest::CreateWorktree { project_root, branch }) => {
             create_worktree(project_root, branch, app_tx, repaint, config)
@@ -238,8 +244,10 @@ fn create_worktree(
     repaint: &impl Repaint,
     config: &CreateConfig,
 ) -> IpcResult {
-    wt::validate_branch_name(&branch).map_err(|e| e.to_string())?;
-    let req = CreateRequest::new(project_root.clone(), None, branch, &config.workspace);
+    let vcs = crate::vcs::for_path(&config.vcs, &project_root)
+        .ok_or_else(|| VcsError::NotARepository(project_root.clone()).to_string())?;
+    vcs.validate_name(&branch).map_err(|e| e.to_string())?;
+    let req = CreateRequest::new(project_root.clone(), None, branch, &config.workspace, vcs);
     let (rx, job) = wt::spawn_create(req, config.hooks.clone(), repaint.clone());
     let outcome = drain_create(&rx, IPC_CREATE_BUDGET);
     // Dropping on every path, including the deadline, is what ends the fetch
@@ -414,7 +422,7 @@ mod tests {
     #[test]
     fn an_ipc_create_lands_under_the_configured_worktree_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let project = crate::test_util::clone_with_origin(dir.path());
+        let project = alacritree_git::test_support::clone_with_origin(dir.path());
         let base = dir.path().join("worktrees");
         let path = socket_dir().join(format!("alacritree-create-test-{}.sock", std::process::id()));
         // With no app thread on the other end, the refresh after the create
@@ -438,6 +446,23 @@ mod tests {
             base.display()
         );
         assert!(created.is_dir());
+    }
+
+    /// With git disabled no backend answers, so a status over IPC reports
+    /// that rather than a clean tree.
+    #[test]
+    fn an_ipc_status_with_git_disabled_says_version_control_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = alacritree_git::test_support::init_repo(dir.path());
+        let path = socket_dir().join(format!("alacritree-status-test-{}.sock", std::process::id()));
+        let config = CreateConfig { vcs: Vec::new(), ..CreateConfig::default() };
+        let (handle, _rx) = listen_at(path, Recorder::default(), config).expect("listener");
+
+        let request = IpcRequest::GitStatus { path: repo };
+        let reply =
+            send_request(Some(handle.path()), &request, Duration::from_secs(30)).expect("a reply");
+
+        assert_eq!(reply["error"], "version control is disabled");
     }
 
     /// The deadline is absolute.  A per-message timeout resets on every progress

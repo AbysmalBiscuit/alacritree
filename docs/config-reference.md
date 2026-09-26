@@ -208,8 +208,8 @@ What the git panel's diff pane runs.
 
 The viewer `preset = "custom"` runs.
 
-- `branch` (array of string, default `[]`): Arguments for a `Changes vs` row. `{file}` is the row's path and `{base}` the branch it diffs against.
-- `branch_scope` (array of string, default `[]`): Arguments for the `Changes vs` section header. `{base}` is the branch it diffs against.
+- `branch` (array of string, default `[]`): Arguments for a `Changes vs` row. `{file}` is the row's path, `{base}` the branch it diffs against and `{range}` the range from that branch to the checkout's head, as the repository spells it.
+- `branch_scope` (array of string, default `[]`): Arguments for the `Changes vs` section header. `{base}` is the branch it diffs against and `{range}` the range from that branch to the checkout's head, as the repository spells it.
 - `pager` (string, default `""`): Pager mode: a command git runs as `core.pager` for the panel's own `git diff`. Set this or `path`, never both.
 - `path` (string, default `""`): Direct mode: a program that renders the diff itself, run with the argument list below that matches what was chosen. An empty list makes that row kind or section open nothing.
 - `staged` (array of string, default `[]`): Arguments for a staged row. `{file}` is the row's path.
@@ -241,7 +241,9 @@ The GitHub CLI behind PR badges and diff base branches.
 
 The git CLI, for the commands alacritree spawns. Repository reads go through libgit2, and scripts inside WSL find git on that distro's PATH.
 
+- `enabled` (boolean, default `true`): Recognize git repositories. Off, every git project is a plain folder: no worktree rows, no git panel and no pull request badges.
 - `path` (string, default `"git"`): The program to run on Windows or natively. Its own name is looked up on PATH; any other value runs as written.
+- `show_icon` (boolean, default `false`): Draw git's icon on the project rows of git repositories.
 - `wsl_path` (string, default `""`): The program to run inside every WSL distro, as written. Empty finds it by name through the distro's login shell.
 
 ### `[integrations.herdr]`
@@ -508,6 +510,8 @@ Sidebar glyph overrides.
 - `upstream_level` (string or table, default `"✓"`): A branch level with its upstream.
   - The table form takes the same keys as `integrations.herdr.icon`.
 - `upstream_untracked` (string or table, default `"↑"`): A branch that tracks nothing.
+  - The table form takes the same keys as `integrations.herdr.icon`.
+- `vcs_git` (string or table, default `"⎇"`): Before a git repository's name, when `[integrations.git] show_icon` is set.
   - The table form takes the same keys as `integrations.herdr.icon`.
 - `worktree` (string or table, default `"○"`): A linked worktree.
   - The table form takes the same keys as `integrations.herdr.icon`.

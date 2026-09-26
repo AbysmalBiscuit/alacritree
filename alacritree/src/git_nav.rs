@@ -6,14 +6,40 @@
 //! changing identity. An index would silently retarget the cursor onto
 //! whatever file happens to land at that position next.
 
-use crate::git_status::{ChangeKind, DiffStat, FileChange};
+use alacritree_vcs::{ChangeKind, DiffStat, FileChange};
+
+pub(crate) fn change_glyph(kind: ChangeKind) -> &'static str {
+    match kind {
+        ChangeKind::Added => "A",
+        ChangeKind::Modified => "M",
+        ChangeKind::Deleted => "D",
+        ChangeKind::Renamed => "R",
+        ChangeKind::Untracked => "?",
+        ChangeKind::Conflicted => "!",
+    }
+}
+
+/// What the glyph stands for, for readers who do not know porcelain.
+pub(crate) fn change_label(kind: ChangeKind) -> &'static str {
+    match kind {
+        ChangeKind::Added => "added",
+        ChangeKind::Modified => "modified",
+        ChangeKind::Deleted => "deleted",
+        ChangeKind::Renamed => "renamed",
+        ChangeKind::Untracked => "untracked",
+        ChangeKind::Conflicted => "conflicted",
+    }
+}
 
 /// Which list of the git panel a row belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GitSection {
     Staged,
-    Unstaged,
-    Branch,
+    /// Changes not yet committed, or not yet staged where the backend has a
+    /// staging area.
+    Working,
+    /// Changes since the base the checkout is compared against.
+    Base,
 }
 
 /// A row the git-panel cursor can rest on, in render order.
@@ -81,12 +107,12 @@ pub(crate) fn visible_rows(
     let staged_count =
         push_change_rows(staged, GitSection::Staged, kind_pass, query_pass, &mut rows);
     let unstaged_count =
-        push_change_rows(unstaged, GitSection::Unstaged, kind_pass, query_pass, &mut rows);
+        push_change_rows(unstaged, GitSection::Working, kind_pass, query_pass, &mut rows);
 
     let mut branch_visible = 0;
     for stat in branch {
         if query_pass(&stat.path) {
-            rows.push(GitRow { section: GitSection::Branch, path: stat.path.clone(), kind: None });
+            rows.push(GitRow { section: GitSection::Base, path: stat.path.clone(), kind: None });
             branch_visible += 1;
         }
     }
@@ -150,8 +176,8 @@ mod tests {
 
         assert_eq!(result.rows, vec![
             row(GitSection::Staged, "a.rs", Some(ChangeKind::Added)),
-            row(GitSection::Unstaged, "b.rs", Some(ChangeKind::Modified)),
-            row(GitSection::Branch, "c.rs", None),
+            row(GitSection::Working, "b.rs", Some(ChangeKind::Modified)),
+            row(GitSection::Base, "c.rs", None),
         ]);
         assert_eq!((result.staged.visible, result.staged.total), (1, 1));
         assert_eq!((result.unstaged.visible, result.unstaged.total), (1, 1));
@@ -167,7 +193,7 @@ mod tests {
 
         let result = visible_rows(&staged, &unstaged, &branch, NONE, &mut query_pass);
 
-        assert_eq!(result.rows, vec![row(GitSection::Branch, "c.rs", None)]);
+        assert_eq!(result.rows, vec![row(GitSection::Base, "c.rs", None)]);
         assert_eq!((result.staged.visible, result.staged.total), (0, 1));
         assert_eq!((result.unstaged.visible, result.unstaged.total), (0, 1));
         assert_eq!((result.branch.visible, result.branch.total), (1, 1));
@@ -203,8 +229,8 @@ mod tests {
 
         assert_eq!(result.rows, vec![
             row(GitSection::Staged, "keep.rs", Some(ChangeKind::Added)),
-            row(GitSection::Unstaged, "keep.rs", Some(ChangeKind::Modified)),
-            row(GitSection::Branch, "keep.rs", None),
+            row(GitSection::Working, "keep.rs", Some(ChangeKind::Modified)),
+            row(GitSection::Base, "keep.rs", None),
         ]);
         assert_eq!((result.staged.visible, result.staged.total), (1, 2));
         assert_eq!((result.unstaged.visible, result.unstaged.total), (1, 2));
@@ -215,7 +241,7 @@ mod tests {
     fn step_clamps_and_ensure_cursor_falls_back_to_first() {
         let rows = vec![
             row(GitSection::Staged, "a.rs", Some(ChangeKind::Added)),
-            row(GitSection::Unstaged, "b.rs", Some(ChangeKind::Modified)),
+            row(GitSection::Working, "b.rs", Some(ChangeKind::Modified)),
         ];
 
         assert_eq!(step(&rows, &rows[0], 1), Some(rows[1].clone()));
@@ -228,7 +254,7 @@ mod tests {
         // Still visible: unchanged.
         assert_eq!(ensure_cursor(&rows, Some(&rows[1])), Some(rows[1].clone()));
         // Vanished cursor and no cursor both fall back to the first row.
-        let gone = row(GitSection::Branch, "gone.rs", None);
+        let gone = row(GitSection::Base, "gone.rs", None);
         assert_eq!(ensure_cursor(&rows, Some(&gone)), Some(rows[0].clone()));
         assert_eq!(ensure_cursor(&rows, None), Some(rows[0].clone()));
         // Empty rows always fall back to None.
@@ -242,7 +268,7 @@ mod tests {
         let modified_kind = row(GitSection::Staged, "a.rs", Some(ChangeKind::Modified));
         assert_eq!(staged_kind, modified_kind);
 
-        let different_section = row(GitSection::Unstaged, "a.rs", Some(ChangeKind::Added));
+        let different_section = row(GitSection::Working, "a.rs", Some(ChangeKind::Added));
         assert_ne!(staged_kind, different_section);
 
         let different_path = row(GitSection::Staged, "b.rs", Some(ChangeKind::Added));

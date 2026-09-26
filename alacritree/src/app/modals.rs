@@ -175,11 +175,18 @@ impl AlacritreeApp {
         );
 
         if recheck {
+            let vcs = self
+                .modals
+                .pending_delete
+                .as_ref()
+                .and_then(|req| self.vcs_for(&req.worktree_path));
             if let Some(req) = self.modals.pending_delete.as_mut() {
                 let path = req.worktree_path.clone();
                 req.dirty_job =
                     Some(jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
-                        git_status::dirty_counts(&path, blocking)
+                        vcs.map_or_else(Dirty::default, |vcs| {
+                            vcs.dirty(&path, blocking).unwrap_or_default()
+                        })
                     }));
             }
             return;
@@ -448,6 +455,11 @@ impl AlacritreeApp {
             return;
         };
         let project_root = self.projects[req.project_idx].root.clone();
+        let Some(vcs) = self.vcs_for(&req.worktree_path) else {
+            self.modals.error_dialog =
+                Some(alacritree_vcs::VcsError::NotARepository(project_root).to_string());
+            return;
+        };
         // Drop sessions whose cwd is the worktree before deleting it; the PTY
         // would otherwise block the directory removal on some filesystems.
         self.close_worktree_sessions(ctx, &req.worktree_path);
@@ -459,26 +471,28 @@ impl AlacritreeApp {
         let worktree_path = req.worktree_path.clone();
         let worktree_name = req.worktree_name.clone();
         let branch = req.branch.clone();
-        let delete_job = if req.prunable {
-            wt::DeleteJob::Prune {
-                worktree_name: req.worktree_name,
-                branch: req.branch,
-                delete_branch: req.delete_branch,
-            }
-        } else {
-            // `req.force` already reflects a resolved dirty count (set in
-            // `request_worktree_delete` or when its probe landed), since the
-            // dialog refuses to confirm before one is known. A tree that went
-            // dirty after a clean count still gets git's refusal, which
-            // `poll_pending_deletes` reopens as a forced retry.
-            wt::DeleteJob::Remove {
-                worktree_path: req.worktree_path,
-                branch: req.branch,
-                force: req.force,
-            }
+        let checkout = Checkout {
+            name: req.worktree_name,
+            path: req.worktree_path,
+            head: alacritree_vcs::Head { name: req.branch, ..Default::default() },
+            is_main: false,
+            gone: req.prunable,
+            upstream: None,
+        };
+        // `req.force` already reflects a resolved dirty count (set in
+        // `request_worktree_delete` or when its probe landed), since the
+        // dialog refuses to confirm before one is known. A tree that went
+        // dirty after a clean count still gets git's refusal, which
+        // `poll_pending_deletes` reopens as a forced retry. Only the prune
+        // dialog asks whether the branch goes too.
+        let remove = alacritree_vcs::RemoveCheckout {
+            main: project_root,
+            checkout,
+            force: req.force,
+            delete_name: !req.prunable || req.delete_branch,
         };
         let hooks = crate::checkout_hooks::from_config(&self.config.integrations);
-        let job = wt::spawn_delete(project_root, delete_job, hooks, ctx.clone());
+        let job = wt::spawn_delete(vcs, remove, hooks, ctx.clone());
         self.modals.pending_deletes.push(DeleteTask {
             project_idx: req.project_idx,
             worktree_path,
@@ -514,7 +528,7 @@ impl AlacritreeApp {
             worktree_path: PathBuf,
             worktree_name: String,
             branch: Option<String>,
-            dirty: Option<DirtyCounts>,
+            dirty: Option<Dirty>,
             delete_branch: bool,
             prunable: bool,
             result: Result<(), wt::WorktreeError>,
@@ -562,7 +576,7 @@ impl AlacritreeApp {
                 // the wrong worktree), and a second refusal landing in this
                 // same batch would silently overwrite the first retry
                 // instead of surfacing it.
-                Err(e) if !f.prunable && refused_for_unsaved_work(&e) => {
+                Err(e) if !f.prunable && offers_force(&e) => {
                     if self.modals.pending_delete.is_none() {
                         self.modals.pending_delete = Some(DeleteRequest {
                             project_idx: f.project_idx,
@@ -904,12 +918,12 @@ impl AlacritreeApp {
         ctx: &Context,
         project_idx: usize,
         mut branch: String,
-        mut error: Option<wt::BranchNameError>,
+        mut error: Option<alacritree_vcs::VcsError>,
     ) -> Option<CreateState> {
         let theme = self.theme;
         let danger = self.theme.error;
         let project_name = self.projects[project_idx].display_name().to_string();
-        let default_branch = self.projects[project_idx].default_branch.clone();
+        let default_branch = self.projects[project_idx].trunk.clone();
         let project_root = self.projects[project_idx].root.clone();
 
         let (cancel_via_key, confirm_via_key) =
@@ -976,7 +990,11 @@ impl AlacritreeApp {
             // Whitespace runs become single hyphens: `some text like this` →
             // `some-text-like-this`.
             let canonical: String = branch.split_whitespace().collect::<Vec<_>>().join("-");
-            if let Err(invalid) = wt::validate_branch_name(&canonical) {
+            let Some(vcs) = self.vcs_for(&project_root) else {
+                error = Some(alacritree_vcs::VcsError::NotARepository(project_root));
+                return Some(CreateState::Prompt { project_idx, branch, error });
+            };
+            if let Err(invalid) = vcs.validate_name(&canonical) {
                 error = Some(invalid);
                 return Some(CreateState::Prompt { project_idx, branch, error });
             }
@@ -985,6 +1003,7 @@ impl AlacritreeApp {
                 default_branch,
                 canonical.clone(),
                 &self.config.workspace,
+                vcs,
             );
             let hooks = crate::checkout_hooks::from_config(&self.config.integrations);
             let (rx, job) = wt::spawn_create(req, hooks, ctx.clone());
@@ -1195,9 +1214,9 @@ pub(super) struct DeleteRequest {
     pub(super) branch: Option<String>,
     /// `None` until a count lands. The cache answers for a worktree the git
     /// panel has shown; one never selected has to wait for the job.
-    pub(super) dirty: Option<DirtyCounts>,
+    pub(super) dirty: Option<Dirty>,
     /// Fills `dirty` when the cache was cold.
-    pub(super) dirty_job: Option<jobs::Job<DirtyCounts>>,
+    pub(super) dirty_job: Option<jobs::Job<Dirty>>,
     /// The checkout dir is already gone; confirm prunes metadata instead of
     /// removing a directory.
     pub(super) prunable: bool,
@@ -1218,7 +1237,7 @@ pub(super) struct DeleteTask {
     pub(super) worktree_path: PathBuf,
     pub(super) worktree_name: String,
     pub(super) branch: Option<String>,
-    pub(super) dirty: Option<DirtyCounts>,
+    pub(super) dirty: Option<Dirty>,
     pub(super) delete_branch: bool,
     /// Distinguishes the "prune" vs "delete" wording in a failure message.
     pub(super) prunable: bool,
@@ -1229,7 +1248,7 @@ pub(super) enum CreateState {
     Prompt {
         project_idx: usize,
         branch: String,
-        error: Option<wt::BranchNameError>,
+        error: Option<alacritree_vcs::VcsError>,
     },
     Running {
         project_idx: usize,
@@ -1290,23 +1309,10 @@ pub(super) struct BaseBranchPicker {
     pub(super) cursor: usize,
 }
 
-/// `git worktree remove` refuses a tree with work in it, and that refusal is
-/// the authority on whether removing would lose anything. `contains modified
-/// or untracked files` is git's current wording, `is dirty` what git 2.17
-/// said before the rewording.
-///
-/// git prints `fatal: '<path>' <reason>`, and a user-chosen path that spells
-/// out a fragment must not turn an unrelated failure into a false "needs
-/// --force" prompt. git's reason always follows the path's closing quote, so
-/// only the text after the last `'` is read.
-pub(super) fn refused_for_unsaved_work(error: &wt::WorktreeError) -> bool {
-    let wt::WorktreeError::Git { output, .. } = error else {
-        return false;
-    };
-    let tail = output.rsplit_once("fatal:").map_or(output.as_str(), |(_, tail)| tail);
-    let reason = tail.rsplit_once('\'').map_or(tail, |(_, after)| after).to_ascii_lowercase();
-    reason.contains("contains modified or untracked files, use --force")
-        || reason.contains("is dirty, use --force")
+/// Whether a failed removal refused only because the checkout held unsaved
+/// work, which a forced retry would discard.
+pub(super) fn offers_force(error: &wt::WorktreeError) -> bool {
+    matches!(error, wt::WorktreeError::Vcs(alacritree_vcs::VcsError::Unsaved { .. }))
 }
 
 /// Whether the delete confirm may execute.
@@ -1317,7 +1323,7 @@ pub(super) fn refused_for_unsaved_work(error: &wt::WorktreeError) -> bool {
 /// already cost the user their shells by the time the refusal arrives.  A
 /// resolved count presets `--force`, which git will not refuse for
 /// dirtiness; a forced retry has already been through that refusal.
-fn delete_confirm_ready(counts: Option<&DirtyCounts>, force: bool) -> bool {
+fn delete_confirm_ready(counts: Option<&Dirty>, force: bool) -> bool {
     force || counts.is_some()
 }
 
@@ -1336,7 +1342,7 @@ fn push_error(slot: &mut Option<String>, message: String) {
     }
 }
 
-pub(super) fn dirty_parts(counts: &DirtyCounts) -> String {
+pub(super) fn dirty_parts(counts: &Dirty) -> String {
     let mut parts = Vec::new();
     if counts.staged > 0 {
         parts.push(format!("{} staged", counts.staged));
@@ -1361,11 +1367,7 @@ pub(super) fn dirty_parts(counts: &DirtyCounts) -> String {
 /// it is never safe to render "nothing to warn about" for it, regardless of
 /// what `counts` holds, whether a stale-clean read or none at all (the
 /// request was confirmed before its probe landed, which cancelled the probe).
-pub(super) fn dirty_warning(
-    counts: Option<&DirtyCounts>,
-    force: bool,
-    checking: bool,
-) -> Option<String> {
+pub(super) fn dirty_warning(counts: Option<&Dirty>, force: bool, checking: bool) -> Option<String> {
     if force {
         return Some(match counts.filter(|c| c.is_dirty()) {
             Some(counts) => {
@@ -1418,7 +1420,7 @@ mod tests {
 
     #[test]
     fn dirty_warning_stays_quiet_for_a_known_clean_unforced_tree() {
-        let clean = DirtyCounts::default();
+        let clean = Dirty::default();
         assert_eq!(dirty_warning(Some(&clean), false, false), None);
     }
 
@@ -1430,38 +1432,26 @@ mod tests {
         assert!(!unavailable.to_lowercase().contains("checking"));
     }
 
-    fn git_refused(path: &str, output: &str) -> wt::WorktreeError {
-        wt::WorktreeError::Git { args: format!("worktree remove {path}"), output: output.into() }
+    #[test]
+    fn an_unsaved_refusal_offers_force() {
+        let err = wt::WorktreeError::Vcs(alacritree_vcs::VcsError::Unsaved { message: "x".into() });
+        assert!(offers_force(&err));
     }
 
     #[test]
-    fn refused_for_unsaved_work_matches_a_real_git_refusal() {
-        let refusal = git_refused(
-            "../wt1",
-            "fatal: '../wt1' contains modified or untracked files, use --force to delete it",
-        );
-        assert!(refused_for_unsaved_work(&refusal));
+    fn any_other_failure_does_not_offer_force() {
+        let err = wt::WorktreeError::Vcs(alacritree_vcs::VcsError::Failed {
+            command: "git x".into(),
+            stderr: "y".into(),
+        });
+        assert!(!offers_force(&err));
+        assert!(!offers_force(&wt::WorktreeError::WorkerPanicked));
     }
 
     #[test]
-    fn refused_for_unsaved_work_ignores_unrelated_failures() {
-        assert!(!refused_for_unsaved_work(&git_refused(
-            "../wt1",
-            "fatal: '../wt1' is a main working tree"
-        )));
-        assert!(!refused_for_unsaved_work(&wt::WorktreeError::WorkerPanicked));
-    }
-
-    /// A worktree path that happens to contain the matched phrase must not
-    /// turn an unrelated failure into a false "needs --force" prompt --
-    /// `refused_for_unsaved_work` only reads the text after the closing
-    /// quote of the path, never the quoted path itself.
-    #[test]
-    fn refused_for_unsaved_work_is_not_fooled_by_a_path_spelling_out_the_phrase() {
-        let path = "../is dirty, use --force to delete it";
-        let refusal =
-            git_refused(path, &format!("fatal: '{path}' cannot be locked: filesystem error"));
-        assert!(!refused_for_unsaved_work(&refusal));
+    fn the_dirty_count_names_only_what_is_there() {
+        let counts = Dirty { staged: 0, modified: 2, untracked: 1 };
+        assert_eq!(dirty_parts(&counts), "2 modified, 1 untracked");
     }
 
     #[test]

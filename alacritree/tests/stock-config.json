@@ -94,7 +94,9 @@
       "wsl_path": null
     },
     "git": {
+      "enabled": true,
       "path": "git",
+      "show_icon": false,
       "wsl_path": null
     },
     "herdr": {
@@ -494,6 +496,13 @@
         "bold": false,
         "color": null,
         "glyph": "↑",
+        "italic": false,
+        "size": null
+      },
+      "vcs_git": {
+        "bold": false,
+        "color": null,
+        "glyph": "⎇",
         "italic": false,
         "size": null
       },

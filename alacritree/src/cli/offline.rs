@@ -11,13 +11,15 @@
 
 use std::path::{Path, PathBuf};
 
+use alacritree_vcs::{Status, VcsError, VersionControl};
 use serde_json::{Value, json};
 
-use crate::ipc::protocol::{self, IpcRequest, IpcResult};
+use crate::ipc::protocol::{IpcRequest, IpcResult, status_json};
 use crate::projects::{self, NotAProject, Project, project_json};
 use crate::state::{self, PersistedProject, PersistedState};
+use crate::vcs::Vcs;
 use crate::worktree::{self as wt, CreateConfig, CreateRequest};
-use crate::{git_status, jobs, scratchpad};
+use crate::{jobs, scratchpad};
 
 pub(super) fn handle(request: &IpcRequest, config: &CreateConfig) -> IpcResult {
     let Some(path) = state::config_path() else {
@@ -32,16 +34,19 @@ fn handle_at(state_path: &Path, request: &IpcRequest, config: &CreateConfig) -> 
             // No window means no focused workspace, the same value the app
             // reports for its home tab.
             "current_workspace": Value::Null,
-            "projects": discover_all(state_path).iter().map(project_json).collect::<Vec<_>>(),
+            "projects": discover_all(state_path, &config.vcs)
+                .iter()
+                .map(project_json)
+                .collect::<Vec<_>>(),
         })),
-        IpcRequest::AddProject { path } => Ok(project_json(&add(state_path, path))),
+        IpcRequest::AddProject { path } => Ok(project_json(&add(state_path, path, &config.vcs))),
         IpcRequest::RemoveProject { root } => {
             remove(state_path, root).map_err(|e| e.to_string())?;
             Ok(json!({ "removed": root }))
         },
         IpcRequest::RenameProject { root, label } => {
             rename(state_path, root, label.clone()).map_err(|e| e.to_string())?;
-            let renamed = discover_all(state_path)
+            let renamed = discover_all(state_path, &config.vcs)
                 .into_iter()
                 .find(|p| p.root == *root)
                 .ok_or_else(|| NotAProject(root.clone()).to_string())?;
@@ -51,16 +56,21 @@ fn handle_at(state_path: &Path, request: &IpcRequest, config: &CreateConfig) -> 
         // It still has to fail on a root the sidebar does not have, or it
         // would report on projects the user never added.
         IpcRequest::RefreshProject { root } => {
-            let known = discover_all(state_path)
+            let known = discover_all(state_path, &config.vcs)
                 .into_iter()
                 .find(|p| p.root == *root)
                 .ok_or_else(|| NotAProject(root.clone()).to_string())?;
             Ok(project_json(&known))
         },
-        IpcRequest::GitStatus { path } => {
-            Ok(protocol::git_status_json(&jobs::on_this_thread(|blocking| {
-                git_status::compute(path, None, blocking)
-            })))
+        IpcRequest::GitStatus { path } => match crate::vcs::for_path(&config.vcs, path) {
+            Some(vcs) => {
+                let result = jobs::on_this_thread(|blocking| vcs.status(path, None, blocking));
+                Ok(match result {
+                    Ok(status) => status_json(&status, None),
+                    Err(e) => status_json(&Status::default(), Some(&e.to_string())),
+                })
+            },
+            None => Ok(status_json(&Status::default(), Some("version control is disabled"))),
         },
         IpcRequest::CreateWorktree { project_root, branch } => {
             create_worktree(project_root.clone(), branch.clone(), config)
@@ -88,14 +98,17 @@ fn handle_at(state_path: &Path, request: &IpcRequest, config: &CreateConfig) -> 
     }
 }
 
-fn add(state_path: &Path, path: &Path) -> Project {
+fn add(state_path: &Path, path: &Path, backends: &[Vcs]) -> Project {
     let root = path.to_path_buf();
     state::mutate_at(state_path, |s| {
         if !s.projects.iter().any(|p| p.root == root) {
             s.projects.push(PersistedProject { root, expanded: true, shell: None, label: None });
         }
     });
-    jobs::on_this_thread(|blocking| Project::discover(path.to_path_buf(), false, blocking)).project
+    jobs::on_this_thread(|blocking| {
+        Project::discover(path.to_path_buf(), backends, false, blocking)
+    })
+    .project
 }
 
 fn remove(state_path: &Path, root: &Path) -> Result<(), NotAProject> {
@@ -125,13 +138,15 @@ fn rename(state_path: &Path, root: &Path, label: Option<String>) -> Result<(), N
     Ok(())
 }
 
-fn discover_all(state_path: &Path) -> Vec<Project> {
+fn discover_all(state_path: &Path, backends: &[Vcs]) -> Vec<Project> {
     let PersistedState { projects, .. } = state::load_from(state_path);
     projects
         .into_iter()
         .map(|p| {
-            let mut project =
-                jobs::on_this_thread(|blocking| Project::discover(p.root, false, blocking)).project;
+            let mut project = jobs::on_this_thread(|blocking| {
+                Project::discover(p.root, backends, false, blocking)
+            })
+            .project;
             project.expanded = p.expanded;
             project.label = p.label;
             project
@@ -143,8 +158,10 @@ fn discover_all(state_path: &Path) -> Vec<Project> {
 /// no sidebar to tell, and the next `project list` discovers the new worktree
 /// from git anyway.
 fn create_worktree(project_root: PathBuf, branch: String, config: &CreateConfig) -> IpcResult {
-    wt::validate_branch_name(&branch).map_err(|e| e.to_string())?;
-    let request = CreateRequest::new(project_root, None, branch, &config.workspace);
+    let vcs = crate::vcs::for_path(&config.vcs, &project_root)
+        .ok_or_else(|| VcsError::NotARepository(project_root.clone()).to_string())?;
+    vcs.validate_name(&branch).map_err(|e| e.to_string())?;
+    let request = CreateRequest::new(project_root, None, branch, &config.workspace, vcs);
     let mut steps = Vec::new();
     let path = jobs::on_this_thread(|blocking| {
         wt::create(&request, config.hooks.as_slice(), |step| steps.push(step.to_string()), blocking)
@@ -158,7 +175,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::test_util::{clone_with_origin, workspace_under};
+    use alacritree_git::test_support::clone_with_origin;
+
+    use crate::test_util::workspace_under;
 
     fn serve(state_path: &Path, request: &IpcRequest) -> IpcResult {
         handle_at(state_path, request, &CreateConfig::default())
@@ -332,6 +351,18 @@ mod tests {
         let result = serve(&state, &IpcRequest::ListSessions);
 
         assert_eq!(result, Err("alacritree is not running".to_string()));
+    }
+
+    #[test]
+    fn an_offline_status_with_git_disabled_says_version_control_is_off() {
+        let dir = TempDir::new().unwrap();
+        let repo = alacritree_git::test_support::init_repo(dir.path());
+        let config = CreateConfig { vcs: Vec::new(), ..CreateConfig::default() };
+
+        let reply = handle_at(&state_file(&dir), &IpcRequest::GitStatus { path: repo }, &config)
+            .expect("a reply");
+
+        assert_eq!(reply["error"], "version control is disabled");
     }
 
     /// The CLI with no window running puts a worktree where `[workspace]`

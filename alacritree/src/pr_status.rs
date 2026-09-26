@@ -3,14 +3,17 @@
 //! of the repo's default branch. The lookup is best-effort: a forge that
 //! fails or finds nothing leaves the default branch in place.
 
+use alacritree_vcs::Checkout;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use alacritree_forge::{Head, PrInfo, PrState, PullRequests, RemoteForge};
+use alacritree_vcs::VersionControl;
 
-use crate::jobs;
-use crate::projects::Worktree;
+use crate::vcs::Vcs;
+use crate::{jobs, wsl};
+
 use crate::repaint::Repaint;
 
 /// Re-query at most this often. PR base branches rarely change, and a stale
@@ -43,7 +46,7 @@ pub(crate) struct PrCache<F> {
     /// Entries that asked for a lookup this frame, handed to the forge by the
     /// next `drain_completed`. Batching needs a whole frame's worth of due
     /// entries before it can group them, which one `poll` call cannot see.
-    due: Vec<Head>,
+    due: Vec<(Head, Vcs)>,
     in_flight: usize,
     concurrency: usize,
     generation: u64,
@@ -123,6 +126,7 @@ impl<F: RemoteForge + Clone + Send + 'static> PrCache<F> {
         &mut self,
         path: &Path,
         branch: Option<&str>,
+        vcs: &Vcs,
         repaint: &impl Repaint,
     ) -> Option<PrInfo> {
         let now = self.now();
@@ -152,7 +156,8 @@ impl<F: RemoteForge + Clone + Send + 'static> PrCache<F> {
             }
             entry.branch = Some(branch.to_string());
             entry.pending = true;
-            self.due.push(Head { path: path.to_path_buf(), branch: branch.to_string() });
+            let head = Head { path: path.to_path_buf(), branch: branch.to_string(), remotes: None };
+            self.due.push((head, vcs.clone()));
             // The frame that queues a lookup is not the frame that starts one,
             // the next drain is, and egui paints on demand. Without asking
             // for that frame the request waits on the user's next input
@@ -259,7 +264,7 @@ impl<F: RemoteForge + Clone + Send + 'static> PrCache<F> {
             return;
         }
         if !may_spawn(self.concurrency, self.in_flight) {
-            for m in &due {
+            for (m, _) in &due {
                 if let Some(entry) = self.entries.get_mut(&m.path) {
                     entry.pending = false;
                     entry.queried_at = None;
@@ -267,7 +272,7 @@ impl<F: RemoteForge + Clone + Send + 'static> PrCache<F> {
             }
             return;
         }
-        let members = due.clone();
+        let members = due.iter().map(|(head, _)| head.clone()).collect();
         let repaint = repaint.clone();
         let forge = self.forge.clone();
         let job = jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
@@ -275,7 +280,19 @@ impl<F: RemoteForge + Clone + Send + 'static> PrCache<F> {
             // that frees this slot only runs on a frame, so an exit without a
             // repaint can stall polling for good.
             let _wake = WakeOnDrop(repaint);
-            forge.pull_requests(due, blocking)
+            // Reading remotes opens the repository, so it happens here rather
+            // than on the frame. Nothing on this side reads one inside a
+            // distro, where the forge finds the push remote itself.
+            let heads = due
+                .into_iter()
+                .map(|(mut head, vcs)| {
+                    if matches!(wsl::classify(&head.path), wsl::Location::Windows(_)) {
+                        head.remotes = Some(vcs.remotes(&head.path, &head.branch));
+                    }
+                    head
+                })
+                .collect();
+            forge.pull_requests(heads, blocking)
         });
         self.bank_batch(members, job);
     }
@@ -389,9 +406,10 @@ pub(crate) fn pr_pass(
     }
 }
 
-/// The branch a worktree's PR lookup is keyed to. The active worktree prefers
-/// its live status branch; every other worktree, and an active one whose
-/// `StatusCache` has not produced a branch yet, uses the stored snapshot.
+/// The branch a worktree's PR lookup is keyed to. The active worktree uses its
+/// live head's branch, which a detached head does not have; every other
+/// worktree, and an active one whose `StatusCache` has not read a head yet,
+/// uses the stored snapshot.
 ///
 /// The split is what keeps two pollers of one path from fighting. [`PrCache`]
 /// is keyed by path alone, so the right sidebar, which polls the active
@@ -401,16 +419,19 @@ pub(crate) fn pr_pass(
 /// in-terminal checkout. Every other worktree has a single poller, and an
 /// inactive workspace's `StatusCache` is created once and then never re-polled
 /// or pruned: reading it would freeze the branch at whatever it was on the last
-/// visit and shadow later `refresh_project` updates to `wt.branch`.
+/// visit and shadow later `refresh_project` updates to `wt.head`.
 pub(crate) fn effective_branch<'a>(
-    wt: &'a Worktree,
+    wt: &'a Checkout,
     current_workspace: Option<&Path>,
-    live_branch: Option<&'a str>,
+    live: Option<&'a alacritree_vcs::Head>,
 ) -> Option<&'a str> {
     if current_workspace == Some(wt.path.as_path()) {
-        live_branch.or(wt.branch.as_deref())
+        match live {
+            Some(head) => head.name.as_deref(),
+            None => wt.head.name.as_deref(),
+        }
     } else {
-        wt.branch.as_deref()
+        wt.head.name.as_deref()
     }
 }
 
@@ -431,6 +452,17 @@ mod tests {
     use alacritree_forge::fake::FakeForge;
 
     use crate::repaint::Recorder;
+
+    fn remotes() -> alacritree_vcs::Remotes {
+        alacritree_vcs::Remotes {
+            origin_url: Some("https://github.com/o/r.git".into()),
+            push_url: Some("https://github.com/me/r.git".into()),
+        }
+    }
+
+    fn vcs() -> Vcs {
+        Vcs::Fake(alacritree_vcs::fake::FakeVcs::new("/repo").with_remotes(remotes()))
+    }
 
     fn cache() -> PrCache<FakeForge> {
         PrCache::new(FakeForge::default())
@@ -467,7 +499,10 @@ mod tests {
         branch: &str,
         job: jobs::Job<PullRequests>,
     ) {
-        cache.bank_batch(vec![Head { path: PathBuf::from(path), branch: branch.to_string() }], job);
+        cache.bank_batch(
+            vec![Head { path: PathBuf::from(path), branch: branch.to_string(), remotes: None }],
+            job,
+        );
     }
 
     /// Wire a stuck request into `cache` as if it had been in flight since
@@ -481,7 +516,7 @@ mod tests {
         started: Duration,
     ) -> mpsc::Sender<()> {
         let (release, job) = spawn_stuck_job();
-        let member = Head { path: path.to_path_buf(), branch: branch.to_string() };
+        let member = Head { path: path.to_path_buf(), branch: branch.to_string(), remotes: None };
         cache.entries.insert(path.to_path_buf(), Entry {
             branch: Some(branch.to_string()),
             pending: true,
@@ -525,11 +560,16 @@ mod tests {
         let path = Path::new("/repo/wt");
         let repaint = Recorder::default();
 
-        assert_eq!(cache.poll(path, Some("topic"), &repaint), None);
+        assert_eq!(cache.poll(path, Some("topic"), &vcs(), &repaint), None);
         drain_until(&mut cache, path, Duration::from_secs(5));
 
-        assert_eq!(forge.calls(), [vec![Head { path: path.into(), branch: "topic".into() }]]);
-        assert_eq!(cache.poll(path, Some("topic"), &repaint), Some(sample_info()));
+        // A native checkout's remotes reach the forge read by its own backend.
+        assert_eq!(forge.calls(), [vec![Head {
+            path: path.into(),
+            branch: "topic".into(),
+            remotes: Some(remotes()),
+        }]]);
+        assert_eq!(cache.poll(path, Some("topic"), &vcs(), &repaint), Some(sample_info()));
         assert_eq!(forge.calls().len(), 1, "a banked answer is fresh for a TTL");
     }
 
@@ -547,7 +587,7 @@ mod tests {
             ..Entry::default()
         });
 
-        cache.poll(path, Some("topic"), &repaint);
+        cache.poll(path, Some("topic"), &vcs(), &repaint);
         drain_until(&mut cache, path, Duration::from_secs(5));
 
         assert_eq!(cache.state(path, Some("topic")), None);
@@ -582,7 +622,7 @@ mod tests {
         });
 
         let repaint = Recorder::default();
-        let result = cache.poll(&path, None, &repaint);
+        let result = cache.poll(&path, None, &vcs(), &repaint);
 
         assert_eq!(result.map(|info| info.number), Some(7));
         let entry = cache.entries.get(&path).unwrap();
@@ -591,13 +631,13 @@ mod tests {
         assert!(!entry.pending, "None poll must not queue a competing lookup");
     }
 
-    fn worktree(path: &str, branch: Option<&str>) -> Worktree {
-        Worktree {
+    fn worktree(path: &str, branch: Option<&str>) -> Checkout {
+        Checkout {
             name: String::new(),
             path: PathBuf::from(path),
-            branch: branch.map(String::from),
+            head: alacritree_vcs::Head { name: branch.map(String::from), ..Default::default() },
             is_main: false,
-            prunable: false,
+            gone: false,
             upstream: None,
         }
     }
@@ -642,7 +682,29 @@ mod tests {
     fn effective_branch_prefers_the_live_branch_for_the_active_worktree() {
         let wt = worktree("/repo/wt", Some("stored"));
         let active = Some(Path::new("/repo/wt"));
-        assert_eq!(effective_branch(&wt, active, Some("live")), Some("live"));
+        assert_eq!(effective_branch(&wt, active, Some(&live_head(Some("live")))), Some("live"));
+    }
+
+    #[test]
+    fn a_detached_checkout_elsewhere_queries_no_pull_request() {
+        let mut wt = worktree("/repo/wt", None);
+        wt.head.revision = Some("abc1234".into());
+        assert_eq!(effective_branch(&wt, Some(Path::new("/repo/other")), None), None);
+    }
+
+    #[test]
+    fn a_detached_active_workspace_queries_no_pull_request() {
+        let wt = worktree("/repo/wt", Some("stored"));
+        let active = Some(Path::new("/repo/wt"));
+        assert_eq!(effective_branch(&wt, active, Some(&live_head(None))), None);
+    }
+
+    fn live_head(name: Option<&str>) -> alacritree_vcs::Head {
+        alacritree_vcs::Head {
+            name: name.map(str::to_string),
+            revision: Some("abc1234".into()),
+            distance: None,
+        }
     }
 
     /// A workspace that just became active has a fresh `StatusCache` with no
@@ -659,7 +721,7 @@ mod tests {
     fn effective_branch_ignores_a_live_branch_from_another_workspace() {
         let wt = worktree("/repo/wt", Some("stored"));
         let active = Some(Path::new("/repo/other"));
-        assert_eq!(effective_branch(&wt, active, Some("live")), Some("stored"));
+        assert_eq!(effective_branch(&wt, active, Some(&live_head(Some("live")))), Some("stored"));
     }
 
     #[test]
@@ -933,7 +995,7 @@ mod tests {
             refresh_requested: false,
         });
         let repaint = Recorder::default();
-        cache.poll(capped, Some("feature"), &repaint);
+        cache.poll(capped, Some("feature"), &vcs(), &repaint);
         cache.drain_completed(&repaint);
 
         assert_eq!(cache.in_flight(), 1, "the cap must refuse the second request");
@@ -948,7 +1010,7 @@ mod tests {
         let repaint = Recorder::default();
         let mut cache = cache();
 
-        cache.poll(Path::new("/repo/wt"), Some("main"), &repaint);
+        cache.poll(Path::new("/repo/wt"), Some("main"), &vcs(), &repaint);
 
         assert_eq!(repaint.wakes(), 1, "a queued lookup must ask for its spawning frame");
     }
@@ -967,7 +1029,7 @@ mod tests {
         let (_release, job) = spawn_stuck_job();
         bank_one(&mut cache, "/repo/busy", "main", job);
 
-        cache.poll(Path::new("/repo/capped"), Some("feature"), &repaint);
+        cache.poll(Path::new("/repo/capped"), Some("feature"), &vcs(), &repaint);
 
         assert_eq!(repaint.wakes(), 0, "a saturated cap must not spin the frame loop");
     }
@@ -1017,11 +1079,10 @@ mod tests {
     fn one_banked_result_reaches_every_member() {
         let repaint = Recorder::default();
         let mut cache = cache();
-        let members =
-            vec![Head { path: PathBuf::from("/repo/a"), branch: "topic-a".into() }, Head {
-                path: PathBuf::from("/repo/b"),
-                branch: "topic-b".into(),
-            }];
+        let members = vec![
+            Head { path: PathBuf::from("/repo/a"), branch: "topic-a".into(), remotes: None },
+            Head { path: PathBuf::from("/repo/b"), branch: "topic-b".into(), remotes: None },
+        ];
         let job = jobs::Pool::new(2).spawn(jobs::Priority::Background, |_| {
             PullRequests::from([
                 (

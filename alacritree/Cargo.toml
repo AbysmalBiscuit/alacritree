@@ -21,10 +21,12 @@ alacritree_diff_viewer.workspace = true
 alacritree_doppler.workspace = true
 alacritree_forge.workspace = true
 alacritree_gh.workspace = true
+alacritree_git.workspace = true
 alacritree_herdr.workspace = true
 alacritree_multiplexer.workspace = true
 alacritree_tasks.workspace = true
 alacritree_taskwarrior.workspace = true
+alacritree_vcs.workspace = true
 alacritree_zellij.workspace = true
 ambassador.workspace = true
 alacritty_terminal = { path = "../alacritty_terminal" }
@@ -33,7 +35,6 @@ eframe = { version = "0.31", default-features = false, features = ["default_font
 egui = { version = "0.31", features = ["serde"] }
 log = "0.4"
 env_logger = "0.11"
-git2 = { version = "0.20", default-features = false }
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -88,9 +89,11 @@ thiserror.workspace = true
 alacritree_checkout_hooks = { workspace = true, features = ["test-support"] }
 alacritree_common = { workspace = true, features = ["test-support"] }
 alacritree_forge = { workspace = true, features = ["test-support"] }
+alacritree_git = { workspace = true, features = ["test-support"] }
 alacritree_herdr = { workspace = true, features = ["test-support"] }
 alacritree_multiplexer = { workspace = true, features = ["test-support"] }
 alacritree_tasks = { workspace = true, features = ["test-support"] }
+alacritree_vcs = { workspace = true, features = ["test-support"] }
 alacritree_zellij = { workspace = true, features = ["test-support"] }
 # Throwaway repos and state files for worktree, prune, and persistence tests.
 tempfile = "3"
