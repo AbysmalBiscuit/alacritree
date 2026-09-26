@@ -37,7 +37,7 @@ use crate::multiplexer::{
 use crate::panel_filter::{self, PanelFilter};
 use crate::path_style::PathStyle;
 use crate::pr_status::{self, PrCache, PrInfo, PrState};
-use crate::projects::{Discovered, Project, Worktree, project_json};
+use crate::projects::{Discovered, NotAProject, Project, Worktree, project_json};
 use crate::session::{
     self, Attachment, AttentionVerdict, LiveState, PendingAttention, Session, SessionActivity,
     SessionId, SessionKind, ShellCommand, ShownState, TermSize, poll_attention_debounce,
@@ -725,12 +725,12 @@ impl AlacritreeApp {
 
     /// Set or clear a project's display label and persist it.  Returns the
     /// project's index so IPC can reply with its JSON.
-    fn rename_project(&mut self, root: &Path, label: Option<String>) -> Result<usize, String> {
+    fn rename_project(&mut self, root: &Path, label: Option<String>) -> Result<usize, NotAProject> {
         let idx = self
             .projects
             .iter()
             .position(|p| p.root == *root)
-            .ok_or_else(|| format!("{} is not a project in the sidebar", root.display()))?;
+            .ok_or_else(|| NotAProject(root.to_path_buf()))?;
         self.projects[idx].label = crate::projects::normalize_label(label);
         self.persist_project_label(root);
         Ok(idx)
@@ -892,7 +892,7 @@ impl AlacritreeApp {
                     project.apply(found, &occupied);
                     Ok(project_json(project))
                 },
-                None => Err(format!("{} is not a project in the sidebar", root.display())),
+                None => Err(NotAProject(root).to_string()),
             };
             waiters.answer(reply);
         }
@@ -1474,23 +1474,16 @@ impl AlacritreeApp {
         &mut self,
         id: SessionId,
         target: WorkspaceKey,
-    ) -> Result<WorkspaceKey, String> {
-        let idx = self
-            .sessions
-            .iter()
-            .position(|s| s.id == id)
-            .ok_or_else(|| format!("no session with id {id}. See list_sessions"))?;
-        if matches!(&self.sessions[idx].kind, SessionKind::Scratchpad { .. }) {
-            return Err("scratchpads belong to their backing workspace and cannot be moved".into());
-        }
-        if matches!(&self.sessions[idx].kind, SessionKind::Tasks) {
-            return Err("a tasks tab shows the lists of the workspace it was opened in".into());
-        }
-        // A workspace's diff pane is found by workspace plus kind, so a pane
-        // carried elsewhere becomes the one the next git click closes while
-        // the workspace it left opens a second.
-        if matches!(&self.sessions[idx].kind, SessionKind::Diff { .. }) {
-            return Err("diff panes belong to the workspace they were opened from".into());
+    ) -> Result<WorkspaceKey, MoveError> {
+        let idx = self.sessions.iter().position(|s| s.id == id).ok_or(MoveError::NoSession(id))?;
+        match &self.sessions[idx].kind {
+            SessionKind::Scratchpad { .. } => return Err(MoveError::Scratchpad),
+            SessionKind::Tasks => return Err(MoveError::Tasks),
+            // A workspace's diff pane is found by workspace plus kind, so a
+            // pane carried elsewhere becomes the one the next git click closes
+            // while the workspace it left opens a second.
+            SessionKind::Diff { .. } => return Err(MoveError::Diff),
+            _ => {},
         }
         if self.sessions.move_to(idx, &target, &self.current_workspace) {
             self.current_workspace = target.clone();
@@ -3765,6 +3758,19 @@ enum CloseFallback {
     Home,
 }
 
+/// Why a session cannot move to another workspace.
+#[derive(Debug, thiserror::Error)]
+enum MoveError {
+    #[error("no session with id {0}. See list_sessions")]
+    NoSession(SessionId),
+    #[error("scratchpads belong to their backing workspace and cannot be moved")]
+    Scratchpad,
+    #[error("a tasks tab shows the lists of the workspace it was opened in")]
+    Tasks,
+    #[error("diff panes belong to the workspace they were opened from")]
+    Diff,
+}
+
 /// Why a session record is going away.  The distinction exists because
 /// neither half of a close, the respawn policy or the navigation, may apply
 /// to a session that never got a PTY.
@@ -4060,7 +4066,9 @@ mod tests {
     };
     use super::widgets::agent_hint;
     use crate::herdr::{self, PendingAttach, PendingCreate};
-    use crate::multiplexer::{AttachRequest, MultiplexerKind, Pane, PaneStatus, Scripted};
+    use crate::multiplexer::{
+        AttachRequest, MultiplexerKind, Pane, PaneError, PaneStatus, Scripted,
+    };
     use crate::sidebar_model::build_snapshot;
     use crate::test_util::herdr_pane_key;
 
@@ -4851,7 +4859,7 @@ mod tests {
         let id = bind_pane_fixture(&mut app, &side, "term-focused");
         app.set_active_in_current_workspace(id);
 
-        assert_eq!(app.create_target(None, None), Ok((MultiplexerKind::Scripted, side)));
+        assert_eq!(app.create_target(None, None).unwrap(), (MultiplexerKind::Scripted, side));
     }
 
     /// A side whose rows are still drawn through one missed poll is still
@@ -4872,7 +4880,7 @@ mod tests {
         app.multiplexers.herdr_mut_for_test().caches_mut_for_test()[0]
             .fail_listing_for_test(herdr::PollError::Absent("spawn_failed"));
 
-        assert_eq!(app.create_target(None, None), Ok((MultiplexerKind::Herdr, Side::Native)));
+        assert_eq!(app.create_target(None, None).unwrap(), (MultiplexerKind::Herdr, Side::Native));
     }
 
     /// A worktree the sidebar does not have is refused before the multiplexer
@@ -4934,7 +4942,10 @@ mod tests {
     fn poll_pane_create_answers_the_waiter_when_the_multiplexer_refuses() {
         let mut app = test_app();
         let (reply_tx, reply_rx) = mpsc::channel();
-        app.multiplexers.scripted_mut().enable().answer_create(Err("boom".to_string()));
+        app.multiplexers
+            .scripted_mut()
+            .enable()
+            .answer_create(Err(PaneError::Scripted("boom".into())));
         app.create_multiplexer_pane(
             &Context::default(),
             (MultiplexerKind::Scripted, Side::Native),
@@ -5054,7 +5065,7 @@ mod tests {
             .scripted_mut()
             .enable()
             .answer_create(Ok(created_pane()))
-            .answer_attach(Err(refusal.clone()));
+            .answer_attach(Err(PaneError::Scripted(refusal.clone())));
         app.create_multiplexer_pane(
             &Context::default(),
             (MultiplexerKind::Scripted, Side::Native),
@@ -5147,7 +5158,10 @@ mod tests {
     fn a_refused_background_create_answers_only_its_client() {
         let mut app = test_app();
         let (reply_tx, reply_rx) = mpsc::channel();
-        app.multiplexers.scripted_mut().enable().answer_create(Err("boom".to_string()));
+        app.multiplexers
+            .scripted_mut()
+            .enable()
+            .answer_create(Err(PaneError::Scripted("boom".into())));
         app.create_multiplexer_pane(
             &Context::default(),
             (MultiplexerKind::Scripted, Side::Native),
@@ -5601,7 +5615,10 @@ mod tests {
         let mut app = test_app();
         let key = Scripted::key(&Side::Native, "t1");
         let (reply_tx, reply_rx) = mpsc::channel();
-        app.multiplexers.scripted_mut().enable().answer_attach(Err("boom".to_string()));
+        app.multiplexers
+            .scripted_mut()
+            .enable()
+            .answer_attach(Err(PaneError::Scripted("boom".into())));
         let unlisted = PaneTarget::unlisted(&key, "w1:p1");
         let switch = WorkspaceSwitch { to: None, from: None };
         app.attach_pane(
@@ -6369,7 +6386,10 @@ mod tests {
                 dirty: None,
                 delete_branch: true,
                 prunable: false,
-                job: jobs::Job::ready(Err(reason.to_string())),
+                job: jobs::Job::ready(Err(wt::WorktreeError::Git {
+                    args: format!("worktree remove {path}"),
+                    output: reason.to_string(),
+                })),
             });
         }
 

@@ -42,8 +42,8 @@ const FONT_LICENSE: &str = include_str!("../../assets/FONT-LICENSE.txt");
 /// window.  These only arrive at launch, so refusing is safe here, and a
 /// measurement run that silently dropped the setting it was varying is worse
 /// than one that never started.
-fn parse_override(fragment: &str) -> Result<toml::Value, String> {
-    toml::from_str(fragment).map_err(|e| e.to_string())
+fn parse_override(fragment: &str) -> Result<toml::Value, toml::de::Error> {
+    toml::from_str(fragment)
 }
 
 #[derive(Debug, Parser)]
@@ -429,8 +429,7 @@ fn refresh(
                 dispatch(&IpcRequest::RefreshProject { root: root.into() }, &transport, config)
             })
             .collect::<Result<Vec<_>, _>>()
-            .map(|projects| serde_json::json!({ "projects": projects }))
-            .map_err(|e| e.to_string());
+            .map(|projects| serde_json::json!({ "projects": projects }));
         return report(&IpcRequest::ListProjects, refreshed, as_json);
     }
 
@@ -498,11 +497,15 @@ fn execute(
     as_json: bool,
     config: ConfigSource<'_>,
 ) -> i32 {
-    let result = dispatch(request, &LocalSocket(socket), config).map_err(|e| e.to_string());
+    let result = dispatch(request, &LocalSocket(socket), config);
     report(request, result, as_json)
 }
 
-fn report(request: &IpcRequest, result: Result<serde_json::Value, String>, as_json: bool) -> i32 {
+fn report(
+    request: &IpcRequest,
+    result: Result<serde_json::Value, SendError>,
+    as_json: bool,
+) -> i32 {
     match result {
         Ok(value) => {
             if as_json {
@@ -512,7 +515,7 @@ fn report(request: &IpcRequest, result: Result<serde_json::Value, String>, as_js
             }
             0
         },
-        Err(e) => fail(&e, as_json),
+        Err(e) => fail(&e.to_string(), as_json),
     }
 }
 
@@ -545,7 +548,7 @@ fn dispatch(
             if let Some(dir) = resolved.state_dir {
                 crate::state::set_dir(dir);
             }
-            offline::handle(request, &create).map_err(SendError::Failed)
+            offline::handle(request, &create).map_err(SendError::Refused)
         },
         result => result,
     }
@@ -928,6 +931,6 @@ mod tests {
         let result =
             LocalSocket(Some(&dead)).send(&IpcRequest::ListProjects, Duration::from_secs(5));
 
-        assert_eq!(result, Err(SendError::NoInstance));
+        assert!(matches!(result, Err(SendError::NoInstance)), "{result:?}");
     }
 }

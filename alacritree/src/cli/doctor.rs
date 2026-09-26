@@ -243,7 +243,15 @@ const WSL_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// What a probe of one distro found. It has a path per [`tools::Tool`], by discriminant, or
 /// why the distro could not be asked.
-type Probe = Result<Vec<Option<String>>, String>;
+type Probe = Result<Vec<Option<String>>, ProbeError>;
+
+#[derive(Debug, thiserror::Error)]
+enum ProbeError {
+    #[error(transparent)]
+    Batch(#[from] wsl::BatchError),
+    #[error("no answer in {}s", WSL_PROBE_TIMEOUT.as_secs())]
+    NoAnswer,
+}
 
 /// What each installed distro can actually do for alacritree.  Nothing else
 /// reports on the inside of a distro: git, gh and delta are resolved there
@@ -275,7 +283,8 @@ fn probe_distros(distros: &[wsl::WslDistro]) -> Vec<(String, Probe)> {
         let name = distro.name.clone();
         let names = names;
         std::thread::spawn(move || {
-            let probe = jobs::on_this_thread(|blocking| wsl::probe_tools(&name, &names, blocking));
+            let probe = jobs::on_this_thread(|blocking| wsl::probe_tools(&name, &names, blocking))
+                .map_err(ProbeError::from);
             let _ = tx.send((name, probe));
         });
     }
@@ -295,9 +304,7 @@ fn probe_distros(distros: &[wsl::WslDistro]) -> Vec<(String, Probe)> {
     distros
         .iter()
         .map(|d| {
-            let probe = answered
-                .remove(&d.name)
-                .unwrap_or_else(|| Err(format!("no answer in {}s", WSL_PROBE_TIMEOUT.as_secs())));
+            let probe = answered.remove(&d.name).unwrap_or(Err(ProbeError::NoAnswer));
             (d.name.clone(), probe)
         })
         .collect()
@@ -466,9 +473,7 @@ fn ipc_checks(socket: Option<&Path>, enabled: bool) -> Vec<Check> {
         Err(SendError::NoInstance) => {
             check("ipc", "instance", Status::Ok, "none running, but offline commands still work")
         },
-        Err(SendError::Failed(e)) => {
-            check("ipc", "instance", Status::Warn, format!("running but not answering: {e}"))
-        },
+        Err(e) => check("ipc", "instance", Status::Warn, format!("running but not answering: {e}")),
     });
     checks
 }
@@ -637,14 +642,14 @@ fn taskwarrior_checks(distros: &[wsl::WslDistro]) -> Vec<Check> {
             });
             let declared = match &declared {
                 Ok((subof, order)) => Ok((subof.as_deref(), order.as_deref())),
-                Err(e) => Err(e.to_string()),
+                Err(e) => Err(e),
             };
             uda_check(&name, declared)
         })
         .collect()
 }
 
-fn uda_check(side: &str, declared: Result<(Option<&str>, Option<&str>), String>) -> Check {
+fn uda_check(side: &str, declared: Result<(Option<&str>, Option<&str>), &TaskError>) -> Check {
     match declared {
         Ok((Some("uuid"), Some("numeric"))) => {
             check("taskwarrior", side, Status::Ok, "subof and order declared")
@@ -655,7 +660,7 @@ fn uda_check(side: &str, declared: Result<(Option<&str>, Option<&str>), String>)
             Status::Warn,
             "subof and order are not declared; run `alacritree task setup`",
         ),
-        Err(e) => check("taskwarrior", side, Status::Warn, e),
+        Err(e) => check("taskwarrior", side, Status::Warn, e.to_string()),
     }
 }
 
@@ -846,14 +851,14 @@ mod tests {
         assert_eq!(uda_check("native", Ok((Some("uuid"), Some("numeric")))).status, Status::Ok);
         assert_eq!(uda_check("native", Ok((Some("uuid"), None))).status, Status::Warn);
         assert_eq!(uda_check("wsl:Ubuntu", Ok((None, None))).status, Status::Warn);
-        let missing = uda_check("native", Err("taskwarrior not found: task".into()));
+        let missing = uda_check("native", Err(&TaskError::Missing { program: "task".into() }));
         assert_eq!(missing.status, Status::Warn);
         assert!(missing.detail.contains("not found"), "{:?}", missing.detail);
     }
 
     #[test]
     fn a_distro_that_cannot_be_reached_says_why() {
-        let probe: Probe = Err("no answer in 15s".to_string());
+        let probe: Probe = Err(ProbeError::NoAnswer);
         let check = wsl_distro_check("Ubuntu", &probe);
         assert_eq!(check.status, Status::Warn);
         assert!(check.detail.contains("no answer in 15s"), "{:?}", check.detail);
