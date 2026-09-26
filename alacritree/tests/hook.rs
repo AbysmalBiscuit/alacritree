@@ -17,6 +17,21 @@ fn succeeds(program: &str, args: &[&str]) -> bool {
     hidden(program).args(args).output().is_ok_and(|o| o.status.success())
 }
 
+/// Runs a setup step that must succeed, and fails with what it printed when
+/// it does not. wsl.exe prints its own errors on stdout, in UTF-16 unless
+/// `WSL_UTF8` is set.
+#[allow(clippy::disallowed_methods)]
+fn run(program: &str, args: &[&str]) {
+    let out = hidden(program).env("WSL_UTF8", "1").args(args).output().expect("setup runs");
+    assert!(
+        out.status.success(),
+        "{program} {args:?} failed ({}): {}{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// A repository, a private taskrc and a private config dir, so nothing the
 /// developer owns is read or written. Taskwarrior 3 has no Windows build, so
 /// a host without a native one keeps the repository and taskrc inside the
@@ -34,7 +49,7 @@ fn with_task() -> Option<Sandbox> {
         let work = tempfile::tempdir().unwrap();
         let repo = work.path().join("myrepo");
         std::fs::create_dir(&repo).unwrap();
-        assert!(succeeds("git", &["-C", repo.to_str()?, "init", "-q", "-b", "main"]));
+        run("git", &["-C", repo.to_str()?, "init", "-q", "-b", "main"]);
         std::fs::write(work.path().join("taskrc"), "").unwrap();
         let root = work.path().to_str()?.to_string();
         let env = vec![("TASKRC", format!("{root}/taskrc")), ("TASKDATA", format!("{root}/data"))];
@@ -51,7 +66,7 @@ fn with_task() -> Option<Sandbox> {
     std::fs::create_dir(&repo).unwrap();
     let linux_repo = format!("{root}/myrepo");
     let init = ["-d", &distro, "-e", "git", "-C", &linux_repo, "init", "-q", "-b", "main"];
-    assert!(succeeds("wsl.exe", &init));
+    run("wsl.exe", &init);
     std::fs::write(work.path().join("taskrc"), "").unwrap();
     let env = vec![
         ("TASKRC", format!("{root}/taskrc")),
@@ -164,6 +179,45 @@ fn a_missing_task_binary_prints_nothing_and_exits_zero() {
     let out = hook(&sandbox, &args, &fixture("claude-session-start.json", &sandbox.repo));
     assert!(out.status.success());
     assert!(out.stdout.is_empty());
+}
+
+/// A configured command answers the hook in taskwarrior's place, guide and
+/// lists both.
+#[cfg(unix)]
+#[test]
+fn a_task_command_answers_the_hook() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = without_task();
+    let bin = sandbox.state.path().join("todo");
+    std::fs::write(&bin, "#!/bin/sh\ncat \"$(dirname \"$0\")/tasks.json\"\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let tasks = r#"[{"id":"t1","description":"from the command","status":"pending","project":"myrepo.main"},
+        {"id":"t2","description":"another repo","status":"pending","project":"other"}]"#;
+    std::fs::write(sandbox.state.path().join("tasks.json"), tasks).unwrap();
+    let path = format!("integrations.tasks.command.path='{}'", bin.display());
+    let args = [
+        "-o",
+        "integrations.tasks.command.enabled=true",
+        "-o",
+        &path,
+        "-o",
+        "integrations.tasks.command.list=['list']",
+        "-o",
+        "integrations.tasks.command.agent_guide='Use todo for {project}.'",
+        "hook",
+        "session-start",
+        "--harness",
+        "claude",
+    ];
+    let out = hook(&sandbox, &args, &fixture("claude-session-start.json", &sandbox.repo));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!("stdout is JSON ({e}): {}", String::from_utf8_lossy(&out.stderr))
+    });
+    let ctx = json["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+    assert!(ctx.starts_with("Use todo for myrepo.main.claude-"), "{ctx}");
+    assert!(ctx.contains("from the command"), "{ctx}");
+    assert!(!ctx.contains("another repo"), "{ctx}");
 }
 
 #[test]

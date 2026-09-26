@@ -3,17 +3,19 @@
 
 use std::path::Path;
 
+use alacritree_common::side::Side;
+use alacritree_common::{jobs, tools, wsl};
+use alacritree_tasks::TaskError;
+use alacritree_tasks::scope::{node, session_from_env};
+use alacritree_taskwarrior::Taskwarrior;
 use clap::Subcommand;
 
-use crate::multiplexer::Side;
+use crate::config;
 use crate::tasks::facts;
-use crate::tasks::scope::{node, session_from_env};
-use crate::tasks::taskwarrior::{TaskError, Taskwarrior, UDA_DECLARATIONS};
-use crate::{config, jobs, tools, wsl};
 
 #[derive(Debug, Subcommand)]
 pub(super) enum TaskCommand {
-    /// Print the taskwarrior project for this directory and agent session.
+    /// Print the project an agent in this directory writes its tasks to.
     Scope,
     /// Declare the `subof` and `order` UDAs in the taskrc on every side.
     Setup,
@@ -33,10 +35,15 @@ pub(super) fn run(
 }
 
 /// Points `task` and `git` at the configured programs, so
-/// `[integrations.taskwarrior] path` and `-o` reach every call.
-pub(super) fn configure_tools(config_dir: Option<&Path>, overrides: &[toml::Value]) {
+/// `[integrations.taskwarrior] path` and `-o` reach every call, and hands back
+/// the integrations for the caller to pick a task backend from.
+pub(super) fn configure_tools(
+    config_dir: Option<&Path>,
+    overrides: &[toml::Value],
+) -> config::IntegrationsConfig {
     let (config, _) = config::load(config_dir, overrides);
     tools::configure(config.integrations.tool_paths());
+    config.integrations
 }
 
 fn scope(json: bool) -> i32 {
@@ -55,17 +62,7 @@ fn scope(json: bool) -> i32 {
 }
 
 fn declare(side: Side) -> Result<Vec<&'static str>, TaskError> {
-    jobs::on_this_thread(|b| {
-        let tw = Taskwarrior::for_side(side, b);
-        let mut written = Vec::new();
-        for (key, value) in UDA_DECLARATIONS {
-            if tw.rc_value(key, b)?.as_deref() != Some(value) {
-                tw.set_config(key, value, b)?;
-                written.push(key);
-            }
-        }
-        Ok(written)
-    })
+    jobs::on_this_thread(|b| Taskwarrior::default().declare_fields(side, b))
 }
 
 fn setup(json: bool) -> i32 {
