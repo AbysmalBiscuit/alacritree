@@ -45,7 +45,7 @@ Every feature and bugfix gets its own worktree and branch, created by `devkit is
 Stack branches that look independent, too. A clean merge between them today says nothing about what `master` moving under both does to them later.
 
 ```sh
-gh pr list --repo mathix420/alacritree --state open --json number,title,headRefName
+gh pr list --repo alacritree/alacritree --state open --json number,title,headRefName
 ```
 
 Take the entry whose title carries the highest `[n]` marker; its `headRefName` is your base and `n + 1` is your marker. PR titles carry that marker: `feat(logging): record why alacritree died [8]`.
@@ -56,7 +56,7 @@ The slug is the whole branch name, type prefix included, and the GitHub issue nu
 devkit issue setup 41 --summary --slug feat/decoration-metrics
 ```
 
-`origin` is Arnaud's repo, `mathix420/alacritree`, and the fork answers to `fork`. That is backwards from the usual fork checkout on purpose: `devkit issue pr create` pushes `-u origin` with the remote name spelled into devkit, and a stacked PR needs its head and the base it targets in the repository the PR is opened against.
+`origin` is the project repo, `alacritree/alacritree`, and my fork answers to `fork`. That is backwards from the usual fork checkout on purpose: `devkit issue pr create` pushes `-u origin` with the remote name spelled into devkit, and a stacked PR needs its head and the base it targets in the repository the PR is opened against.
 
 `devkit issue setup` cuts every branch from `origin/master` and takes no base flag, so a stacked branch is re-pointed once, before it has any commits of its own:
 
@@ -191,23 +191,23 @@ A stacked PR targets the branch below it, not `master`, so merging it merges int
 Merge the lowest PR first, and retarget the next one before merging it:
 
 ```sh
-gh pr merge <lowest> --repo mathix420/alacritree --squash --delete-branch
-gh pr edit <next> --repo mathix420/alacritree --base master
+gh pr merge <lowest> --repo alacritree/alacritree --squash --delete-branch
+gh pr edit <next> --repo alacritree/alacritree --base master
 ```
 
 `--delete-branch` is what makes GitHub retarget the rest of the stack on its own, so the `gh pr edit` line is the belt to its braces. Check the base before merging anything:
 
 ```sh
-gh pr view <number> --repo mathix420/alacritree --json baseRefName
+gh pr view <number> --repo alacritree/alacritree --json baseRefName
 ```
 
 ## Tracking features
 
-Features I plan to work are tracked via GitHub issues on my fork: `https://github.com/AbysmalBiscuit/alacritree/issues`
+Features I plan to work on are tracked as GitHub issues on `alacritree/alacritree` and on the org project `https://github.com/orgs/alacritree/projects/1`. Issues closed before the move to the org stay on my fork, `AbysmalBiscuit/alacritree`, and the PRs of that period reference them there.
 
 ## Upstreaming features for vendored crates
 
-Never propose to upstream features for vendored crates. This is an AI/vibe coded project, so nothing will be upstreamed to vendored crates. The only upstreaming PRs that we will do are to Arnaud's fork (`alacritree`).
+Never propose to upstream features for vendored crates. This is an AI/vibe coded project, so nothing will be upstreamed to vendored crates. The only upstreaming PRs that we will do are to `alacritree/alacritree`.
 
 
 ## Alacritree config
@@ -224,7 +224,7 @@ When adding new entries to the config, always add default values so they are inc
 
 ### Issue tracker
 
-GitHub issues on the fork `AbysmalBiscuit/alacritree`, always with an explicit `-R`. See `docs/agents/issue-tracker.local.md`.
+GitHub issues on `alacritree/alacritree`, always with an explicit `-R`.
 
 ### Triage labels
 
