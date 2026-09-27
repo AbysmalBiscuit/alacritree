@@ -1,6 +1,4 @@
-Whenever working on features, the goal is to preserve the original behavior so Arnaud's workflow isn't affected.
-
-So new UX/UI features need to provide config options that are used to enable them.
+Features ship on, with no config option. Add an option when I ask for one, or when the change makes an action Arnaud already relies on behave differently and he could reasonably want the old behavior back. That option's default keeps the old behavior. Returning to the previous session when a tab closes is one: closing a tab used to leave focus where it landed. Multi-select in the task list, a new palette command or a new panel change nothing he already does and get no option.
 
 ## Code comments and doc strings
 
