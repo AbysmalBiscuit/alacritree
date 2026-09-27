@@ -464,9 +464,8 @@ pub struct AlacritreeApp {
     /// Scratch buffers the painter copies the visible grid into, so the
     /// terminal lock is released before any shape is built.
     grid_snapshot: crate::terminal_view::GridSnapshot,
-    /// Buffers and GL objects for `[ui] gpu_grid`.  Held whether or not the
-    /// option is on: it allocates nothing until a frame writes to it, and
-    /// the GL side is built on the first paint that needs it.
+    /// Buffers and GL objects the terminal grid is drawn with.  The GL side is
+    /// built on the first paint, the first time a GL context is reachable.
     gpu_grid: crate::grid_gl::GpuGrid,
     /// Present only when frame timing was asked for; `None` is the normal run.
     frame_log: Option<crate::frame_log::FrameLog>,
@@ -3192,6 +3191,9 @@ impl AlacritreeApp {
         self.poll_multiplexers();
         self.reconcile_pane_sessions(ctx);
         self.sync_pane_views(ctx);
+        if let Some(err) = self.gpu_grid.take_build_error() {
+            self.modals.error_dialog = Some(format!("the terminal grid cannot be drawn: {err}"));
+        }
         // Poll first, then check `failed`: a panicked job's `poll` returns
         // `None` forever, so `failed` is what stops its handle from sitting
         // here for the rest of the process.
@@ -3348,7 +3350,7 @@ impl AlacritreeApp {
                         &mut self.color_glyphs,
                         &mut self.glyph_cache,
                         &mut self.grid_snapshot,
-                        Some(&self.gpu_grid),
+                        &self.gpu_grid,
                         &mut self.detached_jobs,
                     );
                     self.grid_paint += started.elapsed();
@@ -5135,6 +5137,21 @@ mod tests {
             app.multiplexers.scripted().pending_create().is_empty(),
             "an untranslatable workspace still asked the multiplexer"
         );
+    }
+
+    /// A context too old for the grid still draws every panel, so the window
+    /// says why the terminal is blank, once, rather than leaving it to the log.
+    #[test]
+    fn a_grid_the_driver_rejects_is_reported_in_the_error_dialog_once() {
+        let mut app = test_app();
+        app.gpu_grid.fail_build(crate::grid_gl::BuildError::Outdated("2.1 Mesa".into()));
+
+        app.poll_update_jobs(&Context::default());
+        let shown = app.modals.error_dialog.take().expect("the failure was not reported");
+        app.poll_update_jobs(&Context::default());
+
+        assert!(shown.contains("OpenGL 2.1 Mesa"), "the driver's version is missing: {shown}");
+        assert_eq!(app.modals.error_dialog, None, "a dismissed report came back");
     }
 
     /// A create the multiplexer refused must answer whoever asked for the
