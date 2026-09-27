@@ -49,7 +49,7 @@ enforce_commands = true
 [harness.commands.cargo-fmt]
 programs = ["cargo"]
 args = ["fmt"]
-reason = "Stable rustfmt ignores the nightly-only options in rustfmt.toml and reformats files your change never touched. Run `devkit run task fmt`."
+reason = "Stable rustfmt skips the nightly-only options in rustfmt.toml, including the `ignore` list that keeps it off the vendored crates, and reformats files your change never touched. Run `devkit run task fmt`."
 
 [harness.commands.cargo-test]
 programs = ["cargo"]
@@ -98,30 +98,26 @@ after_end = [["alacritree", "project", "refresh", "."]]
 [tracker]
 kind = "github"
 
-# `enforce_commands` refuses every cargo verb these tasks wire up, so a verb
-# with no task here is a verb nobody can run. All of them are scoped to
-# `-p alacritree`, since the vendored crates are read-only. `--locked` is on
-# the three CI gates and off the fast loops, so an uncommitted `Cargo.lock`
-# fails here rather than in CI.
+# `enforce_commands` refuses the cargo verbs these tasks wire up, so every verb
+# needs a task. `default-members` keeps them off the vendored crates, and
+# `--locked` on the CI gates fails an uncommitted `Cargo.lock` here, not in CI.
 
 [tasks.fmt]
-# Ten of the fifteen options in `rustfmt.toml` are nightly-only, and stable
-# rustfmt ignores every one of them after a warning, so a bare `cargo fmt`
-# reformats files the change never touched. Nightly drifts against itself too,
-# so even this rewrites code it has no business touching: stage the files the
-# change edited, not everything `git status` lists afterwards.
-description = "Format alacritree with the nightly rustfmt its config requires"
-run = ["cargo", "+nightly", "fmt", "-p", "alacritree"]
+# Stable rustfmt skips the nightly-only options in `rustfmt.toml`, `ignore`
+# among them. Nightly drifts against itself too, so stage only the files the
+# change edited.
+description = "Format alacritree and its crates with the nightly rustfmt its config requires"
+run = ["cargo", "+nightly", "fmt"]
 
 [tasks.check]
-description = "Type-check alacritree"
-run = ["cargo", "check", "-p", "alacritree"]
+description = "Type-check alacritree and its crates"
+run = ["cargo", "check"]
 
 [tasks.test]
 # nextest is installed here and is what the suite is run with. CI still says
 # `cargo test`, because it runs on machines where nextest is absent.
-description = "Run the alacritree tests with nextest"
-run = ["cargo", "nextest", "run", "-p", "alacritree", "--locked"]
+description = "Run the alacritree and crates/ tests with nextest"
+run = ["cargo", "nextest", "run", "--locked"]
 
 [tasks.e2e]
 description = "Run the opt-in herdr end-to-end suite against a throwaway server"
@@ -141,26 +137,18 @@ run = [
 ]
 
 [tasks.build]
-description = "Build alacritree"
-run = ["cargo", "build", "-p", "alacritree", "--locked"]
+description = "Build alacritree and its crates"
+run = ["cargo", "build", "--locked"]
 
 [tasks.clippy]
-# Mirrors CI's clippy step. The vendored crates are `#![deny(clippy::all)]`,
-# so `--exclude` and `--no-deps` keep a newer toolchain's lints off them.
+# Mirrors CI's clippy step. The vendored crates are `#![deny(clippy::all)]`;
+# `default-members` leaves them out and `--no-deps` keeps a newer toolchain's
+# lints off them as path dependencies.
 env = { ZCCACHE_PATH_REMAP = "off" }
 description = "Lint every alacritree crate the way CI does"
 run = [
     "cargo",
     "clippy",
-    "--workspace",
-    "--exclude",
-    "alacritty",
-    "--exclude",
-    "alacritty_terminal",
-    "--exclude",
-    "alacritty_config",
-    "--exclude",
-    "alacritty_config_derive",
     "--all-targets",
     "--locked",
     "--no-deps",
