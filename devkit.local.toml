@@ -25,11 +25,11 @@ worktree_include = ["AGENTS.local.md", "CLAUDE.local.md"]
 
 
 # `pr create` pushes `-u origin`, with the remote name spelled into devkit, so
-# `origin` is Arnaud's repo here and the fork answers to `fork`. A stacked PR
+# `origin` is the project repo here and the fork answers to `fork`. A stacked PR
 # needs its head and its base in the repository it is opened against.
 [github]
-issues_repo = "AbysmalBiscuit/alacritree"
-pr_repo = "mathix420/alacritree"
+issues_repo = "alacritree/alacritree"
+pr_repo = "alacritree/alacritree"
 
 # Several agents share this checkout and its worktrees. `enforce_writes`
 # refuses a write to any path the session has not claimed with `lockm acquire`;
@@ -170,9 +170,9 @@ run = [
 ]
 
 [templates]
-# Each `Closes` line spells `issues_repo` out because devkit's built-in
-# template writes a bare `#41`, which resolves against Arnaud's numbering
-# instead of the fork's. The TL;DR heading renders empty, to be filled by hand.
+# Each `Closes` line spells `issues_repo` out, so the body stays correct if
+# issues and PRs ever live in different repositories again. The TL;DR heading
+# renders empty, to be filled by hand.
 pr_body = '''
 {%- set ids = (((issue if issue is defined else "") ~ " " ~ closes) | split) -%}
 {%- set agent = agent_model or agent_harness -%}
@@ -212,10 +212,9 @@ herdr_session = "herdr-session.cmd"
 # for the extra ones a PR closes, whitespace separated: `--arg closes="12 41"`.
 closes = ""
 
-# Issues live on the fork, PRs go to Arnaud's repo, so a bare `#41` in the body
-# would resolve against the wrong one. Spelled out again here because the
-# template context does not carry `[github] issues_repo`; keep the two in sync.
-issues_repo = "AbysmalBiscuit/alacritree"
+# Spelled out again here because the template context does not carry
+# `[github] issues_repo`; keep the two in sync.
+issues_repo = "alacritree/alacritree"
 
 # devkit fills `agent_model` and `agent_harness` from the calling agent.
 # Override per PR: `--arg agent_model="Claude Opus 5 (1M Context)"`.
