@@ -94,7 +94,7 @@ devkit run task clippy
 
 `devkit config tasks` lists them, `--dry-run` prints the argv without running it, and `--dir <worktree>` runs one in a worktree.
 
-Two are not the command you would otherwise type. `fmt` runs nightly rustfmt, because ten of the fifteen options in `rustfmt.toml` are nightly-only and stable rustfmt ignores every one of them after a warning, reformatting files the change never touched. `test` runs nextest, which is installed only here, which is why `AGENTS.md` still names `cargo test` for Arnaud's CI.
+None of them names a package. `default-members` in `Cargo.toml` and `ignore` in `rustfmt.toml` keep every one on alacritree and `crates/`. `fmt` pins nightly because most options in `rustfmt.toml` are nightly-only, the `ignore` list among them, and stable rustfmt skips each one after a warning. `test` runs nextest, which is installed only here, which is why `AGENTS.md` still names `cargo test` for Arnaud's CI.
 
 <critical>
 Never disable rustc cache via env var prefix.
