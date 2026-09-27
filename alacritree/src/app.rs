@@ -443,6 +443,8 @@ type AppSession = Session<Context>;
 pub struct AlacritreeApp {
     show_left_sidebar: bool,
     show_right_sidebar: bool,
+    /// Whether the sidebar `[ui.tasks] sidebar` picks draws the tasks.
+    show_tasks_sidebar: bool,
     focus: PaneFocus,
     /// Runtime copies of `[ui.session_display]`.  The config is only the
     /// startup default; toggles flip these and are never persisted.
@@ -598,6 +600,7 @@ impl AlacritreeApp {
         Self {
             show_left_sidebar: persisted.show_left_sidebar,
             show_right_sidebar: persisted.show_right_sidebar,
+            show_tasks_sidebar: !persisted.hide_tasks_sidebar,
             focus: PaneFocus::Terminal,
             session_rows_always: config.ui.session_display.sidebar_always,
             session_tabs_always: config.ui.session_display.tabs_always,
@@ -814,9 +817,11 @@ impl AlacritreeApp {
         // reappear on next launch.
         let left = self.show_left_sidebar && !self.sidebar_auto_shown;
         let right = self.show_right_sidebar && !self.git_panel.auto_shown;
+        let hide_tasks = !self.show_tasks_sidebar;
         state::mutate(|s| {
             s.show_left_sidebar = left;
             s.show_right_sidebar = right;
+            s.hide_tasks_sidebar = hide_tasks;
         });
     }
 
@@ -1218,6 +1223,15 @@ impl AlacritreeApp {
                 self.close_session(ctx, id);
                 return;
             }
+        }
+        self.open_tasks_tab(ctx);
+    }
+
+    /// Puts the workspace's tasks tab on screen, opening one if it has none.
+    fn open_tasks_tab(&mut self, ctx: &Context) {
+        let workspace = self.current_workspace.clone();
+        if let Some(index) = self.tasks_session_index(&workspace) {
+            let id = self.sessions[index].id;
             self.sessions.set_active(workspace, id);
         } else {
             let session = Session::spawn_tasks(
@@ -6508,6 +6522,65 @@ mod tests {
         assert!(app.tasks_panel.is_none(), "a listing was started");
     }
 
+    #[test]
+    fn a_right_click_on_the_sidebar_tasks_heading_opens_the_tasks_tab() {
+        let mut app = app_with_tasks_on();
+        let view = fake_tasks_view(vec![unscoped_task("test it")]);
+        app.tasks_panel = Some(tasks_panel::TasksPanel { workspace: None, view });
+        let ctx = Context::default();
+        let mut time = 0.0;
+        let mut frame = |app: &mut AlacritreeApp, events: Vec<egui::Event>| {
+            time += 0.05;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::Vec2::new(800.0, 600.0),
+                )),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let output = ctx.run(input, |ctx| _ = app.show_project_sidebar(ctx, Frame::default()));
+            painted_text_rects(&output.shapes)
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let heading = loop {
+            let drawn = frame(&mut app, Vec::new());
+            if drawn.iter().any(|(t, _)| t == "test it") {
+                break drawn.into_iter().find(|(t, _)| t == "Tasks").expect("a heading").1;
+            }
+            assert!(Instant::now() < deadline, "the listing never landed");
+            std::thread::yield_now();
+        };
+        assert!(app.tasks_session_index(&None).is_none());
+
+        let pos = heading.center();
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut app, vec![egui::Event::PointerMoved(pos)]);
+        frame(&mut app, vec![button(true)]);
+        frame(&mut app, vec![button(false)]);
+
+        let tab = app.tasks_session_index(&None).expect("no tasks tab opened");
+        assert_eq!(app.sessions.active(&None), Some(app.sessions[tab].id));
+    }
+
+    #[test]
+    fn a_hidden_tasks_section_leaves_the_sidebar() {
+        let mut app = app_with_tasks_on();
+        let view = fake_tasks_view(vec![unscoped_task("test it")]);
+        app.tasks_panel = Some(tasks_panel::TasksPanel { workspace: None, view });
+        sidebar_texts_until(&mut app, TasksSidebar::Left, shows("test it"));
+
+        app.show_tasks_sidebar = false;
+        let texts = sidebar_texts_until(&mut app, TasksSidebar::Left, |_| true);
+        assert!(!texts.iter().any(|t| t == "test it"), "{texts:?}");
+    }
+
     /// A move re-points both workspaces' active entries, so a close right
     /// after it still leaves each one naming a live session.
     #[test]
@@ -8104,16 +8177,34 @@ mod tests {
     /// whole text even when it paints an ellipsis, so `elided` is what
     /// separates a clipped row from the tooltip spelling it out in full.
     fn painted_texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, bool)> {
-        fn walk(shape: &egui::Shape, out: &mut Vec<(String, bool)>) {
+        painted(shapes, |t| (t.galley.text().to_owned(), t.galley.elided))
+    }
+
+    /// Every text a frame painted and where, for a test to click on.
+    pub(super) fn painted_text_rects(
+        shapes: &[egui::epaint::ClippedShape],
+    ) -> Vec<(String, egui::Rect)> {
+        painted(shapes, |t| (t.galley.text().to_owned(), t.visual_bounding_rect()))
+    }
+
+    fn painted<T>(
+        shapes: &[egui::epaint::ClippedShape],
+        read: impl Fn(&egui::epaint::TextShape) -> T,
+    ) -> Vec<T> {
+        fn walk<T>(
+            shape: &egui::Shape,
+            read: &dyn Fn(&egui::epaint::TextShape) -> T,
+            out: &mut Vec<T>,
+        ) {
             match shape {
-                egui::Shape::Text(t) => out.push((t.galley.text().to_owned(), t.galley.elided)),
-                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                egui::Shape::Text(t) => out.push(read(t)),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, read, out)),
                 _ => {},
             }
         }
         let mut out = Vec::new();
         for clipped in shapes {
-            walk(&clipped.shape, &mut out);
+            walk(&clipped.shape, &read, &mut out);
         }
         out
     }
