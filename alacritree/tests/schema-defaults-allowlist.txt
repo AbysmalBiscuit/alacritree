@@ -22,6 +22,8 @@ RawCursorStyle.blinking
 RawCursorStyle.shape
 RawDebug.log_dir
 RawFocusOutline.color
+RawFont.scratchpad_size
+RawFont.tasks_size
 RawFontFace.family
 RawFontFace.style
 RawGeneral.state_dir

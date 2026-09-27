@@ -203,6 +203,12 @@ pub struct FontConfig {
     /// but that ceiling moves with cell size and with the fallback list, so it
     /// is worth a budget rather than a promise.
     pub color_glyph_cache_mb: usize,
+    /// Typographic points for the scratchpad editor, clamped to ≥ 1.0. Unset
+    /// derives it from the UI font size.
+    pub scratchpad_size: Option<f32>,
+    /// Typographic points for task text in the tasks pane, clamped to ≥ 1.0.
+    /// Unset matches the UI's heading size.
+    pub tasks_size: Option<f32>,
 }
 
 /// Pixel delta with x/y, mirroring alacritty's `Delta<i8>` for `font.offset`
@@ -2037,6 +2043,15 @@ struct RawFont {
     /// is already bounded by how many codepoints the colour fonts cover, but
     /// that ceiling moves with cell size and with the fallback list.
     color_glyph_cache_mb: usize,
+    /// Point size for the scratchpad editor's text, which is drawn in the
+    /// terminal font. Unset scales it with the sidebar font. Also
+    /// alacritree-only, so it belongs in `alacritree.toml`.
+    scratchpad_size: Option<f32>,
+    /// Point size for task text in the tasks pane, which is drawn in the
+    /// terminal font. Buttons and counters in the pane scale with it. Unset
+    /// scales it with the sidebar font. Also alacritree-only, so it belongs
+    /// in `alacritree.toml`.
+    tasks_size: Option<f32>,
 }
 
 impl Default for RawFont {
@@ -2055,6 +2070,8 @@ impl Default for RawFont {
             fallback: Vec::new(),
             color_glyphs: true,
             color_glyph_cache_mb: 10,
+            scratchpad_size: None,
+            tasks_size: None,
         }
     }
 }
@@ -2073,6 +2090,8 @@ impl RawFont {
             fallback: self.fallback,
             color_glyphs: self.color_glyphs,
             color_glyph_cache_mb: self.color_glyph_cache_mb,
+            scratchpad_size: self.scratchpad_size.map(|size| size.max(1.0)),
+            tasks_size: self.tasks_size.map(|size| size.max(1.0)),
         }
     }
 }
@@ -4793,6 +4812,28 @@ program = "second"
         let config = parse("[ui.font]\nfamily = \"Inter\"\nsize = 12.5");
         assert_eq!(config.ui_font.family.as_deref(), Some("Inter"));
         assert_eq!(config.ui_font.size, Some(12.5));
+    }
+
+    #[test]
+    fn font_scratchpad_size_is_unset_by_default() {
+        assert_eq!(parse("").font.scratchpad_size, None);
+    }
+
+    #[test]
+    fn font_scratchpad_size_parses_and_clamps_to_one() {
+        assert_eq!(parse("[font]\nscratchpad_size = 14").font.scratchpad_size, Some(14.0));
+        assert_eq!(parse("[font]\nscratchpad_size = 0.1").font.scratchpad_size, Some(1.0));
+    }
+
+    #[test]
+    fn font_tasks_size_is_unset_by_default() {
+        assert_eq!(parse("").font.tasks_size, None);
+    }
+
+    #[test]
+    fn font_tasks_size_parses_and_clamps_to_one() {
+        assert_eq!(parse("[font]\ntasks_size = 14").font.tasks_size, Some(14.0));
+        assert_eq!(parse("[font]\ntasks_size = 0.1").font.tasks_size, Some(1.0));
     }
 
     #[test]

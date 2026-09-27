@@ -685,9 +685,19 @@
           "$ref": "#/$defs/RawFontDelta",
           "description": "Extra space around each cell in pixels: `y` is line spacing, `x` is\nletter spacing."
         },
+        "scratchpad_size": {
+          "description": "Point size for the scratchpad editor's text, which is drawn in the\nterminal font. Unset scales it with the sidebar font. Also\nalacritree-only, so it belongs in `alacritree.toml`.",
+          "format": "float",
+          "type": "number"
+        },
         "size": {
           "default": 11.25,
           "description": "Font size in points.",
+          "format": "float",
+          "type": "number"
+        },
+        "tasks_size": {
+          "description": "Point size for task text in the tasks pane, which is drawn in the\nterminal font. Buttons and counters in the pane scale with it. Unset\nscales it with the sidebar font. Also alacritree-only, so it belongs\nin `alacritree.toml`.",
           "format": "float",
           "type": "number"
         }
