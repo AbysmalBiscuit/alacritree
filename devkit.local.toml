@@ -29,7 +29,9 @@ worktree_include = ["AGENTS.local.md", "CLAUDE.local.md"]
 # needs its head and its base in the repository it is opened against.
 [github]
 issues_repo = "alacritree/alacritree"
-pr_repo = "alacritree/alacritree"
+
+[forge]
+repo = "alacritree/alacritree"
 
 # Several agents share this checkout and its worktrees. `enforce_writes`
 # refuses a write to any path the session has not claimed with `lockm acquire`;
