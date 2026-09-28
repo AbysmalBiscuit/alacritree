@@ -19,6 +19,7 @@ use egui::{Color32, Context, Frame, Margin, RichText, ScrollArea, SidePanel, Str
 
 use serde_json::{Value, json};
 
+use crate::activity::{Activities, ActivityKind};
 use crate::bindings::{BindingAction, NamedAction, action};
 use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
@@ -63,6 +64,7 @@ use crate::{
 use alacritree_vcs::{Checkout, Dirty, Liveness, UpstreamState, VersionControl};
 
 mod actions;
+mod activity_row;
 mod focus;
 mod git_panel;
 mod ipc_handler;
@@ -479,6 +481,8 @@ pub struct AlacritreeApp {
     current_workspace: WorkspaceKey,
     projects: Vec<Project>,
     pr_cache: PrCache<Forge>,
+    /// Refreshes the user asked for, which the left sidebar's status row shows.
+    activities: Activities,
     /// The enabled version control backends, in the order they claim a root.
     vcs_backends: Vec<crate::vcs::Vcs>,
     /// Renders `[ui] worktree_name` / `project_name` templates at paint time.
@@ -626,6 +630,7 @@ impl AlacritreeApp {
             current_workspace: None,
             projects,
             pr_cache: PrCache::new(Forge::default()),
+            activities: Activities::new(),
             vcs_backends: crate::vcs::backends(&config.integrations),
             row_labels,
             icons: PaintedIcons::new(&config, &multiplexers),
@@ -973,9 +978,21 @@ impl AlacritreeApp {
     /// Re-run worktree discovery for every project, the keyboard/IPC
     /// equivalent of pressing each row's refresh button in turn.
     fn refresh_all_projects(&mut self, ctx: &Context) {
-        for idx in 0..self.projects.len() {
+        self.refresh_projects_for_user(ctx, 0..self.projects.len());
+    }
+
+    /// [`Self::refresh_project`] for a user who is watching: the status row
+    /// counts these off. A root already being scanned counts too, since that
+    /// scan is the one that answers them.
+    fn refresh_projects_for_user(&mut self, ctx: &Context, idxs: impl IntoIterator<Item = usize>) {
+        self.activities.trigger(ActivityKind::ProjectScan);
+        for idx in idxs {
             self.refresh_project(ctx, idx);
+            self.activities.scan_started(self.projects[idx].root.clone());
         }
+        // A click lands after its frame has painted, and a scan can run for
+        // seconds before its own repaint, so the row asks for its frame now.
+        ctx.request_repaint();
     }
 
     /// Re-discover every project holding a checkout whose `HEAD` has left the
@@ -1022,17 +1039,24 @@ impl AlacritreeApp {
     fn poll_project_refreshes(&mut self) {
         for Finished { key: root, outcome, waiters } in self.project_refreshes.take_finished() {
             let Some(found) = outcome else {
-                waiters.answer(Err("the project refresh worker panicked".to_string()));
+                let error = "the project refresh worker panicked".to_string();
+                self.activities.scan_finished(&root, Err(error.clone()));
+                waiters.answer(Err(error));
                 continue;
             };
             let reply = match self.projects.iter_mut().find(|p| p.root == root) {
                 Some(project) => {
+                    let scanned = found.failure.as_ref().map_or(Ok(()), |e| Err(e.to_string()));
+                    self.activities.scan_finished(&root, scanned);
                     let occupied: HashSet<PathBuf> =
                         self.sessions.iter().filter_map(|s| s.working_directory.clone()).collect();
                     project.apply(found, &occupied);
                     Ok(project_json(project))
                 },
-                None => Err(NotAProject(root).to_string()),
+                None => {
+                    self.activities.scan_left(&root);
+                    Err(NotAProject(root).to_string())
+                },
             };
             waiters.answer(reply);
         }
@@ -2137,6 +2161,7 @@ impl AlacritreeApp {
     /// sidebar entry the same way they outlive a workspace switch.
     fn remove_project(&mut self, idx: usize) -> PathBuf {
         let root = self.projects.remove(idx).root;
+        self.activities.scan_left(&root);
         let key = root.clone();
         state::mutate(move |s| s.projects.retain(|p| p.root != key));
         root
@@ -3253,6 +3278,7 @@ impl AlacritreeApp {
         // Unconditional: either sidebar can be hidden, and a drain hung off one
         // of them would strand every entry the other polled.
         self.pr_cache.drain_completed(ctx);
+        self.sync_activities();
         self.poll_pending_deletes(ctx);
         self.poll_pending_creates(ctx);
         self.poll_multiplexers();
@@ -3343,8 +3369,24 @@ impl AlacritreeApp {
             }
         }
         self.phases.mark("git-sidebar");
+        // Hidden sidebars count: a refresh with nothing to poll still has to
+        // settle, and it settles on a drain that follows a paint.
+        self.pr_cache.mark_painted(ctx);
 
         sidebar_rect
+    }
+
+    /// Hand a PR refresh's batches to its activity, end it once the cache
+    /// has settled, and fold whatever landed since the last frame.
+    fn sync_activities(&mut self) {
+        for reader in self.pr_cache.take_progress() {
+            self.activities.add_pr_reader(reader);
+        }
+        if !self.pr_cache.triggered() {
+            self.activities.pr_settled();
+        }
+        let now = self.activities.now();
+        self.activities.tick(now);
     }
 
     fn paint_central(
@@ -4404,6 +4446,227 @@ mod tests {
         );
         app.sessions.push(session);
         app
+    }
+
+    /// What the left sidebar's status row says right now.
+    fn status_text(app: &AlacritreeApp) -> String {
+        crate::activity::status_line(&app.activities, app.activities.now()).text
+    }
+
+    /// Adopt finished scans and fold them in, frame after frame, until the
+    /// row says `done` or ten seconds pass.
+    fn scan_until(app: &mut AlacritreeApp, done: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            app.poll_project_refreshes();
+            app.sync_activities();
+            let text = status_text(app);
+            if text.starts_with(done) || Instant::now() > deadline {
+                return text;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_user_refresh_counts_its_projects_off() {
+        use crate::app::actions::Action;
+
+        let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().expect("temp dir")).collect();
+        let mut app = test_app();
+        for dir in &dirs {
+            app.projects.push(Project::placeholder(dir.path().to_path_buf()));
+        }
+        let ctx = Context::default();
+
+        action::RefreshProjects.run(&mut app, &ctx, ActionOrigin::Keyboard);
+        app.sync_activities();
+        assert_eq!(status_text(&app), "Scanning projects 0/2");
+
+        assert_eq!(scan_until(&mut app, "Projects scanned"), "Projects scanned just now");
+    }
+
+    /// A distro that is down answers no discovery. The project keeps its
+    /// rows, and the row says the scan failed rather than that it finished.
+    #[test]
+    fn a_scan_that_could_not_reach_its_project_says_so() {
+        use crate::app::actions::Action;
+
+        let mut app = test_app();
+        let root = PathBuf::from("/r");
+        app.vcs_backends = vec![crate::vcs::Vcs::Fake(
+            alacritree_vcs::fake::FakeVcs::new("/r").unreachable("the distro is stopped"),
+        )];
+        app.projects.push(Project::placeholder(root));
+        action::RefreshProjects.run(&mut app, &Context::default(), ActionOrigin::Keyboard);
+
+        let text = scan_until(&mut app, "Project scan");
+        assert!(text.starts_with("Project scan: 1 of 1 failed: "), "{text}");
+        assert!(text.contains("the distro is stopped"), "{text}");
+    }
+
+    /// A click starts the scan after its frame has painted, so without a
+    /// frame of its own the row would say nothing until the scan ended.
+    #[test]
+    fn a_user_scan_asks_for_the_frame_that_shows_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut app = test_app();
+        app.projects.push(Project::placeholder(dir.path().to_path_buf()));
+        let ctx = Context::default();
+        // egui asks for a few frames of its own after the first.
+        for _ in 0..5 {
+            let _ = ctx.run(egui::RawInput::default(), |_| {});
+        }
+        assert!(!ctx.has_requested_repaint());
+
+        app.refresh_projects_for_user(&ctx, [0]);
+
+        assert!(ctx.has_requested_repaint());
+    }
+
+    /// Discovery started by anything but the user, here a moved branch or
+    /// startup, is housekeeping and shows nothing.
+    #[test]
+    fn a_scan_nobody_asked_for_shows_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut app = test_app();
+        app.projects.push(Project::placeholder(dir.path().to_path_buf()));
+        app.refresh_project(&Context::default(), 0);
+        app.sync_activities();
+        assert_eq!(status_text(&app), "");
+    }
+
+    #[test]
+    fn a_project_removed_mid_scan_leaves_the_count() {
+        use crate::app::actions::Action;
+
+        let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().expect("temp dir")).collect();
+        let mut app = test_app();
+        for dir in &dirs {
+            app.projects.push(Project::placeholder(dir.path().to_path_buf()));
+        }
+        action::RefreshProjects.run(&mut app, &Context::default(), ActionOrigin::Keyboard);
+        app.remove_project(1);
+        app.sync_activities();
+        assert_eq!(status_text(&app), "Scanning projects 0/1");
+        assert_eq!(scan_until(&mut app, "Projects scanned"), "Projects scanned just now");
+    }
+
+    /// An app whose one project has a checkout on `topic`, asking `forge`
+    /// about its PR, with PR status on. herdr is off: its frame poll spawns
+    /// `herdr` and `wsl.exe`, which can outlive the test process.
+    fn app_asking(forge: alacritree_forge::fake::FakeForge) -> AlacritreeApp {
+        let mut app = test_app();
+        app.config.integrations.gh.pr_status = true;
+        app.config.integrations.herdr.enabled = false;
+        app.multiplexers = Multiplexers::new(&app.config.integrations);
+        app.pr_cache = PrCache::new(Forge::Fake(forge));
+        let root = PathBuf::from("/r");
+        let mut checkout = checkout_at(&root);
+        checkout.head.name = Some("topic".into());
+        app.projects.push(Project {
+            vcs: Some(crate::vcs::Vcs::Fake(alacritree_vcs::fake::FakeVcs::new("/r"))),
+            checkouts: vec![checkout],
+            ..Project::placeholder(root)
+        });
+        app
+    }
+
+    /// Run one whole frame, drains and sidebars, and return every text it
+    /// painted.
+    fn frame(app: &mut AlacritreeApp, ctx: &Context) -> Vec<String> {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run(input, |ctx| {
+            app.poll_update_jobs(ctx);
+            let view = app.frame_paint_view(false);
+            app.paint_sidebars(ctx, view);
+        });
+        painted_texts(&output.shapes).into_iter().map(|(t, _)| t).collect()
+    }
+
+    /// Run frames until one paints a text starting with `want` or ten
+    /// seconds pass. Returns that text, read off the frame rather than
+    /// recomputed, since a worker can move the row on between the paint and
+    /// the check.
+    fn frames_until(app: &mut AlacritreeApp, ctx: &Context, want: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(text) = frame(app, ctx).into_iter().find(|t| t.starts_with(want)) {
+                return text;
+            }
+            if Instant::now() > deadline {
+                return status_text(app);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_pr_refresh_counts_off_and_says_it_finished() {
+        use crate::app::actions::Action;
+
+        let (forge, release) = alacritree_forge::fake::FakeForge::default().paused();
+        let mut app = app_asking(forge);
+        let ctx = Context::default();
+        action::RefreshPrStatus.run(&mut app, &ctx, ActionOrigin::Keyboard);
+
+        let text = frames_until(&mut app, &ctx, "PRs 0/1");
+        assert!(text.starts_with("PRs 0/1 · "), "{text}");
+
+        release.release();
+        assert_eq!(frames_until(&mut app, &ctx, "PRs refreshed"), "PRs refreshed just now");
+    }
+
+    #[test]
+    fn a_failed_pr_refresh_says_why() {
+        use crate::app::actions::Action;
+
+        let forge = alacritree_forge::fake::FakeForge::default().failing_on("topic");
+        let mut app = app_asking(forge);
+        let ctx = Context::default();
+        action::RefreshPrStatus.run(&mut app, &ctx, ActionOrigin::Keyboard);
+
+        let text = frames_until(&mut app, &ctx, "PR refresh");
+        assert_eq!(
+            text,
+            "PR refresh: 1 of 1 failed: fake answered with something other than a pull request \
+             list"
+        );
+    }
+
+    #[test]
+    fn a_pr_refresh_with_pr_status_off_says_so() {
+        use crate::app::actions::Action;
+
+        let mut app = app_asking(alacritree_forge::fake::FakeForge::default());
+        app.config.integrations.gh.pr_status = false;
+        action::RefreshPrStatus.run(&mut app, &Context::default(), ActionOrigin::Keyboard);
+        assert!(!app.pr_cache.triggered());
+        assert_eq!(status_text(&app), "PR status is off");
+    }
+
+    /// With both sidebars hidden nothing polls, and the refresh still ends.
+    #[test]
+    fn a_pr_refresh_with_the_sidebars_hidden_has_nothing_to_check() {
+        use crate::app::actions::Action;
+
+        let mut app = app_asking(alacritree_forge::fake::FakeForge::default());
+        app.show_left_sidebar = false;
+        app.show_right_sidebar = false;
+        let ctx = Context::default();
+        action::RefreshPrStatus.run(&mut app, &ctx, ActionOrigin::Palette);
+        // The palette dispatches after the paint, so the flag waits one
+        // frame's paint before the drain after it can drop it.
+        for _ in 0..2 {
+            frame(&mut app, &ctx);
+        }
+        assert_eq!(status_text(&app), "PRs: nothing to check");
     }
 
     fn checkout_at(path: &std::path::Path) -> alacritree_vcs::Checkout {
