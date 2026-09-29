@@ -123,7 +123,7 @@ devkit issue sync-includes --overwrite --all --yes
 
 ## Specs and plans
 
-Specs go in `docs/superpowers/specs/`, plans in `docs/superpowers/plans/`, always in the main checkout. A sync run collects one written into a worktree back, but only when the main checkout has no file by that name, so write them here rather than relying on that.
+Specs go in `docs/superpowers/specs/`, plans in `docs/superpowers/plans/`, research reports in `docs/superpowers/research/`, always in the main checkout. A sync run collects one written into a worktree back, but only when the main checkout has no file by that name, so write them here rather than relying on that.
 
 `.git/info/exclude` keeps `docs/superpowers/` untracked, so specs and plans stay off feature branches and out of PRs; PR descriptions carry the context instead. The one branch that tracks them is `docs/specs-and-plans`, which holds no code and exists so they survive worktree deletion and reach another machine.
 
