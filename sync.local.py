@@ -4,7 +4,7 @@ checkout and the `docs/specs-and-plans` branch.
 
 Both sides hold files git ignores: the `.local.*` instructions and config at
 the repository root, the repository's own agent skills under `.agents/`, and
-everything under `docs/superpowers/`.  The branch is
+the specs, plans and research under `docs/superpowers/`.  The branch is
 the one place they are tracked, so a second machine can fetch them; the main
 checkout is where they are read and written.  Nothing about that arrangement
 tells git to carry a change from one side to the other, which is what this
@@ -18,7 +18,7 @@ branch on a new machine seeds the checkout.  `--to-branch` and `--to-main`
 override that when a modification time is not the truth, after a clone that
 stamped every file at once.
 
-A run opens by pulling in what the feature worktrees hold.  Specs and plans
+A run opens by pulling in what the feature worktrees hold.  Working docs
 belong in the main checkout, but an agent writes them where it is standing, and
 a document written into a worktree dies with the worktree.  Anything a worktree
 has that the main checkout does not is copied back before the branch is
@@ -58,7 +58,7 @@ from pathlib import Path
 
 BRANCH = "docs/specs-and-plans"
 
-WORKING_DOCS = ("docs/superpowers/specs", "docs/superpowers/plans")
+WORKING_DOCS = ("docs/superpowers/specs", "docs/superpowers/plans", "docs/superpowers/research")
 
 #: The repository's own agent skills and scripts.  Unlike the working docs
 #: this is a whole tree of arbitrary files rather than a flat folder of
@@ -400,7 +400,7 @@ def agents_subject(group: str, moves: list[Move]) -> str:
 def docs_subject(slug: str, moves: list[Move]) -> str:
     kinds = [
         label
-        for directory, label in zip(WORKING_DOCS, ("spec", "plan"))
+        for directory, label in zip(WORKING_DOCS, ("spec", "plan", "research"), strict=True)
         if any(move.relative.startswith(f"{directory}/") for move in moves)
     ]
     verb = "add" if all(move.created for move in moves) else "update"
