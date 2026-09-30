@@ -80,8 +80,7 @@ pub(crate) fn spawn_listener(
     let listener = listen_at(socket_path(), repaint, config)?;
 
     // Advertise the socket to child PTYs, like alacritty does with
-    // ALACRITTY_SOCKET.  Startup runs before the first session spawns, so
-    // no other thread is reading the environment concurrently.
+    // ALACRITTY_SOCKET.
     unsafe { std::env::set_var(SOCKET_ENV, listener.0.path()) };
 
     match std::env::current_exe() {
@@ -89,27 +88,29 @@ pub(crate) fn spawn_listener(
         Err(e) => log::warn!("cannot advertise {EXE_ENV}: {e}"),
     }
 
-    // Only WSLENV-listed variables cross the wsl.exe boundary, in either
-    // direction. Listing the socket lets programs in a distro find this
-    // instance, whether they read the variable themselves or exec the
-    // Windows CLI through interop (which inherits the distro's view); the
-    // session id lets them name their own session in requests; the binary
-    // path lets them exec the CLI at all, since the Windows image is not on
-    // the distro's `$PATH`.
-    #[cfg(windows)]
-    unsafe {
-        std::env::set_var(
-            "WSLENV",
-            wslenv_with_alacritree_vars(std::env::var("WSLENV").ok().as_deref()),
-        )
-    };
-
     Ok(listener)
 }
 
-/// `WSLENV` extended with [`SOCKET_ENV`], [`crate::session::SESSION_ID_ENV`]
-/// and [`EXE_ENV`], the variables alacritree exports. Whatever the user
-/// already shares across the boundary is preserved.
+/// List alacritree's variables in `WSLENV` whether or not the socket is
+/// enabled, so the terminal's name reaches a distro either way. A listed
+/// variable that is never set carries nothing. Runs at startup, before the
+/// first session spawns, so no other thread is reading the environment.
+#[cfg(windows)]
+pub(crate) fn share_with_wsl() {
+    let wslenv = wslenv_with_alacritree_vars(std::env::var("WSLENV").ok().as_deref());
+    unsafe { std::env::set_var("WSLENV", wslenv) };
+}
+
+/// `WSLENV` extended with the variables alacritree exports, since only
+/// listed variables cross the wsl.exe boundary, in either direction.
+/// Whatever the user already shares across the boundary is preserved.
+///
+/// The socket lets programs in a distro find this instance, whether they
+/// read the variable themselves or exec the Windows CLI through interop
+/// (which inherits the distro's view). The session id lets them name their
+/// own session in requests. The binary path lets them exec the CLI at all,
+/// since the Windows image is not on the distro's `$PATH`.
+/// [`crate::session::TERM_PROGRAM_ENV`] names the terminal they run in.
 ///
 /// Only the binary path carries a conversion flag: `/p` has WSL rewrite it
 /// into the distro's view of the drive, honouring whatever automount root
@@ -117,7 +118,14 @@ pub(crate) fn spawn_listener(
 #[cfg(any(test, windows))]
 fn wslenv_with_alacritree_vars(current: Option<&str>) -> String {
     let mut wslenv = current.unwrap_or("").to_string();
-    for (name, flags) in [(SOCKET_ENV, ""), (crate::session::SESSION_ID_ENV, ""), (EXE_ENV, "/p")] {
+    let [(term_program, _), (term_program_version, _)] = crate::session::TERM_PROGRAM_ENV;
+    for (name, flags) in [
+        (SOCKET_ENV, ""),
+        (crate::session::SESSION_ID_ENV, ""),
+        (EXE_ENV, "/p"),
+        (term_program, ""),
+        (term_program_version, ""),
+    ] {
         let listed = wslenv.split(':').any(|entry| entry.split('/').next() == Some(name));
         if !listed {
             if !wslenv.is_empty() {
@@ -341,9 +349,11 @@ mod tests {
     use crate::repaint::Recorder;
     use crate::session::SESSION_ID_ENV;
 
+    const TERM_PROGRAM_VARS: &str = "TERM_PROGRAM:TERM_PROGRAM_VERSION";
+
     #[test]
     fn wslenv_gains_the_socket_exactly_once() {
-        let ours = format!("{SOCKET_ENV}:{SESSION_ID_ENV}:{EXE_ENV}/p");
+        let ours = format!("{SOCKET_ENV}:{SESSION_ID_ENV}:{EXE_ENV}/p:{TERM_PROGRAM_VARS}");
         assert_eq!(wslenv_with_alacritree_vars(None), ours);
         assert_eq!(wslenv_with_alacritree_vars(Some("")), ours);
         assert_eq!(wslenv_with_alacritree_vars(Some("LESS:FOO/p")), format!("LESS:FOO/p:{ours}"));
@@ -352,7 +362,7 @@ mod tests {
         let flagged = format!("{SOCKET_ENV}/u:LESS");
         assert_eq!(
             wslenv_with_alacritree_vars(Some(&flagged)),
-            format!("{flagged}:{SESSION_ID_ENV}:{EXE_ENV}/p")
+            format!("{flagged}:{SESSION_ID_ENV}:{EXE_ENV}/p:{TERM_PROGRAM_VARS}")
         );
     }
 
@@ -360,12 +370,13 @@ mod tests {
     /// Windows image through its automount root, not at `C:\…`.
     #[test]
     fn wslenv_lists_the_exe_path_for_conversion() {
-        assert!(wslenv_with_alacritree_vars(None).ends_with(&format!("{EXE_ENV}/p")));
+        let listed = wslenv_with_alacritree_vars(None);
+        assert!(listed.split(':').any(|entry| entry == format!("{EXE_ENV}/p")), "{listed}");
         // A user who already shares it, however flagged, keeps their spelling.
         let theirs = format!("{EXE_ENV}/up");
         assert_eq!(
             wslenv_with_alacritree_vars(Some(&theirs)),
-            format!("{theirs}:{SOCKET_ENV}:{SESSION_ID_ENV}")
+            format!("{theirs}:{SOCKET_ENV}:{SESSION_ID_ENV}:{TERM_PROGRAM_VARS}")
         );
     }
 
@@ -375,13 +386,23 @@ mod tests {
     fn wslenv_gains_the_session_id_exactly_once() {
         assert_eq!(
             wslenv_with_alacritree_vars(None),
-            format!("{SOCKET_ENV}:{SESSION_ID_ENV}:{EXE_ENV}/p")
+            format!("{SOCKET_ENV}:{SESSION_ID_ENV}:{EXE_ENV}/p:{TERM_PROGRAM_VARS}")
         );
         let flagged = format!("{SESSION_ID_ENV}/u");
         assert_eq!(
             wslenv_with_alacritree_vars(Some(&flagged)),
-            format!("{flagged}:{SOCKET_ENV}:{EXE_ENV}/p")
+            format!("{flagged}:{SOCKET_ENV}:{EXE_ENV}/p:{TERM_PROGRAM_VARS}")
         );
+    }
+
+    /// A program in a distro chooses an image protocol from `TERM_PROGRAM`,
+    /// which only crosses wsl.exe if listed.
+    #[test]
+    fn wslenv_carries_the_term_program() {
+        let wslenv = wslenv_with_alacritree_vars(Some("LESS"));
+        let listed: Vec<&str> = wslenv.split(':').collect();
+        assert!(listed.contains(&"TERM_PROGRAM"), "{wslenv}");
+        assert!(listed.contains(&"TERM_PROGRAM_VERSION"), "{wslenv}");
     }
 
     /// The client/server round trip over whatever transport the platform uses:
