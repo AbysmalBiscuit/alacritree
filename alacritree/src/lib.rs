@@ -47,6 +47,7 @@ pub(crate) mod mouse;
 pub(crate) mod mouse_hide;
 pub(crate) mod multiplexer;
 pub(crate) mod notify;
+pub(crate) mod osc;
 pub(crate) mod panel_filter;
 pub(crate) mod paste;
 pub(crate) mod path_style;

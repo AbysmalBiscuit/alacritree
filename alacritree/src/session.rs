@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use alacritree_common::wsl_helper::{self, WslProbe};
@@ -21,7 +21,7 @@ use crate::clipboard::Target;
 use crate::config::{Config, HoldExitedSessions, Palette};
 use crate::process_probe::{self, ProbeHandle};
 use crate::repaint::Repaint;
-use crate::{colors, scratchpad, wsl_spare};
+use crate::{colors, osc, scratchpad, wsl_spare};
 
 #[derive(Clone)]
 pub(crate) struct EventProxy<R> {
@@ -30,16 +30,48 @@ pub(crate) struct EventProxy<R> {
     /// Whether this session's grid is the one on screen.  Read from the PTY
     /// thread on every event, written by the UI thread once per frame.
     visible: Arc<AtomicBool>,
+    /// `None` when no `[vt]` key is on, and OSC events are then dropped.
+    osc: Option<Arc<Mutex<OscRoute>>>,
+}
+
+/// Runs on the PTY thread under the terminal lock, which is why it only
+/// classifies. Resolving a WSL path waits for `drain_events`.
+struct OscRoute {
+    filter: osc::OscFilter,
+    sender: mpsc::Sender<osc::OscEvent>,
 }
 
 impl<R: Repaint> EventProxy<R> {
     pub(crate) fn new(repaint: R) -> (Self, mpsc::Receiver<TermEvent>) {
         let (sender, receiver) = mpsc::channel();
-        (Self { repaint, sender, visible: Arc::new(AtomicBool::new(true)) }, receiver)
+        (Self { repaint, sender, visible: Arc::new(AtomicBool::new(true)), osc: None }, receiver)
+    }
+
+    /// Classifies OSC events through `filter`, for every clone made after
+    /// this, and hands back what it yields.
+    pub(crate) fn with_osc(
+        mut self,
+        filter: osc::OscFilter,
+    ) -> (Self, mpsc::Receiver<osc::OscEvent>) {
+        let (sender, receiver) = mpsc::channel();
+        self.osc = Some(Arc::new(Mutex::new(OscRoute { filter, sender })));
+        (self, receiver)
     }
 
     pub(crate) fn set_visible(&self, visible: bool) {
         self.visible.store(visible, Ordering::Relaxed);
+    }
+
+    /// Wakes whether or not the session is on screen: the sidebar paints a
+    /// hidden session's progress, and a notification toasts from one.
+    fn route_osc(&self, classify: impl FnOnce(&mut osc::OscFilter) -> Option<osc::OscEvent>) {
+        let Some(route) = &self.osc else { return };
+        let Ok(mut route) = route.lock() else { return };
+        if let Some(event) = classify(&mut route.filter)
+            && route.sender.send(event).is_ok()
+        {
+            self.repaint.wake();
+        }
     }
 }
 
@@ -71,7 +103,15 @@ fn carries_payload(event: &TermEvent) -> bool {
 const SPINNER_COALESCE: Duration = Duration::from_millis(120);
 
 impl<R: Repaint> EventListener for EventProxy<R> {
+    fn unhandled_osc(&self, params: &[&[u8]], _bell_terminated: bool) {
+        self.route_osc(|filter| filter.unhandled(params));
+    }
+
     fn send_event(&self, event: TermEvent) {
+        if let TermEvent::MouseCursorIcon(icon) = event {
+            self.route_osc(|filter| filter.pointer_shape(icon));
+            return;
+        }
         // A hidden session's grid is not on screen, so a repaint for it would
         // redraw the *visible* session to the same pixels.  Nothing then
         // drains the channel either, which is why the payload-free events must
@@ -315,11 +355,23 @@ pub(crate) struct Session<R: Repaint> {
     pub id: SessionId,
     pub title: String,
     pub working_directory: Option<PathBuf>,
+    /// Where the shell says it is. Deliberately not `working_directory`,
+    /// which is the sidebar's workspace key: writing a report into that
+    /// would re-home a session on every `cd`.
+    ///
+    /// Anything that writes to the PTY can set this, local or remote, so
+    /// every consumer guards at use.
+    pub reported_cwd: Option<PathBuf>,
     pub kind: SessionKind,
     pub size: TermSize,
     pub cell_size: (f32, f32),
     pub term: Arc<FairMutex<Term<EventProxy<R>>>>,
     pub events: mpsc::Receiver<TermEvent>,
+    pub osc_events: Option<mpsc::Receiver<osc::OscEvent>>,
+    pub progress: Option<osc::Progress>,
+    pub pointer_shape: Option<egui::CursorIcon>,
+    /// Most recent notification body, kept whether or not it toasted.
+    pub last_notification: Option<String>,
     pub scratchpad: Option<scratchpad::Editor>,
     pub tasks: Option<crate::tasks::view::TasksView>,
     /// Latched ping: the terminal rang while the user was not looking.
@@ -345,6 +397,9 @@ pub(crate) struct Session<R: Repaint> {
     /// process group when identifying which agent is running.  None on
     /// platforms where we don't yet capture it.
     probe: ProbeHandle,
+    /// Distro that translates an OSC cwd report. Present only when cwd
+    /// reporting is enabled.
+    reported_cwd_distro: Option<String>,
     /// Set for shimmed WSL sessions: the distro plus the probe key its
     /// shim published, unregistered again on drop.  The Windows process
     /// table ends at wsl.exe, so this is the only live view inside.
@@ -379,6 +434,25 @@ pub(crate) struct Session<R: Repaint> {
     pub shared_view: bool,
 }
 
+/// A WSL session's payload is a Linux path. The distro comes from the
+/// session rather than the sequence, which is why the resulting UNC path is
+/// trustworthy where one built from the payload would not be.
+fn resolve_reported_cwd(path: &str, distro: Option<&str>) -> PathBuf {
+    match distro {
+        Some(distro) => alacritree_common::wsl::linux_to_windows(path, distro),
+        None => PathBuf::from(path),
+    }
+}
+
+/// The reported directory when it exists here, the workspace otherwise. One
+/// stat, taken when the user asks for a session rather than on every `cd`.
+pub(crate) fn spawn_directory(
+    reported: Option<&PathBuf>,
+    workspace: Option<&PathBuf>,
+) -> Option<PathBuf> {
+    reported.filter(|path| path.is_dir()).or(workspace).cloned()
+}
+
 /// Plain-text dump of a session's grid for IPC clients.
 pub(crate) struct ScreenSnapshot {
     /// Requested scrollback (top) followed by the full visible screen, one
@@ -391,12 +465,22 @@ pub(crate) struct ScreenSnapshot {
     pub history_size: usize,
 }
 
+/// Builds the whole reply sequence from the clipboard's contents, carrying
+/// whatever prefix and terminator the request arrived with.
+pub(crate) type ClipboardFormatter = Arc<dyn Fn(&str) -> String + Send + Sync + 'static>;
+
 #[derive(Default)]
 pub(crate) struct DrainOutcome {
     /// A title went from a spinner to a plain one: the agent finished a turn.
     pub finished: bool,
     /// The terminal rang (BEL).
     pub rang: bool,
+    /// Newest explicit OSC 9 or OSC 777 notification body in this drain.
+    pub notification: Option<String>,
+    /// OSC 52 read requests.  Answered by the caller for the same reason
+    /// copied text is written there: the drain stays free of OS clipboard
+    /// access.
+    pub clipboard_reads: Vec<(Target, ClipboardFormatter)>,
     /// Text the app copied with OSC 52.  Carried out to the caller rather than
     /// written here so the drain — which runs once per frame for every session
     /// — stays free of OS clipboard access.
@@ -405,6 +489,16 @@ pub(crate) struct DrainOutcome {
     /// held session can be written to: the exit arrives after the child's last
     /// output, and every later frame would append the notice again.
     pub exited: bool,
+}
+
+/// Bound retained text to what a platform notification can reasonably display.
+fn truncate_notification(mut body: String) -> String {
+    const LIMIT: usize = 512;
+    if body.len() > LIMIT {
+        let cut = body.char_indices().map(|(i, _)| i).take_while(|i| *i <= LIMIT).last();
+        body.truncate(cut.unwrap_or(0));
+    }
+    body
 }
 
 /// Bytes answering an OSC colour query, or `None` when the query has no
@@ -452,19 +546,19 @@ pub(crate) struct PendingAttention {
     pub since: Instant,
     pub finished: bool,
     pub rang: bool,
+    /// An explicit notification arrived.  Its body is the session's
+    /// `last_notification`, so a burst coalesces to the newest one.
+    pub notified: bool,
 }
 
 impl PendingAttention {
-    /// Folds one frame's triggers into what is already held.  The earliest
+    /// Folds one drain's triggers into what is already held.  The earliest
     /// arrival is kept, so a stream of bells cannot keep restarting the grace
     /// window.
-    pub(crate) fn merge(
-        held: Option<Self>,
-        finished: bool,
-        rang: bool,
-        now: Instant,
-    ) -> Option<Self> {
-        if !finished && !rang {
+    pub(crate) fn merge(held: Option<Self>, drained: &DrainOutcome, now: Instant) -> Option<Self> {
+        let DrainOutcome { finished, rang, .. } = *drained;
+        let notified = drained.notification.is_some();
+        if !finished && !rang && !notified {
             return held;
         }
         Some(match held {
@@ -472,8 +566,9 @@ impl PendingAttention {
                 since: held.since,
                 finished: held.finished || finished,
                 rang: held.rang || rang,
+                notified: held.notified || notified,
             },
-            None => Self { since: now, finished, rang },
+            None => Self { since: now, finished, rang, notified },
         })
     }
 }
@@ -558,6 +653,9 @@ pub(crate) fn term_config(config: &Config) -> TermConfig {
         scrolling_history: config.scrolling.history,
         default_cursor_style: config.cursor_style(),
         semantic_escape_chars: config.selection.semantic_escape_chars.clone(),
+        // `Term` refuses an OSC 52 read before an event is ever emitted
+        // unless this carries the user's choice.
+        osc52: config.osc52,
         // `Term` drops every kitty keyboard request — push, pop, and the
         // support query — unless this is set, so without it an app never gets
         // to enable the protocol and modified keys stay legacy.  alacritty
@@ -778,11 +876,16 @@ impl<R: Repaint> Session<R> {
             id: next_session_id(),
             title: "scratchpad".to_string(),
             working_directory,
+            reported_cwd: None,
             kind: SessionKind::Scratchpad { path },
             size,
             cell_size,
             term,
             events,
+            osc_events: None,
+            progress: None,
+            pointer_shape: None,
+            last_notification: None,
             scratchpad: Some(editor),
             tasks: None,
             needs_attention: false,
@@ -792,6 +895,7 @@ impl<R: Repaint> Session<R> {
             last_report_cell: None,
             cursor: Default::default(),
             probe: ProbeHandle::new(None, None),
+            reported_cwd_distro: None,
             wsl_probe: None,
             priority_job: None,
             notifier: None,
@@ -819,11 +923,16 @@ impl<R: Repaint> Session<R> {
             id: next_session_id(),
             title: "tasks".to_string(),
             working_directory,
+            reported_cwd: None,
             kind: SessionKind::Tasks,
             size,
             cell_size,
             term,
             events,
+            osc_events: None,
+            progress: None,
+            pointer_shape: None,
+            last_notification: None,
             scratchpad: None,
             tasks: Some(view),
             needs_attention: false,
@@ -833,6 +942,7 @@ impl<R: Repaint> Session<R> {
             last_report_cell: None,
             cursor: Default::default(),
             probe: ProbeHandle::new(None, None),
+            reported_cwd_distro: None,
             wsl_probe: None,
             priority_job: None,
             notifier: None,
@@ -879,6 +989,7 @@ impl<R: Repaint> Session<R> {
 
     /// A pending shell session plus what its PTY will need, without opening
     /// it: the shell resolution and the title, and nothing that costs a frame.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn pending_shell(
         repaint: R,
         config: &Config,
@@ -886,6 +997,7 @@ impl<R: Repaint> Session<R> {
         size: TermSize,
         cell_size: (f32, f32),
         shell_override: Option<ShellCommand>,
+        report_distro: Option<String>,
         wsl_probe: Option<WslProbe>,
     ) -> (Self, OpenRequest<R>) {
         // Overrides are argv built in code (`wsl.exe -d <distro> --cd <dir>`),
@@ -909,6 +1021,7 @@ impl<R: Repaint> Session<R> {
             title,
             SessionKind::Shell,
             escape_args,
+            report_distro,
             wsl_probe,
         )
     }
@@ -940,6 +1053,7 @@ impl<R: Repaint> Session<R> {
             kind,
             true,
             None,
+            None,
         )
     }
 
@@ -957,12 +1071,35 @@ impl<R: Repaint> Session<R> {
         title: String,
         kind: SessionKind,
         escape_args: bool,
+        report_distro: Option<String>,
         wsl_probe: Option<WslProbe>,
     ) -> (Self, OpenRequest<R>) {
         let pty_cwd = pty_working_directory(working_directory.clone(), config);
         let window_size = window_size(size, cell_size);
+        let reported_cwd_distro = if config.vt.report_cwd {
+            report_distro.or_else(|| wsl_probe.as_ref().map(|probe| probe.distro.clone()))
+        } else {
+            None
+        };
 
+        let shell_platform = if reported_cwd_distro.is_some() || wsl_probe.is_some() || cfg!(unix) {
+            osc::ShellPlatform::Unix
+        } else {
+            osc::ShellPlatform::Windows
+        };
+        let policy = osc::OscPolicy {
+            vt: config.vt,
+            hostname: osc::local_hostname().to_string(),
+            shell: shell_platform,
+        };
         let (proxy, events) = EventProxy::new(repaint);
+        let (proxy, osc_events) = match osc::OscFilter::new(policy) {
+            Some(filter) => {
+                let (proxy, receiver) = proxy.with_osc(filter);
+                (proxy, Some(receiver))
+            },
+            None => (proxy, None),
+        };
 
         let term = Term::new(term_config(config), &size, proxy.clone());
         let term = Arc::new(FairMutex::new(term));
@@ -1003,11 +1140,16 @@ impl<R: Repaint> Session<R> {
             id,
             title,
             working_directory,
+            reported_cwd: None,
             kind,
             size,
             cell_size,
             term: term.clone(),
             events,
+            osc_events,
+            progress: None,
+            pointer_shape: None,
+            last_notification: None,
             scratchpad: None,
             tasks: None,
             needs_attention: false,
@@ -1017,6 +1159,7 @@ impl<R: Repaint> Session<R> {
             last_report_cell: None,
             cursor: Default::default(),
             probe: ProbeHandle::new(None, wsl_probe.clone()),
+            reported_cwd_distro,
             wsl_probe,
             priority_job: None,
             notifier: None,
@@ -1152,6 +1295,28 @@ impl<R: Repaint> Session<R> {
                     }
                 },
             }
+        }
+        if let Some(receiver) = self.osc_events.take() {
+            while let Ok(event) = receiver.try_recv() {
+                match event {
+                    osc::OscEvent::Cwd(path) => {
+                        let distro = self.reported_cwd_distro.as_deref();
+                        self.reported_cwd = path.map(|path| resolve_reported_cwd(&path, distro));
+                    },
+                    osc::OscEvent::Notify(body) => {
+                        let body = truncate_notification(body);
+                        self.last_notification = Some(body.clone());
+                        outcome.notification = Some(body);
+                    },
+                    osc::OscEvent::Progress(progress) => self.progress = Some(progress),
+                    osc::OscEvent::PointerShape(icon) => self.pointer_shape = Some(icon),
+                }
+            }
+            self.osc_events = Some(receiver);
+        }
+        if outcome.exited {
+            self.progress = None;
+            self.pointer_shape = None;
         }
         outcome
     }
@@ -1374,6 +1539,11 @@ fn apply_term_event(
         // acknowledgement, so dropping it leaves them reporting a successful
         // copy while the system clipboard keeps its previous contents.
         TermEvent::ClipboardStore(ty, text) => outcome.clipboard.push((clipboard_target(ty), text)),
+        // OSC 52 read.  `Term` only emits this once the config allows it, so
+        // reaching here means the user opted in.
+        TermEvent::ClipboardLoad(ty, format) => {
+            outcome.clipboard_reads.push((clipboard_target(ty), format))
+        },
         _ => {},
     }
     None
@@ -1446,10 +1616,11 @@ fn next_session_id() -> SessionId {
 #[cfg(test)]
 // Fixtures drive real processes and wait on them; no frame is pending.
 #[allow(clippy::disallowed_methods)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Mutex;
 
     use alacritty_terminal::Term;
+    use alacritty_terminal::vte::ansi::cursor_icon::CursorIcon;
 
     use super::*;
     use crate::repaint::Recorder;
@@ -1474,6 +1645,53 @@ mod tests {
             0,
             "output from an off-screen session repainted the visible grid"
         );
+    }
+
+    fn all_on_policy() -> osc::OscPolicy {
+        osc::OscPolicy {
+            vt: crate::config::VtConfig {
+                report_cwd: true,
+                notify: true,
+                progress: true,
+                pointer_shape: true,
+            },
+            hostname: String::new(),
+            shell: osc::ShellPlatform::Unix,
+        }
+    }
+
+    /// Shells send OSC 133 on every prompt, and with no `[vt]` key on
+    /// nothing reads it.
+    #[test]
+    fn an_uninterpreted_osc_with_no_vt_key_on_is_dropped_without_a_wake() {
+        let repaint = Recorder::default();
+        let (proxy, events) = EventProxy::new(repaint.clone());
+
+        proxy.unhandled_osc(&[b"133", b"A"], true);
+        proxy.send_event(TermEvent::MouseCursorIcon(CursorIcon::Pointer));
+
+        assert!(events.try_recv().is_err());
+        assert_eq!(repaint.wakes(), 0);
+    }
+
+    /// The sidebar paints a hidden session's progress, so a change wakes the
+    /// loop and a repeat of the value it already shows does not.
+    #[test]
+    fn a_hidden_session_wakes_once_per_changed_progress() {
+        let repaint = Recorder::default();
+        let (proxy, osc_events) = EventProxy::new(repaint.clone())
+            .0
+            .with_osc(osc::OscFilter::new(all_on_policy()).unwrap());
+        proxy.set_visible(false);
+        let progress =
+            |value: &str| proxy.unhandled_osc(&[b"9", b"4", b"1", value.as_bytes()], true);
+
+        progress("50");
+        progress("50");
+        progress("60");
+
+        assert_eq!(osc_events.try_iter().count(), 2);
+        assert_eq!(repaint.wakes(), 2);
     }
 
     #[test]
@@ -1597,6 +1815,413 @@ mod tests {
         assert_eq!(outcome.clipboard, vec![(Target::Clipboard, "hello".to_owned())]);
     }
 
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn osc7_from_a_real_pty_updates_the_reported_cwd() {
+        let mut config = Config::default();
+        config.env.insert("TERM".to_string(), "xterm-256color".to_string());
+        config.vt.report_cwd = true;
+
+        let expected = std::env::temp_dir().join(format!("alacritree-osc7-{}", std::process::id()));
+        #[cfg(unix)]
+        let (program, args) = ("/bin/sh".to_string(), vec![
+            "-c".to_string(),
+            format!("printf '\\033]7;file://localhost{}\\007'; sleep 30", expected.display()),
+        ]);
+        #[cfg(windows)]
+        let (program, args) = {
+            let url_path = expected.to_string_lossy().replace('\\', "/");
+            ("powershell".to_string(), vec![
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                format!(
+                    "[Console]::Out.Write([char]27 + ']7;file://localhost/{url_path}' + [char]7); \
+                     Start-Sleep -Seconds 30"
+                ),
+            ])
+        };
+
+        let mut session = Session::spawn_command(
+            Recorder::default(),
+            &config,
+            std::env::current_dir().ok(),
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            program,
+            args,
+            "osc7 probe".to_string(),
+            SessionKind::Shell,
+        )
+        .expect("spawn OSC 7 probe");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            session.drain_events(&config.palette);
+            if session.reported_cwd.as_ref() == Some(&expected) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "OSC 7 was not drained: {:?}", session.reported_cwd);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn osc52_read_is_refused_by_default_before_the_drain() {
+        let config = Config::default();
+        let (mut session, _) = Session::pending_shell(
+            Recorder::default(),
+            &config,
+            None,
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            None,
+            None,
+            None,
+        );
+
+        {
+            let mut term = session.term.lock();
+            Processor::<StdSyncHandler>::new().advance(&mut *term, b"\x1b]52;c;?\x07");
+        }
+
+        let outcome = session.drain_events(&config.palette);
+        assert!(outcome.clipboard_reads.is_empty());
+    }
+
+    #[test]
+    fn osc52_read_is_carried_out_for_the_caller_to_answer() {
+        let mut title = String::new();
+        let mut exit_status = None;
+        let mut outcome = DrainOutcome::default();
+        let event = TermEvent::ClipboardLoad(
+            ClipboardType::Clipboard,
+            Arc::new(|text: &str| format!("reply:{text}")),
+        );
+
+        apply_term_event(event, &mut title, false, &mut exit_status, &mut outcome);
+
+        assert_eq!(outcome.clipboard_reads.len(), 1);
+        let (target, format) = &outcome.clipboard_reads[0];
+        assert_eq!(*target, Target::Clipboard);
+        assert_eq!(format("hello"), "reply:hello");
+    }
+
+    #[test]
+    fn a_reported_cwd_is_translated_for_a_wsl_session() {
+        assert_eq!(
+            resolve_reported_cwd("/home/dev/src", Some("Ubuntu")),
+            alacritree_common::wsl::linux_to_windows("/home/dev/src", "Ubuntu"),
+        );
+    }
+
+    #[test]
+    fn a_reported_cwd_is_taken_as_given_without_a_distro() {
+        assert_eq!(resolve_reported_cwd("/home/dev/src", None), PathBuf::from("/home/dev/src"),);
+    }
+
+    #[test]
+    fn helper_distro_remains_for_shell_consumers_without_report_context() {
+        let mut config = Config::default();
+        config.vt.report_cwd = false;
+        let probe = Some(WslProbe { distro: "Ubuntu".into(), key: "test-probe".into() });
+        let (mut session, _) = Session::pending_shell(
+            Recorder::default(),
+            &config,
+            Some(PathBuf::from(r"C:\workspace")),
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            Some(ShellCommand::new("wsl.exe".into(), Vec::new())),
+            None,
+            probe,
+        );
+
+        assert_eq!(session.wsl_distro(), Some("Ubuntu"));
+        assert_eq!(session.reported_cwd_distro.as_deref(), None);
+        let (sender, receiver) = mpsc::channel();
+        session.osc_events = Some(receiver);
+        sender.send(osc::OscEvent::Cwd(Some("/home/dev/src".into()))).unwrap();
+
+        session.drain_events(&Palette::default());
+
+        assert_eq!(session.reported_cwd, Some(PathBuf::from("/home/dev/src")));
+    }
+
+    #[test]
+    fn shell_and_report_distro_contexts_are_separate() {
+        for (report_cwd, expected_shell, expected_report) in
+            [(false, Some("Ubuntu"), None), (true, None, Some("Ubuntu"))]
+        {
+            let mut config = Config::default();
+            config.vt.report_cwd = report_cwd;
+            let probe = (!report_cwd)
+                .then(|| WslProbe { distro: "Ubuntu".into(), key: "test-probe".into() });
+            let (session, _) = Session::pending_shell(
+                Recorder::default(),
+                &config,
+                Some(PathBuf::from(r"C:\workspace")),
+                TermSize::new(80, 24),
+                (8.0, 16.0),
+                Some(ShellCommand::new("wsl.exe".into(), Vec::new())),
+                Some("Ubuntu".into()),
+                probe,
+            );
+
+            assert_eq!(session.wsl_distro(), expected_shell);
+            assert_eq!(session.reported_cwd_distro.as_deref(), expected_report);
+            assert_eq!(session.wsl_probe.is_some(), !report_cwd);
+        }
+    }
+
+    #[test]
+    fn the_spawn_directory_falls_back_when_the_reported_path_is_not_here() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().to_path_buf();
+
+        assert_eq!(
+            spawn_directory(Some(&PathBuf::from("/nowhere/at/all")), Some(&workspace)),
+            Some(workspace.clone()),
+        );
+        assert_eq!(spawn_directory(Some(&workspace), Some(&workspace)), Some(workspace));
+    }
+
+    #[test]
+    fn draining_a_wsl_cwd_event_updates_the_reported_directory() {
+        let mut session = pty_less_probe(SessionKind::Shell, "shell");
+        session.reported_cwd_distro = Some("Ubuntu".to_string());
+        let (sender, receiver) = mpsc::channel();
+        session.osc_events = Some(receiver);
+        sender.send(osc::OscEvent::Cwd(Some("/home/dev/src".to_string()))).unwrap();
+
+        session.drain_events(&Palette::default());
+
+        assert_eq!(
+            session.reported_cwd,
+            Some(alacritree_common::wsl::linux_to_windows("/home/dev/src", "Ubuntu")),
+        );
+        assert_eq!(session.working_directory, None);
+    }
+
+    fn feed(session: &Session<Recorder>, bytes: &str) {
+        Processor::<StdSyncHandler>::new().advance(&mut *session.term.lock(), bytes.as_bytes());
+    }
+
+    #[test]
+    fn pointer_shape_osc_updates_the_session() {
+        let mut config = Config::default();
+        config.vt.pointer_shape = true;
+        let (mut session, _) = Session::pending_shell(
+            Recorder::default(),
+            &config,
+            None,
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(session.pointer_shape, None);
+        for (bytes, expected) in [
+            ("\x1b]22;crosshair\x07", egui::CursorIcon::Crosshair),
+            ("\x1b]22;wait\x1b\\", egui::CursorIcon::Wait),
+            ("\x1b]22;default\x07", egui::CursorIcon::Default),
+            // xterm's X11 cursor names, which vte leaves uninterpreted.
+            ("\x1b]22;hand2\x07", egui::CursorIcon::PointingHand),
+            ("\x1b]22;xterm\x1b\\", egui::CursorIcon::Text),
+            // A name neither parser knows leaves the pointer as it was.
+            ("\x1b]22;no-such-cursor\x07", egui::CursorIcon::Text),
+        ] {
+            feed(&session, bytes);
+            let outcome = session.drain_events(&config.palette);
+            assert!(outcome.notification.is_none());
+            assert_eq!(session.pointer_shape, Some(expected), "{bytes:?}");
+        }
+        assert_eq!(session.reported_cwd, None);
+        assert_eq!(session.progress, None);
+        assert_eq!(session.last_notification, None);
+        assert!(!session.needs_attention);
+        assert_eq!(session.exit_status, None);
+    }
+
+    #[test]
+    fn a_session_with_no_vt_key_keeps_no_filter() {
+        let config = Config::default();
+        assert!(!config.vt.any_enabled());
+        let (mut session, _) = Session::pending_shell(
+            Recorder::default(),
+            &config,
+            None,
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            None,
+            None,
+            None,
+        );
+        assert!(session.osc_events.is_none());
+
+        feed(&session, "\x1b]22;pointer\x07\x1b]9;4;1;50\x07");
+        session.drain_events(&config.palette);
+        assert_eq!(session.pointer_shape, None);
+        assert_eq!(session.progress, None);
+    }
+
+    #[test]
+    fn progress_osc_updates_the_session() {
+        use osc::Progress;
+
+        let mut config = Config::default();
+        config.vt.progress = true;
+        let (mut session, _) = Session::pending_shell(
+            Recorder::default(),
+            &config,
+            None,
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(session.progress, None);
+        for (bytes, expected) in [
+            ("\x1b]9;4;1;50\x07", Progress::Set(50)),
+            ("\x1b]9;4;2;25\x1b\\", Progress::Error(25)),
+            ("\x1b]9;4;4;75\x07", Progress::Paused(75)),
+            ("\x1b]9;4;3\x07", Progress::Indeterminate),
+            ("\x1b]9;4;0\x07", Progress::Clear),
+            // CAN cancels the sequence, and vte still dispatches it.
+            ("\x1b]9;4;1;10\x18", Progress::Set(10)),
+        ] {
+            feed(&session, bytes);
+            let outcome = session.drain_events(&config.palette);
+            assert!(outcome.notification.is_none());
+            assert_eq!(session.progress, Some(expected), "{bytes:?}");
+        }
+    }
+
+    #[test]
+    fn reported_cwd_osc_reaches_a_wsl_session_without_a_probe() {
+        let mut config = Config::default();
+        config.vt.report_cwd = true;
+        let workspace = Some(PathBuf::from("C:/workspace"));
+        let (mut session, _) = Session::pending_shell(
+            Recorder::default(),
+            &config,
+            workspace.clone(),
+            TermSize { columns: 80, screen_lines: 24 },
+            (8.0, 16.0),
+            None,
+            Some("Ubuntu".into()),
+            None,
+        );
+        assert_eq!(session.reported_cwd_distro.as_deref(), Some("Ubuntu"));
+        assert_eq!(session.wsl_distro(), None);
+        assert!(session.wsl_probe.is_none());
+
+        for (bytes, expected) in [
+            ("\x1b]7;file://localhost/home/dev/src\x07", Some("/home/dev/src")),
+            ("\x1b]9;9;/home/dev/other\x1b\\", Some("/home/dev/other")),
+            ("\x1b]7;\x07", None),
+        ] {
+            let expected =
+                expected.map(|path| alacritree_common::wsl::linux_to_windows(path, "Ubuntu"));
+            feed(&session, bytes);
+            session.drain_events(&Palette::default());
+            assert_eq!(session.reported_cwd, expected, "{bytes:?}");
+            assert_eq!(session.working_directory, workspace);
+        }
+    }
+
+    pub(crate) fn assert_wsl_reported_cwd(
+        config: &Config,
+        shell: Option<ShellCommand>,
+        probe: Option<WslProbe>,
+        distro: Option<String>,
+        expected_args: &[String],
+    ) {
+        let workspace = Some(PathBuf::from("C:/workspace"));
+        let expected_shell_distro = probe.as_ref().map(|probe| probe.distro.clone());
+        let (mut session, request) = Session::pending_shell(
+            Recorder::default(),
+            config,
+            workspace.clone(),
+            TermSize { columns: 80, screen_lines: 24 },
+            (8.0, 16.0),
+            shell,
+            distro,
+            probe,
+        );
+        assert_eq!(
+            request.pty_options.shell,
+            Some(Shell::new("wsl.exe".into(), expected_args.to_vec())),
+        );
+        for (bytes, expected) in [
+            (
+                "\x1b]7;file://localhost/home/dev/src\x07",
+                Some(r"\\wsl.localhost\Ubuntu\home\dev\src"),
+            ),
+            ("\x1b]9;9;/home/dev/other\x1b\\", Some(r"\\wsl.localhost\Ubuntu\home\dev\other")),
+            ("\x1b]7;\x07", None),
+        ] {
+            feed(&session, bytes);
+            session.drain_events(&Palette::default());
+            assert_eq!(session.reported_cwd, expected.map(PathBuf::from), "{bytes:?}");
+            assert_eq!(session.working_directory, workspace);
+        }
+        assert_eq!(session.reported_cwd_distro.as_deref(), Some("Ubuntu"));
+        assert_eq!(session.wsl_distro(), expected_shell_distro.as_deref());
+    }
+
+    /// A notification body is cut to what a toast can show, on a character
+    /// boundary, and only the drain that carried it reports it.
+    #[test]
+    fn a_drained_notification_is_bounded_on_a_character_boundary() {
+        let mut session = pty_less_probe(SessionKind::Shell, "shell");
+        let (sender, receiver) = mpsc::channel();
+        session.osc_events = Some(receiver);
+        for (body, expected) in [
+            ("a".repeat(512), "a".repeat(512)),
+            ("a".repeat(513), "a".repeat(512)),
+            (format!("{}éz", "a".repeat(511)), "a".repeat(511)),
+            (format!("{}éz", "a".repeat(510)), format!("{}é", "a".repeat(510))),
+            ("🦀".repeat(129), "🦀".repeat(128)),
+        ] {
+            sender.send(osc::OscEvent::Notify(body)).unwrap();
+            let outcome = session.drain_events(&Palette::default());
+            assert_eq!(outcome.notification.as_deref(), Some(expected.as_str()));
+            assert_eq!(session.last_notification.as_deref(), Some(expected.as_str()));
+        }
+        assert!(session.drain_events(&Palette::default()).notification.is_none());
+        assert!(session.last_notification.is_some());
+    }
+
+    #[test]
+    fn child_exit_clears_osc_visual_state_without_clearing_other_state() {
+        let mut session = pty_less_probe(SessionKind::Shell, "shell");
+        session.progress = Some(osc::Progress::Set(42));
+        session.pointer_shape = Some(egui::CursorIcon::Wait);
+        session.last_notification = Some("build failed".to_string());
+        session.needs_attention = true;
+        let pending = PendingAttention {
+            since: Instant::now(),
+            finished: false,
+            rang: true,
+            notified: false,
+        };
+        session.pending_attention = Some(pending);
+
+        let (sender, receiver) = mpsc::channel();
+        session.events = receiver;
+        sender.send(TermEvent::ChildExit(clean_status())).unwrap();
+
+        let outcome = session.drain_events(&Palette::default());
+
+        assert!(outcome.exited);
+        assert_eq!(session.progress, None);
+        assert_eq!(session.pointer_shape, None);
+        assert_eq!(session.last_notification.as_deref(), Some("build failed"));
+        assert!(session.needs_attention);
+        assert_eq!(session.pending_attention, Some(pending));
+    }
+
     /// A session with no PTY behind it, so an injected sequence is the only
     /// event there is to drain.  A real child has to be waited out first, and
     /// on Windows its ConPTY publishes a startup title of its own that would
@@ -1610,11 +2235,16 @@ mod tests {
             id: 0,
             title: title.to_string(),
             working_directory: None,
+            reported_cwd: None,
             kind,
             size,
             cell_size: (8.0, 16.0),
             term,
             events,
+            osc_events: None,
+            progress: None,
+            pointer_shape: None,
+            last_notification: None,
             scratchpad: None,
             tasks: None,
             needs_attention: false,
@@ -1624,6 +2254,7 @@ mod tests {
             last_report_cell: None,
             cursor: Default::default(),
             probe: ProbeHandle::new(None, None),
+            reported_cwd_distro: None,
             wsl_probe: None,
             priority_job: None,
             notifier: None,
@@ -2415,11 +3046,21 @@ mod tests {
     fn pending_triggers_keep_the_first_arrival_and_every_kind() {
         let first = Instant::now();
         let later = first + Duration::from_secs(1);
-        let held = PendingAttention::merge(None, true, false, first);
-        assert_eq!(held, Some(PendingAttention { since: first, finished: true, rang: false }));
-        let held = PendingAttention::merge(held, false, true, later);
-        assert_eq!(held, Some(PendingAttention { since: first, finished: true, rang: true }));
-        assert_eq!(PendingAttention::merge(None, false, false, later), None);
+        let finished = DrainOutcome { finished: true, ..Default::default() };
+        let rang = DrainOutcome { rang: true, ..Default::default() };
+        let notified = DrainOutcome { notification: Some("done".into()), ..Default::default() };
+        let held = PendingAttention::merge(None, &finished, first);
+        assert_eq!(
+            held,
+            Some(PendingAttention { since: first, finished: true, rang: false, notified: false })
+        );
+        let held = PendingAttention::merge(held, &rang, later);
+        let held = PendingAttention::merge(held, &notified, later);
+        assert_eq!(
+            held,
+            Some(PendingAttention { since: first, finished: true, rang: true, notified: true })
+        );
+        assert_eq!(PendingAttention::merge(None, &DrainOutcome::default(), later), None);
     }
 
     #[test]

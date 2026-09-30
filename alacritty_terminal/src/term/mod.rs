@@ -1871,6 +1871,16 @@ impl<T: EventListener> Handler for Term<T> {
     }
 
     #[inline]
+    fn set_mouse_cursor_icon(&mut self, icon: ansi::cursor_icon::CursorIcon) {
+        self.event_proxy.send_event(Event::MouseCursorIcon(icon));
+    }
+
+    #[inline]
+    fn unhandled_osc(&mut self, params: &[&[u8]], bell_terminated: bool) {
+        self.event_proxy.unhandled_osc(params, bell_terminated);
+    }
+
+    #[inline]
     fn set_hyperlink(&mut self, hyperlink: Option<Hyperlink>) {
         trace!("Setting hyperlink: {hyperlink:?}");
         self.grid.cursor.template.set_hyperlink(hyperlink.map(|e| e.into()));
@@ -2517,6 +2527,46 @@ mod tests {
     use crate::term::cell::{Cell, Flags};
     use crate::term::test::TermSize;
     use crate::vte::ansi::{self, CharsetIndex, Handler, StandardCharset};
+
+    type Osc = (Vec<Vec<u8>>, bool);
+
+    #[derive(Clone, Default)]
+    struct Recorder {
+        events: Arc<std::sync::Mutex<Vec<Event>>>,
+        oscs: Arc<std::sync::Mutex<Vec<Osc>>>,
+    }
+
+    impl EventListener for Recorder {
+        fn send_event(&self, event: Event) {
+            self.events.lock().unwrap().push(event);
+        }
+
+        fn unhandled_osc(&self, params: &[&[u8]], bell_terminated: bool) {
+            let params = params.iter().map(|param| param.to_vec()).collect();
+            self.oscs.lock().unwrap().push((params, bell_terminated));
+        }
+    }
+
+    fn parse(bytes: &[u8]) -> (Vec<Event>, Vec<Osc>) {
+        let recorder = Recorder::default();
+        let mut term = Term::new(Config::default(), &TermSize::new(5, 10), recorder.clone());
+        ansi::Processor::<ansi::StdSyncHandler>::new().advance(&mut term, bytes);
+        let events = mem::take(&mut *recorder.events.lock().unwrap());
+        (events, mem::take(&mut *recorder.oscs.lock().unwrap()))
+    }
+
+    #[test]
+    fn uninterpreted_osc_and_pointer_shape_reach_the_listener() {
+        let file_tmp = vec![b"7".to_vec(), b"file:///tmp".to_vec()];
+        assert_eq!(parse(b"\x1b]7;file:///tmp\x07").1, vec![(file_tmp.clone(), true)]);
+        // CAN ends the sequence without a terminator.
+        assert_eq!(parse(b"\x1b]7;file:///tmp\x18").1, vec![(file_tmp, false)]);
+        assert!(matches!(
+            parse(b"\x1b]22;pointer\x1b\\").0.as_slice(),
+            [Event::MouseCursorIcon(ansi::cursor_icon::CursorIcon::Pointer)]
+        ));
+        assert!(parse(b"\x1b]0;t\x07").1.is_empty());
+    }
 
     #[test]
     fn scroll_display_page_up() {
