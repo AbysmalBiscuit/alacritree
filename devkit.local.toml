@@ -164,28 +164,72 @@ run = [
 # issues and PRs ever live in different repositories again. The TL;DR heading
 # renders empty, to be filled by hand.
 pr_body = '''
-{%- set ids = (((issue if issue is defined else "") ~ " " ~ closes) | split) -%}
+{%- set own = (issue_magic_word ~ " " ~ ("#" if issue and issue[0] in "0123456789" else "") ~ issue) if issue else "" -%}
+{%- set ref_lines = ((own ~ ";" ~ refs) if own else refs) | split(";") | map("trim") | reject("eq", "") | list -%}
 {%- set agent = agent_model or agent_harness -%}
+{%- if not agent %}
 ## TL;DR (human written)
 {{ human_tldr }}
-{%- if ids %}
+{%- endif %}
+{%- if ref_lines %}
+{%- if not agent %}
 
 ---
-{% for id in ids %}
-Closes {{ issues_repo }}#{{ id }}
-{%- endfor %}
+{%- endif %}
+
+{{ ref_lines | join("\n") }}
 {%- endif %}
 {%- if agent %}
+{%- if ref_lines %}
 
 ---
+{%- endif %}
 
 ## Agent summary
 {%- endif %}
 
 {{ input | trim }}
+{%- set caveats = [["departures", departures], ["loose ends", loose_ends], ["assumptions", assumptions]] %}
+{%- set filled = [departures, loose_ends, assumptions] | map("trim") | reject("eq", "") | reject("eq", "**None**") | list %}
+{%- if agent or filled %}
+
+## Caveats
+{%- for kind, value in caveats %}
+
+{{ value | trim if value | trim not in ["", "**None**"] else "**0 " ~ kind ~ "**" }}
+{%- endfor %}
+{%- endif %}
+{%- if agent or conceptual_changes | trim %}
+
+## Conceptual Changes
+
+{{ conceptual_changes | trim or "**None**" }}
+{%- endif %}
+{%- if proof | trim %}
+
+## Proof
+
+{{ proof | trim }}
+{%- endif %}
+{%- if door | trim or blast_radius | trim %}
+
+## Merge Danger
+{%- if door | trim %}
+
+**Door:** {{ door | trim }}
+{%- endif %}
+{%- if blast_radius | trim %}
+
+**Blast Radius:** {{ blast_radius | trim }}
+{%- endif %}
+{%- endif %}
 {%- if agent %}
 
 ---
+{%- if implemented_by | trim %}
+
+Implemented by {{ implemented_by | trim }}
+{%- endif %}
 
 🤖 Generated with {{ agent_model }}{% if agent_model and agent_harness %} via {% endif %}{{ agent_harness }}
 {%- endif %}
