@@ -21,7 +21,14 @@ baseline_dir = "../alacritree-baselines"
 
 # Untracked instructions copied into each new worktree, so an agent working
 # there reads the same rules as one working in the main checkout.
-worktree_include = ["AGENTS.local.md", "CLAUDE.local.md"]
+worktree_include = [
+  "AGENTS.local.md",
+  "CLAUDE.local.md",
+  "GLOSSARY.local.md",
+  "docs/agents/issue-tracker.local.md",
+  "docs/agents/triage-labels.local.md",
+  "docs/agents/domain.local.md",
+]
 
 
 # `pr create` pushes `-u origin`, with the remote name spelled into devkit, so
