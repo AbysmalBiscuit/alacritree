@@ -4,7 +4,8 @@ checkout and the `docs/specs-and-plans` branch.
 
 Both sides hold files git ignores: the `.local.*` instructions and config at
 the repository root, the repository's own agent skills under `.agents/`, and
-the specs, plans and research under `docs/superpowers/`.  The branch is
+the specs, plans and research under `docs/superpowers/`, and the ADRs under
+`docs/adr/`.  The branch is
 the one place they are tracked, so a second machine can fetch them; the main
 checkout is where they are read and written.  Nothing about that arrangement
 tells git to carry a change from one side to the other, which is what this
@@ -23,10 +24,11 @@ belong in the main checkout, but an agent writes them where it is standing, and
 a document written into a worktree dies with the worktree.  Anything a worktree
 has that the main checkout does not is copied back before the branch is
 consulted.  It closes by sending the instruction files the other way: every
-worktree carries its own `AGENTS.local.md` and `CLAUDE.local.md`, seeded by
-devkit when the worktree is cut and refreshed by nothing else, so once the run
-has settled which copy of them wins, every worktree copy that disagrees is
-overwritten.
+worktree carries its own `AGENTS.local.md`, `CLAUDE.local.md`,
+`GLOSSARY.local.md` and `docs/agents/*.local.md`, seeded by devkit when the
+worktree is cut and refreshed by
+nothing else, so once the run has settled which copy of them wins, every
+worktree copy that disagrees is overwritten.
 
 Anything that reaches the branch is committed there, grouped so one run that
 touches an instruction file and two specs produces three commits rather than
@@ -58,7 +60,7 @@ from pathlib import Path
 
 BRANCH = "docs/specs-and-plans"
 
-WORKING_DOCS = ("docs/superpowers/specs", "docs/superpowers/plans", "docs/superpowers/research")
+WORKING_DOCS = ("docs/superpowers/specs", "docs/superpowers/plans", "docs/superpowers/research", "docs/adr")
 
 #: The repository's own agent skills and scripts.  Unlike the working docs
 #: this is a whole tree of arbitrary files rather than a flat folder of
@@ -77,7 +79,14 @@ LINKED = ("skills", "scripts")
 #: issue setup` seeds them from `worktree_include` when the worktree is cut,
 #: and nothing refreshes them afterwards, so an old worktree reads rules the
 #: main checkout stopped following weeks ago.
-INSTRUCTIONS = ("AGENTS.local.md", "CLAUDE.local.md")
+INSTRUCTIONS = (
+    "AGENTS.local.md",
+    "CLAUDE.local.md",
+    "GLOSSARY.local.md",
+    "docs/agents/issue-tracker.local.md",
+    "docs/agents/triage-labels.local.md",
+    "docs/agents/domain.local.md",
+)
 
 #: Root files git ignores that the branch carries, grouped by the commit each
 #: one lands in.  A run that touches two groups produces two commits, because
@@ -370,7 +379,7 @@ def topic(relative: str) -> str:
     one commit rather than two describing halves of it.
     """
     stem = Path(relative).stem
-    stem = re.sub(r"^\d{4}-\d{2}-\d{2}-", "", stem)
+    stem = re.sub(r"^\d{4}-\d{2}-\d{2}[-_]", "", stem)
     return re.sub(r"-(design|progress)$", "", stem)
 
 
@@ -400,7 +409,7 @@ def agents_subject(group: str, moves: list[Move]) -> str:
 def docs_subject(slug: str, moves: list[Move]) -> str:
     kinds = [
         label
-        for directory, label in zip(WORKING_DOCS, ("spec", "plan", "research"), strict=True)
+        for directory, label in zip(WORKING_DOCS, ("spec", "plan", "research", "adr"), strict=True)
         if any(move.relative.startswith(f"{directory}/") for move in moves)
     ]
     verb = "add" if all(move.created for move in moves) else "update"
