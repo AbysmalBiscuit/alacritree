@@ -113,7 +113,7 @@ Without `DEVKIT_SESSION` the holder falls back to the parent pid, which differs 
 
 This checkout is a devkit project. `devkit.local.toml` configures it and is untracked, so it rides on the `docs/specs-and-plans` branch with the other local files.
 
-`worktree_include` names the untracked instructions copied into each new worktree, so an agent working there reads the same rules as one working here. It seeds them when the worktree is cut and nothing refreshes them afterwards, so after editing `AGENTS.local.md` or `CLAUDE.local.md` the change has to be pushed into the worktrees that already exist. A bare `sync.local.py` run does that as its last step, and `devkit issue sync-includes` does it on its own. It prompts per worktree, and a non-interactive shell reads the prompt as no, so pass `--yes`:
+`worktree_include` names the untracked instructions copied into each new worktree, so an agent working there reads the same rules as one working here. It seeds them when the worktree is cut and nothing refreshes them afterwards, so after editing `AGENTS.local.md`, `CLAUDE.local.md`, `GLOSSARY.local.md` or a file in `docs/agents/` the change has to be pushed into the worktrees that already exist. A bare `sync.local.py` run does that as its last step, and `devkit issue sync-includes` does it on its own. It prompts per worktree, and a non-interactive shell reads the prompt as no, so pass `--yes`:
 
 ```sh
 devkit issue sync-includes --overwrite --all --yes
@@ -123,11 +123,11 @@ devkit issue sync-includes --overwrite --all --yes
 
 ## Specs and plans
 
-Specs go in `docs/superpowers/specs/`, plans in `docs/superpowers/plans/`, research reports in `docs/superpowers/research/`, always in the main checkout. A sync run collects one written into a worktree back, but only when the main checkout has no file by that name, so write them here rather than relying on that.
+Specs go in `docs/superpowers/specs/`, plans in `docs/superpowers/plans/`, research reports in `docs/superpowers/research/`, ADRs in `docs/adr/`, always in the main checkout. A sync run collects one written into a worktree back, but only when the main checkout has no file by that name, so write them here rather than relying on that.
 
-`.git/info/exclude` keeps `docs/superpowers/` untracked, so specs and plans stay off feature branches and out of PRs; PR descriptions carry the context instead. The one branch that tracks them is `docs/specs-and-plans`, which holds no code and exists so they survive worktree deletion and reach another machine.
+`.git/info/exclude` keeps `docs/superpowers/` and `docs/adr/` untracked, so specs, plans and ADRs stay off feature branches and out of PRs; PR descriptions carry the context instead. The one branch that tracks them is `docs/specs-and-plans`, which holds no code and exists so they survive worktree deletion and reach another machine.
 
-The branch also carries the untracked local files this repository needs and git ignores: `AGENTS.local.md`, `CLAUDE.local.md`, `devkit.local.toml`, `install.local.py` and `sync.local.py`.
+The branch also carries the untracked local files this repository needs and git ignores: `AGENTS.local.md`, `CLAUDE.local.md`, `GLOSSARY.local.md`, the `docs/agents/*.local.md` notes, `devkit.local.toml`, `install.local.py` and `sync.local.py`.
 
 `sync.local.py` moves both kinds of file between the main checkout and that branch, and works from either one. It needs the worktree to exist first:
 
@@ -222,7 +222,7 @@ When adding new entries to the config, always add default values so they are inc
 
 ### Issue tracker
 
-GitHub issues on `alacritree/alacritree`, always with an explicit `-R`.
+GitHub issues on `alacritree/alacritree`, always with an explicit `-R`. See `docs/agents/issue-tracker.local.md`.
 
 ### Triage labels
 
@@ -230,4 +230,4 @@ The five canonical roles, each label string equal to its name. See `docs/agents/
 
 ### Domain docs
 
-Single-context: `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.local.md`.
+Single-context: `GLOSSARY.local.md` at the repo root holds the domain terms. ADRs go in `docs/adr/`, one file per decision, named `yyyy-mm-dd_short-title.md`. See `docs/agents/domain.local.md`.
