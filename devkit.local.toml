@@ -257,5 +257,47 @@ closes = ""
 # `[github] issues_repo`; keep the two in sync.
 issues_repo = "alacritree/alacritree"
 
+[ticket.fields.github.assignees]
+type = "user"
+list = true
+where = "assignees"
+level = "info"
+
+[ticket.fields.github.blocked_by]
+type = "issue"
+list = true
+where = "blocked_by"
+level = "info"
+
+[ticket.fields.github.labels]
+type = "enum"
+list = true
+where = "labels"
+values = [
+  { name = "bug", id = "bug" },
+  { name = "documentation", id = "documentation" },
+  { name = "duplicate", id = "duplicate" },
+  { name = "enhancement", id = "enhancement" },
+  { name = "good first issue", id = "good first issue" },
+  { name = "help wanted", id = "help wanted" },
+  { name = "invalid", id = "invalid" },
+  { name = "question", id = "question" },
+  { name = "wontfix", id = "wontfix" },
+  { name = "autorelease: pending", id = "autorelease: pending" },
+  { name = "autorelease: tagged", id = "autorelease: tagged" },
+  { name = "chore", id = "chore" },
+  { name = "ready-for-agent", id = "ready-for-agent" },
+  { name = "performance", id = "performance" },
+  { name = "priority:low", id = "priority:low" },
+  { name = "refactor", id = "refactor" },
+  { name = "wip", id = "wip" },
+]
+level = "info"
+
+[ticket.fields.github.parent]
+type = "issue"
+where = "parent"
+level = "info"
+
 # devkit fills `agent_model` and `agent_harness` from the calling agent.
 # Override per PR: `--arg agent_model="Claude Opus 5 (1M Context)"`.
