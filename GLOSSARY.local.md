@@ -21,8 +21,8 @@ To take a terminal that no session shows into a session, because its labels name
 _Avoid_: claim, import, reattach
 
 **Sub-agent**:
-A terminal that a program in another terminal started, which the core records as that terminal's child.
-_Avoid_: child pane, helper
+An agent that a session's agent starts inside its own harness, such as a Claude Code `Agent` call, which the sidebar lists under that session.
+_Avoid_: child agent, background agent, helper
 
 **Watch**:
 An attach to a pane that shows its output and never types into it or resizes it.
