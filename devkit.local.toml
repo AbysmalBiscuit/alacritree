@@ -171,7 +171,7 @@ run = [
 # issues and PRs ever live in different repositories again. The TL;DR heading
 # renders empty, to be filled by hand.
 pr_body = '''
-{%- set own = (issue_magic_word ~ " " ~ ("#" if issue and issue[0] in "0123456789" else "") ~ issue) if issue else "" -%}
+{%- set own = (ticket_magic_word ~ " " ~ ("#" if ticket and ticket[0] in "0123456789" else "") ~ ticket) if ticket else "" -%}
 {%- set ref_lines = ((own ~ ";" ~ refs) if own else refs) | split(";") | map("trim") | reject("eq", "") | list -%}
 {%- set agent = agent_model or agent_harness -%}
 {%- if not agent %}
