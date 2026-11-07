@@ -10,7 +10,7 @@ alacritree gets a session backend choice. With the `herdr_core` session backend,
 
 Sessions outlive alacritree. Closing a session kills its terminal. Quitting detaches, and the next launch adopts every terminal that alacritree's labels mark, into the same workspace and position. On WSL, one resident connection per distro carries every stream, so a session costs no `wsl.exe` launch, and a keeper holds the distro open after alacritree quits.
 
-alacritree also lists terminals that it did not create as panes, so the user can attach to them or watch them. Sub-agents appear under their parent session. When a side has no usable core, the session opens native and a notice says why.
+alacritree also lists terminals that it did not create as panes, so the user can attach to them or watch them. Every session reports the agent in its foreground, on either backend and on every side, so the sub-agents of Claude Code and Codex appear under their session, WSL sessions included. When a side has no usable core, the session opens native and a notice says why.
 
 ## User Stories
 
@@ -38,10 +38,10 @@ alacritree also lists terminals that it did not create as panes, so the user can
 22. As a user, I want a "Kill terminal" action on a foreign pane, from the palette and from its sidebar row, with a confirmation, so that I can end a stuck program on purpose.
 23. As a user, I want a foreign terminal's record to stay after its program ends, so that its creator decides what happens to it.
 24. As a user, I want to list foreign panes or not, with a config switch, so that the sidebar shows only what I use.
-25. As a user, I want sub-agents listed under the session of their parent, so that I see what an agent started.
-26. As a user, I want to turn the sub-agent listing off in config, so that a busy agent does not crowd the sidebar.
-27. As a user, I want opening a sub-agent to adopt it, so that it then behaves like a terminal that alacritree created.
-28. As a user, I want to park a sub-agent, so that it leaves my sidebar and keeps running.
+25. As a user, I want the sub-agents of a Claude Code or Codex session listed as indented rows under that session, so that I see what my agent started.
+26. As a user, I want to turn the sub-agent listing off per harness in config, so that a busy agent does not crowd the sidebar.
+27. As a user, I want sub-agents listed for native sessions and for herdr-core sessions alike, so that the session backend does not change what I see.
+28. As a WSL user, I want sub-agents listed for my WSL sessions, so that agents in a distro show the same detail as agents on Windows.
 29. As a user, I want `hc` and `hc attach` typed inside a session to work as they do in any terminal, so that the hc command line stays usable.
 30. As a WSL user, I want `herdr_core` sessions in each distro, so that my agents in WSL survive too.
 31. As a WSL user, I want a new session in a distro to cost no `wsl.exe` launch once that distro is connected, so that a session opens as fast as a native one.
@@ -73,7 +73,7 @@ alacritree also lists terminals that it did not create as panes, so the user can
   - `icon` is the glyph on a pane's row.
   - `session_backend` is an enum, `native` or `herdr_core`, and its default is `native`.
   - `enabled` lists foreign panes, and its default is on.
-  - A switch lists sub-agents, and its default is on.
+- `[integrations.claude]` and `[integrations.codex]` each get a `subagents` switch, and its default is on.
 - The config section lives in the backend crate, and the app's `RawIntegrations` names it with one field, as for the other integrations.
 - The palette and the IPC `create_session` request take an optional session backend that overrides the config for one session.
 
@@ -81,14 +81,24 @@ alacritree also lists terminals that it did not create as panes, so the user can
 
 - A new integration-type crate holds the session backend trait, its shared models, its `thiserror` error type and a scripted test fake.
 - A new native backend crate holds the code that opens a PTY and starts `alacritty_terminal`'s event loop. This code moves out of the app's session module.
-- A new herdr-core backend crate holds the framed client, the demux thread, the per-session parser threads, socket discovery, the keeper and its implementation of the multiplexer trait for foreign panes and sub-agents.
+- A new herdr-core backend crate holds the framed client, the demux thread, the per-session parser threads, socket discovery, the keeper and its implementation of the multiplexer trait for foreign panes.
+- A new integration-type crate for sub-agents holds the source trait, its models, a test fake and the incremental readers for append-only files. The Claude Code integration crate and a new Codex integration crate implement it. These readers read the files each harness already keeps, and need nothing installed in the agent.
 - The app dispatches through a `#[derive(ambassador::Delegate)]` enum over the two backends. Trait signatures name types by absolute path.
 
 ### Session backend interface
 
 - The backend level opens a session, lists the terminals that are adoptable, attaches, watches and detaches.
-- The session handle sends input, resizes, reports focus, kills, and reports the foreground process and the cwd.
+- The session handle sends input, resizes, reports focus, kills, and reports its foreground program: the side, the pid on that side, the argv and the cwd.
 - Kill and detach are separate operations. A detach never kills a terminal.
+- The native backend takes the foreground program from the process probe on the native side, and from the WSL helper's probe in a distro. The helper's probe reports the pid as well as the name.
+- The herdr-core backend takes the foreground program from the core's events, on every side.
+
+### Sub-agents
+
+- A sub-agent source receives each session's foreground program and reads that side's harness files. Claude Code maps an agent pid to its conversation, and Codex matches a session by the directory it started in.
+- On a WSL side, the source reads the distro's harness files through the WSL helper.
+- The sidebar lists each running sub-agent as an indented row under its session. A row is not a session: clicking it brings its session on screen, and the cursor, search and reordering pass over it.
+- A row disappears shortly after its sub-agent finishes or is interrupted. A sub-agent that waits on its own background work stays listed until that work reports back.
 
 ### Data path for herdr-core sessions
 
@@ -110,7 +120,7 @@ alacritree also lists terminals that it did not create as panes, so the user can
 - Closing a session on an own terminal kills the terminal and removes its finished record. Closing a session on a foreign pane only detaches.
 - A finished own terminal closes its session and loses its record. A finished foreign terminal closes its session and keeps its record.
 - "Kill terminal" on a foreign pane asks for a confirmation, from the palette and from the sidebar row.
-- Opening a sub-agent adopts it: alacritree writes its labels and sets `keep`. Parking a sub-agent clears its labels and detaches, and the program keeps running.
+- A terminal that another terminal started with `hc run` gets no special treatment. It is a foreign pane like any other.
 
 ### Reconnect
 
@@ -143,8 +153,9 @@ alacritree also lists terminals that it did not create as panes, so the user can
 ## Testing Decisions
 
 - A good test drives behavior that the user or an IPC client can see: a session opens, closes, survives a quit, gets adopted, or falls back. It does not assert on threads, channels or frame bytes.
-- **Seam 1: the session backend trait, through the app.** The trait crate ships a scripted fake. App tests use it to cover close kills, quit detaches, label-driven adoption, foreign-pane close detaches, the kill confirmation, the fallback to native with a notice, the per-create override and the sub-agent switch. Prior art: `alacritree_multiplexer::Scripted` and the app tests that drive multiplexers through it.
-- **Seam 2: the herdr-core backend against a throwaway core.** A new `hc_e2e` suite joins the opt-in `e2e` task. It isolates its core with its own `HC_SOCKET` in a temporary directory and its own `HC_SESSION`, so it never touches a live core. It covers the attach and the first paint, CREDIT, a reconnect after the `hc connect` child is killed, `keep`, labels, `where`, sub-agents and socket discovery through `core.lock`. Prior art: `herdr_e2e` and `zellij_e2e`.
+- **Seam 1: the session backend trait, through the app.** The trait crate ships a scripted fake. App tests use it to cover close kills, quit detaches, label-driven adoption, foreign-pane close detaches, the kill confirmation, the fallback to native with a notice, the per-create override, and sub-agent rows placed by the foreground program that the fake reports. Prior art: `alacritree_multiplexer::Scripted` and the app tests that drive multiplexers through it.
+- **Seam 2: the herdr-core backend against a throwaway core.** A new `hc_e2e` suite joins the opt-in `e2e` task. It isolates its core with its own `HC_SOCKET` in a temporary directory and its own `HC_SESSION`, so it never touches a live core. It covers the attach and the first paint, CREDIT, a reconnect after the `hc connect` child is killed, `keep`, labels, `where`, the foreground program and socket discovery through `core.lock`. Prior art: `herdr_e2e` and `zellij_e2e`.
+- The sub-agent readers get fixture tests over recorded harness files: both transcript formats, the incremental fold, and a sub-agent that waits on its own background work. Prior art: the readers in the unmerged sub-agent PR.
 - The keeper and the WSL helper path get manual verification, because WSL's idle shutdown needs a real distro.
 - The config keys pass the `config_schema` test, as every new key does.
 
@@ -166,4 +177,5 @@ alacritree also lists terminals that it did not create as panes, so the user can
   - the keeper's exact command, and how it learns that its core has no live terminals;
   - whether the Windows core needs herdr-app's workaround for ConPTY, which merges a bare Escape with the next key and drops Shift+Enter;
   - whether the shell that `keep` starts in place of a lost program opens in the old cwd.
-- The domain terms are in `GLOSSARY.local.md`: side, session backend, pane, core, keeper, adopt, sub-agent and watch.
+- The sub-agent work takes the readers and the sidebar rows from alacritree/alacritree#407, which has not merged. It replaces that PR's process-tree walk with the foreground program that each session backend reports, and it adds WSL.
+- Terms: a side is the native host or one WSL distro. A session backend is a native PTY or a core. A core is a running herdr-core server on one side. A pane is a terminal that alacritree lists without having opened it. A keeper holds a WSL distro open after alacritree quits. To adopt is to take a labelled terminal into a session. To watch is to attach without typing or resizing. A sub-agent is an agent that a session's agent starts inside its own harness.
