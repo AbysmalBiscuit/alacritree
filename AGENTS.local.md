@@ -220,6 +220,8 @@ When adding new entries to the config, always add default values so they are inc
 
 `/rebase-propagate-alacritree` replays the whole open `[n]` stack onto `origin/master` after a PR merges and pushes every branch back to `origin`.
 
+`/record-proof` records a video or a screenshot of an isolated dev build as proof of a change, and cuts the idle stretches from the video.
+
 ### Issue tracker
 
 GitHub issues on `alacritree/alacritree`, always with an explicit `-R`. See `docs/agents/issue-tracker.local.md`.
