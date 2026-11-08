@@ -70,40 +70,6 @@ programs = ["cargo"]
 args = ["clippy"]
 reason = "Without --no-deps clippy lints the vendored crates, which are #![deny(clippy::all)] and cannot be edited here. Run `devkit run task clippy`."
 
-[hooks]
-after_worktree_create = [
-    [
-        "alacritree",
-        "project",
-        "refresh",
-        "--all",
-    ],
-    [
-        "zoxide",
-        "add",
-        "{{ worktree }}",
-    ],
-    [
-        "{{ herdr_session }}",
-        "open",
-        "--no-focus",
-        "--path",
-        "{{ worktree }}",
-    ],
-]
-
-after_worktree_remove = [
-    [
-        "{{ herdr_session }}",
-        "close",
-        "--path",
-        "{{ worktree }}",
-    ],
-]
-
-after_end = [["alacritree", "project", "refresh", "."]]
-
-
 [tracker]
 kind = "github"
 
