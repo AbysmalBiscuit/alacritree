@@ -136,7 +136,7 @@ alacritree also lists terminals that it did not create as panes, so the user can
 
 ### WSL keeper
 
-- On quit, alacritree leaves one detached, hidden `wsl.exe -d <distro>` process for each distro whose core has live terminals.
+- While a distro's core has live terminals, alacritree keeps one detached, hidden `wsl.exe -d <distro>` process for it. The keeper starts before any quit, so it also survives a crash.
 - The keeper exits when its core has no live terminals.
 - `doctor` explains WSL's idle shutdown and the global `instanceIdleTimeout` setting. See the ADR on the keeper.
 
