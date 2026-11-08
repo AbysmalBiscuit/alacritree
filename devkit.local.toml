@@ -129,16 +129,20 @@ description = "Run the alacritree and crates/ tests with nextest"
 run = ["cargo", "nextest", "run", "--locked"]
 
 [tasks.e2e]
-description = "Run the opt-in herdr end-to-end suite against a throwaway server"
+description = "Run the opt-in herdr and herdr-core end-to-end suites against throwaway servers"
 run = [
     "cargo",
     "nextest",
     "run",
     "-p",
     "alacritree",
+    "-p",
+    "alacritree_herdr_core",
     "--locked",
     "--test",
     "herdr_e2e",
+    "--test",
+    "hc_e2e",
     "--run-ignored",
     "ignored-only",
     "--test-threads",
