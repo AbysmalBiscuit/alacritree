@@ -9,7 +9,7 @@ worktree_root = "../alacritree-worktrees"
 # in the slug rather than in a fixed prefix.
 branch_prefix = ""
 
-# `issue setup` cuts every branch from this ref. A stacked branch is re-pointed
+# `ticket setup` cuts every branch from this ref. A stacked branch is re-pointed
 # at its real base afterwards, per AGENTS.local.md.
 baseline_ref = "origin/master"
 
@@ -22,12 +22,12 @@ baseline_dir = "../alacritree-baselines"
 # Untracked instructions copied into each new worktree, so an agent working
 # there reads the same rules as one working in the main checkout.
 worktree_include = [
-  "AGENTS.local.md",
-  "CLAUDE.local.md",
-  "GLOSSARY.local.md",
-  "docs/agents/issue-tracker.local.md",
-  "docs/agents/triage-labels.local.md",
-  "docs/agents/domain.local.md",
+    "AGENTS.local.md",
+    "CLAUDE.local.md",
+    "GLOSSARY.local.md",
+    "docs/agents/issue-tracker.local.md",
+    "docs/agents/triage-labels.local.md",
+    "docs/agents/domain.local.md",
 ]
 
 
@@ -174,77 +174,6 @@ run = [
 # Each `Closes` line spells `issues_repo` out, so the body stays correct if
 # issues and PRs ever live in different repositories again. The TL;DR heading
 # renders empty, to be filled by hand.
-pr_body = '''
-{%- set own = (ticket_magic_word ~ " " ~ ("#" if ticket and ticket[0] in "0123456789" else "") ~ ticket) if ticket else "" -%}
-{%- set ref_lines = ((own ~ ";" ~ refs) if own else refs) | split(";") | map("trim") | reject("eq", "") | list -%}
-{%- set agent = agent_model or agent_harness -%}
-{%- if not agent %}
-## TL;DR (human written)
-{{ human_tldr }}
-{%- endif %}
-{%- if ref_lines %}
-{%- if not agent %}
-
----
-{%- endif %}
-
-{{ ref_lines | join("\n") }}
-{%- endif %}
-{%- if agent %}
-{%- if ref_lines %}
-
----
-{%- endif %}
-
-## Agent summary
-{%- endif %}
-
-{{ input | trim }}
-{%- set caveats = [["departures", departures], ["loose ends", loose_ends], ["assumptions", assumptions]] %}
-{%- set filled = [departures, loose_ends, assumptions] | map("trim") | reject("eq", "") | reject("eq", "**None**") | list %}
-{%- if agent or filled %}
-
-## Caveats
-{%- for kind, value in caveats %}
-
-{{ value | trim if value | trim not in ["", "**None**"] else "**0 " ~ kind ~ "**" }}
-{%- endfor %}
-{%- endif %}
-{%- if agent or conceptual_changes | trim %}
-
-## Conceptual Changes
-
-{{ conceptual_changes | trim or "**None**" }}
-{%- endif %}
-{%- if proof | trim %}
-
-## Proof
-
-{{ proof | trim }}
-{%- endif %}
-{%- if door | trim or blast_radius | trim %}
-
-## Merge Danger
-{%- if door | trim %}
-
-**Door:** {{ door | trim }}
-{%- endif %}
-{%- if blast_radius | trim %}
-
-**Blast Radius:** {{ blast_radius | trim }}
-{%- endif %}
-{%- endif %}
-{%- if agent %}
-
----
-{%- if implemented_by | trim %}
-
-Implemented by {{ implemented_by | trim }}
-{%- endif %}
-
-🤖 Generated with {{ agent_model }}{% if agent_model and agent_harness %} via {% endif %}{{ agent_harness }}
-{%- endif %}
-'''
 
 [templates.variables]
 # Hooks are spawned without a shell, so `~` stays literal and a bare name is
@@ -253,13 +182,13 @@ Implemented by {{ implemented_by | trim }}
 # differently re-points this one line.
 herdr_session = "herdr-session.cmd"
 
-# The worktree's own issue is already in the render context as `issue`; this is
+# The worktree's own ticket is already in the render context as `ticket`; this is
 # for the extra ones a PR closes, whitespace separated: `--arg closes="12 41"`.
 closes = ""
 
 # Spelled out again here because the template context does not carry
-# `[github] issues_repo`; keep the two in sync.
-issues_repo = "alacritree/alacritree"
+# `[github] tickets_repo`; keep the two in sync.
+tickets_repo = "alacritree/alacritree"
 
 [ticket.fields.github.assignees]
 type = "user"
@@ -278,23 +207,23 @@ type = "enum"
 list = true
 where = "labels"
 values = [
-  { name = "bug", id = "bug" },
-  { name = "documentation", id = "documentation" },
-  { name = "duplicate", id = "duplicate" },
-  { name = "enhancement", id = "enhancement" },
-  { name = "good first issue", id = "good first issue" },
-  { name = "help wanted", id = "help wanted" },
-  { name = "invalid", id = "invalid" },
-  { name = "question", id = "question" },
-  { name = "wontfix", id = "wontfix" },
-  { name = "autorelease: pending", id = "autorelease: pending" },
-  { name = "autorelease: tagged", id = "autorelease: tagged" },
-  { name = "chore", id = "chore" },
-  { name = "ready-for-agent", id = "ready-for-agent" },
-  { name = "performance", id = "performance" },
-  { name = "priority:low", id = "priority:low" },
-  { name = "refactor", id = "refactor" },
-  { name = "wip", id = "wip" },
+    { name = "bug", id = "bug" },
+    { name = "documentation", id = "documentation" },
+    { name = "duplicate", id = "duplicate" },
+    { name = "enhancement", id = "enhancement" },
+    { name = "good first issue", id = "good first issue" },
+    { name = "help wanted", id = "help wanted" },
+    { name = "invalid", id = "invalid" },
+    { name = "question", id = "question" },
+    { name = "wontfix", id = "wontfix" },
+    { name = "autorelease: pending", id = "autorelease: pending" },
+    { name = "autorelease: tagged", id = "autorelease: tagged" },
+    { name = "chore", id = "chore" },
+    { name = "ready-for-agent", id = "ready-for-agent" },
+    { name = "performance", id = "performance" },
+    { name = "priority:low", id = "priority:low" },
+    { name = "refactor", id = "refactor" },
+    { name = "wip", id = "wip" },
 ]
 level = "info"
 
