@@ -45,5 +45,5 @@ A running herdr-core server on one side, which owns terminals that outlive the c
 _Avoid_: hc server, daemon, herdr server
 
 **Keeper**:
-A process that alacritree leaves behind when it quits, which holds a WSL distro open while that distro's core still has terminals.
+A process that holds a WSL distro open while that distro's core still has terminals, and outlives alacritree however alacritree ends.
 _Avoid_: keepalive, holder
