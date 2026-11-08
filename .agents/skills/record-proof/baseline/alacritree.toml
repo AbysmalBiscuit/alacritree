@@ -1,0 +1,33 @@
+# The human's font settings and nothing else. Without the fallback chain the
+# prompt's Nerd Font glyphs draw wrong, and without the UI size the sidebar does.
+[font]
+fallback = [
+  # Sarasa's cell is half an em, and nothing here fits it: Meslo's icons are
+  # 0.60em, the Symbols faces' are 0.92-1.00em. Until glyphs are fitted to the
+  # cell, the narrowest face overruns least, so Meslo leads.
+  "MesloLGM Nerd Font Propo",
+  "Symbols Nerd Font Mono",
+  "Symbols Nerd Font",
+  "Atkinson Hyperlegible Mono",
+  "Noto Sans Mono CJK KR",
+  "Noto Sans Mono CJK SC",
+  "Noto Sans Mono CJK HK",
+  "Noto Sans Mono CJK JP",
+  "Noto Sans Mono CJK TC",
+  "Menlo",
+  "Monaco",
+  "Consolas",
+  "Twemoji Mozilla",
+  "Noto Color Emoji",
+  "Apple Color Emoji",
+  "Segoe UI Emoji",
+  "Segoe UI Symbol",
+  "Font Awesome 6 Pro",
+  "Noto Emoji",
+  "Segoe UI Historic",
+  "Noto Sans Bamum",
+]
+scratchpad_size = 12
+
+[ui.font]
+size = 10.6

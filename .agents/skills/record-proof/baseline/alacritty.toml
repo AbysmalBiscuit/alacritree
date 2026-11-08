@@ -1,0 +1,5 @@
+# The human's font settings and nothing else. A take passes every other
+# setting with `-o`, so the scenario shows each one it depends on.
+[font]
+normal = { family = "Sarasa Fixed K", style = "Regular" }
+size = 12

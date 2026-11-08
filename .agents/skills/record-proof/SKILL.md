@@ -5,7 +5,7 @@ description: Record a video or take a screenshot of a dev alacritree build as pr
 
 # Record proof
 
-A take is one recorded run of a scenario script against an isolated dev window. `proof_kit.py` beside this file holds everything a take needs: it launches the dev build, drives it through the alacritree CLI, records the window with ffmpeg, and cuts the idle stretches. Windows only.
+A take is one recorded run of a scenario script against an isolated dev window. `proof_kit.py` beside this file holds everything a take needs: it launches the dev build, drives it through the alacritree CLI, records the window with ffmpeg, and cuts the idle stretches. Windows only, and it needs an ffmpeg 8 or later on PATH, since older builds have no `gfxcapture`.
 
 ## Steps
 
@@ -13,9 +13,10 @@ A take is one recorded run of a scenario script against an isolated dev window. 
 2. Write the scenario as a `.py` file in your scratchpad. The write harness cannot follow an inline `python -c` that imports the kit.
 3. Run the scenario. A failed take raises. Fix the scenario and run it again, since every `Demo` starts from empty state.
 4. Review the take. Read a contact sheet with `Demo.contact_sheet`, then single frames with `Demo.frame` wherever the sheet is unclear. The take is done when each claim the issue names is readable in a frame you looked at.
-5. Run `Demo.finish_video(mkv, mp4)`. It cuts each idle stretch to a short hold, keeps a longer hold on the last one, and encodes an MP4 small enough to attach to a PR.
-6. Put the MP4 and any screenshots under the worktree's `.devkit/proof/` and report their paths. Attaching them to the PR is the human's step, because GitHub has no API to upload video.
-7. Confirm that no dev window is left: `Get-Process alacritree` lists no process from `target\debug`.
+5. Check the take's privacy. The window shows only what the scenario made: no project, session or path the scenario did not create. A frame that fails the check ends the take: delete it and record again.
+6. Run `Demo.finish_video(mkv, mp4)`. It cuts each idle stretch to a short hold, keeps a longer hold on the last one, and encodes an MP4 small enough to attach to a PR.
+7. Put the MP4 and any screenshots under the worktree's `.devkit/proof/` and report their paths. Never attach media that failed step 5. An upload stays readable at its URL after the PR stops showing it.
+8. Confirm that no dev window is left: `Get-Process alacritree` lists no process from `target\debug`.
 
 ## Scenario
 
@@ -32,7 +33,7 @@ repo.mkdir(exist_ok=True)
 subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
 
 with Demo(work=here / "run", worktree=r"<worktree>", core=True,
-          alacritree_toml='[integrations.herdr_core]\nsession_backend = "herdr_core"\n') as demo:
+          overrides=["integrations.herdr_core.session_backend='herdr_core'"]) as demo:
     demo.add_project(repo)
     with demo.record(here / "take.mkv"):
         first = demo.select_workspace(repo)
@@ -45,14 +46,23 @@ Demo.contact_sheet(here / "take.mkv", here / "sheet.png")
 
 `Demo.cli` runs any `alacritree` subcommand against the dev window: `project`, `session`, `workspace`, `action`. `alacritree --help` lists them. Use `wait_for` on `read-screen` text for every step that takes time, so the scenario does not rely on a fixed delay.
 
+`demo.relaunch()` kills the window and starts it again on the same config, state and core. Inside `record`, the take goes on across it: the kit records one segment per window and joins them into the take.
+
+## Config
+
+Every take starts from `baseline/`, which holds the human's font settings and nothing else. Without them the prompt's Nerd Font glyphs and the sidebar text draw wrong. When the human changes their fonts, copy the new `[font]` and `[ui.font]` tables into `baseline/`.
+
+Pass every other setting a scenario needs in `overrides`, one `key=value` string per setting, in the syntax of the app's `-o` flag. The kit passes each one as `-o`, after its own `general.state_dir` and `terminal.shell` settings. Do not edit `baseline/` to set up a scenario.
+
 ## Isolation
 
 The kit keeps the take away from the human's own alacritree and herdr-core:
 
 - `--config-dir` points the dev build at a scratch config. That flag does not move `state.toml`, so the kit also sets `-o general.state_dir=...`. Without it the dev window loads the human's projects and can write their state.
-- With `core=True`, the kit starts a core of its own on its own `HC_SOCKET` pipe, `HC_SESSION` and XDG homes. Run `hc` only through `Demo.hc`. A bare `hc server stop` stops the human's core.
-- The kit removes the variables that tie a child to your agent session, such as `CLAUDE_CODE_SESSION_ID`. A Claude Code started in the take reads them and warns that its transcript is off.
-- The window sits on top at a fixed rect, and ffmpeg records that region of the desktop. A GL window records black when ffmpeg grabs the window itself.
+- With `core=True`, the kit starts a core of its own on its own `HC_SOCKET` pipe, `HC_SESSION` and XDG homes. Each `Demo` gets a unique pipe, so concurrent takes by other agents never share a core. Run `hc` only through `Demo.hc`. A bare `hc server stop` stops the human's core.
+- The kit removes the variables your own terminal set, so the dev window starts with the environment of a fresh one. `NO_COLOR` strips the prompt's colours, `STARSHIP_*` loads the prompt of your shell, `HC_*` points `hc` at the human's core, and a Claude Code started in the take reads `CLAUDE_*` and warns that its transcript is off. When the window draws differently from the human's, look for a variable the kit still passes on.
+- ffmpeg's `gfxcapture` records the dev window itself through Windows Graphics Capture. A frame holds that window's pixels only, so other windows and the desktop never reach a take, even when they cover the window. Never record with `gdigrab` or any other desktop capture.
+- The kit sizes the window but leaves it where it is in the z-order and never focuses it, so a take does not cover the human's windows or another agent's take. Concurrent takes do not see each other.
 
 If a dev window ever shows the human's projects, kill it at once with `Stop-Process -Force`. A hard kill writes no state.
 
@@ -65,7 +75,7 @@ If a dev window ever shows the human's projects, kill it at once with `Stop-Proc
 - Claude Code's status line shows the human's email and spending. Start it with `claude --settings <file>`, where the file sets `{"statusLine":{"type":"command","command":"echo demo"}}`.
 - Claude Code asks whether to trust a new folder, and its default answer exits. Send `DOWN`, then an empty `--enter`.
 - PSReadLine shows a gray history suggestion while the kit types. It is not part of the command.
-- When someone moves or resizes the window during a take, call `demo.pin()` and record the take again.
+- When someone resizes the window during a take, call `demo.pin()` and record the take again. The capture keeps its first frame size and adds black bars around a smaller window.
 
 ## Tools
 
